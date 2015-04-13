@@ -15,7 +15,7 @@ GPLv3
 
 # Isn't the GPL incompatible with the App Store?
 
-Yes, that's why we're using it for now.  
+Yes, that's why we're using it (for now).  
 
 Until this implementation matures, we just want this code to be
 visible, not used.  We'll revisit licensing issues later.
@@ -28,7 +28,7 @@ develop it.
 # Will this stay in F# as the only implementation?
 
 If Apple and Google deprecate all their tooling and standardize on Xamarin
-for all mobile development, yes.
+for all mobile development, yes.  :-)
 
 Otherwise, this would need to get ported and/or reimplemented in something
 else so that people building apps with ObjC or Java could use it.
@@ -45,15 +45,17 @@ It stands for Embeddable Lite Mongo.
 
 # How complete is this?
 
+Most CRUD operations work just like they do in Mongo.
+
 Intentionally omitted:  Sharding, JavaScript
 
-Not done yet:  Full text search, geo, actually *using* indexes
+Not done yet:  Full text search, geo, indexes
 
 Number of passing test cases in jstests:  Over 300
 
 For more info, see the blog entry mentioned near the top of this README.  
 
-# How can you be running Mongo's jstests on this?  
+# How can you be running Mongo's jstests on an "embedded" database?  
 
 Elmo has a server which was written specifically for that purpose.
 
