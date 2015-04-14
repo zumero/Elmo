@@ -17,6 +17,452 @@
 
 namespace Zumero
 
+module storage =
+    open SQLitePCL
+    open SQLitePCL.Ugly
+
+    // TODO special type for the pair db and coll
+
+    type index_info =
+        {
+            db:string
+            coll:string
+            ndx:string
+            spec:BsonValue
+            options:BsonValue
+        }
+
+    type write_methods =
+        {
+            insert:BsonValue->unit
+            update:BsonValue->unit
+            delete:BsonValue->bool
+            commit:unit->unit
+            rollback:unit->unit
+        }
+
+    type conn_methods =
+        {
+            listCollections:unit->(string*string*BsonValue)[]
+            createCollection:string->string->BsonValue->bool
+            dropCollection:string->string->bool
+            renameCollection:string->string->bool->bool
+            clearCollection:string->string->bool
+            listIndexes:unit->index_info[]
+            createIndexes:index_info[]->bool[]
+            dropIndex:string->string->string->bool
+            beginWrite:string->string->write_methods
+            getCollectionSequence:string->string->(seq<BsonValue>*(unit->unit))
+            dropDatabase:string->bool
+            close:unit->unit
+        }
+
+    let openStorage =
+        let conn = ugly.``open``("elmodata.db")
+        conn.exec("PRAGMA journal_mode=WAL")
+        conn.exec("CREATE TABLE IF NOT EXISTS \"collections\" (dbName TEXT NOT NULL, collName TEXT NOT NULL, options BLOB NOT NULL, PRIMARY KEY (dbName,collName))")
+        conn.exec("CREATE TABLE IF NOT EXISTS \"indexes\" (dbName TEXT NOT NULL, collName TEXT NOT NULL, ndxName TEXT NOT NULL, spec BLOB NOT NULL, options BLOB NOT NULL, PRIMARY KEY (dbName, collName, ndxName), FOREIGN KEY (dbName,collName) REFERENCES \"collections\" ON DELETE CASCADE, UNIQUE (spec,dbName,collName))")
+
+        let getCollectionOptions db coll =
+            use stmt = conn.prepare("SELECT options FROM \"collections\" WHERE dbName=? AND collName=?")
+            stmt.bind_text(1,db)
+            stmt.bind_text(2,coll)
+            if raw.SQLITE_ROW=stmt.step() then
+                stmt.column_blob(0) |> BinReader.ReadDocument |> Some
+            else
+                None
+
+        let sqlSelectIndexes = "SELECT ndxName, spec, indexes.options, dbName, collName FROM \"indexes\" INNER JOIN \"collections\" ON (indexes.dbName=collections.dbName AND indexes.collName=collections.collName)"
+
+        let getIndexFromRow (stmt:sqlite3_stmt) =
+            let ndx = stmt.column_text(0)
+            let spec = stmt.column_blob(1) |> BinReader.ReadDocument
+            let options = stmt.column_blob(2) |> BinReader.ReadDocument
+            let db = stmt.column_text(3)
+            let coll = stmt.column_text(4)
+            {db=db;coll=coll;ndx=ndx;spec=spec;options=options}
+
+        let getIndexInfo db coll ndx =
+            use stmt = conn.prepare(sqlSelectIndexes + " WHERE dbName=? AND collName=? AND ndxName=?")
+            stmt.bind_text(1,db)
+            stmt.bind_text(2,coll)
+            stmt.bind_text(3,ndx)
+            if raw.SQLITE_ROW=stmt.step() then
+                getIndexFromRow(stmt) |> Some
+            else
+                None
+
+        let getTableNameForCollection db coll = sprintf "docs.%s.%s" db coll // TODO cleanse?
+
+        let getTableNameForIndex db coll ndx = sprintf "ndx.%s.%s.%s" db coll ndx // TODO cleanse?
+
+        let getStmtSequence (stmt:sqlite3_stmt) =
+            seq {
+                while raw.SQLITE_ROW = stmt.step() do
+                    let doc = stmt.column_blob(0) |> BinReader.ReadDocument
+                    yield doc
+            }
+
+        let createIndex info =
+            match getIndexInfo info.db info.coll info.ndx with
+            | Some already ->
+                if already.spec<>info.spec then
+                    failwith "index already exists with different keys"
+                false
+            | None ->
+                let baSpec = bson.toBinaryArray info.spec
+                let baOptions = bson.toBinaryArray info.options
+                use stmt = conn.prepare("INSERT INTO \"indexes\" (dbName,collName,ndxName,spec,options) VALUES (?,?,?,?,?)")
+                stmt.bind_text(1,info.db)
+                stmt.bind_text(2,info.coll)
+                stmt.bind_text(3,info.ndx)
+                stmt.bind_blob(4,baSpec)
+                stmt.bind_blob(5,baOptions)
+                let collTable = getTableNameForCollection info.db info.coll
+                let ndxTable = getTableNameForIndex info.db info.coll info.ndx
+                // TODO WITHOUT ROWID ?
+                match bson.tryGetValueForKey info.options "unique" with
+                | Some (BBoolean true) ->
+                    conn.exec(sprintf "CREATE TABLE \"%s\" (k BLOB NOT NULL, doc_rowid int NOT NULL REFERENCES \"%s\"(rowid) ON DELETE CASCADE, PRIMARY KEY (k))" ndxTable collTable)
+                | _ ->
+                    conn.exec(sprintf "CREATE TABLE \"%s\" (k BLOB NOT NULL, doc_rowid int NOT NULL REFERENCES \"%s\"(rowid) ON DELETE CASCADE, PRIMARY KEY (k,docid))" ndxTable collTable)
+                stmt.step_done()
+                true
+
+        let createCollection db coll options =
+            match getCollectionOptions db coll with
+            | Some _ ->
+                false
+            | None ->
+                let baOptions = bson.toBinaryArray options
+                use stmt = conn.prepare("INSERT INTO \"collections\" (dbName,collName,options) VALUES (?,?,?)", db, coll, baOptions)
+                stmt.step_done()
+                let collTable = getTableNameForCollection db coll
+                conn.exec(sprintf "CREATE TABLE \"%s\" (bson BLOB NOT NULL)" collTable)
+                match bson.tryGetValueForKey options "autoIndexId" with
+                | Some (BBoolean false) ->
+                    ()
+                | _ ->
+                    let info = 
+                        {
+                            db = db
+                            coll = coll
+                            ndx = "_id"
+                            spec = BDocument [| ("_id",BInt32 1) |]
+                            options = BDocument [| ("unique",BBoolean true) |]
+                        }
+                    let created = createIndex info
+                    ignore created
+                true
+
+        let listCollections() =
+            use stmt = conn.prepare("SELECT dbName, collName, options FROM \"collections\"")
+            let results = ResizeArray<_>()
+            while raw.SQLITE_ROW = stmt.step() do
+                let dbName = stmt.column_text(0)
+                let collName = stmt.column_text(1)
+                let options = stmt.column_blob(2) |> BinReader.ReadDocument
+                results.Add(dbName,collName,options)
+            results.ToArray()
+
+        let listIndexes() =
+            use stmt = conn.prepare(sqlSelectIndexes)
+            let results = ResizeArray<_>()
+            while raw.SQLITE_ROW = stmt.step() do
+                results.Add(getIndexFromRow stmt)
+            results.ToArray()
+
+        let dropIndex db coll ndxName =
+            match getIndexInfo db coll ndxName with
+            | Some _ ->
+                use stmt_ndx = conn.prepare("DELETE FROM \"indexes\" WHERE dbName=? AND collName=? AND ndxName=?")
+                stmt_ndx.bind_text(1,db)
+                stmt_ndx.bind_text(2,coll)
+                stmt_ndx.bind_text(2,ndxName)
+                stmt_ndx.step_done()
+                let deleted = conn.changes()>0
+                // TODO assert deleted is true?
+                let ndxTable = getTableNameForIndex db coll ndxName
+                conn.exec(sprintf "DROP TABLE \"%s\"" ndxTable)
+                deleted
+            | None ->
+                false
+
+        let dropCollection db coll =
+            match getCollectionOptions db coll with
+            | Some _ ->
+                let indexes = listIndexes() |> Array.filter (fun ndxInfo -> db=ndxInfo.db && coll=ndxInfo.coll)
+                Array.iter (fun info ->
+                    let deleted = dropIndex info.db info.coll info.ndx
+                    ignore deleted
+                ) indexes
+                let collTable = getTableNameForCollection db coll
+                conn.exec(sprintf "DROP TABLE \"%s\"" collTable)
+                use stmt=conn.prepare("DELETE FROM \"collections\" WHERE dbName=? AND collName=?")
+                stmt.bind_text(1,db)
+                stmt.bind_text(2,coll)
+                stmt.step_done()
+                let deleted = conn.changes()>0
+                // TODO assert deleted is true?
+                deleted
+            | None ->
+                false
+
+        let renameCollection oldName newName dropTarget =
+            let (oldDb,oldColl) = bson.splitname oldName
+            let (newDb,newColl) = bson.splitname newName
+
+            // jstests/core/rename8.js seems to think that renaming to/from a system collection is illegal unless
+            // that collection is system.users, which is "whitelisted".  for now, we emulate this behavior, even
+            // though system.users isn't supported.
+            if oldColl<>"system.users" && oldColl.StartsWith("system.") then failwith "renameCollection with a system collection not allowed."
+            if newColl<>"system.users" && newColl.StartsWith("system.") then failwith "renameCollection with a system collection not allowed."
+
+            if dropTarget then 
+                let deleted = dropCollection newDb newColl
+                ignore deleted
+
+            match getCollectionOptions oldDb oldColl with
+            | Some _ -> 
+                let indexes = listIndexes() |> Array.filter (fun ndxInfo -> oldDb=ndxInfo.db && oldColl=ndxInfo.coll)
+                let oldTable = getTableNameForCollection oldDb oldColl
+                let newTable = getTableNameForCollection newDb newColl
+                let f which =
+                    use stmt = conn.prepare(sprintf "UPDATE \"%s\" SET dbName=?, collName=? WHERE dbName=? AND collName=?" which)
+                    stmt.bind_text(1, newDb)
+                    stmt.bind_text(2, newColl)
+                    stmt.bind_text(3, oldDb)
+                    stmt.bind_text(4, oldColl)
+                    stmt.step_done()
+                f "collections"
+                f "indexes"
+                conn.exec(sprintf "ALTER TABLE \"%s\" RENAME TO \"%s\"" oldTable newTable)
+                Array.iter (fun ndxInfo ->
+                    let oldName = getTableNameForIndex oldDb oldColl ndxInfo.ndx
+                    let newName = getTableNameForIndex newDb newColl ndxInfo.ndx
+                    conn.exec(sprintf "ALTER TABLE \"%s\" RENAME TO \"%s\"" oldName newName)
+                ) indexes
+                false
+            | None -> 
+                createCollection newDb newColl (BDocument Array.empty)
+
+        let fn_close() = conn.close()
+
+        let fn_beginWrite db coll = 
+            // TODO ensure coll exists?
+            let tblCollection = getTableNameForCollection db coll
+            let stmt_insert = conn.prepare(sprintf "INSERT INTO \"%s\" (bson) VALUES (?)" tblCollection)
+            let stmt_delete = conn.prepare(sprintf "DELETE FROM \"%s\" WHERE rowid=?" tblCollection)
+            // TODO not if autoIndexId was false?
+            let tblIndex = getTableNameForIndex db coll "_id_"
+            let stmt_find_rowid = conn.prepare(sprintf "SELECT doc_rowid FROM \"%s\" WHERE k=?" tblIndex)
+
+            let fn_insert newDoc =
+                let ba = bson.toBinaryArray newDoc
+                if ba.Length > 16*1024*1024 then raise (MongoCode(10329, "document more than 16MB"))
+                stmt_insert.clear_bindings()
+                stmt_insert.bind_blob(1, ba)
+                stmt_insert.step_done()
+                stmt_insert.reset()
+
+            let fn_delete id =
+                let idk = bson.encodeForIndex id
+                stmt_find_rowid.clear_bindings()
+                stmt_find_rowid.bind_blob(1, idk)
+                let b =
+                    if raw.SQLITE_ROW=stmt_find_rowid.step() then
+                        let rowid = stmt_find_rowid.column_int64(0)
+                        stmt_delete.clear_bindings()
+                        stmt_delete.bind_int64(1,rowid)
+                        stmt_delete.step_done()
+                        stmt_delete.reset()
+                        true
+                    else
+                        false
+                stmt_find_rowid.reset()
+                b
+
+            let fn_update newDoc =
+                match bson.tryGetValueForKey newDoc "_id" with
+                | Some id ->
+                    let deleted = fn_delete id
+                    ignore deleted
+                    fn_insert newDoc
+                | None ->
+                    failwith "cannot update without id"
+
+            let fn_rollback() =
+                conn.exec("ROLLBACK TRANSACTION")
+                stmt_insert.sqlite3_finalize()
+                stmt_find_rowid.sqlite3_finalize()
+                stmt_delete.sqlite3_finalize()
+                
+            let fn_commit() =
+                conn.exec("COMMIT TRANSACTION")
+                stmt_insert.sqlite3_finalize()
+                stmt_find_rowid.sqlite3_finalize()
+                stmt_delete.sqlite3_finalize()
+                
+            conn.exec("BEGIN TRANSACTION")
+
+            {
+                insert = fn_insert
+                update = fn_update
+                delete = fn_delete
+                commit = fn_commit
+                rollback = fn_rollback
+            }
+
+        let fn_getCollectionSequence db coll =
+            match getCollectionOptions db coll with
+            | Some _ ->
+                let collTable = getTableNameForCollection db coll
+                conn.exec("BEGIN TRANSACTION")
+                let stmt = conn.prepare(sprintf "SELECT bson FROM \"%s\"" collTable)
+
+                let s = getStmtSequence stmt
+
+                let killFunc() =
+                    // TODO would it be possible/helpful to make sure this function
+                    // can be safely called more than once?
+                    conn.exec("COMMIT TRANSACTION")
+                    stmt.sqlite3_finalize()
+
+                (s, killFunc)
+            | None ->
+                (Seq.empty, (fun () -> ()))
+
+        let fn_listCollections() =
+            conn.exec("BEGIN TRANSACTION")
+            try
+                let a = listCollections()
+                conn.exec("COMMIT TRANSACTION")
+                a
+            with
+            | _ ->
+                conn.exec("ROLLBACK TRANSACTION")
+                reraise()
+
+        let fn_listIndexes() =
+            conn.exec("BEGIN TRANSACTION")
+            try
+                let a = listIndexes()
+                conn.exec("COMMIT TRANSACTION")
+                a
+            with
+            | _ ->
+                conn.exec("ROLLBACK TRANSACTION")
+                reraise()
+
+        let fn_dropIndex db coll ndx =
+            conn.exec("BEGIN TRANSACTION")
+            try
+                let a = dropIndex db coll ndx
+                conn.exec("COMMIT TRANSACTION")
+                a
+            with
+            | _ ->
+                conn.exec("ROLLBACK TRANSACTION")
+                reraise()
+
+        let fn_createCollection db coll =
+            conn.exec("BEGIN TRANSACTION")
+            try
+                let a = createCollection db coll 
+                conn.exec("COMMIT TRANSACTION")
+                a
+            with
+            | _ ->
+                conn.exec("ROLLBACK TRANSACTION")
+                reraise()
+
+        let fn_dropCollection db coll =
+            conn.exec("BEGIN TRANSACTION")
+            try
+                let a = dropCollection db coll 
+                conn.exec("COMMIT TRANSACTION")
+                a
+            with
+            | _ ->
+                conn.exec("ROLLBACK TRANSACTION")
+                reraise()
+
+        let fn_renameCollection oldFullName newFullName dropTarget =
+            conn.exec("BEGIN TRANSACTION")
+            try
+                let a = renameCollection oldFullName newFullName dropTarget
+                conn.exec("COMMIT TRANSACTION")
+                a
+            with
+            | _ ->
+                conn.exec("ROLLBACK TRANSACTION")
+                reraise()
+
+        let fn_clearCollection db coll = 
+            conn.exec("BEGIN TRANSACTION")
+            try
+                let created = 
+                    match getCollectionOptions db coll with
+                    | Some _ ->
+                        let collTable = getTableNameForCollection db coll
+                        conn.exec(sprintf "DELETE FROM \"%s\"" collTable)
+                        false
+                    | None ->
+                        createCollection db coll (BDocument Array.empty)
+                conn.exec("COMMIT TRANSACTION")
+                created
+            with
+            | _ ->
+                conn.exec("ROLLBACK TRANSACTION")
+                reraise()
+
+        let fn_dropDatabase db =
+            conn.exec("BEGIN TRANSACTION")
+            try
+                let a = listCollections() |> Array.filter (fun (name,_,_) -> db=name)
+                let deleted = Array.isEmpty a |> not
+                Array.iter (fun (db,coll,_) ->
+                    let deleted = dropCollection db coll
+                    ignore deleted
+                ) a
+                conn.exec("COMMIT TRANSACTION")
+                deleted
+            with
+            | _ ->
+                conn.exec("ROLLBACK TRANSACTION")
+                reraise()
+
+        let fn_createIndexes a =
+            conn.exec("BEGIN TRANSACTION")
+            try
+                let r =
+                    Array.map (fun info ->
+                        createIndex info
+                    ) a
+                conn.exec("COMMIT TRANSACTION")
+                r
+            with
+            | _ ->
+                conn.exec("ROLLBACK TRANSACTION")
+                reraise()
+
+        // ----------------------------------------------------------------
+
+        {
+            close = fn_close
+            beginWrite = fn_beginWrite
+            listCollections = fn_listCollections
+            listIndexes = fn_listIndexes
+            getCollectionSequence = fn_getCollectionSequence
+            clearCollection = fn_clearCollection
+            dropDatabase = fn_dropDatabase
+            createIndexes = fn_createIndexes
+            dropIndex = fn_dropIndex
+            createCollection = fn_createCollection
+            dropCollection = fn_dropCollection
+            renameCollection = fn_renameCollection
+        }
+
 module crud = 
 
     open System
@@ -236,6 +682,7 @@ module crud =
             results.Add(getIndexFromRow stmt)
         results.ToArray()
 
+    // TODO move this into bson module?
     let encodeIndexKey ndxInfo doc =
         let w = BinWriter()
         match ndxInfo.spec with
@@ -246,7 +693,7 @@ module crud =
                     match bson.findPath doc k with
                     | Some v -> v
                     | None -> BUndefined
-                bson.encodeForIndex w v
+                bson.encodeForIndexInto w v
             ) keys
         | _ -> failwith "must be a doc"
         w.ToArray()
@@ -286,6 +733,7 @@ module crud =
         // index rows will get deleted by cascade
 
     let insert dbName collName docs =
+        // TODO and if autoIndexId was false?
         let docs = 
             Seq.map (fun doc ->
                 match bson.tryGetValueForKey doc "_id" with
@@ -422,13 +870,6 @@ module crud =
         db.exec("BEGIN TRANSACTION")
         let collId = ensureCollectionExists db dbName collName options
         db.exec("COMMIT TRANSACTION")
-
-    let splitname (s:string) =
-        let dot = s.IndexOf('.')
-        if dot<0 then failwith "bad namespace"
-        let left = s.Substring(0, dot)
-        let right = s.Substring(dot+1)
-        (left,right)
 
     let listCollections (ofDb:string option) =
         use db = openDatabase "unused"
@@ -1215,8 +1656,8 @@ module crud =
         !count
            
     let renameCollection oldName newName dropTarget =
-        let (oldDb,oldColl) = splitname oldName
-        let (newDb,newColl) = splitname newName
+        let (oldDb,oldColl) = bson.splitname oldName
+        let (newDb,newColl) = bson.splitname newName
         // jstests/core/rename8.js seems to think that renaming to/from a system collection is illegal unless
         // that collection is system.users, which is "whitelisted".  for now, we emulate this behavior, even
         // though system.users isn't supported.

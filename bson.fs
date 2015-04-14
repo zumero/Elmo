@@ -43,6 +43,13 @@ module bson =
 
     open System
 
+    let splitname (s:string) =
+        let dot = s.IndexOf('.')
+        if dot<0 then failwith "bad namespace"
+        let left = s.Substring(0, dot)
+        let right = s.Substring(dot+1)
+        (left,right)
+
     let newObjectID() =
         // TODO make this a real object ID, not just 12 random bytes
         let id:byte[] = Array.zeroCreate 12
@@ -313,12 +320,14 @@ module bson =
         toBinary bv w
         w.ToArray()
 
-    let encodeForIndex (w:BinWriter) bv =
-        // TODO
-        w.WriteByte(getTypeOrder bv |> byte)
-        match bv with
-        | BObjectID a ->
-            w.WriteBytes(a)
+    let encodeForIndexInto (w:BinWriter) bv =
+        toBinary bv w
+        // TODO encode for memcmp
+
+    let encodeForIndex bv =
+        let w = BinWriter()
+        encodeForIndexInto w bv
+        w.ToArray()
 
     let setValueAtIndex bv ndx v =
         match bv with

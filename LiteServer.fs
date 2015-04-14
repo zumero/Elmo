@@ -720,7 +720,7 @@ module LiteServer =
         let dbName,collName = 
             match bson.tryGetValueForKey q "ns" with
             | Some (BString ns) -> 
-                let a,b = crud.splitname ns
+                let a,b = bson.splitname ns
                 (Some a, Some b)
             | _ -> 
                 None,None
@@ -774,7 +774,7 @@ module LiteServer =
 
     let private reply_Query clientMsg = 
         let fullCollectionName = clientMsg.q_fullCollectionName
-        let (db,coll) = crud.splitname fullCollectionName
+        let (db,coll) = bson.splitname fullCollectionName
         let bvQuery = clientMsg.q_query
 
         // TODO what if somebody queries on a field named query?  ambiguous.
