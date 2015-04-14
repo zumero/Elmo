@@ -17,7 +17,7 @@
 
 namespace Zumero
 
-module Storage = 
+module crud = 
 
     open System
     open System.IO

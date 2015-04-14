@@ -96,7 +96,7 @@ module LiteServer =
                 | BBoolean b -> b
                 | _ -> false
             | None -> false
-        Storage.renameCollection oldName newName dropTarget
+        crud.renameCollection oldName newName dropTarget
         let pairs = ResizeArray<_>()
         // TODO
         pairs.Add("ok", BDouble 1.0)
@@ -264,7 +264,7 @@ module LiteServer =
         doc
 
     let doInsert db coll s =
-        let results = Storage.insert db coll s
+        let results = crud.insert db coll s
         let writeErrors =
             results
             |> Array.filter (fun (_,err) ->
@@ -288,12 +288,12 @@ module LiteServer =
         | Some _ -> failwith "nope"
         | None -> ()
         try
-            let (out,s,funk) = Storage.aggregate db coll pipeline
+            let (out,s,funk) = crud.aggregate db coll pipeline
             try
                 match out with
                 | Some newCollName ->
                     if newCollName.StartsWith("system.") then raise (MongoCode(17385, "no $out into system collection"))
-                    match db |> Some |> Storage.listCollections |> Array.tryFind (fun (collId,dbName,collName,options) -> collName=newCollName) with
+                    match db |> Some |> crud.listCollections |> Array.tryFind (fun (collId,dbName,collName,options) -> collName=newCollName) with
                     | Some (collId,dbName,collName,options) ->
                         match bson.tryGetValueForKey options "capped" with
                         | Some _ -> raise (MongoCode(17152, "no $out into capped collection"))
@@ -301,7 +301,7 @@ module LiteServer =
                     | None -> ()
                     let fullColl = sprintf "%s.%s" db newCollName
                     removeCursorsForCollection fullColl
-                    Storage.clearCollection db newCollName
+                    crud.clearCollection db newCollName
                     let (results,writeErrors) = doInsert db newCollName s
                     funk()
                     let doc = reply_with_cursor (db+"."+coll) (Seq.empty) (fun ()->()) (Some (BDocument Array.empty)) 100
@@ -338,7 +338,7 @@ module LiteServer =
         let coll = bson.getValueForKey q "drop" |> bson.getString
         let fullColl = sprintf "%s.%s" db coll
         removeCursorsForCollection fullColl
-        let bDeleted = Storage.dropCollection db coll
+        let bDeleted = crud.dropCollection db coll
         let pairs = ResizeArray<_>()
         //pairs.Add("lastOp", BTimeStamp 0L) // TODO
         // TODO electionId?
@@ -351,7 +351,7 @@ module LiteServer =
     let private reply_DropDatabase clientMsg db = 
         let q = clientMsg.q_query
         //let whatever = bson.getValueForKey q "dropDatabase"
-        Storage.dropDatabase db
+        crud.dropDatabase db
         let pairs = ResizeArray<_>()
         pairs.Add("ok", BDouble 1.0)
         let doc = BDocument (pairs.ToArray())
@@ -386,7 +386,7 @@ module LiteServer =
             | Some (BInt64 n) -> bson.setValueForKey options "max" (n |> int64 |> BInt64)
             | Some (BDouble n) -> bson.setValueForKey options "max" (n |> int64 |> BInt64)
             | _ -> options
-        let ids = Storage.createCollection db coll options
+        let ids = crud.createCollection db coll options
         let pairs = ResizeArray<_>()
         pairs.Add("ok", BDouble 1.0)
         let doc = BDocument (pairs.ToArray())
@@ -398,7 +398,7 @@ module LiteServer =
         let deletes = bson.getValueForKey q "deletes" |> bson.getArray
         // TODO limit
         // TODO ordered
-        let results = Storage.delete db coll deletes
+        let results = crud.delete db coll deletes
         let pairs = ResizeArray<_>()
         pairs.Add("n", BInt32 results)
         //pairs.Add("lastOp", BTimeStamp 0L) // TODO
@@ -425,7 +425,7 @@ module LiteServer =
             | _ -> false
 
         // TODO remove needs to return number removed?  or is it always 1 or 0?
-        let (found,err,changed,upserted,result) = Storage.findandmodify db coll query sort remove update gnew fields upsert
+        let (found,err,changed,upserted,result) = crud.findandmodify db coll query sort remove update gnew fields upsert
 
         let lastErrorObject = ResizeArray<_>()
         let pairs = ResizeArray<_>()
@@ -466,8 +466,8 @@ module LiteServer =
         | Some v -> 
             match fields with
             | Some proj ->
-                let prep = Storage.verifyProjection proj None // TODO projection position op allowed here?
-                pairs.Add("value", Storage.projectDocument v None prep) // TODO projection position op allowed here?
+                let prep = crud.verifyProjection proj None // TODO projection position op allowed here?
+                pairs.Add("value", crud.projectDocument v None prep) // TODO projection position op allowed here?
             | None ->
                 pairs.Add("value", v)
         | None -> pairs.Add("value", BNull)
@@ -488,7 +488,7 @@ module LiteServer =
             match qv with
             | Some (BDocument s) -> qv
             | _ -> raise (MongoCode(18511, "invalid type for distinct"))
-        let values = Storage.distinct db coll key qry
+        let values = crud.distinct db coll key qry
         let pairs = ResizeArray<_>()
         pairs.Add("values", BArray values)
         pairs.Add("ok", BDouble 1.0)
@@ -500,7 +500,7 @@ module LiteServer =
         let coll = bson.getValueForKey q "update" |> bson.getString
         let updates = bson.getValueForKey q "updates" |> bson.getArray
         // TODO ordered
-        let results = Storage.update db coll updates
+        let results = crud.update db coll updates
         //printfn "results: %A" results
         let matches = Array.sumBy (fun (matches,_,_,_) -> matches) results
         let mods = Array.sumBy (fun (_,mods,_,_) -> mods) results
@@ -548,7 +548,7 @@ module LiteServer =
             match query with
             | Some q -> q
             | None -> BDocument [| |]
-        let count = Storage.count db coll query
+        let count = crud.count db coll query
         // TODO it's a little weird to do skip/limit here instead of
         // the way it's done for find.
         let skip = bson.tryGetValueForKey q "skip"
@@ -592,7 +592,7 @@ module LiteServer =
         let q = clientMsg.q_query
         let coll = bson.getValueForKey q "createIndexes" |> bson.getString
         let indexes = bson.getValueForKey q "indexes" |> bson.getArray
-        let result = Storage.createIndexes db coll indexes
+        let result = crud.createIndexes db coll indexes
         // TODO createdCollectionAutomatically
         // TODO numIndexesBefore
         // TODO numIndexesAfter
@@ -608,7 +608,7 @@ module LiteServer =
         let index = bson.getValueForKey q "index"
         let fullColl = sprintf "%s.%s" db coll
         removeCursorsForCollection fullColl
-        Storage.deleteIndex db coll index
+        crud.deleteIndex db coll index
         // TODO nIndexesWas
         let pairs = ResizeArray<_>()
         pairs.Add("ok", BDouble 1.0)
@@ -627,11 +627,11 @@ module LiteServer =
 
     let private reply_listCollections clientMsg (db:string) =
         let q = clientMsg.q_query
-        let result = Storage.listCollections (Some db)
+        let result = crud.listCollections (Some db)
         let result = Array.map (fun (collId,dbName,collName,options) -> BDocument [| ("name", BString collName);("options", options) |]) result
         let result = 
             match bson.tryGetValueForKey q "filter" with
-            | Some d -> Storage.doFilter result d
+            | Some d -> crud.doFilter result d
             | None -> result
         let s = Seq.ofArray result
         let funk() = ()
@@ -652,9 +652,9 @@ module LiteServer =
             | BString "" -> failwith "empty string not allowed here"
             | BString s -> s
             | _ -> failwith "must be a string"
-        let result = Storage.cmd_listIndexes (Some db) (Some coll)
+        let result = crud.cmd_listIndexes (Some db) (Some coll)
         let result = 
-            Array.map (fun (ndxInfo:Storage.IndexInfo) -> 
+            Array.map (fun (ndxInfo:crud.IndexInfo) -> 
                 let unique = 
                     match bson.tryGetValueForKey ndxInfo.options "unique" with
                     | Some (BBoolean true) -> true
@@ -720,16 +720,16 @@ module LiteServer =
         let dbName,collName = 
             match bson.tryGetValueForKey q "ns" with
             | Some (BString ns) -> 
-                let a,b = Storage.splitname ns
+                let a,b = crud.splitname ns
                 (Some a, Some b)
             | _ -> 
                 None,None
-        let result = Storage.cmd_listIndexes dbName collName
+        let result = crud.cmd_listIndexes dbName collName
         let result = result |> Array.map (fun ndxInfo -> BDocument [| "name", BString ndxInfo.ndxName |])
         createReply clientMsg.q_requestID result 0L
 
     let private reply_system_namespaces clientMsg (db:string) =
-        let result = None |> Storage.listCollections |> Array.map (fun (collId,dbName,collName,options) -> BDocument [| "name", BString (sprintf "%s.%s" dbName collName) |])
+        let result = None |> crud.listCollections |> Array.map (fun (collId,dbName,collName,options) -> BDocument [| "name", BString (sprintf "%s.%s" dbName collName) |])
         createReply clientMsg.q_requestID result 0L
 
     let private reply_err clientMsg (e:Exception) =
@@ -774,7 +774,7 @@ module LiteServer =
 
     let private reply_Query clientMsg = 
         let fullCollectionName = clientMsg.q_fullCollectionName
-        let (db,coll) = Storage.splitname fullCollectionName
+        let (db,coll) = crud.splitname fullCollectionName
         let bvQuery = clientMsg.q_query
 
         // TODO what if somebody queries on a field named query?  ambiguous.
@@ -814,12 +814,12 @@ module LiteServer =
         let projection = clientMsg.q_returnFieldsSelector
 
         //printfn "actualQuery: %A" actualQuery
-        let (s,kill) = Storage.find db coll actualQuery orderby projection ndxMin ndxMax
+        let (s,kill) = crud.find db coll actualQuery orderby projection ndxMin ndxMax
 
         try
             let s = 
                 if clientMsg.q_numberToSkip > 0 then
-                    Storage.seqSkip (clientMsg.q_numberToSkip) s
+                    crud.seqSkip (clientMsg.q_numberToSkip) s
                 else if clientMsg.q_numberToSkip < 0 then
                     failwith "negative skip"
                 else
