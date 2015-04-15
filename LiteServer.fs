@@ -293,8 +293,8 @@ module LiteServer =
                 match out with
                 | Some newCollName ->
                     if newCollName.StartsWith("system.") then raise (MongoCode(17385, "no $out into system collection"))
-                    match db |> Some |> crud.listCollections |> Array.tryFind (fun (collId,dbName,collName,options) -> collName=newCollName) with
-                    | Some (collId,dbName,collName,options) ->
+                    match db |> Some |> crud.listCollections |> Array.tryFind (fun (dbName,collName,options) -> collName=newCollName) with
+                    | Some (dbName,collName,options) ->
                         match bson.tryGetValueForKey options "capped" with
                         | Some _ -> raise (MongoCode(17152, "no $out into capped collection"))
                         | _ -> ()
@@ -628,7 +628,7 @@ module LiteServer =
     let private reply_listCollections clientMsg (db:string) =
         let q = clientMsg.q_query
         let result = crud.listCollections (Some db)
-        let result = Array.map (fun (collId,dbName,collName,options) -> BDocument [| ("name", BString collName);("options", options) |]) result
+        let result = Array.map (fun (dbName,collName,options) -> BDocument [| ("name", BString collName);("options", options) |]) result
         let result = 
             match bson.tryGetValueForKey q "filter" with
             | Some d -> crud.doFilter result d
@@ -654,17 +654,17 @@ module LiteServer =
             | _ -> failwith "must be a string"
         let result = crud.cmd_listIndexes (Some db) (Some coll)
         let result = 
-            Array.map (fun (ndxInfo:crud.IndexInfo) -> 
+            Array.map (fun (ndxInfo:index_info) -> 
                 let unique = 
                     match bson.tryGetValueForKey ndxInfo.options "unique" with
                     | Some (BBoolean true) -> true
                     | _ -> false
                 let pairs = ResizeArray<_>()
-                pairs.Add("name", BString ndxInfo.ndxName)
-                pairs.Add("ns", BString (sprintf "%s.%s" ndxInfo.dbName ndxInfo.collName))
+                pairs.Add("name", BString ndxInfo.ndx)
+                pairs.Add("ns", BString (sprintf "%s.%s" ndxInfo.db ndxInfo.coll))
                 pairs.Add("key", ndxInfo.spec)
                 // TODO it seems the automatic index on _id is NOT supposed to be marked unique
-                if unique then pairs.Add("unique", BBoolean unique)
+                if unique && ndxInfo.ndx<>"_id_" then pairs.Add("unique", BBoolean unique)
                 pairs.ToArray() |> BDocument
                 ) result
         let s = Seq.ofArray result
@@ -725,11 +725,11 @@ module LiteServer =
             | _ -> 
                 None,None
         let result = crud.cmd_listIndexes dbName collName
-        let result = result |> Array.map (fun ndxInfo -> BDocument [| "name", BString ndxInfo.ndxName |])
+        let result = result |> Array.map (fun ndxInfo -> BDocument [| "name", BString ndxInfo.ndx |])
         createReply clientMsg.q_requestID result 0L
 
     let private reply_system_namespaces clientMsg (db:string) =
-        let result = None |> crud.listCollections |> Array.map (fun (collId,dbName,collName,options) -> BDocument [| "name", BString (sprintf "%s.%s" dbName collName) |])
+        let result = None |> crud.listCollections |> Array.map (fun (dbName,collName,options) -> BDocument [| "name", BString (sprintf "%s.%s" dbName collName) |])
         createReply clientMsg.q_requestID result 0L
 
     let private reply_err clientMsg (e:Exception) =

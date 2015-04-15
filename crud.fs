@@ -17,51 +17,70 @@
 
 namespace Zumero
 
+type index_info =
+    {
+        db:string
+        coll:string
+        ndx:string
+        spec:BsonValue
+        options:BsonValue
+    }
+
+type tx =
+    {
+        database:string
+        collection:string
+        insert:BsonValue->unit
+        update:BsonValue->unit
+        delete:BsonValue->bool
+        getSelect:unit->(seq<BsonValue>*(unit->unit))
+        commit:unit->unit
+        rollback:unit->unit
+    }
+
+type conn_methods =
+    {
+        listCollections:unit->(string*string*BsonValue)[]
+        createCollection:string->string->BsonValue->bool
+        dropCollection:string->string->bool
+        renameCollection:string->string->bool->bool
+        clearCollection:string->string->bool
+        listIndexes:unit->index_info[]
+        createIndexes:index_info[]->bool[]
+        dropIndex:string->string->string->bool
+        beginWrite:string->string->tx
+        getCollectionSequence:string->string->(seq<BsonValue>*(unit->unit))
+        dropDatabase:string->bool
+        close:unit->unit
+    }
+
 module storage =
     open SQLitePCL
     open SQLitePCL.Ugly
 
+    let private encodeIndexKey ndxInfo doc =
+        let w = BinWriter()
+        match ndxInfo.spec with
+        | BDocument keys ->
+            Array.iter (fun (k,dir) ->
+                let v = 
+                    // TODO maybe when a key is missing we should just not insert an index entry for this doc?
+                    match bson.findPath doc k with
+                    | Some v -> v
+                    | None -> BUndefined
+                bson.encodeForIndexInto w v
+            ) keys
+        | _ -> failwith "must be a doc"
+        w.ToArray()
+
     // TODO special type for the pair db and coll
 
-    type index_info =
-        {
-            db:string
-            coll:string
-            ndx:string
-            spec:BsonValue
-            options:BsonValue
-        }
-
-    type write_methods =
-        {
-            insert:BsonValue->unit
-            update:BsonValue->unit
-            delete:BsonValue->bool
-            commit:unit->unit
-            rollback:unit->unit
-        }
-
-    type conn_methods =
-        {
-            listCollections:unit->(string*string*BsonValue)[]
-            createCollection:string->string->BsonValue->bool
-            dropCollection:string->string->bool
-            renameCollection:string->string->bool->bool
-            clearCollection:string->string->bool
-            listIndexes:unit->index_info[]
-            createIndexes:index_info[]->bool[]
-            dropIndex:string->string->string->bool
-            beginWrite:string->string->write_methods
-            getCollectionSequence:string->string->(seq<BsonValue>*(unit->unit))
-            dropDatabase:string->bool
-            close:unit->unit
-        }
-
-    let openStorage =
+    let connect() =
         let conn = ugly.``open``("elmodata.db")
         conn.exec("PRAGMA journal_mode=WAL")
+        conn.exec("PRAGMA foreign_keys=ON")
         conn.exec("CREATE TABLE IF NOT EXISTS \"collections\" (dbName TEXT NOT NULL, collName TEXT NOT NULL, options BLOB NOT NULL, PRIMARY KEY (dbName,collName))")
-        conn.exec("CREATE TABLE IF NOT EXISTS \"indexes\" (dbName TEXT NOT NULL, collName TEXT NOT NULL, ndxName TEXT NOT NULL, spec BLOB NOT NULL, options BLOB NOT NULL, PRIMARY KEY (dbName, collName, ndxName), FOREIGN KEY (dbName,collName) REFERENCES \"collections\" ON DELETE CASCADE, UNIQUE (spec,dbName,collName))")
+        conn.exec("CREATE TABLE IF NOT EXISTS \"indexes\" (dbName TEXT NOT NULL, collName TEXT NOT NULL, ndxName TEXT NOT NULL, spec BLOB NOT NULL, options BLOB NOT NULL, PRIMARY KEY (dbName, collName, ndxName), FOREIGN KEY (dbName,collName) REFERENCES \"collections\" ON DELETE CASCADE ON UPDATE CASCADE, UNIQUE (spec,dbName,collName))")
 
         let getCollectionOptions db coll =
             use stmt = conn.prepare("SELECT options FROM \"collections\" WHERE dbName=? AND collName=?")
@@ -72,7 +91,7 @@ module storage =
             else
                 None
 
-        let sqlSelectIndexes = "SELECT ndxName, spec, indexes.options, dbName, collName FROM \"indexes\" INNER JOIN \"collections\" ON (indexes.dbName=collections.dbName AND indexes.collName=collections.collName)"
+        let sqlSelectIndexes = "SELECT ndxName, spec, options, dbName, collName FROM \"indexes\""
 
         let getIndexFromRow (stmt:sqlite3_stmt) =
             let ndx = stmt.column_text(0)
@@ -104,12 +123,15 @@ module storage =
             }
 
         let createIndex info =
+            //printfn "createIndex: %A" info
             match getIndexInfo info.db info.coll info.ndx with
             | Some already ->
+                //printfn "it already exists: %A" already
                 if already.spec<>info.spec then
                     failwith "index already exists with different keys"
                 false
             | None ->
+                //printfn "did not exist, creating it"
                 let baSpec = bson.toBinaryArray info.spec
                 let baOptions = bson.toBinaryArray info.options
                 use stmt = conn.prepare("INSERT INTO \"indexes\" (dbName,collName,ndxName,spec,options) VALUES (?,?,?,?,?)")
@@ -118,27 +140,30 @@ module storage =
                 stmt.bind_text(3,info.ndx)
                 stmt.bind_blob(4,baSpec)
                 stmt.bind_blob(5,baOptions)
+                stmt.step_done()
                 let collTable = getTableNameForCollection info.db info.coll
                 let ndxTable = getTableNameForIndex info.db info.coll info.ndx
                 // TODO WITHOUT ROWID ?
                 match bson.tryGetValueForKey info.options "unique" with
                 | Some (BBoolean true) ->
-                    conn.exec(sprintf "CREATE TABLE \"%s\" (k BLOB NOT NULL, doc_rowid int NOT NULL REFERENCES \"%s\"(rowid) ON DELETE CASCADE, PRIMARY KEY (k))" ndxTable collTable)
+                    conn.exec(sprintf "CREATE TABLE \"%s\" (k BLOB NOT NULL, doc_rowid int NOT NULL REFERENCES \"%s\"(did) ON DELETE CASCADE, PRIMARY KEY (k))" ndxTable collTable)
                 | _ ->
-                    conn.exec(sprintf "CREATE TABLE \"%s\" (k BLOB NOT NULL, doc_rowid int NOT NULL REFERENCES \"%s\"(rowid) ON DELETE CASCADE, PRIMARY KEY (k,docid))" ndxTable collTable)
-                stmt.step_done()
+                    conn.exec(sprintf "CREATE TABLE \"%s\" (k BLOB NOT NULL, doc_rowid int NOT NULL REFERENCES \"%s\"(did) ON DELETE CASCADE, PRIMARY KEY (k,doc_rowid))" ndxTable collTable)
                 true
 
         let createCollection db coll options =
+            //printfn "createCollection: %s.%s" db coll
             match getCollectionOptions db coll with
             | Some _ ->
+                //printfn "collection %s.%s already exists" db coll
                 false
             | None ->
+                //printfn "collection %s.%s did not exist, creating it" db coll
                 let baOptions = bson.toBinaryArray options
                 use stmt = conn.prepare("INSERT INTO \"collections\" (dbName,collName,options) VALUES (?,?,?)", db, coll, baOptions)
                 stmt.step_done()
                 let collTable = getTableNameForCollection db coll
-                conn.exec(sprintf "CREATE TABLE \"%s\" (bson BLOB NOT NULL)" collTable)
+                conn.exec(sprintf "CREATE TABLE \"%s\" (did INTEGER PRIMARY KEY, bson BLOB NOT NULL)" collTable)
                 match bson.tryGetValueForKey options "autoIndexId" with
                 | Some (BBoolean false) ->
                     ()
@@ -147,7 +172,7 @@ module storage =
                         {
                             db = db
                             coll = coll
-                            ndx = "_id"
+                            ndx = "_id_"
                             spec = BDocument [| ("_id",BInt32 1) |]
                             options = BDocument [| ("unique",BBoolean true) |]
                         }
@@ -156,7 +181,7 @@ module storage =
                 true
 
         let listCollections() =
-            use stmt = conn.prepare("SELECT dbName, collName, options FROM \"collections\"")
+            use stmt = conn.prepare("SELECT dbName, collName, options FROM \"collections\" ORDER BY collName ASC")
             let results = ResizeArray<_>()
             while raw.SQLITE_ROW = stmt.step() do
                 let dbName = stmt.column_text(0)
@@ -173,12 +198,14 @@ module storage =
             results.ToArray()
 
         let dropIndex db coll ndxName =
+            //printfn "dropping index: %s.%s.%s" db coll ndxName
             match getIndexInfo db coll ndxName with
             | Some _ ->
+                //printfn "and yes, it did exist"
                 use stmt_ndx = conn.prepare("DELETE FROM \"indexes\" WHERE dbName=? AND collName=? AND ndxName=?")
                 stmt_ndx.bind_text(1,db)
                 stmt_ndx.bind_text(2,coll)
-                stmt_ndx.bind_text(2,ndxName)
+                stmt_ndx.bind_text(3,ndxName)
                 stmt_ndx.step_done()
                 let deleted = conn.changes()>0
                 // TODO assert deleted is true?
@@ -186,11 +213,14 @@ module storage =
                 conn.exec(sprintf "DROP TABLE \"%s\"" ndxTable)
                 deleted
             | None ->
+                //printfn "it did not exist"
                 false
 
         let dropCollection db coll =
+            //printfn "dropping collection: %s.%s" db coll
             match getCollectionOptions db coll with
             | Some _ ->
+                //printfn "it exists, dropping it"
                 let indexes = listIndexes() |> Array.filter (fun ndxInfo -> db=ndxInfo.db && coll=ndxInfo.coll)
                 Array.iter (fun info ->
                     let deleted = dropIndex info.db info.coll info.ndx
@@ -206,6 +236,7 @@ module storage =
                 // TODO assert deleted is true?
                 deleted
             | None ->
+                //printfn "but it did not exist"
                 false
 
         let renameCollection oldName newName dropTarget =
@@ -234,8 +265,8 @@ module storage =
                     stmt.bind_text(3, oldDb)
                     stmt.bind_text(4, oldColl)
                     stmt.step_done()
+                // f "indexes" // ON UPDATE CASCADE does this
                 f "collections"
-                f "indexes"
                 conn.exec(sprintf "ALTER TABLE \"%s\" RENAME TO \"%s\"" oldTable newTable)
                 Array.iter (fun ndxInfo ->
                     let oldName = getTableNameForIndex oldDb oldColl ndxInfo.ndx
@@ -246,78 +277,24 @@ module storage =
             | None -> 
                 createCollection newDb newColl (BDocument Array.empty)
 
-        let fn_close() = conn.close()
+        //let fn_close() = conn.close()
 
-        let fn_beginWrite db coll = 
-            // TODO ensure coll exists?
-            let tblCollection = getTableNameForCollection db coll
-            let stmt_insert = conn.prepare(sprintf "INSERT INTO \"%s\" (bson) VALUES (?)" tblCollection)
-            let stmt_delete = conn.prepare(sprintf "DELETE FROM \"%s\" WHERE rowid=?" tblCollection)
-            // TODO not if autoIndexId was false?
-            let tblIndex = getTableNameForIndex db coll "_id_"
-            let stmt_find_rowid = conn.prepare(sprintf "SELECT doc_rowid FROM \"%s\" WHERE k=?" tblIndex)
+        let fn_close() = 
+            try
+                conn.close()
+            with
+            | _ ->
+                let mutable cur = conn.next_stmt(null)
+                while cur<>null do
+                    printfn "%s" (cur.sql())
+                    cur <- conn.next_stmt(cur)
+                reraise()
 
-            let fn_insert newDoc =
-                let ba = bson.toBinaryArray newDoc
-                if ba.Length > 16*1024*1024 then raise (MongoCode(10329, "document more than 16MB"))
-                stmt_insert.clear_bindings()
-                stmt_insert.bind_blob(1, ba)
-                stmt_insert.step_done()
-                stmt_insert.reset()
-
-            let fn_delete id =
-                let idk = bson.encodeForIndex id
-                stmt_find_rowid.clear_bindings()
-                stmt_find_rowid.bind_blob(1, idk)
-                let b =
-                    if raw.SQLITE_ROW=stmt_find_rowid.step() then
-                        let rowid = stmt_find_rowid.column_int64(0)
-                        stmt_delete.clear_bindings()
-                        stmt_delete.bind_int64(1,rowid)
-                        stmt_delete.step_done()
-                        stmt_delete.reset()
-                        true
-                    else
-                        false
-                stmt_find_rowid.reset()
-                b
-
-            let fn_update newDoc =
-                match bson.tryGetValueForKey newDoc "_id" with
-                | Some id ->
-                    let deleted = fn_delete id
-                    ignore deleted
-                    fn_insert newDoc
-                | None ->
-                    failwith "cannot update without id"
-
-            let fn_rollback() =
-                conn.exec("ROLLBACK TRANSACTION")
-                stmt_insert.sqlite3_finalize()
-                stmt_find_rowid.sqlite3_finalize()
-                stmt_delete.sqlite3_finalize()
-                
-            let fn_commit() =
-                conn.exec("COMMIT TRANSACTION")
-                stmt_insert.sqlite3_finalize()
-                stmt_find_rowid.sqlite3_finalize()
-                stmt_delete.sqlite3_finalize()
-                
-            conn.exec("BEGIN TRANSACTION")
-
-            {
-                insert = fn_insert
-                update = fn_update
-                delete = fn_delete
-                commit = fn_commit
-                rollback = fn_rollback
-            }
-
-        let fn_getCollectionSequence db coll =
+        let getCollectionSequence tx db coll =
             match getCollectionOptions db coll with
             | Some _ ->
                 let collTable = getTableNameForCollection db coll
-                conn.exec("BEGIN TRANSACTION")
+                if tx then conn.exec("BEGIN TRANSACTION")
                 let stmt = conn.prepare(sprintf "SELECT bson FROM \"%s\"" collTable)
 
                 let s = getStmtSequence stmt
@@ -325,12 +302,168 @@ module storage =
                 let killFunc() =
                     // TODO would it be possible/helpful to make sure this function
                     // can be safely called more than once?
-                    conn.exec("COMMIT TRANSACTION")
+                    if tx then conn.exec("COMMIT TRANSACTION")
                     stmt.sqlite3_finalize()
 
                 (s, killFunc)
             | None ->
                 (Seq.empty, (fun () -> ()))
+
+        let beginWrite db coll = 
+            let created = createCollection db coll (BDocument Array.empty)
+            ignore created
+            let tblCollection = getTableNameForCollection db coll
+            let stmt_insert = conn.prepare(sprintf "INSERT INTO \"%s\" (bson) VALUES (?)" tblCollection)
+            let stmt_delete = conn.prepare(sprintf "DELETE FROM \"%s\" WHERE rowid=?" tblCollection)
+            let stmt_update = conn.prepare(sprintf "UPDATE \"%s\" SET bson=? WHERE rowid=?" tblCollection)
+            let indexes = listIndexes() |> Array.filter (fun ndxInfo -> db=ndxInfo.db && coll=ndxInfo.coll)
+            let opt_stmt_find_rowid = 
+                match Array.tryFind (fun info -> info.ndx="_id_") indexes with
+                | Some info ->
+                    let tblIndex = getTableNameForIndex db coll "_id_"
+                    let stmt_find_rowid = conn.prepare(sprintf "SELECT doc_rowid FROM \"%s\" WHERE k=?" tblIndex)
+                    Some stmt_find_rowid
+                | None ->
+                    None
+
+            let index_stmts = 
+                Array.map (fun info->
+                    let tbl = getTableNameForIndex db coll info.ndx
+                    let stmt_insert = conn.prepare(sprintf "INSERT INTO \"%s\" (k,doc_rowid) VALUES (?,?)" tbl)
+                    let stmt_delete = conn.prepare(sprintf "DELETE FROM \"%s\" WHERE doc_rowid=?" tbl)
+                    (info,stmt_insert,stmt_delete)
+                ) indexes
+
+            let find_rowid id =
+                match opt_stmt_find_rowid with
+                | Some stmt_find_rowid ->
+                    let idk = bson.encodeForIndex id
+                    stmt_find_rowid.clear_bindings()
+                    stmt_find_rowid.bind_blob(1, idk)
+                    let rowid = 
+                        if raw.SQLITE_ROW=stmt_find_rowid.step() then
+                            stmt_find_rowid.column_int64(0) |> Some
+                        else
+                            None
+                    stmt_find_rowid.reset()
+                    rowid
+                | None ->
+                    None
+
+            let update_indexes doc_rowid newDoc =
+                Array.iter (fun (info,stmt_insert:sqlite3_stmt,stmt_delete:sqlite3_stmt) ->
+                    stmt_delete.clear_bindings()
+                    stmt_delete.bind_int64(1, doc_rowid)
+                    stmt_delete.step_done()
+                    stmt_delete.reset()
+
+                    let k = encodeIndexKey info newDoc
+                    stmt_insert.clear_bindings()
+                    stmt_insert.bind_blob(1, k)
+                    stmt_insert.bind_int64(2, doc_rowid)
+                    try
+                        stmt_insert.step_done()
+                    with
+                    | e ->
+                        let msg = conn.errmsg()
+                        failwith (sprintf "%s:%A" msg e)
+                    if conn.changes()<>1 then failwith "insert failed"
+                    stmt_insert.reset()
+                ) index_stmts
+
+            let to_bson newDoc =
+                // TODO validateKeys here?
+                let ba = bson.toBinaryArray newDoc
+                if ba.Length > 16*1024*1024 then raise (MongoCode(10329, "document more than 16MB"))
+                ba
+
+            let fn_insert newDoc =
+                let ba = to_bson newDoc
+                stmt_insert.clear_bindings()
+                stmt_insert.bind_blob(1, ba)
+                stmt_insert.step_done()
+                let doc_rowid = conn.last_insert_rowid()
+                stmt_insert.reset()
+                if conn.changes()<>1 then failwith "insert failed"
+                update_indexes doc_rowid newDoc
+
+            let fn_delete id =
+                match find_rowid id with
+                | Some rowid ->
+                    stmt_delete.clear_bindings()
+                    stmt_delete.bind_int64(1,rowid)
+                    stmt_delete.step_done()
+                    stmt_delete.reset()
+                    true
+                | None ->
+                    false
+
+            let fn_update newDoc =
+                match bson.tryGetValueForKey newDoc "_id" with
+                | Some id ->
+                    match find_rowid id with
+                    | Some rowid ->
+                        let ba = to_bson newDoc
+                        stmt_update.clear_bindings()
+                        stmt_update.bind_blob(1, ba)
+                        stmt_update.bind_int64(2, rowid)
+                        stmt_update.step_done()
+                        stmt_update.reset()
+                        if conn.changes()<>1 then failwith "insert failed"
+                        update_indexes rowid newDoc
+                    | None ->
+                        failwith "update, but does not exist"
+                | None ->
+                    failwith "cannot update without id"
+
+            let finalize_stmts() =
+                match opt_stmt_find_rowid with
+                | Some stmt_find_rowid -> stmt_find_rowid.sqlite3_finalize()
+                | None -> ()
+                stmt_insert.sqlite3_finalize()
+                stmt_delete.sqlite3_finalize()
+                stmt_update.sqlite3_finalize()
+                Array.iter (fun (_,stmt_insert:sqlite3_stmt,stmt_delete:sqlite3_stmt) -> 
+                    stmt_insert.sqlite3_finalize()
+                    stmt_delete.sqlite3_finalize()
+                    ) index_stmts
+
+            let fn_rollback() =
+                //printfn "rollback"
+                conn.exec("ROLLBACK TRANSACTION")
+                finalize_stmts()
+                
+            let fn_commit() =
+                //printfn "commit"
+                conn.exec("COMMIT TRANSACTION")
+                finalize_stmts()
+                
+            let fn_select() =
+                getCollectionSequence false db coll
+
+            conn.exec("BEGIN TRANSACTION")
+
+            {
+                database = db
+                collection = db
+                insert = fn_insert
+                update = fn_update
+                delete = fn_delete
+                getSelect = fn_select
+                commit = fn_commit
+                rollback = fn_rollback
+            }
+
+        let fn_beginWrite db coll =
+            try
+                beginWrite db coll
+            with
+            | e ->
+                printfn "%A" e
+                reraise()
+
+        let fn_getCollectionSequence db coll =
+            getCollectionSequence true db coll
 
         let fn_listCollections() =
             conn.exec("BEGIN TRANSACTION")
@@ -468,132 +601,6 @@ module crud =
     open System
     open System.IO
 
-    // TODO move the SQLite-specific pieces here down into a new layer.
-    // most of this file isn't actually about storage.  It's CRUD logic.
-
-    open SQLitePCL
-    open SQLitePCL.Ugly
-
-    let private openDatabase _ =
-        let db = ugly.``open``("elmodata.db")
-        db.exec("PRAGMA journal_mode=WAL")
-        db.exec("CREATE TABLE IF NOT EXISTS \"collections\" (collId INTEGER PRIMARY KEY, dbName TEXT, collName TEXT, options BLOB NOT NULL, UNIQUE (dbName,collName))")
-        // TODO so it seems like we should also have UNIQUE (spec,collId)
-        db.exec("CREATE TABLE IF NOT EXISTS \"indexes\" (ndxId INTEGER PRIMARY KEY, ndxName TEXT NOT NULL, spec BLOB NOT NULL, options BLOB NOT NULL, collId NOT NULL REFERENCES \"collections\" ON DELETE CASCADE, UNIQUE (ndxName,collId))")
-        db
-
-    type IndexInfo =
-        {
-            ndxId:int64
-            ndxName:string
-            spec:BsonValue
-            options:BsonValue
-            collId:int64
-            dbName:string
-            collName:string
-        }
-
-    let private getTableNameForCollection dbName collName =
-        sprintf "%s.%s" dbName collName // TODO prefix?  cleanse?
-
-    let private getTableNameForIndex ndxInfo =
-        sprintf "ndx.%s.%s.%s" ndxInfo.dbName ndxInfo.collName ndxInfo.ndxName // TODO prefix?  cleanse?
-
-    let private getCollectionId (db:sqlite3) dbName collName =           
-        use stmt = db.prepare("SELECT collId FROM \"collections\" WHERE dbName=? AND collName=?", dbName, collName)
-        if raw.SQLITE_ROW=stmt.step() then
-            stmt.column_int64(0) |> Some
-        else
-            None
-
-    let sqlSelectIndexes = "SELECT ndxId, ndxName, spec, indexes.options, indexes.collId, dbName, collName FROM \"indexes\" INNER JOIN \"collections\" ON indexes.collId=collections.collId"
-
-    let getIndexFromRow (stmt:sqlite3_stmt) =
-        let ndxId = stmt.column_int64(0)
-        let ndxName = stmt.column_text(1)
-        let spec = stmt.column_blob(2) |> BinReader.ReadDocument
-        let options = stmt.column_blob(3) |> BinReader.ReadDocument
-        let collId = stmt.column_int64(4)
-        let dbName = stmt.column_text(5)
-        let collName = stmt.column_text(6)
-        {ndxId=ndxId;ndxName=ndxName;spec=spec;options=options;collId=collId;dbName=dbName;collName=collName}
-
-    // TODO the following function implies that a spec must be unique for a given db/coll
-    let private findIndexBySpec (db:sqlite3) (dbName:string) (collName:string) spec =
-        let baSpec = bson.toBinaryArray spec
-        use stmt = db.prepare(sqlSelectIndexes + " WHERE dbName=? AND collName=? AND spec=?", dbName, collName, baSpec)
-        if raw.SQLITE_ROW = stmt.step() then
-            getIndexFromRow stmt |> Some
-        else
-            None
-
-    let private findIndexByName (db:sqlite3) (dbName:string) (collName:string) (ndxName:string) =
-        use stmt = db.prepare(sqlSelectIndexes + " WHERE dbName=? AND collName=? AND ndxName=?", dbName, collName, ndxName)
-        if raw.SQLITE_ROW = stmt.step() then
-            getIndexFromRow stmt |> Some
-        else
-            None
-
-    let rec private ensureCollectionExists (db:sqlite3) dbName collName options =
-        match getCollectionId db dbName collName with
-        | Some collId ->
-            collId
-        | None ->
-            let baOptions = bson.toBinaryArray options
-            use stmt = db.prepare("INSERT INTO \"collections\" (dbName,collName,options) VALUES (?,?,?)", dbName, collName, baOptions)
-            stmt.step_done()
-            let collId = db.last_insert_rowid()
-            let collTable = getTableNameForCollection dbName collName
-            db.exec(sprintf "CREATE TABLE IF NOT EXISTS \"%s\" (bson BLOB NOT NULL)" collTable)
-            match bson.tryGetValueForKey options "autoIndexId" with
-            | Some (BBoolean false) ->
-                ()
-            | _ ->
-                let idNdxSpec = BDocument [| ("_id",BInt32 1) |]
-                let idNdxName = "_id_"
-                // tests assume the name of this index is "_id_", which means its name is not unique across all dbs/collections
-                // TODO it seems the automatic index on _id is NOT supposed to be marked unique
-                //let unique = (BDocument [| ("unique",BBoolean true) |])
-                let unique = BDocument Array.empty
-                ensureIndexExists db dbName collName idNdxSpec idNdxName unique |> ignore
-            collId
-
-    and private ensureIndexExists (db:sqlite3) dbName collName spec ndxName options =
-        match findIndexByName db dbName collName ndxName with
-        | Some ndxInfo ->
-            if ndxInfo.spec<>spec then
-                failwith "index already exists with different keys"
-            false,false
-        | None ->
-            let createdColl,collId = 
-                match getCollectionId db dbName collName with
-                | Some collId -> false,collId
-                | None -> true,ensureCollectionExists db dbName collName (BDocument Array.empty)
-            let baSpec = bson.toBinaryArray spec
-            let baOptions = bson.toBinaryArray options
-            use stmt = db.prepare("INSERT INTO \"indexes\" (ndxName,spec,options,collId) VALUES (?,?,?,?)", ndxName, baSpec, baOptions, collId)
-            let ndxId = db.last_insert_rowid()
-            let collTable = getTableNameForCollection dbName collName
-            let tmpIndexInfo =
-                {
-                    ndxId=ndxId
-                    ndxName=ndxName
-                    spec=spec
-                    options=options
-                    collId=collId
-                    dbName=dbName
-                    collName=collName
-                }
-            let ndxTable = getTableNameForIndex tmpIndexInfo
-            // TODO WITHOUT ROWID ?
-            match bson.tryGetValueForKey options "unique" with
-            | Some (BBoolean true) ->
-                db.exec(sprintf "CREATE TABLE \"%s\" (k BLOB NOT NULL, docid int NOT NULL REFERENCES \"%s\" ON DELETE CASCADE, PRIMARY KEY (k))" ndxTable collTable)
-            | _ ->
-                db.exec(sprintf "CREATE TABLE \"%s\" (k BLOB NOT NULL, docid int NOT NULL REFERENCES \"%s\" ON DELETE CASCADE, PRIMARY KEY (k,docid))" ndxTable collTable)
-            stmt.step_done()
-            createdColl,true
-
     let private validateKeys doc =
         let rec f doc depth =
             match doc with
@@ -658,79 +665,18 @@ module crud =
         validateDepth doc 1
         bson.getValueForKey doc "_id"
 
-    let private prepareSelect (db:sqlite3) collTable =
-        db.prepare(sprintf "SELECT rowid, bson FROM \"%s\"" collTable)
 
-    let private prepareInsert (db:sqlite3) collTable =
-        db.prepare(sprintf "INSERT INTO \"%s\" (bson) VALUES (?)" collTable)
-
-    // TODO consider the possibility that we want to implement updates with a
-    // delete followed by an insert.  this would mean every row gets a new rowid
-    // on every update.
-    // but it would also make index updates a lot simpler.
-    let private prepareUpdate (db:sqlite3) collTable =
-        db.prepare(sprintf "UPDATE \"%s\" SET bson=? WHERE rowid=?" collTable)
-
-    let private prepareDelete (db:sqlite3) collTable =
-        db.prepare(sprintf "DELETE FROM \"%s\" WHERE rowid=?" collTable)
-
-    let listIndexesFor (conn:sqlite3) (collId:int64) =
-        // TODO fix code duplication with other forms of this function
-        use stmt = conn.prepare(sqlSelectIndexes + " WHERE indexes.collId=?", collId)
-        let results = ResizeArray<_>()
-        while raw.SQLITE_ROW = stmt.step() do
-            results.Add(getIndexFromRow stmt)
-        results.ToArray()
-
-    // TODO move this into bson module?
-    let encodeIndexKey ndxInfo doc =
-        let w = BinWriter()
-        match ndxInfo.spec with
-        | BDocument keys ->
-            Array.iter (fun (k,dir) ->
-                let v = 
-                    // TODO maybe when a key is missing we should just not insert an index entry for this doc?
-                    match bson.findPath doc k with
-                    | Some v -> v
-                    | None -> BUndefined
-                bson.encodeForIndexInto w v
-            ) keys
-        | _ -> failwith "must be a doc"
-        w.ToArray()
-
-    let insertIndexEntry ndxInfo doc rowid =
-        let ndxKey = encodeIndexKey ndxInfo doc
-        // TODO need an insert stmt here
-        ()
-
-    let private basicInsert (stmt:sqlite3_stmt) newDoc = 
+    let private basicInsert w newDoc = 
         //printfn "basicInsert: %A" newDoc
-        let id = validateKeys newDoc
-        let ba = bson.toBinaryArray newDoc
-        if ba.Length > 16*1024*1024 then raise (MongoCode(10329, "document more than 16MB"))
-        stmt.clear_bindings()
-        stmt.bind_blob(1, ba)
-        stmt.step_done()
-        stmt.reset()
-        // TODO update index rows
+        validateKeys newDoc |> ignore
+        w.insert newDoc
 
-    let private basicUpdate (stmt:sqlite3_stmt) rowid newDoc =
-        let id = validateKeys newDoc
-        let ba = bson.toBinaryArray newDoc
-        if ba.Length > 16*1024*1024 then raise (MongoCode(10329, "document more than 16MB"))
-        stmt.clear_bindings()
-        stmt.bind_blob(1, ba)
-        stmt.bind_int64(2, rowid)
-        stmt.step_done()
-        stmt.reset()
-        // TODO update index rows
+    let private basicUpdate w newDoc =
+        validateKeys newDoc |> ignore
+        w.update newDoc
 
-    let private basicDelete (stmt:sqlite3_stmt) rowid =
-        stmt.clear_bindings()
-        stmt.bind_int64(1, rowid)
-        stmt.step_done()
-        stmt.reset()
-        // index rows will get deleted by cascade
+    let private basicDelete w newDoc =
+        w.delete newDoc
 
     let insert dbName collName docs =
         // TODO and if autoIndexId was false?
@@ -740,51 +686,51 @@ module crud =
                 | Some _ -> doc
                 | None -> bson.setValueForKey doc "_id" (bson.newObjectID())
                 ) docs
-        use db = openDatabase dbName
-        db.exec("BEGIN TRANSACTION")
-        let collId = ensureCollectionExists db dbName collName (BDocument Array.empty)
-        let collTable = getTableNameForCollection dbName collName
-        let indexes = listIndexesFor db collId
-        use stmt = prepareInsert db collTable
-        let results = 
-            Seq.map (fun doc -> 
-                try 
-                    basicInsert stmt doc // TODO pass indexes here?
-                    (doc, None)
-                with e -> (doc,Some (e.ToString()))
-            ) docs |> Seq.toArray
-        db.exec("COMMIT TRANSACTION")
-        results
-
-    // TODO we currently don't even use the index on _id.  requesting a specific
-    // document by _id will actually iterate over all of them.  :-(
-
-    let private getStmtSequence (stmt:sqlite3_stmt) =
-        seq {
-            while raw.SQLITE_ROW = stmt.step() do
-                let rowid = stmt.column_int64(0)
-                let doc = stmt.column_blob(1) |> BinReader.ReadDocument
-                yield (rowid,doc,None)
-        }
+        let conn = storage.connect()
+        try
+            let w = conn.beginWrite dbName collName
+            try
+                let results = 
+                    Seq.map (fun doc -> 
+                        try 
+                            basicInsert w doc
+                            (doc, None)
+                        with e -> (doc,Some (e.ToString()))
+                    ) docs |> Seq.toArray
+                w.commit()
+                results
+            with
+            | _ ->
+                w.rollback()
+                reraise()
+        finally
+            conn.close()
 
     let private seqMatch m s =
         s 
-        |> Seq.choose (fun (rowid,doc,_) ->
+        |> Seq.choose (fun doc ->
                 let (ok,ndx) = Matcher.matchQuery m doc
-                if ok then Some (rowid,doc,ndx)
+                if ok then Some (doc,ndx)
                 else None
               )
 
-    let private getOneMatch (db:sqlite3) collTable m =
-        use stmt = prepareSelect db collTable
-        // TODO list match
-        let a = getStmtSequence stmt |> seqMatch m |> Seq.truncate 1 |> Seq.toList
-        if List.isEmpty a then None
-        else List.head a |> Some
+    let private seqMatchNoPos m s =
+        s 
+        |> Seq.choose (fun doc ->
+                let (ok,_) = Matcher.matchQuery m doc
+                if ok then Some doc
+                else None
+              )
 
-    let private forEachMatch (db:sqlite3) collTable m f =
-        use stmt = prepareSelect db collTable
-        getStmtSequence stmt |> seqMatch m |> Seq.iter f
+    let private getOneMatch w m =
+        let (s,funk) = w.getSelect()
+        let a = s |> seqMatch m |> Seq.truncate 1 |> Seq.toList
+        // TODO list match
+        let d = 
+            if List.isEmpty a then None
+            else List.head a |> Some
+        funk()
+        d
 
     let sortFunc ord f =
         match ord with
@@ -830,26 +776,24 @@ module crud =
         a2
 
     let deleteIndex dbName collName index =
-        use db = openDatabase dbName
-        let ndx =
-            match index with
-            | BString name -> findIndexByName db dbName collName name
-            | BDocument spec -> findIndexBySpec db dbName collName index
-            | _ -> failwith "must be name or index doc"
-        match ndx with
-        | Some ndxInfo ->
-            use stmt = db.prepare("DELETE FROM \"indexes\" WHERE ndxId=?", ndxInfo.ndxId)
-            stmt.step_done()
-            let ndxTable = getTableNameForIndex ndxInfo
-            db.exec(sprintf "DROP TABLE \"%s\"" ndxTable)
-        | None ->
-            // not found
-            ()
+        let conn = storage.connect()
+        try
+            let indexes = conn.listIndexes()
+            let ndx =
+                match index with
+                | BString name -> Array.filter (fun info -> info.db=dbName && info.coll=collName && info.ndx=name) indexes
+                | BDocument _ -> Array.filter (fun info -> info.db=dbName && info.coll=collName && info.spec=index) indexes
+                | _ -> failwith "must be name or index doc"
+            if Array.isEmpty ndx then false
+            else if Array.length ndx > 1 then failwith "should never happen"
+            else
+                let info = ndx.[0]
+                conn.dropIndex info.db info.coll info.ndx
+        finally
+            conn.close()
 
     let createIndexes dbName collName indexes =
-        use db = openDatabase "unused"
-        db.exec("BEGIN TRANSACTION")
-        let result = 
+        let a = 
             Array.map (fun d -> 
                 let ndxKey = bson.getValueForKey d "key"
                 let ndxName = bson.getValueForKey d "name" |> bson.getString
@@ -860,104 +804,85 @@ module crud =
                     | Some _ -> failwith "no"
                     | None -> BDocument Array.empty
                 // TODO what other options might exist here?
-                ensureIndexExists db dbName collName ndxKey ndxName options
+                {
+                    db=dbName
+                    coll=collName
+                    ndx=ndxName
+                    spec=ndxKey
+                    options=options
+                }
                 ) indexes
-        db.exec("COMMIT TRANSACTION")
-        result
+        let conn = storage.connect()
+        try
+            conn.createIndexes a
+        finally
+            conn.close()
 
     let createCollection dbName collName options =
-        use db = openDatabase dbName
-        db.exec("BEGIN TRANSACTION")
-        let collId = ensureCollectionExists db dbName collName options
-        db.exec("COMMIT TRANSACTION")
+        let conn = storage.connect()
+        try
+            conn.createCollection dbName collName options
+        finally
+            conn.close()
 
     let listCollections (ofDb:string option) =
-        use db = openDatabase "unused"
-        use stmt =
-            match ofDb with
-            | Some s ->
-                db.prepare("SELECT collId, dbName, collName, options FROM \"collections\" WHERE dbName=?", s)
-            | None ->
-                db.prepare("SELECT collId, dbName, collName, options FROM \"collections\"")
-        let results = ResizeArray<_>()
-        while raw.SQLITE_ROW = stmt.step() do
-            let collId = stmt.column_int64(0)
-            let dbName = stmt.column_text(1)
-            let collName = stmt.column_text(2)
-            let options = stmt.column_blob(3) |> BinReader.ReadDocument
-            results.Add(collId,dbName,collName,options)
-        results.ToArray()
+        let a = 
+            let conn = storage.connect()
+            try
+                conn.listCollections()
+            finally
+                conn.close()
 
-    let listIndexes conn (dbName:string option) (collName:string option) =
-        use stmt = 
-            match dbName,collName with
-            | Some nsDb,Some nsColl ->
-                match getCollectionId conn nsDb nsColl with
-                | Some _ -> ()
-                | None -> failwith "collection not found"
-                conn.prepare(sqlSelectIndexes + " WHERE dbName=? AND collName=?", nsDb, nsColl)
-            | Some nsDb,None ->
-                // TODO gripe if db does not exist?
-                conn.prepare(sqlSelectIndexes + " WHERE dbName=?", nsDb)
-            | None, Some _ ->
-                failwith "should not happen"
-            | None,None ->
-                conn.prepare(sqlSelectIndexes)
-        let results = ResizeArray<_>()
-        while raw.SQLITE_ROW = stmt.step() do
-            results.Add(getIndexFromRow stmt)
-        results.ToArray()
+        match ofDb with
+        | Some s -> Array.filter (fun (db,_,_) -> db=s) a
+        | None -> a
 
     let cmd_listIndexes (dbName:string option) (collName:string option) =
-        use conn = openDatabase "unused"
-        listIndexes conn dbName collName
+        let a = 
+            let conn = storage.connect()
+            try
+                conn.listIndexes()
+            finally
+                conn.close()
+
+        match dbName,collName with
+        | Some nsDb,Some nsColl ->
+            let result = Array.filter (fun info -> info.db=nsDb && info.coll=nsColl) a
+            if Array.isEmpty result then
+                if listCollections None |> Array.filter (fun (db,coll,_) -> db=nsDb && coll=nsColl) |> Array.isEmpty then
+                    failwith "collection does not exist"
+                else
+                    result
+            else
+                result
+        | Some nsDb,None ->
+            // TODO gripe if db does not exist?
+            Array.filter (fun info -> info.db=nsDb) a
+        | None, Some _ ->
+            failwith "should not happen"
+        | None,None ->
+            a
 
     let clearCollection dbName collName =
-        use db = openDatabase dbName
-        match getCollectionId db dbName collName with
-        | Some collId ->
-            let indexes = listIndexes db (Some dbName) (Some collName)
-            let collTable = getTableNameForCollection dbName collName
-            db.exec("BEGIN TRANSACTION")
-            db.exec(sprintf "DELETE FROM \"%s\"" collTable)
-            // all the indexes have ON DELETE CASCADE, so they should get cleared automatically
-            db.exec("COMMIT TRANSACTION")
-        | None ->
-            db.exec("BEGIN TRANSACTION")
-            let collId = ensureCollectionExists db dbName collName (BDocument Array.empty)
-            db.exec("COMMIT TRANSACTION")
+        let conn = storage.connect()
+        try
+            conn.clearCollection dbName collName
+        finally
+            conn.close()
 
     let dropCollection dbName collName =
-        use db = openDatabase dbName
-        match getCollectionId db dbName collName with
-        | Some collId ->
-            let indexes = listIndexes db (Some dbName) (Some collName)
-            let collTable = getTableNameForCollection dbName collName
-            db.exec("BEGIN TRANSACTION")
-            db.exec(sprintf "DROP TABLE IF EXISTS \"%s\"" collTable)
-            use stmt_ndx = db.prepare("DELETE FROM \"indexes\" WHERE ndxId=?")
-            Array.iter (fun ndxInfo ->
-                stmt_ndx.clear_bindings()
-                stmt_ndx.bind_int64(1, ndxInfo.ndxId)
-                stmt_ndx.step_done()
-                stmt_ndx.reset()
-                let ndxTable = getTableNameForIndex ndxInfo
-                db.exec(sprintf "DROP TABLE \"%s\"" ndxTable)
-            ) indexes
-            use stmt=db.prepare("DELETE FROM \"collections\" WHERE collId=?", collId)
-            stmt.step_done()
-            let bDeleted = db.changes()>0
-            db.exec("COMMIT TRANSACTION")
-            bDeleted
-        | None ->
-            false
+        let conn = storage.connect()
+        try
+            conn.dropCollection dbName collName
+        finally
+            conn.close()
 
     let dropDatabase (dbName:string) =
-        // TODO this approach is opening/closing the db for every collection it deletes.  bad.
-        let colls = listCollections (Some dbName)
-        Array.iter (fun (collId,dbName,collName,options) ->
-            dropCollection dbName collName |> ignore
-        ) colls
+        let conn = storage.connect()
+        try
+            conn.dropDatabase dbName
+        finally
+            conn.close()
 
     let private myMin va vb =
         let c = Matcher.cmp va vb
@@ -1549,144 +1474,139 @@ module crud =
         let id2 = bson.getValueForKey d2 "_id"
         id1 <> id2
 
-    let private oneUpdateOrUpsert db collTable upd =
-        let q = bson.getValueForKey upd "q"
-        let u = bson.getValueForKey upd "u"
-        let multi = bson.getValueForKey upd "multi" |> bson.getBool
-        let upsert = bson.getValueForKey upd "upsert" |> bson.getBool
-        let m = Matcher.parseQuery q
-        let hasUpdateOperators = Array.exists (fun (k:string,_) -> k.StartsWith("$")) (bson.getDocument u)
-        if hasUpdateOperators then
-            let ops = parseUpdateDoc u
-            let (countMatches,countModified) = 
-                use stmt = prepareUpdate db collTable
-                if multi then
-                    let mods = ref 0
-                    let matches = ref 0
-                    forEachMatch db collTable m (fun (rowid,doc,ndx) -> 
-                        let newDoc = applyUpdateOps doc ops false ndx
-                        if idChanged doc newDoc then failwith "cannot change _id"
-                        //printfn "after updates: %A" newDoc
-                        matches := !matches + 1
-                        if newDoc <> doc then
-                            basicUpdate stmt rowid newDoc
-                            mods := !mods + 1
-                        )
-                    (!matches, !mods)
-                else
-                    match getOneMatch db collTable m with
-                    | Some (rowid,doc,ndx) ->
-                        let newDoc = applyUpdateOps doc ops false ndx
-                        if idChanged doc newDoc then failwith "cannot change _id"
-                        //printfn "after updates: %A" newDoc
-                        if newDoc <> doc then
-                            basicUpdate stmt rowid newDoc
-                            (1,1)
-                        else
-                            (1,0)
-                    | None -> (0,0)
-            if countMatches=0 then
-                if upsert then
-                    use stmt = prepareInsert db collTable
-                    let (id,newDoc) = buildUpsertWithUpdateOperators q u
-                    basicInsert stmt newDoc
-                    (countMatches, countModified, Some id, None)
-                else
-                    (countMatches, countModified, None, None)
-            else
-                (countMatches, countModified, None, None)
-        else
-            // TODO what happens if the update document has no update operators
-            // but it has keys which are dotted?
-            if multi then failwith "multi update requires $ update operators"
-            match getOneMatch db collTable m with
-            | Some (rowid,found,ndx) ->
-                let id1 = bson.getValueForKey found "_id"
-                let newDoc =
-                    match bson.tryGetValueForKey u "_id" with
-                    | Some id2 ->
-                        if id1=id2 then u
-                        else failwith  "cannot change _id"
-                    | None ->
-                        bson.setValueForKey u "_id" id1
-                use stmt = prepareUpdate db collTable
-                basicUpdate stmt rowid newDoc
-                (1,1,None, None)
-            | None ->
-                if upsert then
-                    use stmt = prepareInsert db collTable
-                    let (id,newDoc) = buildSimpleUpsert q u
-                    basicInsert stmt newDoc
-                    (0,0,Some id, None)
-                else
-                    (0,0,None, None)
-
     let update dbName collName (updates:BsonValue[]) =
-        use db = openDatabase dbName
         // TODO $isolated should determine whether there is a tx around the whole operation
-        db.exec("BEGIN TRANSACTION")
-        let collId = ensureCollectionExists db dbName collName (BDocument Array.empty)
-        let collTable = getTableNameForCollection dbName collName
-        let results = 
-            Array.map (fun upd ->
-                try oneUpdateOrUpsert db collTable upd
-                with e -> (0,0,None,Some (e.ToString()))
-                ) updates
-        db.exec("COMMIT TRANSACTION")
-        results
+
+        let conn = storage.connect()
+
+        try
+            let w = conn.beginWrite dbName collName
+
+            try
+                let oneUpdateOrUpsert upd =
+                    //printfn "oneUpdateOrUpsert: %A" upd
+                    let q = bson.getValueForKey upd "q"
+                    let u = bson.getValueForKey upd "u"
+                    let multi = bson.getValueForKey upd "multi" |> bson.getBool
+                    let upsert = bson.getValueForKey upd "upsert" |> bson.getBool
+                    let m = Matcher.parseQuery q
+                    let hasUpdateOperators = Array.exists (fun (k:string,_) -> k.StartsWith("$")) (bson.getDocument u)
+                    if hasUpdateOperators then
+                        let ops = parseUpdateDoc u
+                        let (countMatches,countModified) = 
+                            if multi then
+                                let mods = ref 0
+                                let matches = ref 0
+                                let (s,funk) = w.getSelect()
+                                s |> seqMatch m |> 
+                                Seq.iter (fun (doc,ndx) -> 
+                                    //printfn "iter, doc = %A" doc
+                                    let newDoc = applyUpdateOps doc ops false ndx
+                                    if idChanged doc newDoc then failwith "cannot change _id"
+                                    //printfn "after updates: %A" newDoc
+                                    matches := !matches + 1
+                                    if newDoc <> doc then
+                                        basicUpdate w newDoc
+                                        mods := !mods + 1
+                                    )
+                                funk()
+                                (!matches, !mods)
+                            else
+                                match getOneMatch w m with
+                                | Some (doc,ndx) ->
+                                    let newDoc = applyUpdateOps doc ops false ndx
+                                    if idChanged doc newDoc then failwith "cannot change _id"
+                                    //printfn "after updates: %A" newDoc
+                                    if newDoc <> doc then
+                                        basicUpdate w newDoc
+                                        (1,1)
+                                    else
+                                        (1,0)
+                                | None -> (0,0)
+                        if countMatches=0 then
+                            if upsert then
+                                let (id,newDoc) = buildUpsertWithUpdateOperators q u
+                                basicInsert w newDoc
+                                (countMatches, countModified, Some id, None)
+                            else
+                                (countMatches, countModified, None, None)
+                        else
+                            (countMatches, countModified, None, None)
+                    else
+                        // TODO what happens if the update document has no update operators
+                        // but it has keys which are dotted?
+                        if multi then failwith "multi update requires $ update operators"
+                        match getOneMatch w m with
+                        | Some (found,ndx) ->
+                            let id1 = bson.getValueForKey found "_id"
+                            let newDoc =
+                                match bson.tryGetValueForKey u "_id" with
+                                | Some id2 ->
+                                    if id1=id2 then u
+                                    else failwith  "cannot change _id"
+                                | None ->
+                                    bson.setValueForKey u "_id" id1
+                            basicUpdate w newDoc
+                            (1,1,None, None)
+                        | None ->
+                            if upsert then
+                                let (id,newDoc) = buildSimpleUpsert q u
+                                basicInsert w newDoc
+                                (0,0,Some id, None)
+                            else
+                                (0,0,None, None)
+
+                let results = 
+                    Array.map (fun upd ->
+                        try oneUpdateOrUpsert upd
+                        with e -> (0,0,None,Some (e.ToString()))
+                        ) updates
+                w.commit()
+                results
+            with
+            | _ ->
+                w.rollback()
+                reraise()
+        finally
+            conn.close()
 
     let delete dbName collName (deletes:BsonValue[]) =
-        use db = openDatabase dbName
-        db.exec("BEGIN TRANSACTION")
-        let collId = ensureCollectionExists db dbName collName (BDocument Array.empty)
-        let collTable = getTableNameForCollection dbName collName
-        use stmt = prepareDelete db collTable
-        let count = ref 0
-        Array.iter (fun upd ->
-            let q = bson.getValueForKey upd "q"
-            let limit = bson.tryGetValueForKey upd "limit"
-            let m = Matcher.parseQuery q
-            forEachMatch db collTable m (fun (rowid,doc,ndx) -> 
-                basicDelete stmt rowid
-                if db.changes()=1 then
-                    count := !count + 1
-                )
-            ) deletes
-        db.exec("COMMIT TRANSACTION")
-        !count
-           
-    let renameCollection oldName newName dropTarget =
-        let (oldDb,oldColl) = bson.splitname oldName
-        let (newDb,newColl) = bson.splitname newName
-        // jstests/core/rename8.js seems to think that renaming to/from a system collection is illegal unless
-        // that collection is system.users, which is "whitelisted".  for now, we emulate this behavior, even
-        // though system.users isn't supported.
-        if oldColl<>"system.users" && oldColl.StartsWith("system.") then failwith "renameCollection with a system collection not allowed."
-        if newColl<>"system.users" && newColl.StartsWith("system.") then failwith "renameCollection with a system collection not allowed."
-        if dropTarget then dropCollection newDb newColl |> ignore
-        use db = openDatabase oldDb
-        match getCollectionId db oldDb oldColl with
-        | Some collId -> 
-            let oldIndexes = listIndexesFor db collId
-            let oldTable = getTableNameForCollection oldDb oldColl
-            let newTable = getTableNameForCollection newDb newColl
-            use stmt = db.prepare("UPDATE \"collections\" SET dbName=?, collName=? WHERE dbName=? AND collName=?", newDb, newColl, oldDb, oldColl)
-            stmt.step_done()
-            db.exec(sprintf "ALTER TABLE \"%s\" RENAME TO \"%s\"" oldTable newTable)
-            Array.iter (fun ndxInfo ->
-                let oldName = getTableNameForIndex ndxInfo
-                match findIndexByName db newDb newColl ndxInfo.ndxName with
-                | Some newInfo -> 
-                    let newName = getTableNameForIndex newInfo
-                    db.exec(sprintf "ALTER TABLE \"%s\" RENAME TO \"%s\"" oldName newName)
-                | None ->
-                    failwith "index should still exist"
-            ) oldIndexes
-        | None -> 
-            let collId = ensureCollectionExists db newDb newColl (BDocument Array.empty)
-            ignore collId
+        let conn = storage.connect()
+        try
+            let w = conn.beginWrite dbName collName
+            try
+                let count = ref 0
+                Array.iter (fun upd ->
+                    let q = bson.getValueForKey upd "q"
+                    let limit = bson.tryGetValueForKey upd "limit"
+                    let m = Matcher.parseQuery q
+                    let (s,funk) = w.getSelect()
+                    s |> seqMatch m |> 
+                    Seq.iter (fun (doc,ndx) -> 
+                        // TODO is it possible to delete from an autoIndexId=false collection?
+                        let id = bson.getValueForKey doc "_id"
+                        if basicDelete w id then
+                            count := !count + 1
+                        )
+                    funk()
+                ) deletes
+                w.commit()
+                !count
+            with
+            | _ ->
+                w.rollback()
+                reraise()
+        finally
+            conn.close()
 
-    let private dofam_upsert (db:sqlite3) collTable query update gnew fields =
+    let renameCollection oldName newName dropTarget =
+        let conn = storage.connect()
+        try
+            conn.renameCollection oldName newName dropTarget
+        finally
+            conn.close()
+
+    let private dofam_upsert w query update gnew fields =
         let hasUpdateOperators = Array.exists (fun (k:string,_) -> k.StartsWith("$")) (bson.getDocument update)
         let q =
             match query with
@@ -1697,20 +1617,17 @@ module crud =
                 buildUpsertWithUpdateOperators q update
             else
                 buildSimpleUpsert q update
-        use stmt = prepareInsert db collTable
-        basicInsert stmt newDoc
-        let inserted = db.changes()=1
-        if gnew then (None,inserted,Some id,Some newDoc) else (None,inserted,Some id,None)
+        basicInsert w newDoc
+        if gnew then (None,true,Some id,Some newDoc) else (None,true,Some id,None)
 
-    let private dofam_remove (db:sqlite3) collTable (rowid,doc,ndx) =
-        use stmt = prepareDelete db collTable
-        basicDelete stmt rowid
-        let removed = db.changes()=1
+    let private dofam_remove w doc =
+        // TODO is it possible to delete from an autoIndexId=false collection?
+        let id = bson.getValueForKey doc "_id"
+        let removed  = basicDelete w id
         (None,removed,None,Some doc)
 
-    let private dofam_update (db:sqlite3) collTable (rowid,doc,ndx) query update gnew fields =
+    let private dofam_update w (doc,ndx) query update gnew fields =
         let hasUpdateOperators = Array.exists (fun (k:string,_) -> k.StartsWith("$")) (bson.getDocument update)
-        use stmt = prepareUpdate db collTable
         let (updated,result) =
             if hasUpdateOperators then
                 let ops = parseUpdateDoc update
@@ -1719,7 +1636,7 @@ module crud =
                 //printfn "after updates: %A" newDoc
                 let updated = 
                     if newDoc <> doc then 
-                        basicUpdate stmt rowid newDoc
+                        basicUpdate w newDoc
                         true
                     else
                         false
@@ -1736,7 +1653,7 @@ module crud =
                         bson.setValueForKey update "_id" id1
                 let updated =
                     if newDoc <> doc then 
-                        basicUpdate stmt rowid newDoc
+                        basicUpdate w newDoc
                         true
                     else
                         false
@@ -1744,18 +1661,30 @@ module crud =
                 (updated,result)
         (None,updated,None,result)
 
-    let private getFirstMatch db collTable m s =
+    let private seqSort ord s =
+        let a1 = s |> Seq.toArray
+        let fsort = sortFunc ord (fun (doc,_) -> doc)
+        Array.sortInPlaceWith fsort a1
+        Array.toSeq a1
+
+    let private seqAggSort ord s =
+        let a1 = s |> Seq.toArray
+        let fsort = sortFunc ord (fun doc -> doc)
+        Array.sortInPlaceWith fsort a1
+        Array.toSeq a1
+
+    let private getFirstMatch w m ord =
         // TODO collecting all the results and sorting and taking the first one.
         // would probably be faster to just iterate over all and keep track of what
         // the first one would be.
-        let docs = ResizeArray<_>()
-        forEachMatch db collTable m (fun (rowid,doc,ndx) -> docs.Add(rowid,doc,ndx))
-        let a = docs.ToArray()
-        if a.Length > 0 then
-            let a2 = sortDocumentsBy a s (fun (rowid,doc,ndx) -> doc)
-            a2.[0] |> Some
-        else
-            None
+        let (s,funk) = w.getSelect()
+        let a = s |> seqMatch m |> seqSort ord |> Seq.truncate 1 |> Seq.toList
+        // TODO list match
+        let d = 
+            if List.isEmpty a then None
+            else List.head a |> Some
+        funk()
+        d
 
     let private doProjectionOperator cur k (projOp:(string*BsonValue)[]) =
         // TODO is it really true that the projection op document can only have one thing in it?
@@ -2054,28 +1983,6 @@ module crud =
                 failwith "wrong format for $min"
         m
 
-    let private getBaseSequence dbName collName =
-        let db = openDatabase "unused"
-        match getCollectionId db dbName collName with
-        | Some collId ->
-            let collTable = getTableNameForCollection dbName collName
-            db.exec("BEGIN TRANSACTION")
-            let stmt = prepareSelect db collTable
-
-            let s = getStmtSequence stmt
-
-            let killFunc() =
-                // TODO would it be possible/helpful to make sure this function
-                // can be safely called more than once?
-                db.exec("COMMIT TRANSACTION")
-                stmt.sqlite3_finalize()
-                db.close()
-
-            (s, killFunc)
-        | None ->
-            db.close()
-            (Seq.empty, (fun () -> ()))
-
     // TODO just put this in Seq module?
     let seqSkip n s =
         s
@@ -2087,19 +1994,21 @@ module crud =
 
     let private seqProject proj m s =
         let prep = verifyProjection proj m
-        Seq.map (fun (rowid,doc,ndx) -> 
+        Seq.map (fun (doc,ndx) -> 
             let newDoc = projectDocument doc ndx prep
-            (rowid,newDoc,ndx)
+            (newDoc,ndx)
             ) s
 
-    let private seqSort ord s =
-        let a1 = s |> Seq.toArray
-        let fsort = sortFunc ord (fun (_,doc,_) -> doc)
-        Array.sortInPlaceWith fsort a1
-        Array.toSeq a1
-
     let private seqOnlyDoc s =
-        Seq.map (fun (_,doc,_) -> doc) s
+        Seq.map (fun (doc,_) -> doc) s
+
+    let getSelectWithClose dbName collName = 
+        let conn = storage.connect()
+        let (s,funk) = conn.getCollectionSequence dbName collName
+        let funk2() =
+            funk()
+            conn.close()
+        (s,funk2)
 
     let find dbName collName q orderby projection ndxMin ndxMax =
         let m = Matcher.parseQuery q
@@ -2126,7 +2035,7 @@ module crud =
                 let and_items = QueryItem.AND items
                 QueryDoc [| and_items |]
             | None,None -> m
-        let (s,funk) = getBaseSequence dbName collName
+        let (s,funk) = getSelectWithClose dbName collName
         try
             let s = seqMatch m s
             let s =
@@ -2153,68 +2062,77 @@ module crud =
             kill()
 
     let findandmodify dbName collName query sort remove update gnew fields upsert =
-        use db = openDatabase dbName
-        db.exec("BEGIN TRANSACTION")
-        let collId = ensureCollectionExists db dbName collName (BDocument Array.empty)
-        let collTable = getTableNameForCollection dbName collName
         let m = 
             match query with
             | Some q -> Matcher.parseQuery q
             | None -> [| |] |> BDocument |> Matcher.parseQuery
-        let found = 
-            match sort with
-            | Some s -> getFirstMatch db collTable m s
-            | None -> getOneMatch db collTable m
-        //printfn "found: %A" found
-        // TODO a 4-tuple is kinda big
-        let (err,changed,upserted,result) =
-            // TODO only the catch case returns an err
+        let conn = storage.connect()
+        try
+            let w = conn.beginWrite dbName collName
             try
-                match update,remove with
-                | Some _, Some _ -> failwith "don't specify both update and remove"
-                | None, None -> failwith "must specify either update or remove"
-                | Some u, None -> 
-                    match found with
-                    | Some t ->
-                        dofam_update db collTable t query u gnew fields
-                    | None ->
-                        if upsert then
-                            dofam_upsert db collTable query u gnew fields
-                        else
-                            (None,false,None,None)
-                | None, Some r -> 
-                    if upsert then failwith "no upsert with remove"
-                    match found with
-                    | Some t ->
-                        dofam_remove db collTable t
-                    | None ->
-                        (None,false,None,None)
+                let found = 
+                    match sort with
+                    | Some s -> getFirstMatch w m s
+                    | None -> getOneMatch w m
+                //printfn "found: %A" found
+                // TODO a 4-tuple is kinda big
+                try
+                    let (err,changed,upserted,result) =
+                        // TODO only the catch case returns an err, so don't put None
+                        // at the front of every tuple below.
+                        match update,remove with
+                        | Some _, Some _ -> failwith "don't specify both update and remove"
+                        | None, None -> failwith "must specify either update or remove"
+                        | Some u, None -> 
+                            match found with
+                            | Some t ->
+                                dofam_update w t query u gnew fields
+                            | None ->
+                                if upsert then
+                                    dofam_upsert w query u gnew fields
+                                else
+                                    (None,false,None,None)
+                        | None, Some r -> 
+                            if upsert then failwith "no upsert with remove"
+                            match found with
+                            | Some t ->
+                                dofam_remove w (fst t)
+                            | None ->
+                                (None,false,None,None)
+                    w.commit()
+                    (found,err,changed,upserted,result)
+                with
+                | e ->
+                    w.rollback()
+                    (found,Some (e.ToString()),false,None,None)
             with
-                e ->
-                    (Some (e.ToString()),false,None,None)
-        db.exec("COMMIT TRANSACTION")
-        (found,err,changed,upserted,result)
+            | e ->
+                w.rollback()
+                (None,Some (e.ToString()),false,None,None)
+        finally
+            conn.close()
 
     let distinct dbName collName key query =
         let m = 
             match query with
             | Some q -> Matcher.parseQuery q
             | None -> [| |] |> BDocument |> Matcher.parseQuery
-        use db = openDatabase dbName
-        match getCollectionId db dbName collName with
-        | Some collId ->
+        let conn = storage.connect()
+        try
+            // TODO do we need special handling here for the case where the collection
+            // does not exist?
             let results = ref Set.empty
-            let collTable = getTableNameForCollection dbName collName
-            db.exec("BEGIN TRANSACTION")
-            forEachMatch db collTable m (fun (rowid,doc,ndx) -> 
+            let (s,funk) = conn.getCollectionSequence dbName collName
+            s |> seqMatch m |> 
+            Seq.iter (fun (doc,ndx) -> 
                 match bson.findPath doc key with
                 | Some v -> results := Set.add v !results
                 | None -> ()
                 )
-            db.exec("COMMIT TRANSACTION")
+            funk()
             Set.toArray !results
-        | None ->
-            [| |]
+        finally
+            conn.close()
 
     type Expr =
         | Expr_var of string
@@ -2890,7 +2808,7 @@ module crud =
                 // flatten so that:
                 // project b:{a:1} should be an inclusion of b.a, not {a:1} as a doc literal for b
                 let args = args |> BDocument |> flattenProjection
-                printfn "args: %A" args
+                //printfn "args: %A" args
                 if Array.exists (fun (k:string,_) -> k.StartsWith("$")) args then
                     raise (MongoCode(16404, "$project key begins with $"))
                 let (id,notid) = Array.partition (fun (k,v) -> k="_id") args
@@ -2924,7 +2842,7 @@ module crud =
                 let id = args.[0] |> snd
                 let accums = Array.sub args 1 (len-1) |> Array.map (fun (k,op) -> (k, parseAccum op))
                 if Array.exists (fun (k:string,_) -> k.IndexOf('.')>=0) accums then raise (MongoCode(16414,"$group field name cannot contain '.'"))
-                printfn "parsed accums: %A" accums
+                //printfn "parsed accums: %A" accums
                 AggGroup (id, accums)
             | BDocument [| ("$redact", v) |] -> 
                 let e = parseExpr v
@@ -2936,7 +2854,7 @@ module crud =
             ) items
 
     let private seqRedact e s =
-        Seq.choose (fun (rowid,doc,ndx) -> 
+        Seq.choose (fun doc -> 
             let rec f doc =
                 match eval (initEval doc) e with
                 | BString "__descend__" ->
@@ -2969,14 +2887,14 @@ module crud =
                     Some doc
                 | _ -> raise (MongoCode(17053, "invalid result from redact expression"))
             match f doc with
-            | Some d -> Some (rowid,d,ndx)
+            | Some d -> Some d
             | None -> None
             ) s
 
     let private seqAggProject expressions s =
-        printfn "expressions: %A" expressions
-        Seq.map (fun (rowid,d,ndx) ->
-            printfn "projecting from: %A" d
+        //printfn "expressions: %A" expressions
+        Seq.map (fun d ->
+            //printfn "projecting from: %A" d
             let d0 = BDocument [| |]
             let includes = 
                 Array.choose (fun (k,op) ->
@@ -3031,13 +2949,13 @@ module crud =
                         cur
                     ) d0 exes
             //printfn "projection result: %A" d3
-            (rowid,d3,ndx)
+            d3
             ) s
 
     let private seqUnwind (path:string) s =
         // TODO strip the $ in front.  verify it?
         let path = path.Substring(1)
-        Seq.collect (fun (rowid,d,ndx) ->
+        Seq.collect (fun d ->
             match bson.findPath d path with
             | Some (BArray a) ->
                 if Array.length a=0 then
@@ -3050,7 +2968,7 @@ module crud =
                             // TODO no positional operator here?
                             let d2 = bson.changeValueForPath d path f
                             //printfn "unwound: %A" d2
-                            yield (rowid,d2,ndx)
+                            yield d2
                     }
             | Some BNull -> Seq.empty
             | Some _ -> raise (MongoCode(15978, "$unwind needs array"))
@@ -3060,7 +2978,7 @@ module crud =
     let private seqGroup id ops s =
         let exprId = parseExpr id
         let mapa =
-            Seq.fold (fun cur (_,doc,_) ->
+            Seq.fold (fun cur doc ->
                 let idval = eval (initEval doc) exprId
                 let accums = 
                     match Map.tryFind idval cur with
@@ -3178,11 +3096,11 @@ module crud =
                 accums
                 ) mapa
         //printfn "last step: %A" mapa
-        mapa |> Map.toSeq |> Seq.map (fun (_,d) -> (0L,d,None) )
+        mapa |> Map.toSeq |> Seq.map (fun (_,d) -> d )
 
     let aggregate dbName collName pipeline =
         let ops = parseAgg pipeline
-        let (s,funk) = getBaseSequence dbName collName
+        let (s,funk) = getSelectWithClose dbName collName
 
         try
             let (out,ops) =
@@ -3194,13 +3112,16 @@ module crud =
                     | AggOut s -> (Some s, Array.sub ops 0 (len-1))
                     | _ -> (None,ops)
 
+            // the agg pipeline, AFAICT, has no way of using positional operators.
+            // so this uses seq<doc> rather than seq<doc,ndx>
+
             let s = 
                 Array.fold (fun cur op ->
                     match op with
                     | AggSkip n -> seqSkip n cur
                     | AggLimit n -> seqLimit n cur
-                    | AggSort keys -> seqSort keys cur
-                    | AggMatch m -> seqMatch m cur
+                    | AggSort keys -> cur |> seqAggSort keys
+                    | AggMatch m -> seqMatchNoPos m cur
                     | AggProject expressions -> seqAggProject expressions cur
                     | AggOut s -> failwith "$out can only appear at the end of the pipeline"
                     | AggUnwind s -> seqUnwind s cur
@@ -3208,8 +3129,6 @@ module crud =
                     | AggGeoNear _ -> failwith "not implemented" // TODO only as first stage
                     | AggRedact e -> seqRedact e cur
                     ) s ops
-
-            let s = seqOnlyDoc s
 
             (out,s,funk)
         with
@@ -3219,5 +3138,5 @@ module crud =
 
     let doFilter a q =
         let m = Matcher.parseQuery q
-        a |> Array.map (fun d -> (0,d,None)) |> Seq.ofArray |> seqMatch m |> seqOnlyDoc |> Seq.toArray
+        a |> Seq.ofArray |> seqMatchNoPos m |> Seq.toArray
 
