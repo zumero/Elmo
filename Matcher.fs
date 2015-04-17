@@ -107,11 +107,12 @@ module Matcher =
             else if m<litv then -1
             else 1
         | BInt64 m, BInt32 litv ->
-            let m = int32 m
+            let litv = int64 litv
             if m=litv then 0
             else if m<litv then -1
             else 1
         | BInt64 m, BDouble litv ->
+            // TODO this can overflow
             let m = float m
             if m=litv then 0
             else if Double.IsNaN(litv) then 1
@@ -126,6 +127,7 @@ module Matcher =
             else 1
         | BDouble m, BInt64 litv ->
             // when comparing double and int, cast the int to double, regardless of ordering
+            // TODO this can overflow
             let litv = float litv
             if m=litv then 0
             else if Double.IsNaN(m) then -1

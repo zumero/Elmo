@@ -45,6 +45,32 @@ type BinWriter () =
         writeInt32At v i
         i <- i + 4
 
+    let writeInt16BigEndian (v:int16) =
+        ensureSpace 2
+        ba.[i+1] <- byte (v >>> 0)
+        ba.[i+0] <- byte (v >>> 8)
+        i <- i + 2
+
+    let writeInt32BigEndian v =
+        ensureSpace 4
+        ba.[i+3] <- byte (v >>> 0)
+        ba.[i+2] <- byte (v >>> 8)
+        ba.[i+1] <- byte (v >>> 16)
+        ba.[i+0] <- byte (v >>> 24)
+        i <- i + 4
+
+    let writeInt64BigEndian (v:int64) =
+        ensureSpace 8
+        ba.[i+7] <- byte (v >>> 0)
+        ba.[i+6] <- byte (v >>> 8)
+        ba.[i+5] <- byte (v >>> 16)
+        ba.[i+4] <- byte (v >>> 24)
+        ba.[i+3] <- byte (v >>> 32)
+        ba.[i+2] <- byte (v >>> 40)
+        ba.[i+1] <- byte (v >>> 48)
+        ba.[i+0] <- byte (v >>> 56)
+        i <- i + 8
+
     let writeInt64 (v:int64) =
         ensureSpace 8
         ba.[i+0] <- byte (v >>> 0)
@@ -88,6 +114,9 @@ type BinWriter () =
         writeBytes a
 
     member this.Position = i
+    member this.WriteInt16BigEndian(v) = writeInt16BigEndian v
+    member this.WriteInt32BigEndian(v) = writeInt32BigEndian v
+    member this.WriteInt64BigEndian(v) = writeInt64BigEndian v
     member this.WriteInt32(v) = writeInt32 v
     member this.WriteInt32At(v,p) = writeInt32At v p
     member this.WriteInt64(v) = writeInt64 v

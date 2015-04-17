@@ -39,6 +39,155 @@ type BsonValue =
     | BArray of BsonValue[]
     | BDocument of (string*BsonValue)[]
 
+type sqlite4_num =
+    {
+        neg:bool
+        approx:bool
+        e:int16
+        m:uint64
+    }
+
+module sqlite4 =
+    // the code below is a very direct port of sqlite4's numeric key encoding
+    // from C to F#.  It uses mutables.  It's yucky (from a functional programming
+    // perspective).  Very non-idiomatic.
+
+    let LARGEST_UINT64 = System.UInt64.MaxValue
+    let TENTH_MAX = LARGEST_UINT64 / (uint64 10)
+    let SQLITE4_MX_EXP = 999s
+    let SQLITE4_NAN_EXP = 2000s
+
+    let num_from_double d =
+        // TODO probably this function should be done by decoding the bits
+        let nan =
+            {
+                neg = false
+                approx = true
+                e = SQLITE4_NAN_EXP
+                m = 0UL
+            }
+        let posInf = {nan with m=1UL}
+        let negInf = {posInf with neg=true}
+        let zero =
+            {
+                neg = false
+                approx = false
+                e = 0s
+                m = 0UL
+            }
+
+        if System.Double.IsNaN(d) then nan
+        else if System.Double.IsPositiveInfinity(d) then posInf
+        else if System.Double.IsNegativeInfinity(d) then negInf
+        else if d=0.0 then zero
+        else
+            let large = double LARGEST_UINT64
+            let large10 = double TENTH_MAX
+            let neg = d<0.0
+            let mutable d = if neg then -d else d
+            let mutable e = 0
+            while d>large || (d>1.0 && d=(double (int64 d))) do
+                d <- d / 10.0
+                e <- e + 1
+            while d<large10 && d<>(double (int64 d)) do
+                d <- d * 10.0
+                e <- e - 1
+            {
+                neg = neg
+                approx = true
+                e = int16 e
+                m = uint64 d
+            }
+
+    let num_isinf num =
+        num.e>SQLITE4_MX_EXP && num.m<>0UL
+
+    let num_isnan num =
+        num.e>SQLITE4_MX_EXP && num.m=0UL
+
+    let num_from_int64 n =
+        {
+            neg = n<0L
+            approx = false
+            m = if n>=0L then (uint64 n) else if n<>System.Int64.MinValue then (uint64 (-n)) else 1UL + (System.Int64.MaxValue |> uint64)
+            e = 0s
+        }
+
+    let private normalize num =
+        let mutable m = num.m
+        let mutable e = num.e
+
+        while (m%10UL)=0UL do
+            e <- e + 1s
+            m <- m / 10UL
+
+        {num with m = m; e = e}
+
+    let encodeForIndexInto (w:BinWriter) num =
+        // TODO the first byte of this encoding is designed to mesh with the
+        // overall type order byte, but we're not doing that.  instead, we are
+        // always prefixing this with the numeric type order byte.
+
+        if num.m=0UL then
+            if num_isnan num then
+                w.WriteByte(0x06uy)
+            else
+                w.WriteByte(0x15uy)
+        else if num_isinf num then
+            if num.neg then
+                w.WriteByte(0x07uy)
+            else
+                w.WriteByte(0x23uy)
+        else
+            let num = normalize num
+            let mutable m = num.m
+            let mutable e = num.e
+            let mutable iDigit = 0
+            let aDigit:byte[] = Array.zeroCreate 12
+
+            if (num.e%2s)<>0s then
+                aDigit.[0] <- byte (10UL * (m % 10UL))
+                m <- m / 10UL
+                e <- e - 1s
+                iDigit <- 1
+            else
+                iDigit <- 0
+
+            while m<>0UL do
+                aDigit.[iDigit] <- byte (m % 100UL)
+                iDigit <- iDigit + 1
+                m <- m / 100UL
+
+            e <- ((int16 iDigit) + (e/2s))
+
+            if e>= 11s then
+                if not num.neg then
+                    w.WriteByte(0x22uy)
+                    w.WriteInt16BigEndian(e)
+                else
+                    w.WriteByte(0x08uy)
+                    w.WriteInt16BigEndian(~~~e)
+            else if e>=0s then
+                if not num.neg then
+                    w.WriteByte(0x17uy+(byte e))
+                else
+                    w.WriteByte(0x13uy-(byte e))
+            else
+                if not num.neg then
+                    w.WriteByte(0x16uy)
+                    w.WriteInt16BigEndian(~~~(-e))
+                else
+                    w.WriteByte(0x14uy)
+                    w.WriteInt16BigEndian(-e)
+
+            while iDigit>0 do
+                iDigit <- iDigit - 1
+                let mutable d = aDigit.[iDigit]*2uy
+                if iDigit<>0 then d <- d ||| 0x01uy
+                if num.neg then d <- ~~~d
+                w.WriteByte(d)
+
+
 module bson = 
 
     open System
@@ -320,9 +469,130 @@ module bson =
         toBinary bv w
         w.ToArray()
 
+#if not
+    // failed attempt to implement a base-2 version of sqlite4's decimal key encoding
+
+    let width n =
+        let mutable w = 0
+        while (n>>>w) <> 0L do
+            w <- w + 1
+        printfn "n : %A" n
+        printfn "w : %d" w
+        w
+
+    let encodeTrioForIndexInto (w:BinWriter) negative mantissa exponent =
+        let exponent = exponent + width mantissa
+        if negative then
+            if exponent >= 0 then
+                w.WriteByte(0x08uy)
+                w.WriteInt32BigEndian(~~~exponent)
+            else
+                w.WriteByte(0x09uy)
+                w.WriteInt32BigEndian(~~~(-exponent))
+            w.WriteInt64BigEndian(~~~mantissa)
+        else
+            if exponent < 0 then
+                w.WriteByte(0x16uy)
+                w.WriteInt32BigEndian(~~~(-exponent))
+            else
+                w.WriteByte(0x17uy)
+                w.WriteInt32BigEndian(exponent)
+            w.WriteInt64BigEndian(mantissa)
+
+    let normalize mantissa exponent =
+        if mantissa<>0L then
+            let mutable m = mantissa
+            let mutable e = exponent
+            while m&&&1L=0L do
+                m <- m >>> 1
+                e <- e + 1
+            (m,e)
+        else
+            (mantissa,exponent)
+
+    let encodeDoubleForIndexInto (w:BinWriter) f =
+        let bits = System.BitConverter.DoubleToInt64Bits(f)
+        let negative = bits<0L
+        let exponent = int ((bits >>> 52) &&& 0x7ffL)
+        let mantissa = bits &&& 0xfffffffffffffL
+
+        printfn "f: %A" f
+        printfn "raw exponent: %d" exponent
+        printfn "raw mantissa: %A" mantissa
+
+        if exponent=2047 && mantissa<>0L then
+            //printfn "NaN"
+            w.WriteByte(0x06uy) // Double.IsNan(f)
+        else if exponent=2047 && mantissa=0L then
+            if negative then
+                //printfn "neg inf"
+                w.WriteByte(0x07uy) // Double.IsNegativeInfinity(f)
+            else
+                //printfn "pos inf"
+                w.WriteByte(0x23uy) // Double.IsPositiveInfinity(f)
+        else if exponent=0 && mantissa=0L then
+            //printfn "zero"
+            w.WriteByte(0x15uy) // we make no distinction between positive zero and negative zero
+        else
+            let (m,e) =
+                if exponent=0 then 
+                    // subnormal
+                    //printfn "subnormal"
+                    normalize mantissa (1 - 1023 - 52)
+                else
+                    // normal.  set the implicit bit.
+                    //printfn "normal"
+                    normalize (mantissa ||| (1L<<<52)) (exponent - 1023 - 52)
+
+            printfn "exponent: %d" e
+            printfn "mantissa: %A" m
+
+            encodeTrioForIndexInto w negative m e
+
+    let encodeInt64ForIndexInto w n =
+        printfn "i: %A" n
+        let negative = n<0L
+        // TODO there's an edge case here.  the most negative int64 won't work.
+        // TODO use an unsigned int64 ?
+        let mantissa = if negative then (-n) else n
+        let exponent = 0
+        let (m,e) = normalize mantissa exponent
+        printfn "int64 exponent: %d" e
+        printfn "int64 mantissa: %A" m
+        encodeTrioForIndexInto w negative m e
+#else
+    let encodeInt64ForIndexInto w n =
+        n |> sqlite4.num_from_int64 |> sqlite4.encodeForIndexInto w
+
+    let encodeDoubleForIndexInto w f =
+        f |> sqlite4.num_from_double |> sqlite4.encodeForIndexInto w
+#endif
+
+
+    let _encodeForIndexInto (w:BinWriter) bv =
+        w.WriteByte(getTypeOrder bv |> byte)
+        match bv with
+        | BBoolean b -> w.WriteByte(if b then 1uy else 0uy)
+        | BInt64 n -> encodeInt64ForIndexInto w n
+        | BInt32 n -> n |> int64 |> encodeInt64ForIndexInto w
+        | BDouble f -> encodeDoubleForIndexInto w f
+        | BObjectID a -> w.WriteBytes(a)
+        | BNull -> ()
+        | BUndefined -> ()
+        | BMinKey -> ()
+        | BMaxKey -> ()
+        | BString s->
+            w.WriteBytes(System.Text.Encoding.UTF8.GetBytes (s))
+            w.WriteByte(0uy)
+
+    let _encodeForIndex bv =
+        let w = BinWriter()
+        _encodeForIndexInto w bv
+        w.ToArray()
+
     let encodeForIndexInto (w:BinWriter) bv =
         toBinary bv w
-        // TODO encode for memcmp
+        // TODO switch this to the new stuff just above
 
     let encodeForIndex bv =
         let w = BinWriter()
