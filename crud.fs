@@ -1425,7 +1425,7 @@ module crud =
 
     let getSelectWithClose dbName collName = 
         let conn = kv.connect()
-        let (s,funk) = conn.getCollectionSequence dbName collName
+        let (s,funk) = conn.beginRead dbName collName
         let funk2() =
             funk()
             conn.close()
@@ -1543,7 +1543,7 @@ module crud =
             // TODO do we need special handling here for the case where the collection
             // does not exist?
             let results = ref Set.empty
-            let (s,funk) = conn.getCollectionSequence dbName collName
+            let (s,funk) = conn.beginRead dbName collName
             s |> seqMatch m |> 
             Seq.iter (fun (doc,ndx) -> 
                 match bson.findPath doc key with

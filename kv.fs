@@ -26,7 +26,7 @@ type index_info =
         options:BsonValue
     }
 
-type tx =
+type tx_write =
     {
         database:string
         collection:string
@@ -38,19 +38,33 @@ type tx =
         rollback:unit->unit
     }
 
+// TODO
+type tx_read = 
+    {
+        docs:seq<BsonValue>
+        funk:unit->unit
+    }
+
 type conn_methods =
     {
+        // TODO filename:string
+
         listCollections:unit->(string*string*BsonValue)[]
+        listIndexes:unit->index_info[]
+
         createCollection:string->string->BsonValue->bool
         dropCollection:string->string->bool
         renameCollection:string->string->bool->bool
         clearCollection:string->string->bool
-        listIndexes:unit->index_info[]
+
         createIndexes:index_info[]->bool[]
         dropIndex:string->string->string->bool
-        beginWrite:string->string->tx
-        getCollectionSequence:string->string->(seq<BsonValue>*(unit->unit))
+
         dropDatabase:string->bool
+
+        beginWrite:string->string->tx_write
+        beginRead:string->string->(seq<BsonValue>*(unit->unit))
+
         close:unit->unit
     }
 
@@ -76,6 +90,7 @@ module kv =
     // TODO special type for the pair db and coll
 
     let connect() =
+        // TODO allow a different filename to be specified
         let conn = ugly.``open``("elmodata.db")
         conn.exec("PRAGMA journal_mode=WAL")
         conn.exec("PRAGMA foreign_keys=ON")
@@ -462,7 +477,7 @@ module kv =
                 printfn "%A" e
                 reraise()
 
-        let fn_getCollectionSequence db coll =
+        let fn_beginRead db coll =
             getCollectionSequence true db coll
 
         let fn_listCollections() =
@@ -586,7 +601,7 @@ module kv =
             beginWrite = fn_beginWrite
             listCollections = fn_listCollections
             listIndexes = fn_listIndexes
-            getCollectionSequence = fn_getCollectionSequence
+            beginRead = fn_beginRead
             clearCollection = fn_clearCollection
             dropDatabase = fn_dropDatabase
             createIndexes = fn_createIndexes
