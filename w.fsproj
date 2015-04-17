@@ -43,6 +43,7 @@
     <Compile Include="Matcher.fs" />
     <Compile Include="protocol.fs" />
     <Compile Include="ProxyServer.fs" />
+    <Compile Include="kv.fs" />
     <Compile Include="crud.fs" />
     <Compile Include="LiteServer.fs" />
     <Compile Include="main.fs" />
