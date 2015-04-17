@@ -569,7 +569,7 @@ module bson =
 #endif
 
 
-    let _encodeForIndexInto (w:BinWriter) bv =
+    let rec encodeForIndexInto (w:BinWriter) bv =
         w.WriteByte(getTypeOrder bv |> byte)
         match bv with
         | BBoolean b -> w.WriteByte(if b then 1uy else 0uy)
@@ -581,18 +581,38 @@ module bson =
         | BUndefined -> ()
         | BMinKey -> ()
         | BMaxKey -> ()
-        | BString s->
+        | BDateTime n -> w.WriteInt64BigEndian(n)
+        | BTimeStamp n -> w.WriteInt64BigEndian(n)
+        | BDocument pairs ->
+            w.WriteInt32BigEndian(pairs.Length)
+            Array.iter (fun (k:string,v) ->
+                w.WriteBytes(System.Text.Encoding.UTF8.GetBytes (k))
+                w.WriteByte(0uy)
+                encodeForIndexInto w v
+            ) pairs
+        | BArray a ->
+            w.WriteInt32BigEndian(a.Length)
+            Array.iter (fun v ->
+                encodeForIndexInto w v
+            ) a
+        | BBinary (subtype,a) ->
+            w.WriteByte(subtype)
+            w.WriteInt32BigEndian(a.Length)
+            w.WriteBytes(a)
+        | BRegex (s,opt) ->
             w.WriteBytes(System.Text.Encoding.UTF8.GetBytes (s))
             w.WriteByte(0uy)
-
-    let _encodeForIndex bv =
-        let w = BinWriter()
-        _encodeForIndexInto w bv
-        w.ToArray()
-
-    let encodeForIndexInto (w:BinWriter) bv =
-        toBinary bv w
-        // TODO switch this to the new stuff just above
+            w.WriteBytes(System.Text.Encoding.UTF8.GetBytes (opt))
+            w.WriteByte(0uy)
+        | BJSCode s ->
+            w.WriteBytes(System.Text.Encoding.UTF8.GetBytes (s))
+            w.WriteByte(0uy)
+        | BJSCodeWithScope s ->
+            w.WriteBytes(System.Text.Encoding.UTF8.GetBytes (s))
+            w.WriteByte(0uy)
+        | BString s ->
+            w.WriteBytes(System.Text.Encoding.UTF8.GetBytes (s))
+            w.WriteByte(0uy)
 
     let encodeForIndex bv =
         let w = BinWriter()

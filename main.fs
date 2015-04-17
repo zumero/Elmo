@@ -90,7 +90,7 @@ module main =
             // TODO NaN would be nice here too, but of course it causes the match comparison to fail.  :-)
 
         let a:BsonValue[] = Array.zeroCreate 500 |> Array.map (fun _ -> frand())
-        let b = Array.map (fun f -> (f,f|>bson._encodeForIndex)) a
+        let b = Array.map (fun f -> (f,f|>bson.encodeForIndex)) a
         let s1 = b |> Array.copy
         Array.sortInPlaceWith sortByNumber s1
         let s2 = b |> Array.copy 
@@ -101,7 +101,7 @@ module main =
 
     let n3 s =
         let f = double s
-        let x = f |> BDouble |> bson._encodeForIndex
+        let x = f |> BDouble |> bson.encodeForIndex
         printfn "%A" x
 
     [<EntryPoint>]
