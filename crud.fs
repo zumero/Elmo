@@ -145,13 +145,14 @@ module crud =
 
     let private getOneMatch w m =
         let {docs=s;funk=funk} = w.getSelect()
-        let a = s |> seqMatch m |> Seq.truncate 1 |> Seq.toList
-        // TODO list match
-        let d = 
-            if List.isEmpty a then None
-            else List.head a |> Some
-        funk()
-        d
+        try
+            let a = s |> seqMatch m |> Seq.truncate 1 |> Seq.toList
+            let d = 
+                if List.isEmpty a then None
+                else List.head a |> Some
+            d
+        finally
+            funk()
 
     let sortFunc ord f =
         match ord with
@@ -916,22 +917,24 @@ module crud =
                         let ops = parseUpdateDoc u
                         let (countMatches,countModified) = 
                             if multi then
-                                let mods = ref 0
-                                let matches = ref 0
                                 let {docs=s;funk=funk} = w.getSelect()
-                                s |> seqMatch m |> 
-                                    Seq.iter (fun (doc,ndx) -> 
-                                        //printfn "iter, doc = %A" doc
-                                        let newDoc = applyUpdateOps doc ops false ndx
-                                        if idChanged doc newDoc then failwith "cannot change _id"
-                                        //printfn "after updates: %A" newDoc
-                                        matches := !matches + 1
-                                        if newDoc <> doc then
-                                            basicUpdate w newDoc
-                                            mods := !mods + 1
-                                        )
-                                funk()
-                                (!matches, !mods)
+                                try
+                                    let mods = ref 0
+                                    let matches = ref 0
+                                    s |> seqMatch m |> 
+                                        Seq.iter (fun (doc,ndx) -> 
+                                            //printfn "iter, doc = %A" doc
+                                            let newDoc = applyUpdateOps doc ops false ndx
+                                            if idChanged doc newDoc then failwith "cannot change _id"
+                                            //printfn "after updates: %A" newDoc
+                                            matches := !matches + 1
+                                            if newDoc <> doc then
+                                                basicUpdate w newDoc
+                                                mods := !mods + 1
+                                            )
+                                    (!matches, !mods)
+                                finally
+                                    funk()
                             else
                                 match getOneMatch w m with
                                 | Some (doc,ndx) ->
@@ -1002,14 +1005,16 @@ module crud =
                     let limit = bson.tryGetValueForKey upd "limit"
                     let m = Matcher.parseQuery q
                     let {docs=s;funk=funk} = w.getSelect()
-                    s |> seqMatch m |> 
-                        Seq.iter (fun (doc,ndx) -> 
-                            // TODO is it possible to delete from an autoIndexId=false collection?
-                            let id = bson.getValueForKey doc "_id"
-                            if basicDelete w id then
-                                count := !count + 1
-                            )
-                    funk()
+                    try
+                        s |> seqMatch m |> 
+                            Seq.iter (fun (doc,ndx) -> 
+                                // TODO is it possible to delete from an autoIndexId=false collection?
+                                let id = bson.getValueForKey doc "_id"
+                                if basicDelete w id then
+                                    count := !count + 1
+                                )
+                    finally
+                        funk()
                 ) deletes
                 w.commit()
                 !count
@@ -1099,13 +1104,15 @@ module crud =
         // would probably be faster to just iterate over all and keep track of what
         // the first one would be.
         let {docs=s;funk=funk} = w.getSelect()
-        let a = s |> seqMatch m |> seqSort ord |> Seq.truncate 1 |> Seq.toList
-        // TODO list match
-        let d = 
-            if List.isEmpty a then None
-            else List.head a |> Some
-        funk()
-        d
+        try
+            let a = s |> seqMatch m |> seqSort ord |> Seq.truncate 1 |> Seq.toList
+            // TODO list match
+            let d = 
+                if List.isEmpty a then None
+                else List.head a |> Some
+            d
+        finally
+            funk()
 
     let private doProjectionOperator cur k (projOp:(string*BsonValue)[]) =
         // TODO is it really true that the projection op document can only have one thing in it?
