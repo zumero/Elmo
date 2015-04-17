@@ -154,7 +154,7 @@ module crud =
         finally
             funk()
 
-    let sortFunc ord f =
+    let private sortFunc ord f =
         match ord with
         | BDocument keys ->
             let rec mycmp cur ta tb =
@@ -191,7 +191,7 @@ module crud =
         | BInt32 dir -> failwith "TODO" // TODO this will end up being allowed for orderby
         | _ -> failwith "orderby needs a document or an int"
 
-    let sortDocumentsBy docs ord f =
+    let private sortDocumentsBy docs ord f =
         let a2 = Array.copy docs
         let fsort = sortFunc ord f
         Array.sortInPlaceWith fsort a2
@@ -259,7 +259,7 @@ module crud =
         | Some s -> Array.filter (fun (db,_,_) -> db=s) a
         | None -> a
 
-    let cmd_listIndexes (dbName:string option) (collName:string option) =
+    let listIndexes (dbName:string option) (collName:string option) =
         let a = 
             let conn = kv.connect()
             try
@@ -372,7 +372,7 @@ module crud =
     // the check cannot be done correctly with simple string.StartsWith()
     // calls, because x.fu is not actually a prefix of x.fubar, since x
     // can happily have both fu and fubar as a key.
-    let checkPrefix (a:string) (b:string) =
+    let private checkPrefix (a:string) (b:string) =
         let aparts = a.Split('.')
         let bparts = b.Split('.')
         let alen = Array.length aparts
@@ -384,7 +384,7 @@ module crud =
         let bsub = Array.sub bparts 0 len
         asub = bsub
 
-    let anyPrefix (a:ResizeArray<string>) (s:string) =
+    let private anyPrefix (a:ResizeArray<string>) (s:string) =
         Seq.exists (fun q -> checkPrefix q s) a
 
     let private checkUpdateDocForConflicts ops =
@@ -1236,6 +1236,7 @@ module crud =
             else failwith "projection position operator only allowed at end of path"
         | None -> false
 
+    // TODO seems weird that the server needs access to the stuff below
     type Projection =
         {
             excludes:string[]
@@ -1245,6 +1246,7 @@ module crud =
             id:(string*BsonValue) option
         }
 
+    // TODO seems weird that the server needs access to the stuff below
     let verifyProjection proj q =
         match proj with
         | BDocument pairs ->
@@ -1327,6 +1329,7 @@ module crud =
 
         | _ -> failwith "projection must be a document"
 
+    // TODO seems weird that the server needs access to the stuff below
     let projectDocument d ndx proj =
         //printfn "d = %A" d
 
@@ -1411,7 +1414,6 @@ module crud =
                 failwith "wrong format for $min"
         m
 
-    // TODO just put this in Seq module?
     let seqSkip n s =
         s
         |> Seq.mapi (fun i elem -> i, elem)
@@ -1430,14 +1432,14 @@ module crud =
     let private seqOnlyDoc s =
         Seq.map (fun (doc,_) -> doc) s
 
-    let addCloseToKillFunc conn rdr =
+    let private addCloseToKillFunc conn rdr =
         let {docs=s;funk=funk} = rdr
         let funk2() =
             funk()
             conn.close()
         {docs=s;funk=funk2}
 
-    let getSelectWithClose dbName collName = 
+    let private getSelectWithClose dbName collName = 
         let conn = kv.connect()
         conn.beginRead dbName collName |> addCloseToKillFunc conn
 
@@ -1564,7 +1566,7 @@ module crud =
         finally
             funk()
 
-    type Expr =
+    type private Expr =
         | Expr_var of string
         | Expr_literal of BsonValue
 
@@ -1618,7 +1620,7 @@ module crud =
 
         // TODO | Expr_meta
 
-    let rec parseExpr v =
+    let rec private parseExpr v =
         let getOneArg v =
             match v with
             | BArray a ->
@@ -1765,7 +1767,7 @@ module crud =
         | _ -> v |> Expr_literal
         //| _ -> failwith (sprintf "cannot parse expression: %A" v)
 
-    let coerceToString v =
+    let private coerceToString v =
         // TODO what are the rules for how/when string coercion happens?
         // this function was written simply because the string expression
         // functions in the aggregation pipeline are documented to require
@@ -1784,30 +1786,30 @@ module crud =
         | BNull -> ""
         | _ -> failwith (sprintf "coerceToString invalid type: %A" v) // TODO raise
 
-    let initEval d =
+    let private initEval d =
         BDocument [| ("CURRENT", d); ("ROOT", d); ("DESCEND", BString "__descend__"); ("PRUNE", BString "__prune__"); ("KEEP", BString "__keep__") |]
 
-    let legalVarName s =
+    let private legalVarName s =
         s="CURRENT" || Char.IsLower(s.[0])
 
-    let floatCanBeInt32 f =
+    let private floatCanBeInt32 f =
         let n = int32 f
         let f2 = float n
         f = f2
 
-    let floatCanBeInt64 f =
+    let private floatCanBeInt64 f =
         let n = int64 f
         let f2 = float n
         f = f2
 
-    let weekOfYear dt =
+    let private weekOfYear dt =
         let cal = System.Globalization.GregorianCalendar()
         let week = cal.GetWeekOfYear(dt, System.Globalization.CalendarWeekRule.FirstFullWeek, DayOfWeek.Sunday)
         let month = dt.Month
         let week = if month=1 && week>6 then 0 else week
         week
 
-    let rec formatDate (dt:DateTime) s cur =
+    let rec private formatDate (dt:DateTime) s cur =
         let len = String.length s // have to calc this every time because it changes
         if cur >= len then
             s
@@ -1836,7 +1838,7 @@ module crud =
                 let s2 = before + repl + after
                 formatDate dt s2 (n + repl.Length)
 
-    let rec eval ctx e =
+    let rec private eval ctx e =
         match e with
         | Expr_literal lit -> lit
         | Expr_allElementsTrue a ->

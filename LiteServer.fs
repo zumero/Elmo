@@ -466,6 +466,7 @@ module LiteServer =
         | Some v -> 
             match fields with
             | Some proj ->
+                // TODO calling stuff below that seems like it should be private to the crud module
                 let prep = crud.verifyProjection proj None // TODO projection position op allowed here?
                 pairs.Add("value", crud.projectDocument v None prep) // TODO projection position op allowed here?
             | None ->
@@ -631,6 +632,7 @@ module LiteServer =
         let result = Array.map (fun (dbName,collName,options) -> BDocument [| ("name", BString collName);("options", options) |]) result
         let result = 
             match bson.tryGetValueForKey q "filter" with
+            // TODO calling stuff below that seems like it should be private to the crud module
             | Some d -> crud.doFilter result d
             | None -> result
         let s = Seq.ofArray result
@@ -652,7 +654,7 @@ module LiteServer =
             | BString "" -> failwith "empty string not allowed here"
             | BString s -> s
             | _ -> failwith "must be a string"
-        let result = crud.cmd_listIndexes (Some db) (Some coll)
+        let result = crud.listIndexes (Some db) (Some coll)
         let result = 
             Array.map (fun (ndxInfo:index_info) -> 
                 let unique = 
@@ -724,7 +726,7 @@ module LiteServer =
                 (Some a, Some b)
             | _ -> 
                 None,None
-        let result = crud.cmd_listIndexes dbName collName
+        let result = crud.listIndexes dbName collName
         let result = result |> Array.map (fun ndxInfo -> BDocument [| "name", BString ndxInfo.ndx |])
         createReply clientMsg.q_requestID result 0L
 
@@ -819,6 +821,7 @@ module LiteServer =
         try
             let s = 
                 if clientMsg.q_numberToSkip > 0 then
+                    // TODO do we want seqSkip to be public?
                     crud.seqSkip (clientMsg.q_numberToSkip) s
                 else if clientMsg.q_numberToSkip < 0 then
                     failwith "negative skip"

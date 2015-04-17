@@ -15,9 +15,9 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *)
 
-// consider having the LiteServer layer keep the kv.conn open all the time.
+// bson binary subtypes
 //
-// cmd_ prefix
+// consider having the LiteServer layer keep the kv.conn open all the time.
 //
 // funk never gets called when the client abandons a cursor.  time it out.
 //
