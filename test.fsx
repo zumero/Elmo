@@ -15,11 +15,9 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *)
 
-// conn = open
-//
 // cmd_ prefix
 //
-// lsof problem, funk not called?
+// funk never gets called when the client abandons a cursor.  time it out.
 //
 // figure out why none of the parallel shell things work
 //
@@ -43,8 +41,6 @@
 //
 // insert empty timestamp, mongo fills it in, top level only
 //
-// datetime is signed.  allows dates before 1970.
-//
 // explain
 //
 // regex tests
@@ -52,8 +48,6 @@
 // geo
 //
 // $text ? fts ?
-//
-// regex option m multiline
 //
 // $natural query modifier
 //
@@ -70,15 +64,9 @@
 //
 // should find and aggregate share their implementation of projection?
 // 
-// break up Storage.fs.  move sqlite-specific stuff down a layer.
-//
 // no test case for $orderby int?  see sortFunc.
 //
 // should count (and maybe distinct) map onto the agg pipeline?
-//
-// Expr_dateToString parse should not care about order of subdoc keys
-//
-// remove rowid from the sequences ?
 
 open System
 open System.IO
