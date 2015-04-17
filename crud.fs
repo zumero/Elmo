@@ -144,7 +144,7 @@ module crud =
               )
 
     let private getOneMatch w m =
-        let (s,funk) = w.getSelect()
+        let {docs=s;funk=funk} = w.getSelect()
         let a = s |> seqMatch m |> Seq.truncate 1 |> Seq.toList
         // TODO list match
         let d = 
@@ -918,18 +918,18 @@ module crud =
                             if multi then
                                 let mods = ref 0
                                 let matches = ref 0
-                                let (s,funk) = w.getSelect()
+                                let {docs=s;funk=funk} = w.getSelect()
                                 s |> seqMatch m |> 
-                                Seq.iter (fun (doc,ndx) -> 
-                                    //printfn "iter, doc = %A" doc
-                                    let newDoc = applyUpdateOps doc ops false ndx
-                                    if idChanged doc newDoc then failwith "cannot change _id"
-                                    //printfn "after updates: %A" newDoc
-                                    matches := !matches + 1
-                                    if newDoc <> doc then
-                                        basicUpdate w newDoc
-                                        mods := !mods + 1
-                                    )
+                                    Seq.iter (fun (doc,ndx) -> 
+                                        //printfn "iter, doc = %A" doc
+                                        let newDoc = applyUpdateOps doc ops false ndx
+                                        if idChanged doc newDoc then failwith "cannot change _id"
+                                        //printfn "after updates: %A" newDoc
+                                        matches := !matches + 1
+                                        if newDoc <> doc then
+                                            basicUpdate w newDoc
+                                            mods := !mods + 1
+                                        )
                                 funk()
                                 (!matches, !mods)
                             else
@@ -1001,14 +1001,14 @@ module crud =
                     let q = bson.getValueForKey upd "q"
                     let limit = bson.tryGetValueForKey upd "limit"
                     let m = Matcher.parseQuery q
-                    let (s,funk) = w.getSelect()
+                    let {docs=s;funk=funk} = w.getSelect()
                     s |> seqMatch m |> 
-                    Seq.iter (fun (doc,ndx) -> 
-                        // TODO is it possible to delete from an autoIndexId=false collection?
-                        let id = bson.getValueForKey doc "_id"
-                        if basicDelete w id then
-                            count := !count + 1
-                        )
+                        Seq.iter (fun (doc,ndx) -> 
+                            // TODO is it possible to delete from an autoIndexId=false collection?
+                            let id = bson.getValueForKey doc "_id"
+                            if basicDelete w id then
+                                count := !count + 1
+                            )
                     funk()
                 ) deletes
                 w.commit()
@@ -1098,7 +1098,7 @@ module crud =
         // TODO collecting all the results and sorting and taking the first one.
         // would probably be faster to just iterate over all and keep track of what
         // the first one would be.
-        let (s,funk) = w.getSelect()
+        let {docs=s;funk=funk} = w.getSelect()
         let a = s |> seqMatch m |> seqSort ord |> Seq.truncate 1 |> Seq.toList
         // TODO list match
         let d = 
@@ -1423,13 +1423,16 @@ module crud =
     let private seqOnlyDoc s =
         Seq.map (fun (doc,_) -> doc) s
 
-    let getSelectWithClose dbName collName = 
-        let conn = kv.connect()
-        let (s,funk) = conn.beginRead dbName collName
+    let addCloseToKillFunc conn rdr =
+        let {docs=s;funk=funk} = rdr
         let funk2() =
             funk()
             conn.close()
-        (s,funk2)
+        {docs=s;funk=funk2}
+
+    let getSelectWithClose dbName collName = 
+        let conn = kv.connect()
+        conn.beginRead dbName collName |> addCloseToKillFunc conn
 
     let find dbName collName q orderby projection ndxMin ndxMax =
         let m = Matcher.parseQuery q
@@ -1456,7 +1459,7 @@ module crud =
                 let and_items = QueryItem.AND items
                 QueryDoc [| and_items |]
             | None,None -> m
-        let (s,funk) = getSelectWithClose dbName collName
+        let {docs=s;funk=funk} = getSelectWithClose dbName collName
         try
             let s = seqMatch m s
             let s =
@@ -1538,22 +1541,21 @@ module crud =
             match query with
             | Some q -> Matcher.parseQuery q
             | None -> [| |] |> BDocument |> Matcher.parseQuery
-        let conn = kv.connect()
+
+        // TODO do we need special handling here for the case where the collection
+        // does not exist?
+        let {docs=s;funk=funk} = getSelectWithClose dbName collName
         try
-            // TODO do we need special handling here for the case where the collection
-            // does not exist?
             let results = ref Set.empty
-            let (s,funk) = conn.beginRead dbName collName
-            s |> seqMatch m |> 
-            Seq.iter (fun (doc,ndx) -> 
-                match bson.findPath doc key with
-                | Some v -> results := Set.add v !results
-                | None -> ()
-                )
-            funk()
+            s |> seqMatch m |>
+                Seq.iter (fun (doc,ndx) -> 
+                    match bson.findPath doc key with
+                    | Some v -> results := Set.add v !results
+                    | None -> ()
+                    )
             Set.toArray !results
         finally
-            conn.close()
+            funk()
 
     type Expr =
         | Expr_var of string
@@ -2521,7 +2523,7 @@ module crud =
 
     let aggregate dbName collName pipeline =
         let ops = parseAgg pipeline
-        let (s,funk) = getSelectWithClose dbName collName
+        let {docs=s;funk=funk} = getSelectWithClose dbName collName
 
         try
             let (out,ops) =

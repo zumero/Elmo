@@ -26,6 +26,12 @@ type index_info =
         options:BsonValue
     }
 
+type reader = 
+    {
+        docs:seq<BsonValue>
+        funk:unit->unit
+    }
+
 type tx_write =
     {
         database:string
@@ -33,16 +39,9 @@ type tx_write =
         insert:BsonValue->unit
         update:BsonValue->unit
         delete:BsonValue->bool
-        getSelect:unit->(seq<BsonValue>*(unit->unit))
+        getSelect:unit->reader
         commit:unit->unit
         rollback:unit->unit
-    }
-
-// TODO
-type tx_read = 
-    {
-        docs:seq<BsonValue>
-        funk:unit->unit
     }
 
 type conn_methods =
@@ -63,7 +62,7 @@ type conn_methods =
         dropDatabase:string->bool
 
         beginWrite:string->string->tx_write
-        beginRead:string->string->(seq<BsonValue>*(unit->unit))
+        beginRead:string->string->reader
 
         close:unit->unit
     }
@@ -320,9 +319,9 @@ module kv =
                     if tx then conn.exec("COMMIT TRANSACTION")
                     stmt.sqlite3_finalize()
 
-                (s, killFunc)
+                {docs=s; funk=killFunc}
             | None ->
-                (Seq.empty, (fun () -> ()))
+                {docs=Seq.empty; funk=(fun () -> ())}
 
         let beginWrite db coll = 
             let created = createCollection db coll (BDocument Array.empty)
