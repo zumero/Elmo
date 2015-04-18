@@ -619,6 +619,11 @@ module bson =
         encodeForIndexInto w bv
         w.ToArray()
 
+    let encodeMultiForIndex a =
+        let w = BinWriter()
+        Array.iter (fun v -> encodeForIndexInto w v) a
+        w.ToArray()
+
     let setValueAtIndex bv ndx v =
         match bv with
         | BArray a ->

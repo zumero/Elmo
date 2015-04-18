@@ -143,8 +143,26 @@ module crud =
                 else None
               )
 
+    let findIndex indexes a =
+        //printfn "indexes: %A" indexes
+        //printfn "keys: %A" a
+        Array.tryFind (fun ndx ->
+            match ndx.spec with
+            | BDocument pairs ->
+                let keys = Array.map (fun (k,v) -> k) pairs
+                // TODO this could be a lot friendlier.  it could accept
+                // an index which has more keys after the ones we want.
+                // although then an EQ would never match.
+                keys = a
+            | _ ->
+                failwith "index spec must be a doc"
+        ) indexes
+
+    let private chooseIndex m indexes =
+        None // TODO
+
     let private getOneMatch w m =
-        let {docs=s;funk=funk} = w.getSelect()
+        let {docs=s;funk=funk} = w.getSelect None // TODO choose an index
         try
             let a = s |> seqMatch m |> Seq.truncate 1 |> Seq.toList
             let d = 
@@ -259,17 +277,23 @@ module crud =
         | Some s -> Array.filter (fun (db,_,_) -> db=s) a
         | None -> a
 
-    let listIndexes (dbName:string option) (collName:string option) =
-        let a = 
-            let conn = kv.connect()
-            try
-                conn.listIndexes()
-            finally
-                conn.close()
+    let private listAllIndexes() =
+        let conn = kv.connect()
+        try
+            conn.listIndexes()
+        finally
+            conn.close()
 
+    let private listIndexesForCollection db coll =
+        listAllIndexes() |> Array.filter (fun info -> info.db=db && info.coll=coll)
+
+    let private listIndexesForDatabase db =
+        listAllIndexes() |> Array.filter (fun info -> info.db=db)
+
+    let listIndexes (dbName:string option) (collName:string option) =
         match dbName,collName with
         | Some nsDb,Some nsColl ->
-            let result = Array.filter (fun info -> info.db=nsDb && info.coll=nsColl) a
+            let result = listIndexesForCollection nsDb nsColl
             if Array.isEmpty result then
                 if listCollections None |> Array.filter (fun (db,coll,_) -> db=nsDb && coll=nsColl) |> Array.isEmpty then
                     failwith "collection does not exist"
@@ -278,12 +302,12 @@ module crud =
             else
                 result
         | Some nsDb,None ->
+            listIndexesForDatabase nsDb
             // TODO gripe if db does not exist?
-            Array.filter (fun info -> info.db=nsDb) a
         | None, Some _ ->
             failwith "should not happen"
         | None,None ->
-            a
+            listAllIndexes()
 
     let clearCollection dbName collName =
         let conn = kv.connect()
@@ -917,7 +941,7 @@ module crud =
                         let ops = parseUpdateDoc u
                         let (countMatches,countModified) = 
                             if multi then
-                                let {docs=s;funk=funk} = w.getSelect()
+                                let {docs=s;funk=funk} = w.getSelect None // TODO choose an index
                                 try
                                     let mods = ref 0
                                     let matches = ref 0
@@ -1004,7 +1028,7 @@ module crud =
                     let q = bson.getValueForKey upd "q"
                     let limit = bson.tryGetValueForKey upd "limit"
                     let m = Matcher.parseQuery q
-                    let {docs=s;funk=funk} = w.getSelect()
+                    let {docs=s;funk=funk} = w.getSelect None // TODO choose an index
                     try
                         s |> seqMatch m |> 
                             Seq.iter (fun (doc,ndx) -> 
@@ -1103,7 +1127,7 @@ module crud =
         // TODO collecting all the results and sorting and taking the first one.
         // would probably be faster to just iterate over all and keep track of what
         // the first one would be.
-        let {docs=s;funk=funk} = w.getSelect()
+        let {docs=s;funk=funk} = w.getSelect None // TODO choose an index
         try
             let a = s |> seqMatch m |> seqSort ord |> Seq.truncate 1 |> Seq.toList
             // TODO list match
@@ -1387,32 +1411,19 @@ module crud =
 
         step4
 
-    let private parseIndexMax v =
+    let private parseIndexMinMax v =
         let m = Matcher.parseQuery v
-        //printfn "%A" m
-        // TODO there can be more than one Compare below    
-        let m = 
-            match m with
-            | QueryDoc [| Compare(k,[| EQ v |]) |] ->
-                // server9547.js says max() is exclusive upper bound
-                QueryDoc [| Compare(k,[| LT v |]) |]
-            | _ -> 
-                failwith "wrong format for $max"
-        m
-
-    let private parseIndexMin v =
-        let m = Matcher.parseQuery v
-        //printfn "%A" m    
-        // TODO there can be more than one Compare below    
-        let m = 
-            match m with
-            | QueryDoc [| Compare(k,[| EQ v |]) |] ->
-                // server9547.js says max() is exclusive upper bound.
-                // TODO is min() exclusive as well?
-                QueryDoc [| Compare(k,[| GT v |]) |]
-            | _ -> 
-                failwith "wrong format for $min"
-        m
+        match m with
+        | QueryDoc a ->
+            Array.choose (fun it ->
+                match it with
+                | Compare (k,[| EQ v |]) ->
+                    Some (k,v)
+                | _ -> 
+                    failwith "wrong format for $min/$max"
+            ) a
+        | _ ->
+            failwith "wrong format for $min/$max"
 
     let seqSkip n s =
         s
@@ -1439,36 +1450,44 @@ module crud =
             conn.close()
         {docs=s;funk=funk2}
 
-    let private getSelectWithClose dbName collName = 
+    let private getSelectWithClose dbName collName plan = 
         let conn = kv.connect()
-        conn.beginRead dbName collName |> addCloseToKillFunc conn
+        conn.beginRead dbName collName plan |> addCloseToKillFunc conn
 
     let find dbName collName q orderby projection ndxMin ndxMax =
+        // TODO need a list of indexes, but the conn isn't open yet
+        let indexes = listIndexesForCollection dbName collName
         let m = Matcher.parseQuery q
-        // TODO ndxMin/ndxMax should actually force the use of a certain
-        // index and should be included in the sqlite statement.  for now,
-        // as a temporary implementation, we shove them into the query
-        // itself.
-        let m = 
+        let plan = 
             match (ndxMin,ndxMax) with
-            | Some vmin, Some vmax ->
-                let m_min = parseIndexMin vmin
-                let m_max = parseIndexMax vmax
-                let items = [| m_min; m_max; m |]
-                let and_items = QueryItem.AND items
-                QueryDoc [| and_items |]
+            | Some vmin, Some vmax -> 
+                let amin = parseIndexMinMax vmin
+                let amax = parseIndexMinMax vmax
+                if Array.length amin <> Array.length amax then failwith "different"
+                let keys = Array.map (fun (k,v) -> k) amin
+                if Array.map (fun (k,v) -> k) amax <> keys then failwith "different"
+                let minvals = Array.map (fun (k,v) -> v) amin
+                let maxvals = Array.map (fun (k,v) -> v) amax
+                match findIndex indexes keys with
+                | Some ndx -> plan.GTE_LT (ndx,minvals,maxvals) |> Some
+                | None -> failwith "index not found" // TODO or None
             | Some vmin, None ->
-                let m_min = parseIndexMin vmin
-                let items = [| m_min; m |]
-                let and_items = QueryItem.AND items
-                QueryDoc [| and_items |]
+                let amin = parseIndexMinMax vmin
+                let keys = Array.map (fun (k,v) -> k) amin
+                let minvals = Array.map (fun (k,v) -> v) amin
+                match findIndex indexes keys with
+                | Some ndx -> plan.One (plan.GTE,ndx,minvals) |> Some
+                | None -> failwith "index not found" // TODO or None
             | None, Some vmax ->
-                let m_max = parseIndexMax vmax
-                let items = [| m_max; m |]
-                let and_items = QueryItem.AND items
-                QueryDoc [| and_items |]
-            | None,None -> m
-        let {docs=s;funk=funk} = getSelectWithClose dbName collName
+                let amax = parseIndexMinMax vmax
+                let keys = Array.map (fun (k,v) -> k) amax
+                let maxvals = Array.map (fun (k,v) -> v) amax
+                match findIndex indexes keys with
+                | Some ndx -> plan.One (plan.LT,ndx,maxvals) |> Some
+                | None -> failwith "index not found" // TODO or None
+            | None,None -> 
+                chooseIndex indexes m
+        let {docs=s;funk=funk} = getSelectWithClose dbName collName plan
         try
             let s = seqMatch m s
             let s =
@@ -1553,7 +1572,7 @@ module crud =
 
         // TODO do we need special handling here for the case where the collection
         // does not exist?
-        let {docs=s;funk=funk} = getSelectWithClose dbName collName
+        let {docs=s;funk=funk} = getSelectWithClose dbName collName None // TODO choose an index
         try
             let results = ref Set.empty
             s |> seqMatch m |>
@@ -2532,7 +2551,11 @@ module crud =
 
     let aggregate dbName collName pipeline =
         let ops = parseAgg pipeline
-        let {docs=s;funk=funk} = getSelectWithClose dbName collName
+
+        // TODO check to see if the first pipeline stage is match.  if so,
+        // check for an index we can use.
+
+        let {docs=s;funk=funk} = getSelectWithClose dbName collName None // TODO choose an index
 
         try
             let (out,ops) =

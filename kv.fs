@@ -26,6 +26,18 @@ type index_info =
         options:BsonValue
     }
 
+module plan =
+    type op1 =
+        | EQ
+        | LT
+        | GT
+        | LTE
+        | GTE
+
+    type t =
+        | One of op1*index_info*(BsonValue[])
+        | GTE_LT of index_info*(BsonValue[])*(BsonValue[])
+
 type reader = 
     {
         docs:seq<BsonValue>
@@ -39,7 +51,7 @@ type tx_write =
         insert:BsonValue->unit
         update:BsonValue->unit
         delete:BsonValue->bool
-        getSelect:unit->reader
+        getSelect:(plan.t option)->reader
         commit:unit->unit
         rollback:unit->unit
     }
@@ -62,7 +74,7 @@ type conn_methods =
         dropDatabase:string->bool
 
         beginWrite:string->string->tx_write
-        beginRead:string->string->reader
+        beginRead:string->string->(plan.t option)->reader
 
         close:unit->unit
     }
@@ -80,7 +92,8 @@ module kv =
                     // TODO maybe when a key is missing we should just not insert an index entry for this doc?
                     match bson.findPath doc k with
                     | Some v -> v
-                    | None -> BUndefined
+                    | None -> BUndefined // TODO this can't be right...
+                // TODO what if dir < 0 ?
                 bson.encodeForIndexInto w v
             ) keys
         | _ -> failwith "must be a doc"
@@ -136,7 +149,9 @@ module kv =
                     yield doc
             }
 
-        let createIndex info =
+        let rec createIndex info =
+            let createdColl = createCollection info.db info.coll (BDocument Array.empty)
+            ignore createdColl // TODO are we supposed to tell the caller we created the collection?
             //printfn "createIndex: %A" info
             match getIndexInfo info.db info.coll info.ndx with
             | Some already ->
@@ -165,7 +180,7 @@ module kv =
                     conn.exec(sprintf "CREATE TABLE \"%s\" (k BLOB NOT NULL, doc_rowid int NOT NULL REFERENCES \"%s\"(did) ON DELETE CASCADE, PRIMARY KEY (k,doc_rowid))" ndxTable collTable)
                 true
 
-        let createCollection db coll options =
+        and createCollection db coll options =
             //printfn "createCollection: %s.%s" db coll
             match getCollectionOptions db coll with
             | Some _ ->
@@ -304,12 +319,46 @@ module kv =
                     cur <- conn.next_stmt(cur)
                 reraise()
 
-        let getCollectionSequence tx db coll =
+        let getStmtForIndex ndxu =
+            match ndxu with
+            | plan.One (op,ndx,lits) ->
+                let tblColl = getTableNameForCollection ndx.db ndx.coll
+                let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
+                let strop = 
+                    match op with
+                    | plan.EQ -> "="
+                    | plan.LT -> "<"
+                    | plan.GT -> ">"
+                    | plan.LTE -> "<="
+                    | plan.GTE -> ">="
+                let sql = sprintf "SELECT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ?" tblColl tblIndex strop
+                let stmt = conn.prepare(sql)
+                let k = bson.encodeMultiForIndex lits
+                stmt.bind_blob(1, k)
+                stmt
+            | plan.GTE_LT (ndx,minvals,maxvals) ->
+                let tblColl = getTableNameForCollection ndx.db ndx.coll
+                let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
+                let sql = sprintf "SELECT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k >= ? AND k < ?" tblColl tblIndex
+                let stmt = conn.prepare(sql)
+                let kmin = bson.encodeMultiForIndex minvals
+                let kmax = bson.encodeMultiForIndex maxvals
+                stmt.bind_blob(1, kmin)
+                stmt.bind_blob(2, kmax)
+                stmt
+
+        let getSeq tx db coll plan =
             match getCollectionOptions db coll with
             | Some _ ->
-                let collTable = getTableNameForCollection db coll
                 if tx then conn.exec("BEGIN TRANSACTION")
-                let stmt = conn.prepare(sprintf "SELECT bson FROM \"%s\"" collTable)
+
+                let stmt =
+                    match plan with
+                    | Some ndxu ->
+                        getStmtForIndex ndxu
+                    | None ->
+                        let collTable = getTableNameForCollection db coll
+                        conn.prepare(sprintf "SELECT bson FROM \"%s\"" collTable)
 
                 let s = getStmtSequence stmt
 
@@ -452,8 +501,8 @@ module kv =
                 conn.exec("COMMIT TRANSACTION")
                 finalize_stmts()
                 
-            let fn_select() =
-                getCollectionSequence false db coll
+            let fn_getSelect plan =
+                getSeq false db coll plan
 
             conn.exec("BEGIN TRANSACTION")
 
@@ -463,7 +512,7 @@ module kv =
                 insert = fn_insert
                 update = fn_update
                 delete = fn_delete
-                getSelect = fn_select
+                getSelect = fn_getSelect
                 commit = fn_commit
                 rollback = fn_rollback
             }
@@ -476,8 +525,8 @@ module kv =
                 printfn "%A" e
                 reraise()
 
-        let fn_beginRead db coll =
-            getCollectionSequence true db coll
+        let fn_beginRead db coll plan =
+            getSeq true db coll plan
 
         let fn_listCollections() =
             conn.exec("BEGIN TRANSACTION")
