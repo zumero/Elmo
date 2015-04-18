@@ -91,7 +91,7 @@ module test =
             // TODO NaN would be nice here too, but of course it causes the match comparison to fail.  :-)
 
         let a:BsonValue[] = Array.zeroCreate 500 |> Array.map (fun _ -> frand())
-        let b = Array.map (fun f -> (f,f|>bson.encodeForIndex)) a
+        let b = Array.map (fun f -> (f,bson.encodeOneForIndex f false)) a
         let s1 = b |> Array.copy
         Array.sortInPlaceWith sortByNumber s1
         let s2 = b |> Array.copy 
@@ -102,6 +102,6 @@ module test =
 
     let num (s:string) =
         let f = double s
-        let x = f |> BDouble |> bson.encodeForIndex
+        let x = bson.encodeOneForIndex (f |> BDouble) false
         printfn "%A" x
 

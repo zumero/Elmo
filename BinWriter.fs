@@ -21,7 +21,7 @@ open System
 
 type BinWriter () =
     let mutable i = 0
-    let mutable space = 1024
+    let mutable space = 1024 // TODO too big
     let mutable ba:byte[] = Array.zeroCreate space
 
     let ensureSpace more =

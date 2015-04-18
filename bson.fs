@@ -470,34 +470,7 @@ module bson =
         w.ToArray()
 
 #if not
-    // failed attempt to implement a base-2 version of sqlite4's decimal key encoding
-
-    let width n =
-        let mutable w = 0
-        while (n>>>w) <> 0L do
-            w <- w + 1
-        printfn "n : %A" n
-        printfn "w : %d" w
-        w
-
-    let encodeTrioForIndexInto (w:BinWriter) negative mantissa exponent =
-        let exponent = exponent + width mantissa
-        if negative then
-            if exponent >= 0 then
-                w.WriteByte(0x08uy)
-                w.WriteInt32BigEndian(~~~exponent)
-            else
-                w.WriteByte(0x09uy)
-                w.WriteInt32BigEndian(~~~(-exponent))
-            w.WriteInt64BigEndian(~~~mantissa)
-        else
-            if exponent < 0 then
-                w.WriteByte(0x16uy)
-                w.WriteInt32BigEndian(~~~(-exponent))
-            else
-                w.WriteByte(0x17uy)
-                w.WriteInt32BigEndian(exponent)
-            w.WriteInt64BigEndian(mantissa)
+    // code to decode IEEE double
 
     let normalize mantissa exponent =
         if mantissa<>0L then
@@ -510,7 +483,7 @@ module bson =
         else
             (mantissa,exponent)
 
-    let encodeDoubleForIndexInto (w:BinWriter) f =
+    let decodeDouble (w:BinWriter) f =
         let bits = System.BitConverter.DoubleToInt64Bits(f)
         let negative = bits<0L
         let exponent = int ((bits >>> 52) &&& 0x7ffL)
@@ -548,28 +521,15 @@ module bson =
             printfn "mantissa: %A" m
 
             encodeTrioForIndexInto w negative m e
+#endif
 
-    let encodeInt64ForIndexInto w n =
-        printfn "i: %A" n
-        let negative = n<0L
-        // TODO there's an edge case here.  the most negative int64 won't work.
-        // TODO use an unsigned int64 ?
-        let mantissa = if negative then (-n) else n
-        let exponent = 0
-        let (m,e) = normalize mantissa exponent
-        printfn "int64 exponent: %d" e
-        printfn "int64 mantissa: %A" m
-        encodeTrioForIndexInto w negative m e
-#else
     let encodeInt64ForIndexInto w n =
         n |> sqlite4.num_from_int64 |> sqlite4.encodeForIndexInto w
 
     let encodeDoubleForIndexInto w f =
         f |> sqlite4.num_from_double |> sqlite4.encodeForIndexInto w
-#endif
 
-
-    let rec encodeForIndexInto (w:BinWriter) bv =
+    let rec private encodeForIndexInto (w:BinWriter) bv =
         w.WriteByte(getTypeOrder bv |> byte)
         match bv with
         | BBoolean b -> w.WriteByte(if b then 1uy else 0uy)
@@ -614,14 +574,22 @@ module bson =
             w.WriteBytes(System.Text.Encoding.UTF8.GetBytes (s))
             w.WriteByte(0uy)
 
-    let encodeForIndex bv =
+    let encodeOneForIndex bv neg =
         let w = BinWriter()
         encodeForIndexInto w bv
-        w.ToArray()
+        let a = w.ToArray()
+        if neg then
+            for i in 0 .. (Array.length a - 1) do
+                let b = a.[i]
+                a.[i] <- ~~~b
+        a
 
     let encodeMultiForIndex a =
         let w = BinWriter()
-        Array.iter (fun v -> encodeForIndexInto w v) a
+        Array.iter (fun (v,neg) -> 
+            let a = encodeOneForIndex v neg
+            w.WriteBytes(a)
+        ) a
         w.ToArray()
 
     let setValueAtIndex bv ndx v =

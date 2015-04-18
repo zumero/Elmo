@@ -149,11 +149,14 @@ module crud =
         Array.tryFind (fun ndx ->
             match ndx.spec with
             | BDocument pairs ->
-                let keys = Array.map (fun (k,v) -> k) pairs
-                // TODO this could be a lot friendlier.  it could accept
-                // an index which has more keys after the ones we want.
-                // although then an EQ would never match.
-                keys = a
+                let len = Array.length a
+                if Array.length pairs < len then
+                    false
+                else
+                    // TODO by trimming the index here, EQ will never match?
+                    let pairs = Array.sub pairs 0 len
+                    let keys = Array.map (fun (k,v) -> k) pairs
+                    keys = a
             | _ ->
                 failwith "index spec must be a doc"
         ) indexes

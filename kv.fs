@@ -83,21 +83,28 @@ module kv =
     open SQLitePCL
     open SQLitePCL.Ugly
 
-    let private encodeIndexKey ndxInfo doc =
-        let w = BinWriter()
+    let private encodeIndexEntry ndxInfo doc =
         match ndxInfo.spec with
         | BDocument keys ->
-            Array.iter (fun (k,dir) ->
-                let v = 
-                    // TODO maybe when a key is missing we should just not insert an index entry for this doc?
-                    match bson.findPath doc k with
-                    | Some v -> v
-                    | None -> BUndefined // TODO this can't be right...
-                // TODO what if dir < 0 ?
-                bson.encodeForIndexInto w v
-            ) keys
+            let vals = 
+                Array.map (fun (k,dir) ->
+                    let dir = 
+                        match dir with
+                        | BInt32 n -> n<0
+                        | BInt64 n -> n<0L
+                        | BDouble n -> n<0.0
+                        | _ -> failwith "dir not numeric"
+                    let v = 
+                        // TODO maybe when a key is missing we should just not insert an index entry for this doc?
+                        match bson.findPath doc k with
+                        | Some v -> v
+                        | None -> BUndefined // TODO this can't be right...
+                    (v,dir)
+                ) keys
+
+            bson.encodeMultiForIndex vals
+
         | _ -> failwith "must be a doc"
-        w.ToArray()
 
     // TODO special type for the pair db and coll
 
@@ -319,9 +326,26 @@ module kv =
                     cur <- conn.next_stmt(cur)
                 reraise()
 
+        let getDirs spec vals =
+            match spec with
+            | BDocument pairs ->
+                let len = Array.length vals
+                let pairs = Array.sub pairs 0 len
+                let dirs = 
+                    Array.map (fun (_,v) -> 
+                        match v with
+                        | BInt32 n -> n<0
+                        | BInt64 n -> n<0L
+                        | BDouble f -> f<0.0
+                        | _ -> failwith "index dir must be numeric"
+                    ) pairs
+                Array.zip vals dirs
+            | _ ->
+                failwith "index spec must be a doc"
+
         let getStmtForIndex ndxu =
             match ndxu with
-            | plan.One (op,ndx,lits) ->
+            | plan.One (op,ndx,vals) ->
                 let tblColl = getTableNameForCollection ndx.db ndx.coll
                 let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
                 let strop = 
@@ -333,7 +357,7 @@ module kv =
                     | plan.GTE -> ">="
                 let sql = sprintf "SELECT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ?" tblColl tblIndex strop
                 let stmt = conn.prepare(sql)
-                let k = bson.encodeMultiForIndex lits
+                let k = vals |> getDirs ndx.spec |> bson.encodeMultiForIndex
                 stmt.bind_blob(1, k)
                 stmt
             | plan.GTE_LT (ndx,minvals,maxvals) ->
@@ -341,8 +365,8 @@ module kv =
                 let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
                 let sql = sprintf "SELECT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k >= ? AND k < ?" tblColl tblIndex
                 let stmt = conn.prepare(sql)
-                let kmin = bson.encodeMultiForIndex minvals
-                let kmax = bson.encodeMultiForIndex maxvals
+                let kmin = minvals |> getDirs ndx.spec |> bson.encodeMultiForIndex
+                let kmax = maxvals |> getDirs ndx.spec |> bson.encodeMultiForIndex
                 stmt.bind_blob(1, kmin)
                 stmt.bind_blob(2, kmax)
                 stmt
@@ -400,7 +424,7 @@ module kv =
             let find_rowid id =
                 match opt_stmt_find_rowid with
                 | Some stmt_find_rowid ->
-                    let idk = bson.encodeForIndex id
+                    let idk = bson.encodeOneForIndex id false
                     stmt_find_rowid.clear_bindings()
                     stmt_find_rowid.bind_blob(1, idk)
                     let rowid = 
@@ -420,7 +444,7 @@ module kv =
                     stmt_delete.step_done()
                     stmt_delete.reset()
 
-                    let k = encodeIndexKey info newDoc
+                    let k = encodeIndexEntry info newDoc
                     stmt_insert.clear_bindings()
                     stmt_insert.bind_blob(1, k)
                     stmt_insert.bind_int64(2, doc_rowid)
