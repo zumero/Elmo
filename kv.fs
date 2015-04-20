@@ -413,7 +413,7 @@ module kv =
                     | plan.GT -> ">"
                     | plan.LTE -> "<="
                     | plan.GTE -> ">="
-                let sql = sprintf "SELECT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ?" tblColl tblIndex strop
+                let sql = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ?" tblColl tblIndex strop
                 let stmt = conn.prepare(sql)
                 let k = vals |> getDirs ndx.spec |> bson.encodeMultiForIndex
                 stmt.bind_blob(1, k)
@@ -421,7 +421,7 @@ module kv =
             | plan.GTE_LT (ndx,minvals,maxvals) ->
                 let tblColl = getTableNameForCollection ndx.db ndx.coll
                 let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
-                let sql = sprintf "SELECT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k >= ? AND k < ?" tblColl tblIndex
+                let sql = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k >= ? AND k < ?" tblColl tblIndex
                 let stmt = conn.prepare(sql)
                 let kmin = minvals |> getDirs ndx.spec |> bson.encodeMultiForIndex
                 let kmax = maxvals |> getDirs ndx.spec |> bson.encodeMultiForIndex

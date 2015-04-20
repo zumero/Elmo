@@ -541,8 +541,8 @@ module bson =
         | BUndefined -> ()
         | BMinKey -> ()
         | BMaxKey -> ()
-        | BDateTime n -> w.WriteInt64BigEndian(n)
-        | BTimeStamp n -> w.WriteInt64BigEndian(n)
+        | BDateTime n -> encodeInt64ForIndexInto w n
+        | BTimeStamp n -> w.WriteInt64BigEndian(n) // TODO er, how to encode this?
         | BDocument pairs ->
             w.WriteInt32BigEndian(pairs.Length)
             Array.iter (fun (k:string,v) ->

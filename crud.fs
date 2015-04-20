@@ -143,7 +143,7 @@ module crud =
                 else None
               )
 
-    let findIndexForInequality indexes a =
+    let private findIndexForInequality indexes a =
         //printfn "indexes: %A" indexes
         //printfn "keys: %A" a
         Array.tryFind (fun ndx ->
@@ -161,7 +161,7 @@ module crud =
                 failwith "index spec must be a doc"
         ) indexes
 
-    let findIndexForEQ indexes a =
+    let private findIndexForEQ indexes a =
         //printfn "indexes: %A" indexes
         //printfn "keys: %A" a
         Array.tryFind (fun ndx ->
@@ -173,7 +173,7 @@ module crud =
                 failwith "index spec must be a doc"
         ) indexes
 
-    let findCompares m =
+    let private findCompares m =
         match m with
         | QueryDoc a ->
             // TODO only compares in the top level of the query?
@@ -185,7 +185,7 @@ module crud =
                 | _ ->  None
             ) a
 
-    let findPossibleIndexesEQ indexes comps =
+    let private findPossibleIndexesForEQ indexes comps =
         Array.choose (fun (k,p) ->
             match p with
             | Pred.EQ v ->
@@ -195,12 +195,43 @@ module crud =
             | _ -> None
         ) comps
 
+    let private findPossibleIndexesForInequality indexes comps =
+        Array.choose (fun (k,p) ->
+            match findIndexForInequality indexes [| k |] with
+            | Some ndx ->
+                match p with
+                | Pred.LT v -> (plan.LT,ndx,[| v |]) |> Some
+                | Pred.LTE v -> (plan.LTE,ndx,[| v |]) |> Some
+                | Pred.GT v -> (plan.GT,ndx,[| v |]) |> Some
+                | Pred.GTE v -> (plan.GTE,ndx,[| v |]) |> Some
+                | _ -> None
+            | None -> None
+        ) comps
+
+    let private chooseFromEQPossibles possibles =
+        // TODO how do we decide which one to choose?
+        // TODO should we give preference to _id EQ if it's in the query?
+        if Array.isEmpty possibles then None
+        else possibles.[0] |> Some
+
+    let private chooseFromInequalityPossibles possibles =
+        // TODO how do we decide which one to choose?
+        if Array.isEmpty possibles then None
+        else possibles.[0] |> Some
+
     let private chooseIndex indexes m =
         let comps = findCompares m
-        let possibles = findPossibleIndexesEQ indexes comps
-        match Array.tryFind (fun (op,ndx,vala) -> op=plan.EQ) possibles with
-        | Some p -> p |> plan.One |> Some
-        | None -> None // TODO look for inequalities too
+        let eqPossibles = findPossibleIndexesForEQ indexes comps
+        match chooseFromEQPossibles eqPossibles with
+        | Some p -> 
+            p |> plan.One |> Some
+        | None -> 
+            let ineqPossibles = findPossibleIndexesForInequality indexes comps
+            match chooseFromInequalityPossibles ineqPossibles with
+            | Some p -> 
+                p |> plan.One |> Some
+            | None -> 
+                None
 
     let private getOneMatch w m =
         let {docs=s;funk=funk} = w.getSelect None // TODO choose an index

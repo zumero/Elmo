@@ -15,8 +15,6 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *)
 
-// chooseIndex: inequalities
-//
 // chooseIndex: dive into AND?
 //
 // chooseIndex: deal with multiple items in a Compare?
