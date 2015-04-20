@@ -229,18 +229,10 @@ module crud =
                 let dir = if dir1 < 0 then -1 else 1
                 let a = f ta
                 let b = f tb
-                let ova = bson.findPath a k
-                let ovb = bson.findPath b k
-                let c = 
-                    match (ova,ovb) with
-                    | Some va, Some vb ->
-                        Matcher.cmpdir va vb dir
-                    | Some va, None ->
-                        Matcher.cmpdir va BNull dir
-                    | None, Some vb ->
-                        Matcher.cmpdir BNull vb dir
-                    | None,None ->
-                        0
+                // note that, apparently, mongo always treats undefined as null for sorting purposes
+                let va = bson.findPath a k |> bson.replaceUndefined
+                let vb = bson.findPath b k |> bson.replaceUndefined
+                let c = Matcher.cmpdir va vb dir
                 if c<>0 then
                     c
                 else
@@ -1268,13 +1260,13 @@ module crud =
         Array.fold (fun cur (k,_) ->
             let k = fixPositional k ndx
             match bson.findPath orig k with
-            | Some v ->
+            | BUndefined -> cur
+            | v ->
                 let f ov = 
                     match ov with
                     | Some _ -> ov
                     | None -> Some v
                 bson.changeValueForPath cur k f
-            | None -> cur
             ) doc pairs
 
     let private isExplicitInclude v =
@@ -1622,8 +1614,8 @@ module crud =
             s |> seqMatch m |>
                 Seq.iter (fun (doc,ndx) -> 
                     match bson.findPath doc key with
-                    | Some v -> results := Set.add v !results
-                    | None -> ()
+                    | BUndefined -> ()
+                    | v -> results := Set.add v !results
                     )
             Set.toArray !results
         finally
@@ -2087,8 +2079,8 @@ module crud =
                 let subPath = s.Substring(dot+1)
                 if subPath.IndexOf(Convert.ToChar(0))>=0 then raise (MongoCode(16419,"field path cannot contain NUL char"))
                 match bson.findPath v subPath with
-                | Some v -> v |> bson.removeUndefined
-                | None -> BUndefined // TODO is this right?
+                | BUndefined -> BUndefined // TODO is this right?  or should it just throw?
+                | v -> v |> bson.removeUndefined
         | Expr_let (newVars,inExpr) ->
             let ctx =
                 // we're supposed to do eager evaluation here, not lazy, right? 
@@ -2452,7 +2444,9 @@ module crud =
         let path = path.Substring(1)
         Seq.collect (fun d ->
             match bson.findPath d path with
-            | Some (BArray a) ->
+            | BUndefined -> Seq.empty
+            | BNull -> Seq.empty
+            | BArray a ->
                 if Array.length a=0 then
                     Seq.empty
                 else
@@ -2465,9 +2459,7 @@ module crud =
                             //printfn "unwound: %A" d2
                             yield d2
                     }
-            | Some BNull -> Seq.empty
-            | Some _ -> raise (MongoCode(15978, "$unwind needs array"))
-            | None -> Seq.empty
+            | _ -> raise (MongoCode(15978, "$unwind needs array"))
             ) s
 
     let private seqGroup id ops s =

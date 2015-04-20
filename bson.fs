@@ -754,6 +754,7 @@ module bson =
                     | _ -> Some v
                 ) a
             BArray a
+        | BUndefined -> BUndefined // TODO is this right?  or should it throw?
         | _ -> bv
 
     let rec replaceUndefined bv =
@@ -781,9 +782,6 @@ module bson =
         | BUndefined -> BNull
         | _ -> bv
 
-    // TODO maybe findPath should return BUndefined instead of an option.
-    // basically, BUndefined *is* bson's way of indicating the lack of
-    // a value.  maybe we don't need to layer Option on top of that.
     let rec findPath start (path:string) = 
         let dot = path.IndexOf('.')
         let name = if dot<0 then path else path.Substring(0, dot)
@@ -791,16 +789,10 @@ module bson =
         | BDocument pairs ->
             match Array.tryFind (fun (k,_) -> k=name) pairs with
             | Some (_,v) ->
-                if dot<0 then 
-                    Some v
-                else 
-                    let subPath = path.Substring(dot+1)
-                    match v with
-                    | BDocument _ -> findPath v subPath
-                    | BArray a -> findPath v subPath
-                    | _ -> None
+                if dot<0 then v
+                else path.Substring(dot+1) |> findPath v
             | None -> 
-                None
+                BUndefined
         | BArray items ->
             let (ok,ndx) = Int32.TryParse(name)
             if not ok then
@@ -817,31 +809,22 @@ module bson =
                 let a = 
                     Array.choose (fun subv ->
                         match subv with
-                        | BDocument _ -> 
-                            match findPath subv path with
-                            | Some v -> Some v
-                            | None -> Some BUndefined
+                        | BDocument _ -> findPath subv path |> Some
                         | _ -> None
                     ) items
                 // if nothing matched, return None instead of an empty array.
                 // TODO is this right?
-                if Array.length a=0 then None else a |> BArray |> Some
-                //a |> BArray |> Some
+                if Array.length a=0 then BUndefined else a |> BArray
+                //a |> BArray
             else if ndx<0 then
-                None // TODO if ndx is out of bounds, maybe this should error instead of None?
+                failwith "array index < 0"
             else if ndx>=Array.length items then
-                None // TODO if ndx is out of bounds, maybe this should error instead of None?
+                failwith "array index too large"
             else
                 let v = items.[ndx]
-                if dot<0 then 
-                    Some v
-                else 
-                    let subPath = path.Substring(dot+1)
-                    match v with
-                    | BDocument _ -> findPath v subPath
-                    | BArray a -> findPath v subPath
-                    | _ -> None
-        | _ -> failwith "can't dive"
+                if dot<0 then v
+                else path.Substring(dot+1) |> findPath v
+        | _ -> BUndefined
 
     let rec divesIntoAnyArray start (path:string) =
         let dot = path.IndexOf('.')

@@ -103,12 +103,8 @@ module kv =
                     | BInt64 n -> n<0L
                     | BDouble n -> n<0.0
                     | _ -> failwith (sprintf "index type: %A" dir)
-                let v = 
-                    match bson.findPath doc k with
-                    | Some v -> 
-                        //printfn "findPath returned: %A" v
-                        v
-                    | None -> BUndefined
+                let v = bson.findPath doc k
+
                 // now we replace any BUndefined with BNull.  this seems, well,
                 // kinda wrong, as it effectively encodes the index entries to
                 // contain information that is slightly incorrect, since BNull

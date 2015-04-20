@@ -134,6 +134,7 @@ module Matcher =
             else if m<litv then -1
             else 1
         | BNull , BNull -> 0
+        | BUndefined , BUndefined -> 0
         | BArray m, BArray litv ->
             let lenm = m.Length
             let lenlitv = litv.Length
@@ -167,7 +168,7 @@ module Matcher =
             let torder_d = bson.getTypeOrder d
             let torder_lit = bson.getTypeOrder lit
             if torder_d = torder_lit then
-                failwith "should have been handled above"
+                failwith (sprintf "should have been handled above: d = %A  lit = %A" d lit)
             else if torder_d < torder_lit then
                 -1
             else
