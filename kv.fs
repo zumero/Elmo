@@ -26,13 +26,6 @@ type index_info =
         options:BsonValue
     }
 
-// TODO
-module index_type =
-    type t =
-        | Forward
-        | Backward
-        | Text
-
 module plan =
     type op1 =
         | EQ
@@ -95,14 +88,9 @@ module kv =
         //printfn "doc: %A" doc
         match ndxInfo.spec with
         | BDocument keys ->
-            Array.map (fun (k,dir) ->
+            Array.map (fun (k,typ) ->
                 //printfn "k : %s" k
-                let dir = 
-                    match dir with
-                    | BInt32 n -> n<0
-                    | BInt64 n -> n<0L
-                    | BDouble n -> n<0.0
-                    | _ -> failwith (sprintf "index type: %A" dir)
+                let typ = bson.decodeIndexType typ
                 let v = bson.findPath doc k
 
                 // now we replace any BUndefined with BNull.  this seems, well,
@@ -114,7 +102,7 @@ module kv =
                 // The matcher can and must still distinguish between null and
                 // undefined.
                 let v = bson.replaceUndefined v
-                (v,dir)
+                (v,typ)
             ) keys
 
         | _ -> failwith "must be a doc"
@@ -130,12 +118,16 @@ module kv =
         // to generate more index entries for this document, one
         // for each item in the array.  Mongo calls this a
         // multikey index.
-        Array.iteri (fun i (v,dir) ->
+
+        // TODO I wonder if the way to handle text indexes is to detect
+        // them here and to add one entry for each word.
+
+        Array.iteri (fun i (v,typ) ->
             match v with
             | BArray a ->
                 let a = a |> Set.ofArray |> Set.toArray
                 Array.iter (fun av ->
-                    replaceArrayElement vals i (av,dir) |> bson.encodeMultiForIndex |> f
+                    replaceArrayElement vals i (av,typ) |> bson.encodeMultiForIndex |> f
                 ) a
             | _ -> ()
         ) vals
@@ -389,14 +381,7 @@ module kv =
             | BDocument pairs ->
                 let len = Array.length vals
                 let pairs = Array.sub pairs 0 len
-                let dirs = 
-                    Array.map (fun (_,v) -> 
-                        match v with
-                        | BInt32 n -> n<0
-                        | BInt64 n -> n<0L
-                        | BDouble f -> f<0.0
-                        | _ -> failwith "index dir must be numeric"
-                    ) pairs
+                let dirs = Array.map (fun (_,v) -> bson.decodeIndexType v) pairs
                 Array.zip vals dirs
             | _ ->
                 failwith "index spec must be a doc"
@@ -482,7 +467,7 @@ module kv =
             let find_rowid id =
                 match opt_stmt_find_rowid with
                 | Some stmt_find_rowid ->
-                    let idk = bson.encodeOneForIndex id false
+                    let idk = bson.encodeOneForIndex id bson.IndexType.Forward
                     stmt_find_rowid.clear_bindings()
                     stmt_find_rowid.bind_blob(1, idk)
                     let rowid = 

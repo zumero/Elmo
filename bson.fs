@@ -192,6 +192,21 @@ module bson =
 
     open System
 
+    type IndexType =
+        | Forward
+        | Backward
+        | Text
+        | Geo2d
+
+    let decodeIndexType v =
+        match v with
+        | BInt32 n -> if n<0 then IndexType.Backward else IndexType.Forward
+        | BInt64 n -> if n<0L then IndexType.Backward else IndexType.Forward
+        | BDouble n -> if n<0.0 then IndexType.Backward else IndexType.Forward
+        | BString "text" -> IndexType.Text
+        | BString "2d" -> IndexType.Geo2d
+        | _ -> failwith (sprintf "index type: %A" v)
+
     let splitname (s:string) =
         let dot = s.IndexOf('.')
         if dot<0 then failwith "bad namespace"
@@ -574,20 +589,26 @@ module bson =
             w.WriteBytes(System.Text.Encoding.UTF8.GetBytes (s))
             w.WriteByte(0uy)
 
-    let encodeOneForIndex bv neg =
+    let encodeOneForIndex bv typ =
         let w = BinWriter()
-        encodeForIndexInto w bv
-        let a = w.ToArray()
-        if neg then
+        match typ with
+        | IndexType.Forward ->
+            encodeForIndexInto w bv
+            w.ToArray()
+        | IndexType.Backward -> 
+            encodeForIndexInto w bv
+            let a = w.ToArray()
             for i in 0 .. (Array.length a - 1) do
                 let b = a.[i]
                 a.[i] <- ~~~b
-        a
+            a
+        | IndexType.Text -> Array.empty // TODO
+        | IndexType.Geo2d -> Array.empty // TODO
 
     let encodeMultiForIndex a =
         let w = BinWriter()
-        Array.iter (fun (v,neg) -> 
-            let a = encodeOneForIndex v neg
+        Array.iter (fun (v,typ) -> 
+            let a = encodeOneForIndex v typ
             w.WriteBytes(a)
         ) a
         w.ToArray()
