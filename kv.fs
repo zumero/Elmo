@@ -108,7 +108,16 @@ module kv =
                     | Some v -> 
                         //printfn "findPath returned: %A" v
                         v
-                    | None -> BNull // TODO null?  undefined?  or both?
+                    | None -> BUndefined
+                // now we replace any BUndefined with BNull.  this seems, well,
+                // kinda wrong, as it effectively encodes the index entries to
+                // contain information that is slightly incorrect, since BNull
+                // means "it was present and explicitly null", whereas BUndefined
+                // means "it was absent".  Still, this appears to be the exact
+                // behavior of Mongo.  Note that this only affects index entries.
+                // The matcher can and must still distinguish between null and
+                // undefined.
+                let v = bson.replaceUndefined v
                 (v,dir)
             ) keys
 

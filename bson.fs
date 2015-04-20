@@ -756,6 +756,31 @@ module bson =
             BArray a
         | _ -> bv
 
+    let rec replaceUndefined bv =
+        match bv with
+        | BDocument pairs ->
+            let pairs = 
+                Array.map (fun (k,v) -> 
+                    match v with
+                    | BUndefined -> (k, BNull)
+                    | BDocument _ -> (k, replaceUndefined v)
+                    | BArray _ -> (k, replaceUndefined v)
+                    | _ -> (k,v)
+                ) pairs
+            BDocument pairs
+        | BArray a ->
+            let a =
+                Array.map (fun v ->
+                    match v with
+                    | BUndefined -> BNull
+                    | BDocument _ -> replaceUndefined v
+                    | BArray _ -> replaceUndefined v
+                    | _ -> v
+                ) a
+            BArray a
+        | BUndefined -> BNull
+        | _ -> bv
+
     // TODO maybe findPath should return BUndefined instead of an option.
     // basically, BUndefined *is* bson's way of indicating the lack of
     // a value.  maybe we don't need to layer Option on top of that.
