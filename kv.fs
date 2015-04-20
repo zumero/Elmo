@@ -26,6 +26,13 @@ type index_info =
         options:BsonValue
     }
 
+// TODO
+module index_type =
+    type t =
+        | Forward
+        | Backward
+        | Text
+
 module plan =
     type op1 =
         | EQ
@@ -83,28 +90,53 @@ module kv =
     open SQLitePCL
     open SQLitePCL.Ugly
 
-    let private encodeIndexEntry ndxInfo doc =
+    let private findIndexEntryVals ndxInfo doc =
+        //printfn "ndxInfo: %A" ndxInfo
+        //printfn "doc: %A" doc
         match ndxInfo.spec with
         | BDocument keys ->
-            let vals = 
-                Array.map (fun (k,dir) ->
-                    let dir = 
-                        match dir with
-                        | BInt32 n -> n<0
-                        | BInt64 n -> n<0L
-                        | BDouble n -> n<0.0
-                        | _ -> failwith "dir not numeric"
-                    let v = 
-                        // TODO maybe when a key is missing we should just not insert an index entry for this doc?
-                        match bson.findPath doc k with
-                        | Some v -> v
-                        | None -> BUndefined // TODO this can't be right...
-                    (v,dir)
-                ) keys
-
-            bson.encodeMultiForIndex vals
+            Array.map (fun (k,dir) ->
+                //printfn "k : %s" k
+                let dir = 
+                    match dir with
+                    | BInt32 n -> n<0
+                    | BInt64 n -> n<0L
+                    | BDouble n -> n<0.0
+                    | _ -> failwith (sprintf "index type: %A" dir)
+                let v = 
+                    match bson.findPath doc k with
+                    | Some v -> 
+                        //printfn "findPath returned: %A" v
+                        v
+                    | None -> BNull // TODO null?  undefined?  or both?
+                (v,dir)
+            ) keys
 
         | _ -> failwith "must be a doc"
+
+    let replaceArrayElement vals i v =
+        let a = Array.copy vals
+        a.[i] <- v
+        a
+
+    let private encodeIndexEntries vals f =
+        bson.encodeMultiForIndex vals |> f
+        // if any of the vals in the key are an array, we need
+        // to generate more index entries for this document, one
+        // for each item in the array.  Mongo calls this a
+        // multikey index.
+        Array.iteri (fun i (v,dir) ->
+            match v with
+            | BArray a ->
+                let a = a |> Set.ofArray |> Set.toArray
+                Array.iter (fun av ->
+                    // TODO if BUndefined, change to BNull?  Or also add BNull?
+                    // queries for EQ null are supposed to match undefined as well.
+                    replaceArrayElement vals i (av,dir) |> bson.encodeMultiForIndex |> f
+                ) a
+            | _ -> ()
+        ) vals
+
 
     // TODO special type for the pair db and coll
 
@@ -149,6 +181,17 @@ module kv =
 
         let getTableNameForIndex db coll ndx = sprintf "ndx.%s.%s.%s" db coll ndx // TODO cleanse?
 
+        let prepareIndexInsert tbl =
+            conn.prepare(sprintf "INSERT INTO \"%s\" (k,doc_rowid) VALUES (?,?)" tbl)
+
+        let indexInsertStep (stmt_insert:sqlite3_stmt) k doc_rowid = 
+            stmt_insert.clear_bindings()
+            stmt_insert.bind_blob(1, k)
+            stmt_insert.bind_int64(2, doc_rowid)
+            stmt_insert.step_done()
+            if conn.changes()<>1 then failwith "index entry insert failed"
+            stmt_insert.reset()
+
         let getStmtSequence (stmt:sqlite3_stmt) =
             seq {
                 while raw.SQLITE_ROW = stmt.step() do
@@ -180,11 +223,23 @@ module kv =
                 let collTable = getTableNameForCollection info.db info.coll
                 let ndxTable = getTableNameForIndex info.db info.coll info.ndx
                 // TODO WITHOUT ROWID ?
+                // TODO we need a sqlite index on the child key below
                 match bson.tryGetValueForKey info.options "unique" with
                 | Some (BBoolean true) ->
                     conn.exec(sprintf "CREATE TABLE \"%s\" (k BLOB NOT NULL, doc_rowid int NOT NULL REFERENCES \"%s\"(did) ON DELETE CASCADE, PRIMARY KEY (k))" ndxTable collTable)
                 | _ ->
                     conn.exec(sprintf "CREATE TABLE \"%s\" (k BLOB NOT NULL, doc_rowid int NOT NULL REFERENCES \"%s\"(did) ON DELETE CASCADE, PRIMARY KEY (k,doc_rowid))" ndxTable collTable)
+                // now insert index entries for every doc that already exists
+                use stmt2 = conn.prepare(sprintf "SELECT did,bson FROM \"%s\"" collTable)
+                use stmt_insert = prepareIndexInsert ndxTable
+                while raw.SQLITE_ROW = stmt2.step() do
+                    let doc_rowid = stmt2.column_int64(0)
+                    let newDoc = stmt2.column_blob(1) |> BinReader.ReadDocument
+                    let vals = findIndexEntryVals info newDoc
+
+                    let f k = indexInsertStep stmt_insert k doc_rowid
+
+                    encodeIndexEntries vals f
                 true
 
         and createCollection db coll options =
@@ -416,7 +471,7 @@ module kv =
             let index_stmts = 
                 Array.map (fun info->
                     let tbl = getTableNameForIndex db coll info.ndx
-                    let stmt_insert = conn.prepare(sprintf "INSERT INTO \"%s\" (k,doc_rowid) VALUES (?,?)" tbl)
+                    let stmt_insert = prepareIndexInsert tbl
                     let stmt_delete = conn.prepare(sprintf "DELETE FROM \"%s\" WHERE doc_rowid=?" tbl)
                     (info,stmt_insert,stmt_delete)
                 ) indexes
@@ -444,18 +499,11 @@ module kv =
                     stmt_delete.step_done()
                     stmt_delete.reset()
 
-                    let k = encodeIndexEntry info newDoc
-                    stmt_insert.clear_bindings()
-                    stmt_insert.bind_blob(1, k)
-                    stmt_insert.bind_int64(2, doc_rowid)
-                    try
-                        stmt_insert.step_done()
-                    with
-                    | e ->
-                        let msg = conn.errmsg()
-                        failwith (sprintf "%s:%A" msg e)
-                    if conn.changes()<>1 then failwith "insert failed"
-                    stmt_insert.reset()
+                    let vals = findIndexEntryVals info newDoc
+
+                    let f k = indexInsertStep stmt_insert k doc_rowid
+
+                    encodeIndexEntries vals f
                 ) index_stmts
 
             let to_bson newDoc =

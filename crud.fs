@@ -143,7 +143,7 @@ module crud =
                 else None
               )
 
-    let findIndex indexes a =
+    let findIndexForInequality indexes a =
         //printfn "indexes: %A" indexes
         //printfn "keys: %A" a
         Array.tryFind (fun ndx ->
@@ -161,8 +161,48 @@ module crud =
                 failwith "index spec must be a doc"
         ) indexes
 
-    let private chooseIndex m indexes =
-        None // TODO
+    let findIndexForEQ indexes a =
+        //printfn "indexes: %A" indexes
+        //printfn "keys: %A" a
+        Array.tryFind (fun ndx ->
+            match ndx.spec with
+            | BDocument pairs ->
+                let keys = Array.map (fun (k,v) -> k) pairs
+                keys = a
+            | _ ->
+                failwith "index spec must be a doc"
+        ) indexes
+
+    let findCompares m =
+        match m with
+        | QueryDoc a ->
+            // TODO only compares in the top level of the query?
+            // TODO dive into AND?
+            // TODO what if a Compare has multiple items in it?
+            Array.choose (fun it ->
+                match it with
+                | Compare (k, [| p |])  -> Some (k,p)
+                | _ ->  None
+            ) a
+        | _ ->
+            failwith "wrong format for $min/$max"
+
+    let findPossibleIndexesEQ indexes comps =
+        Array.choose (fun (k,p) ->
+            match p with
+            | Pred.EQ v ->
+                match findIndexForEQ indexes [| k |] with
+                | Some ndx -> (plan.EQ,ndx,[| v |]) |> Some
+                | None -> None
+            | _ -> None
+        ) comps
+
+    let private chooseIndex indexes m =
+        let comps = findCompares m
+        let possibles = findPossibleIndexesEQ indexes comps
+        match Array.tryFind (fun (op,ndx,vala) -> op=plan.EQ) possibles with
+        | Some p -> p |> plan.One |> Some
+        | None -> None // TODO look for inequalities too
 
     let private getOneMatch w m =
         let {docs=s;funk=funk} = w.getSelect None // TODO choose an index
@@ -1471,25 +1511,26 @@ module crud =
                 if Array.map (fun (k,v) -> k) amax <> keys then failwith "different"
                 let minvals = Array.map (fun (k,v) -> v) amin
                 let maxvals = Array.map (fun (k,v) -> v) amax
-                match findIndex indexes keys with
+                match findIndexForInequality indexes keys with
                 | Some ndx -> plan.GTE_LT (ndx,minvals,maxvals) |> Some
                 | None -> failwith "index not found" // TODO or None
             | Some vmin, None ->
                 let amin = parseIndexMinMax vmin
                 let keys = Array.map (fun (k,v) -> k) amin
                 let minvals = Array.map (fun (k,v) -> v) amin
-                match findIndex indexes keys with
+                match findIndexForInequality indexes keys with
                 | Some ndx -> plan.One (plan.GTE,ndx,minvals) |> Some
                 | None -> failwith "index not found" // TODO or None
             | None, Some vmax ->
                 let amax = parseIndexMinMax vmax
                 let keys = Array.map (fun (k,v) -> k) amax
                 let maxvals = Array.map (fun (k,v) -> v) amax
-                match findIndex indexes keys with
+                match findIndexForInequality indexes keys with
                 | Some ndx -> plan.One (plan.LT,ndx,maxvals) |> Some
                 | None -> failwith "index not found" // TODO or None
             | None,None -> 
                 chooseIndex indexes m
+                // None
         let {docs=s;funk=funk} = getSelectWithClose dbName collName plan
         try
             let s = seqMatch m s
@@ -2046,7 +2087,7 @@ module crud =
                 let subPath = s.Substring(dot+1)
                 if subPath.IndexOf(Convert.ToChar(0))>=0 then raise (MongoCode(16419,"field path cannot contain NUL char"))
                 match bson.findPath v subPath with
-                | Some v -> v
+                | Some v -> v |> bson.removeUndefined
                 | None -> BUndefined // TODO is this right?
         | Expr_let (newVars,inExpr) ->
             let ctx =

@@ -724,6 +724,41 @@ module bson =
                     | None -> start
         | _ -> failwith "error"
 
+    let rec removeUndefined bv =
+        match bv with
+        | BDocument pairs ->
+            let pairs = 
+                Array.choose (fun (k,v) -> 
+                    match v with
+                    | BUndefined -> None
+                    | BDocument _ ->
+                        let v = removeUndefined v
+                        Some (k,v)
+                    | BArray _ ->
+                        let v = removeUndefined v
+                        Some (k,v)
+                    | _ -> Some (k,v)
+                ) pairs
+            BDocument pairs
+        | BArray a ->
+            let a =
+                Array.choose (fun v ->
+                    match v with
+                    | BUndefined -> None
+                    | BDocument _ ->
+                        let v = removeUndefined v
+                        Some v
+                    | BArray _ ->
+                        let v = removeUndefined v
+                        Some v
+                    | _ -> Some v
+                ) a
+            BArray a
+        | _ -> bv
+
+    // TODO maybe findPath should return BUndefined instead of an option.
+    // basically, BUndefined *is* bson's way of indicating the lack of
+    // a value.  maybe we don't need to layer Option on top of that.
     let rec findPath start (path:string) = 
         let dot = path.IndexOf('.')
         let name = if dot<0 then path else path.Substring(0, dot)
@@ -757,7 +792,10 @@ module bson =
                 let a = 
                     Array.choose (fun subv ->
                         match subv with
-                        | BDocument _ -> findPath subv path
+                        | BDocument _ -> 
+                            match findPath subv path with
+                            | Some v -> Some v
+                            | None -> Some BUndefined
                         | _ -> None
                     ) items
                 // if nothing matched, return None instead of an empty array.
