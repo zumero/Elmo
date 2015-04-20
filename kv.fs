@@ -135,8 +135,6 @@ module kv =
             | BArray a ->
                 let a = a |> Set.ofArray |> Set.toArray
                 Array.iter (fun av ->
-                    // TODO if BUndefined, change to BNull?  Or also add BNull?
-                    // queries for EQ null are supposed to match undefined as well.
                     replaceArrayElement vals i (av,dir) |> bson.encodeMultiForIndex |> f
                 ) a
             | _ -> ()

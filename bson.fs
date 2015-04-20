@@ -24,7 +24,7 @@ type BsonValue =
     | BString of string
     | BInt64 of int64
     | BInt32 of int32
-    | BUndefined // TODO need this?
+    | BUndefined
     | BObjectID of byte[]
     | BNull
     | BRegex of string*string

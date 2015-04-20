@@ -15,6 +15,28 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *)
 
+// chooseIndex: inequalities
+//
+// chooseIndex: dive into AND?
+//
+// chooseIndex: deal with multiple items in a Compare?
+//
+// use chooseIndex in getOneMatch
+//
+// use chooseIndex in getFirstMatch
+//
+// use chooseIndex in agg pipeline
+//
+// use chooseIndex in update/getSelect
+//
+// use chooseIndex in delete/getSelect
+//
+// use chooseIndex in distinct
+//
+// hint
+//
+// explain
+//
 // bson binary subtypes
 //
 // consider having the LiteServer layer keep the kv.conn open all the time.
@@ -22,10 +44,6 @@
 // funk never gets called when the client abandons a cursor.  time it out.
 //
 // figure out why none of the parallel shell things work
-//
-// implement indexes
-//
-// multiple compares in IndexMax
 //
 // separate actual networking part of the server from the layer that
 // just takes a message and returns a reply message
@@ -42,8 +60,6 @@
 // string sort uses strcmpi ?
 //
 // insert empty timestamp, mongo fills it in, top level only
-//
-// explain
 //
 // regex tests
 //
