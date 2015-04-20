@@ -15,6 +15,9 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *)
 
+// chooseIndex should be smart enough to combine expressions to
+// use a compound index?
+//
 // chooseIndex: dive into AND?
 //
 // chooseIndex: deal with multiple items in a Compare?
@@ -112,7 +115,7 @@ let tests = [
     // "jstests/core/elemMatchProjection.js"; // jira server-1013, partial
     // "jstests/core/remove_undefined.js"; // test is broken.  doesn't drop its coll first.
     // "jstests/aggregation/bugs/server5932.js"; // unwind, exceeds message size
-    // "jstests/core/minmax.js"; // min/max query modifier, 2 Compares
+    "jstests/core/minmax.js"; // min/max query modifier, 2 Compares
     // "jstests/core/server9547.js"; // comment in test says that mongo SHOULD be giving the result we are giving
     // "jstests/aggregation/bugs/server9444.js"; // huge
     // "jstests/aggregation/bugs/server14969.js"; // outofmemory ?

@@ -143,7 +143,21 @@ module crud =
                 else None
               )
 
-    let private findIndexForInequality indexes a =
+    let private findExactIndex indexes a =
+        printfn "indexes: %A" indexes
+        printfn "keys: %A" a
+        Array.tryFind (fun ndx ->
+            //printfn "considering %A" ndx
+            match ndx.spec with
+            | BDocument pairs ->
+                let keys = Array.map (fun (k,v) -> k) pairs
+                //printfn "considering keys: %A" keys
+                keys = a
+            | _ ->
+                failwith "index spec must be a doc"
+        ) indexes
+
+    let private findPrefixIndex indexes a =
         //printfn "indexes: %A" indexes
         //printfn "keys: %A" a
         Array.tryFind (fun ndx ->
@@ -153,22 +167,10 @@ module crud =
                 if Array.length pairs < len then
                     false
                 else
-                    // TODO by trimming the index here, EQ will never match?
+                    // by trimming the index here, EQ will never match
                     let pairs = Array.sub pairs 0 len
                     let keys = Array.map (fun (k,v) -> k) pairs
                     keys = a
-            | _ ->
-                failwith "index spec must be a doc"
-        ) indexes
-
-    let private findIndexForEQ indexes a =
-        //printfn "indexes: %A" indexes
-        //printfn "keys: %A" a
-        Array.tryFind (fun ndx ->
-            match ndx.spec with
-            | BDocument pairs ->
-                let keys = Array.map (fun (k,v) -> k) pairs
-                keys = a
             | _ ->
                 failwith "index spec must be a doc"
         ) indexes
@@ -185,53 +187,72 @@ module crud =
                 | _ ->  None
             ) a
 
-    let private findPossibleIndexesForEQ indexes comps =
+    let private findUsableCompares comps =
         Array.choose (fun (k,p) ->
             match p with
-            | Pred.EQ v ->
-                match findIndexForEQ indexes [| k |] with
-                | Some ndx -> (plan.EQ,ndx,[| v |]) |> Some
-                | None -> None
+            | Pred.EQ v -> Some (plan.EQ,k,v)
+            | Pred.LT v -> Some (plan.LT,k,v)
+            | Pred.GT v -> Some (plan.GT,k,v)
+            | Pred.LTE v -> Some (plan.LTE,k,v)
+            | Pred.GTE v -> Some (plan.GTE,k,v)
             | _ -> None
         ) comps
 
-    let private findPossibleIndexesForInequality indexes comps =
-        Array.choose (fun (k,p) ->
-            match findIndexForInequality indexes [| k |] with
-            | Some ndx ->
-                match p with
-                | Pred.LT v -> (plan.LT,ndx,[| v |]) |> Some
-                | Pred.LTE v -> (plan.LTE,ndx,[| v |]) |> Some
-                | Pred.GT v -> (plan.GT,ndx,[| v |]) |> Some
-                | Pred.GTE v -> (plan.GTE,ndx,[| v |]) |> Some
-                | _ -> None
+    let private findIndexPreferExact indexes a =
+        //printfn "findIndexPreferExact: %A" a
+        match findExactIndex indexes a with
+        | Some ndx -> Some ndx
+        | None ->
+            //printfn "exact not found"
+            match findPrefixIndex indexes a with
+            | Some ndx -> Some ndx
             | None -> None
+
+    let private findPossibleIndexes indexes comps =
+        Array.choose (fun (op,k,v) ->
+            match op with
+            | plan.EQ -> 
+                // only an exact index will suffice
+                match findExactIndex indexes [| k |] with
+                | Some ndx -> (op,k,ndx,[| v |]) |> Some
+                | None -> None
+            // TODO might need an exact index for LTE and GTE as well, right?
+            | _ ->
+                // prefer an exact index if there is one
+                match findIndexPreferExact indexes [| k |] with
+                | Some ndx -> (op,k,ndx,[| v |]) |> Some
+                | None ->
+                    match findPrefixIndex indexes [| k |] with
+                    | Some ndx -> (op,k,ndx,[| v |]) |> Some
+                    | None -> None
         ) comps
 
-    let private chooseFromEQPossibles possibles =
-        // TODO how do we decide which one to choose?
-        // TODO should we give preference to _id EQ if it's in the query?
-        if Array.isEmpty possibles then None
-        else possibles.[0] |> Some
+    let private chooseFromPossibles possibles =
+        if Array.isEmpty possibles then 
+            None
+        else
+            // prefer the _id index if we can use it
+            match Array.tryFind (fun (op,k,ndx,vals) -> op=plan.EQ && k="_id") possibles with
+            | Some (op,k,ndx,vals) -> (op,ndx,vals) |> Some
+            | None ->
+                // TODO otherwise prefer any unique index
+                // otherwise prefer any EQ index
+                match Array.tryFind (fun (op,k,ndx,vals) -> op=plan.EQ) possibles with
+                | Some (op,k,ndx,vals) -> (op,ndx,vals) |> Some
+                | None ->
+                    // otherwise any index at all.  just take the first one.
+                    let (op,k,ndx,vals) = possibles.[0]
+                    (op,ndx,vals) |> Some
 
-    let private chooseFromInequalityPossibles possibles =
-        // TODO how do we decide which one to choose?
-        if Array.isEmpty possibles then None
-        else possibles.[0] |> Some
 
     let private chooseIndex indexes m =
-        let comps = findCompares m
-        let eqPossibles = findPossibleIndexesForEQ indexes comps
-        match chooseFromEQPossibles eqPossibles with
-        | Some p -> 
-            p |> plan.One |> Some
-        | None -> 
-            let ineqPossibles = findPossibleIndexesForInequality indexes comps
-            match chooseFromInequalityPossibles ineqPossibles with
-            | Some p -> 
-                p |> plan.One |> Some
-            | None -> 
-                None
+        let comps = findCompares m |> findUsableCompares
+        let possibles = findPossibleIndexes indexes comps
+        //printfn "m: %A" m
+        //printfn "possibles: %A" possibles
+        match chooseFromPossibles possibles with
+        | Some p -> p |> plan.One |> Some
+        | None ->  None
 
     let private getOneMatch w m =
         let {docs=s;funk=funk} = w.getSelect None // TODO choose an index
@@ -279,20 +300,23 @@ module crud =
         Array.sortInPlaceWith fsort a2
         a2
 
+    let private tryFindIndexByNameOrSpec dbName collName indexes desc =
+        let a = 
+            match desc with
+            | BString name -> Array.filter (fun info -> info.db=dbName && info.coll=collName && info.ndx=name) indexes
+            | BDocument _ -> Array.filter (fun info -> info.db=dbName && info.coll=collName && info.spec=desc) indexes
+            | _ -> failwith "must be name or index doc"
+        if Array.isEmpty a then None
+        else if Array.length a > 1 then failwith "should never happen"
+        else a.[0] |> Some
+
     let deleteIndex dbName collName index =
         let conn = kv.connect()
         try
             let indexes = conn.listIndexes()
-            let ndx =
-                match index with
-                | BString name -> Array.filter (fun info -> info.db=dbName && info.coll=collName && info.ndx=name) indexes
-                | BDocument _ -> Array.filter (fun info -> info.db=dbName && info.coll=collName && info.spec=index) indexes
-                | _ -> failwith "must be name or index doc"
-            if Array.isEmpty ndx then false
-            else if Array.length ndx > 1 then failwith "should never happen"
-            else
-                let info = ndx.[0]
-                conn.dropIndex info.db info.coll info.ndx
+            match tryFindIndexByNameOrSpec dbName collName indexes index with
+            | Some info -> conn.dropIndex info.db info.coll info.ndx
+            | None -> false
         finally
             conn.close()
 
@@ -1516,10 +1540,27 @@ module crud =
         let conn = kv.connect()
         conn.beginRead dbName collName plan |> addCloseToKillFunc conn
 
-    let find dbName collName q orderby projection ndxMin ndxMax =
+    // TODO too many arguments here.  move options into a record.
+    let find dbName collName q orderby projection ndxMin ndxMax ndxHint =
         // TODO need a list of indexes, but the conn isn't open yet
         let indexes = listIndexesForCollection dbName collName
         let m = Matcher.parseQuery q
+
+        // TODO tests indicate that if there is a $min and/or $max as well as a $hint,
+        // then we need to error if they don't match each other.  so the following is wrong.
+
+        let ensureHintMatch ndx =
+            printfn "ensureHintMatch: %A" ndxHint
+            match ndxHint with
+            | Some desc ->
+                match tryFindIndexByNameOrSpec dbName collName indexes desc with
+                | Some hinted -> if ndx.spec<>hinted.spec then failwith "hint doesn't match"
+                | None -> () // TODO error hint index doesn't exist?
+            | None -> ()
+
+        // TODO is a prefix index really okay here for the min side, which is
+        // inclusive, ie GTE?  or does it need an exact index because of the E?
+        
         let plan = 
             match (ndxMin,ndxMax) with
             | Some vmin, Some vmax -> 
@@ -1530,21 +1571,21 @@ module crud =
                 if Array.map (fun (k,v) -> k) amax <> keys then failwith "different"
                 let minvals = Array.map (fun (k,v) -> v) amin
                 let maxvals = Array.map (fun (k,v) -> v) amax
-                match findIndexForInequality indexes keys with
+                match findIndexPreferExact indexes keys with
                 | Some ndx -> plan.GTE_LT (ndx,minvals,maxvals) |> Some
                 | None -> failwith "index not found" // TODO or None
             | Some vmin, None ->
                 let amin = parseIndexMinMax vmin
                 let keys = Array.map (fun (k,v) -> k) amin
                 let minvals = Array.map (fun (k,v) -> v) amin
-                match findIndexForInequality indexes keys with
+                match findIndexPreferExact indexes keys with
                 | Some ndx -> plan.One (plan.GTE,ndx,minvals) |> Some
                 | None -> failwith "index not found" // TODO or None
             | None, Some vmax ->
                 let amax = parseIndexMinMax vmax
                 let keys = Array.map (fun (k,v) -> k) amax
                 let maxvals = Array.map (fun (k,v) -> v) amax
-                match findIndexForInequality indexes keys with
+                match findIndexPreferExact indexes keys with
                 | Some ndx -> plan.One (plan.LT,ndx,maxvals) |> Some
                 | None -> failwith "index not found" // TODO or None
             | None,None -> 
@@ -1570,7 +1611,7 @@ module crud =
 
     let count dbName collName q =
         // TODO should this support query modifiers $min and $max ?
-        let (s,kill) = find dbName collName q None None None None
+        let (s,kill) = find dbName collName q None None None None None
         try
             Seq.length s
         finally
