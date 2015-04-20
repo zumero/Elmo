@@ -244,15 +244,24 @@ module crud =
                     let (op,k,ndx,vals) = possibles.[0]
                     (op,ndx,vals) |> Some
 
-
-    let private chooseIndex indexes m =
+    let private chooseIndex indexes m hint =
         let comps = findCompares m |> findUsableCompares
         let possibles = findPossibleIndexes indexes comps
         //printfn "m: %A" m
         //printfn "possibles: %A" possibles
-        match chooseFromPossibles possibles with
-        | Some p -> p |> plan.One |> Some
-        | None ->  None
+        match hint with
+        | Some ndxHint ->
+            match Array.tryFind (fun (op,k,ndx,vals) -> ndx.spec=ndxHint.spec) possibles with
+            | Some (op,k,ndx,vals) -> 
+                (op,ndx,vals) |> plan.One |> Some
+            | None ->
+                match chooseFromPossibles possibles with
+                | Some p -> p |> plan.One |> Some
+                | None ->  None
+        | None ->
+            match chooseFromPossibles possibles with
+            | Some p -> p |> plan.One |> Some
+            | None ->  None
 
     let private getOneMatch w m =
         let {docs=s;funk=funk} = w.getSelect None // TODO choose an index
@@ -1560,23 +1569,18 @@ module crud =
             explain=None
         }
 
-    // TODO too many arguments here.  move options into a record.
     let find dbName collName q mods =
         // TODO need a list of indexes, but the conn isn't open yet
         let indexes = listIndexesForCollection dbName collName
         let m = Matcher.parseQuery q
 
         // TODO tests indicate that if there is a $min and/or $max as well as a $hint,
-        // then we need to error if they don't match each other.  so the following is wrong.
+        // then we need to error if they don't match each other.
 
-        let ensureHintMatch ndx =
-            printfn "ensureHintMatch: %A" mods.hint
+        let hint = 
             match mods.hint with
-            | Some desc ->
-                match tryFindIndexByNameOrSpec dbName collName indexes desc with
-                | Some hinted -> if ndx.spec<>hinted.spec then failwith "hint doesn't match"
-                | None -> () // TODO error hint index doesn't exist?
-            | None -> ()
+            | Some desc -> tryFindIndexByNameOrSpec dbName collName indexes desc
+            | None -> None
 
         // TODO is a prefix index really okay here for the min side, which is
         // inclusive, ie GTE?  or does it need an exact index because of the E?
@@ -1609,8 +1613,9 @@ module crud =
                 | Some ndx -> plan.One (plan.LT,ndx,maxvals) |> Some
                 | None -> failwith "index not found" // TODO or None
             | None,None -> 
-                chooseIndex indexes m
+                chooseIndex indexes m hint
                 // None
+
         let {docs=s;funk=funk} = getSelectWithClose dbName collName plan
         try
             let s = seqMatch m s

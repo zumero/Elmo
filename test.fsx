@@ -116,6 +116,8 @@ let tests = [
     // "jstests/core/remove_undefined.js"; // test is broken.  doesn't drop its coll first.
     // "jstests/aggregation/bugs/server5932.js"; // unwind, exceeds message size
     "jstests/core/minmax.js"; // min/max query modifier, 2 Compares
+    "jstests/core/count_hint.js";
+    "jstests/core/hint1.js";
     // "jstests/core/server9547.js"; // comment in test says that mongo SHOULD be giving the result we are giving
     // "jstests/aggregation/bugs/server9444.js"; // huge
     // "jstests/aggregation/bugs/server14969.js"; // outofmemory ?
