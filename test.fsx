@@ -34,7 +34,9 @@
 //
 // use chooseIndex in distinct
 //
-// hint
+// sparse indexes
+//
+// hint -- is this feature working?
 //
 // explain
 //
