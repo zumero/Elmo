@@ -228,12 +228,12 @@ module kv =
                 let collTable = getTableNameForCollection info.db info.coll
                 let ndxTable = getTableNameForIndex info.db info.coll info.ndx
                 // TODO WITHOUT ROWID ?
-                // TODO we need a sqlite index on the child key below
                 match bson.tryGetValueForKey info.options "unique" with
                 | Some (BBoolean true) ->
                     conn.exec(sprintf "CREATE TABLE \"%s\" (k BLOB NOT NULL, doc_rowid int NOT NULL REFERENCES \"%s\"(did) ON DELETE CASCADE, PRIMARY KEY (k))" ndxTable collTable)
                 | _ ->
                     conn.exec(sprintf "CREATE TABLE \"%s\" (k BLOB NOT NULL, doc_rowid int NOT NULL REFERENCES \"%s\"(did) ON DELETE CASCADE, PRIMARY KEY (k,doc_rowid))" ndxTable collTable)
+                conn.exec(sprintf "CREATE INDEX \"childndx_%s\" ON \"%s\" (doc_rowid)" ndxTable ndxTable)
                 // now insert index entries for every doc that already exists
                 use stmt2 = conn.prepare(sprintf "SELECT did,bson FROM \"%s\"" collTable)
                 use stmt_insert = prepareIndexInsert ndxTable
