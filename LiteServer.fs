@@ -819,10 +819,26 @@ module LiteServer =
             else
                 None
 
+        let explain = 
+            if queryFormat2 then
+                tryGetKeyWithOrWithoutDollarSignPrefix bvQuery "explain"
+            else
+                None
+
         let projection = clientMsg.q_returnFieldsSelector
 
+        let mods = 
+            {
+                crud.orderby = orderby
+                crud.projection = projection
+                crud.min = ndxMin
+                crud.max = ndxMax
+                crud.hint = ndxHint
+                crud.explain = explain
+            }
+
         //printfn "actualQuery: %A" actualQuery
-        let (s,kill) = crud.find db coll actualQuery orderby projection ndxMin ndxMax ndxHint
+        let (s,kill) = crud.find db coll actualQuery mods
 
         try
             let s = 

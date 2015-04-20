@@ -144,8 +144,8 @@ module crud =
               )
 
     let private findExactIndex indexes a =
-        printfn "indexes: %A" indexes
-        printfn "keys: %A" a
+        //printfn "indexes: %A" indexes
+        //printfn "keys: %A" a
         Array.tryFind (fun ndx ->
             //printfn "considering %A" ndx
             match ndx.spec with
@@ -1540,8 +1540,28 @@ module crud =
         let conn = kv.connect()
         conn.beginRead dbName collName plan |> addCloseToKillFunc conn
 
+    type query_modifiers = 
+        {
+            orderby:BsonValue option
+            projection:BsonValue option
+            min:BsonValue option
+            max:BsonValue option
+            hint:BsonValue option
+            explain:BsonValue option
+        }
+
+    let noQueryModifiers = 
+        {
+            orderby=None
+            projection=None
+            min=None
+            max=None
+            hint=None
+            explain=None
+        }
+
     // TODO too many arguments here.  move options into a record.
-    let find dbName collName q orderby projection ndxMin ndxMax ndxHint =
+    let find dbName collName q mods =
         // TODO need a list of indexes, but the conn isn't open yet
         let indexes = listIndexesForCollection dbName collName
         let m = Matcher.parseQuery q
@@ -1550,8 +1570,8 @@ module crud =
         // then we need to error if they don't match each other.  so the following is wrong.
 
         let ensureHintMatch ndx =
-            printfn "ensureHintMatch: %A" ndxHint
-            match ndxHint with
+            printfn "ensureHintMatch: %A" mods.hint
+            match mods.hint with
             | Some desc ->
                 match tryFindIndexByNameOrSpec dbName collName indexes desc with
                 | Some hinted -> if ndx.spec<>hinted.spec then failwith "hint doesn't match"
@@ -1562,7 +1582,7 @@ module crud =
         // inclusive, ie GTE?  or does it need an exact index because of the E?
         
         let plan = 
-            match (ndxMin,ndxMax) with
+            match (mods.min,mods.max) with
             | Some vmin, Some vmax -> 
                 let amin = parseIndexMinMax vmin
                 let amax = parseIndexMinMax vmax
@@ -1595,11 +1615,11 @@ module crud =
         try
             let s = seqMatch m s
             let s =
-                match orderby with
+                match mods.orderby with
                 | Some ord -> seqSort ord s
                 | None -> s
             let s = 
-                match projection with
+                match mods.projection with
                 | Some proj -> seqProject proj (Some m) s
                 | None -> s
             let s = seqOnlyDoc s
@@ -1611,7 +1631,7 @@ module crud =
 
     let count dbName collName q =
         // TODO should this support query modifiers $min and $max ?
-        let (s,kill) = find dbName collName q None None None None None
+        let (s,kill) = find dbName collName q noQueryModifiers
         try
             Seq.length s
         finally
