@@ -184,8 +184,6 @@ module crud =
                 | Compare (k, [| p |])  -> Some (k,p)
                 | _ ->  None
             ) a
-        | _ ->
-            failwith "wrong format for $min/$max"
 
     let findPossibleIndexesEQ indexes comps =
         Array.choose (fun (k,p) ->
@@ -1457,8 +1455,6 @@ module crud =
                 | _ -> 
                     failwith "wrong format for $min/$max"
             ) a
-        | _ ->
-            failwith "wrong format for $min/$max"
 
     let seqSkip n s =
         s
