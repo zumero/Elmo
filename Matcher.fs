@@ -25,6 +25,7 @@ and QueryItem =
     | OR of docs:QueryDoc[]
     | NOR of docs:QueryDoc[]
     | Where of BsonValue
+    | Text of string
 and Pred =
     | Exists of bool
     | Size of int
@@ -548,6 +549,8 @@ module Matcher =
         | NOR docs ->
             let anyMatches = Array.exists (fun psub -> matchQueryDoc psub d cbArrayPos) docs
             not anyMatches
+        | Text s ->
+            true // TODO this is wrong.  there is more work to do even after the index.
         | Where _ ->
             failwith "$where is not supported" //16395 in agg
 
@@ -654,6 +657,13 @@ module Matcher =
             | "$where" -> result.Add(QueryItem.Where v)
             | "$and" -> do_andor v QueryItem.AND
             | "$or" -> do_andor v QueryItem.OR
+            | "$text" -> 
+                match v with
+                | BDocument pairs ->
+                    // TODO there's a language tag in here as well
+                    match Array.tryFind (fun (k,v) -> k="$search") pairs with
+                    | Some (_,BString s) -> result.Add(QueryItem.Text s)
+                    | _ -> failwith "invalid $text"
             | "$nor" -> 
                 let a = bson.getArray v
                 if a.Length=0 then failwith "array for $and $or $nor cannot be empty"

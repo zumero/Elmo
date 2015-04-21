@@ -602,8 +602,12 @@ module bson =
                 let b = a.[i]
                 a.[i] <- ~~~b
             a
-        | IndexType.Text -> Array.empty // TODO
-        | IndexType.Geo2d -> Array.empty // TODO
+        | IndexType.Text ->
+            // TODO could assert that bv is a string 
+            encodeForIndexInto w bv
+            w.ToArray()
+        | IndexType.Geo2d -> 
+            Array.empty // TODO
 
     let encodeMultiForIndex a =
         let w = BinWriter()

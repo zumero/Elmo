@@ -37,6 +37,8 @@ module plan =
     type t =
         | One of op1*index_info*(BsonValue[])
         | GTE_LT of index_info*(BsonValue[])*(BsonValue[])
+        | SimpleText of index_info*string
+        // TODO nothing above is quite right for a compound index involving text
 
 type reader = 
     {
@@ -112,22 +114,39 @@ module kv =
         a.[i] <- v
         a
 
+    let private doEncode vals f =
+        let hasText = Array.exists (fun (_,typ) -> typ=bson.IndexType.Text) vals
+
+        if hasText then
+            Array.iteri (fun i (v,typ) ->
+                match (v,typ) with
+                | (BString s,bson.IndexType.Text) ->
+                    let a = s.Split(' ') // TODO tokenize properly
+                    let a = a |> Set.ofArray |> Set.toArray
+                    Array.iter (fun s ->
+                        let replaced = replaceArrayElement vals i (BString s,typ)
+                        bson.encodeMultiForIndex replaced |> f
+                    ) a
+                | (_,bson.IndexType.Text) -> () // no index entry unless it's a string
+                | _ -> ()
+            ) vals
+        else
+            bson.encodeMultiForIndex vals |> f
+
     let private encodeIndexEntries vals f =
-        bson.encodeMultiForIndex vals |> f
+        doEncode vals f
         // if any of the vals in the key are an array, we need
         // to generate more index entries for this document, one
         // for each item in the array.  Mongo calls this a
         // multikey index.
-
-        // TODO I wonder if the way to handle text indexes is to detect
-        // them here and to add one entry for each word.
 
         Array.iteri (fun i (v,typ) ->
             match v with
             | BArray a ->
                 let a = a |> Set.ofArray |> Set.toArray
                 Array.iter (fun av ->
-                    replaceArrayElement vals i (av,typ) |> bson.encodeMultiForIndex |> f
+                    let replaced = replaceArrayElement vals i (av,typ)
+                    doEncode replaced f
                 ) a
             | _ -> ()
         ) vals
@@ -388,6 +407,16 @@ module kv =
 
         let getStmtForIndex ndxu =
             match ndxu with
+            | plan.SimpleText (ndx,search) ->
+                let BDocument [| (k,_) |] = ndx.spec
+                let tblColl = getTableNameForCollection ndx.db ndx.coll
+                let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
+                let sql = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ?" tblColl tblIndex "="
+                let stmt = conn.prepare(sql)
+                // TODO this code assumes search is a single term
+                let k = [| BString search |] |> getDirs ndx.spec |> bson.encodeMultiForIndex
+                stmt.bind_blob(1, k)
+                stmt
             | plan.One (op,ndx,vals) ->
                 let tblColl = getTableNameForCollection ndx.db ndx.coll
                 let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
