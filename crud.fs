@@ -365,7 +365,8 @@ module crud =
                            | BInt32 a -> a
                            | BInt64 a -> int32 a
                            | BDouble a -> int32 a
-                           | _ -> failwith "dir must be a number"
+                           | BDocument [| ("$meta",BString "textScore") |] -> 1 // TODO fake textScore
+                           | _ -> failwith (sprintf "invalid sort: %A" dir)
                 if dir1=0 then failwith "sort dir cannot be 0"
                 let dir = if dir1 < 0 then -1 else 1
                 let a = f ta
@@ -1322,6 +1323,12 @@ module crud =
         if projOp.Length <> 1 then failwith (sprintf "projOp: %A" projOp)
         let (op,arg) = projOp.[0]
         match op with
+        | "$meta" ->
+            let f ov =
+                match ov with
+                | Some v -> Some v // TODO overwrite?
+                | None -> 1.0 |> BDouble |> Some // TODO fake textScore
+            bson.changeValueForPath cur k f
         | "$elemMatch" ->
             let f ov =
                 match ov with
@@ -1475,6 +1482,12 @@ module crud =
                     // and another test where the projection has only an $elemMatch, and these
                     // two cases end up in different modes.  So...
 
+                    let hasMeta = 
+                        Array.exists (fun (_,v) ->
+                            match v with
+                            | BDocument pairs -> Array.exists (fun (k,v) -> k="$meta") pairs
+                            | _ -> false
+                            ) ops
                     let hasSlice = 
                         Array.exists (fun (_,v) ->
                             match v with
@@ -1489,6 +1502,7 @@ module crud =
                             ) ops
                     if hasSlice then true
                     else if hasElemMatch then false
+                    else if hasMeta then false
                     else
                         match id with
                         | Some (_,v) -> 

@@ -411,11 +411,15 @@ module kv =
                 let BDocument [| (k,_) |] = ndx.spec
                 let tblColl = getTableNameForCollection ndx.db ndx.coll
                 let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
-                let sql = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ?" tblColl tblIndex "="
+                let words = search.Split(' ') // TODO tokenize properly
+                let words = words |> Set.ofArray |> Set.toArray
+                let placeholders = Array.create (Array.length words) "?" |> String.concat ","
+                let sql = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k IN (%s)" tblColl tblIndex placeholders
                 let stmt = conn.prepare(sql)
-                // TODO this code assumes search is a single term
-                let k = [| BString search |] |> getDirs ndx.spec |> bson.encodeMultiForIndex
-                stmt.bind_blob(1, k)
+                Array.iteri (fun i s ->
+                    let k = [| BString s |] |> getDirs ndx.spec |> bson.encodeMultiForIndex
+                    stmt.bind_blob(i+1, k)
+                ) words
                 stmt
             | plan.One (op,ndx,vals) ->
                 let tblColl = getTableNameForCollection ndx.db ndx.coll
