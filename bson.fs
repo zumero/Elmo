@@ -604,6 +604,8 @@ module bson =
             a
         | IndexType.Text ->
             // TODO could assert that bv is a string 
+            // TODO needs to be last
+            // TODO put weight in just after the term
             encodeForIndexInto w bv
             w.ToArray()
         | IndexType.Geo2d -> 

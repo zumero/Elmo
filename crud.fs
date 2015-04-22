@@ -228,7 +228,7 @@ module crud =
                             // if there is no textQuery, give up
                             None
                         | Some tq ->
-                            plan.q.Text (ndx, tq) |> Some
+                            (ndx, plan.bounds.Text (Array.empty,tq)) |> Some
                     | None ->
                         // er, why are we here?
                         failwith "index with no keys?"
@@ -270,7 +270,7 @@ module crud =
                             None
                         | None ->
                             // we have an EQ for every key.  this index will work.
-                            plan.q.EQ_Text (ndx, matching_eqs, tq) |> Some
+                            (ndx, plan.bounds.Text (matching_eqs, tq)) |> Some
                     | None ->
                         // there is no text query.  note that this might still be a text index,
                         // but at this point we don't care.  we are considering whether we can
@@ -283,21 +283,33 @@ module crud =
                         let num_ineq = Array.length ineq
                         if num_ineq = 0 then
                             if num_eq>0 then
-                                plan.q.EQ (ndx, matching_eqs) |> Some
+                                (ndx, plan.bounds.EQ matching_eqs) |> Some
                             else
                                 // we can't use this index at all.
                                 None
                         else if num_ineq = 1 then
-                            if num_eq>0 then
-                                plan.q.EQ_Ineq1 (ndx, matching_eqs, ineq.[0]) |> Some
-                            else
-                                plan.q.Ineq1 (ndx, ineq.[0]) |> Some
+                            let (op,v) = Array.get ineq 0
+                            let vals = Array.append matching_eqs [| v |]
+                            match op with
+                            | plan.opIneq.GT | plan.opIneq.GTE ->
+                                (ndx, plan.bounds.Min vals) |> Some
+                            | plan.opIneq.LT | plan.opIneq.LTE ->
+                                (ndx, plan.bounds.Max vals) |> Some
                         else
-                            // TODO figure this out properly
-                            if num_eq>0 then
-                                plan.q.EQ_Ineq2 (ndx, matching_eqs, ineq.[0], ineq.[1]) |> Some
-                            else
-                                plan.q.Ineq2 (ndx, ineq.[0], ineq.[1]) |> Some
+                            // TODO figure this out properly when there are multiples
+                            let cmin = Array.tryFind (fun (op,v) -> op=plan.opIneq.GT || op=plan.opIneq.GTE) ineq
+                            let cmax = Array.tryFind (fun (op,v) -> op=plan.opIneq.LT || op=plan.opIneq.LTE) ineq
+                            match (cmin,cmax) with
+                            | None,None ->
+                                None
+                            | Some (_,vmin),None ->
+                                let vals = Array.append matching_eqs [| vmin |]
+                                (ndx, plan.bounds.Min vals) |> Some
+                            | None,Some (_,vmax) ->
+                                let vals = Array.append matching_eqs [| vmax |]
+                                (ndx, plan.bounds.Max vals) |> Some
+                            | Some (_,vmin),Some (_,vmax) ->
+                                (ndx, plan.bounds.Min_Max (matching_eqs,vmin,vmax)) |> Some
 
         | _ -> failwith "index spec must be a doc"
 

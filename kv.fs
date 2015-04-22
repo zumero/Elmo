@@ -40,20 +40,22 @@ module plan =
         | SimpleText of index_info*string
         // TODO nothing above is quite right for a compound index involving text
 
+    // TODO should maybe move to the crud module
     type opIneq =
         | LT
         | GT
         | LTE
         | GTE
 
-    type q = 
-        | EQ of index_info*(BsonValue[])
-        | EQ_Text of index_info*(BsonValue[])*string
-        | Text of index_info*string
-        | Ineq1 of index_info*(opIneq*BsonValue)
-        | Ineq2 of index_info*(opIneq*BsonValue)*(opIneq*BsonValue)
-        | EQ_Ineq1 of index_info*(BsonValue[])*(opIneq*BsonValue)
-        | EQ_Ineq2 of index_info*(BsonValue[])*(opIneq*BsonValue)*(opIneq*BsonValue)
+    type bounds = 
+        | EQ of BsonValue[]
+        | Text of BsonValue[]*string
+        | Min of BsonValue[]
+        | Max of BsonValue[]
+        | Min_Max of BsonValue[]*BsonValue*BsonValue
+
+    type q =
+        | Plan of index_info*bounds
 
 type reader = 
     {
@@ -136,6 +138,7 @@ module kv =
             Array.iteri (fun i (v,typ) ->
                 match (v,typ) with
                 | (BString s,bson.IndexType.Text) ->
+                    // TODO put weights in here
                     let a = s.Split(' ') // TODO tokenize properly
                     let a = a |> Set.ofArray |> Set.toArray
                     Array.iter (fun s ->
@@ -424,10 +427,72 @@ module kv =
             | _ ->
                 failwith "index spec must be a doc"
 
+        let add_one ba =
+            let rec f (a:byte[]) ndx =
+                let b = a.[ndx]
+                if b < 255uy then
+                    a.[ndx] <- b + 1uy
+                else
+                    a.[ndx] <- 0uy
+                    if ndx>0 then f a (ndx-1)
+            let ba = Array.copy ba
+            f ba (ba.Length - 1)
+            ba
+
+        let getStmtForIndex2 (ndx,b) =
+            let tblColl = getTableNameForCollection ndx.db ndx.coll
+            let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
+
+            let f_min kmin = 
+                let sql_min = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k >= ?" tblColl tblIndex
+                let stmt = conn.prepare(sql_min)
+                stmt.bind_blob(1, kmin)
+                stmt
+
+            let f_max kmax =
+                let sql_max = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k <= ?" tblColl tblIndex
+                let stmt = conn.prepare(sql_max)
+                stmt.bind_blob(1, kmax)
+                stmt
+
+            let f_both (kmin,kmax) =
+                let sql_both = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k >= ? AND k <= ?" tblColl tblIndex
+                let stmt = conn.prepare(sql_both)
+                stmt.bind_blob(1, kmin)
+                stmt.bind_blob(2, kmax)
+                stmt
+
+            match b with
+            | plan.bounds.Text (eq,search) ->
+                //let BDocument [| (k,_) |] = ndx.spec
+                let words = search.Split(' ') // TODO tokenize properly
+                let words = words |> Set.ofArray |> Set.toArray
+                // TODO this is kinda wrong.  assume each index entries is a term followed by a numeric weight.
+                // calculate the bounds.  sort the words lexicographically.  the lower bound is the first
+                // word.  the upper bound is the last word.  (append low and high weight as well?)
+                // fetch all keys between those bounds and then let the matcher do the rest of the work.
+                let minword = Array.get words 0 // TODO wrong
+                let maxword = Array.get words 0 // TODO wrong
+                let kmin = [| BString minword |] |> Array.append eq |> getDirs ndx.spec |> bson.encodeMultiForIndex
+                let kmax = [| BString maxword |] |> Array.append eq |> getDirs ndx.spec |> bson.encodeMultiForIndex
+                (kmin,kmax) |> f_both
+            | plan.bounds.Min vals ->
+                vals |> getDirs ndx.spec |> bson.encodeMultiForIndex |> f_min
+            | plan.bounds.Max vals ->
+                vals |> getDirs ndx.spec |> bson.encodeMultiForIndex |> f_max
+            | plan.bounds.EQ vals ->
+                let kmin = vals |> getDirs ndx.spec |> bson.encodeMultiForIndex
+                let kmax = add_one kmin
+                (kmin,kmax) |> f_both
+            | plan.bounds.Min_Max (eq,vmin,vmax) ->
+                let kmin = [| vmin |] |> Array.append eq |> getDirs ndx.spec |> bson.encodeMultiForIndex
+                let kmax = [| vmax |] |> Array.append eq |> getDirs ndx.spec |> bson.encodeMultiForIndex
+                (kmin,kmax) |> f_both
+
         let getStmtForIndex ndxu =
             match ndxu with
             | plan.SimpleText (ndx,search) ->
-                let BDocument [| (k,_) |] = ndx.spec
+                //let BDocument [| (k,_) |] = ndx.spec
                 let tblColl = getTableNameForCollection ndx.db ndx.coll
                 let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
                 let words = search.Split(' ') // TODO tokenize properly
