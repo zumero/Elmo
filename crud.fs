@@ -233,15 +233,35 @@ module crud =
                 else
                     // we have some scalar keys, and maybe a text index after it.
                     // for every scalar key, find comparisons from the query.
-                    // TODO do we really care about more than one comp per key?
-                    // TODO what if the comps have incompatible comparisons for a given key?
-                    // TODO like two EQs with different values?  or GT 0 AND LT 0?
-                    let matching_comps = Array.map (fun (k,typ) -> (k, Array.choose (fun (op,km,v) -> if k=km then Some (op,v) else None) comps)) scalar_keys
-                    let first_no_comps = Array.tryFindIndex (fun (k,acomps) -> 0 = Array.length acomps) matching_comps
-                    let matching_eqs = Array.map (fun (k,acomps) -> (k, Array.choose (fun (op,v) -> if op=plan.EQ then Some v else None) acomps)) matching_comps
-                    let first_no_eqs = Array.tryFindIndex (fun (k,acomps) -> 0 = Array.length acomps) matching_eqs
-                    match text with
-                    | Some tq ->
+                    let matching_comps = Array.map (fun (k,_) -> Array.choose (fun (op,km,v) -> if k=km then Some (op,v) else None) comps) scalar_keys
+                    let first_no_comps = Array.tryFindIndex (fun acomps -> 0 = Array.length acomps) matching_comps
+                    let matching_eqs = Array.map (fun acomps -> Array.choose (fun (op,v) -> if op=plan.EQ then Some v else None) acomps) matching_comps
+                    let first_no_eqs = Array.tryFindIndex (fun acomps -> 0 = Array.length acomps) matching_eqs
+
+                    // fail if our matcher has something like 
+                    // (a=3) && (a=5)
+                    // TODO this seems like the wrong place to do this check.
+                    // and we should be doing other checks, like
+                    // (a<0) && (a>0)
+                    // or
+                    // (a=5) && (a<4)
+                    // and we should maybe eliminate redundant checks like
+                    // (a<4) && (a<7)
+                    // but still, this seems like the wrong place for this.
+                    // because if it's here, then it will get checked on every
+                    // index.  and if there are no indexes, it won't get checked
+                    // at all.
+
+                    if Array.exists (fun acomps -> 
+                        let distinct = acomps |> Set.ofArray |> Set.toArray
+                        (Array.length distinct > 1)
+                    ) matching_eqs then
+                        failwith "matcher has something eq multiple different values"
+
+                    let matching_eqs = Array.map (fun acomps -> Array.get acomps 0) matching_eqs
+
+                    match textQuery with
+                    | Some _ ->
                         match first_no_eqs with
                         | Some _ ->
                             // if there is a text index, we need an EQ for every scalar key.
@@ -249,9 +269,11 @@ module crud =
                             None
                         | None ->
                             // we have an EQ for every key.  this index will work.
-                            (Some matching_eqs, None, Some tq) |> Some
+                            (Some matching_eqs, None, textQuery) |> Some
                     | None ->
-                        // no text index.
+                        // there is no text query.  note that this might still be a text index,
+                        // but at this point we don't care.  we are considering whether we can
+                        // use the scalar keys to the left of the text index.
                         let num_eq = 
                             match first_no_eqs with
                             | None -> num_scalar_keys
@@ -264,6 +286,9 @@ module crud =
                         if num_comps > num_eq then
                             // we will have one inequality
                             let ineq = matching_comps.[num_eq]
+                            // assert ineq is an array of comparisons, but there are no EQs in it.
+                            // we will use either one or two of them in the bounds of the index scan.
+                            // TODO should we determine those bounds now?
                             if num_eq>0 then
                                 (Some matching_eqs, Some ineq, None) |> Some
                             else
@@ -376,6 +401,15 @@ module crud =
                     | Some ndx -> (op,k,ndx,[| v |]) |> Some
                     | None -> None
         ) comps
+
+    let private findFitIndexes indexes m =
+        let textQuery = findTextQuery m
+        let comps = findUsableCompares m
+        Array.choose (fun ndx ->
+            match tryFitIndexToQuery ndx comps textQuery with
+            | Some fit -> (ndx, fit) |> Some
+            | None -> None
+        ) indexes
 
     let private chooseFromPossibles possibles =
         if Array.isEmpty possibles then 
