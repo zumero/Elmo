@@ -320,6 +320,11 @@ module crud =
                 match ndx.spec with
                 | BDocument keys ->
                     if Array.length keys > 1 then
+                        // docs say:
+                        // If the compound text index includes keys preceding
+                        // the text index key, to perform a $text search, the
+                        // query predicate must include equality match
+                        // conditions on the preceding keys.
                         failwith "TODO learn how to deal with a compound index with text"
                     else
                         plan.SimpleText (ndx,s) |> Some
@@ -417,12 +422,27 @@ module crud =
             Array.map (fun d -> 
                 let ndxKey = bson.getValueForKey d "key"
                 let ndxName = bson.getValueForKey d "name" |> bson.getString
-                let ndxUnique = bson.tryGetValueForKey d "unique"
+                let options = BDocument Array.empty
                 let options = 
-                    match ndxUnique with
-                    | Some (BBoolean b) -> BDocument [| ("unique",BBoolean b) |]
-                    | Some _ -> failwith "no"
-                    | None -> BDocument Array.empty
+                    match bson.tryGetValueForKey d "unique" with
+                    | Some v -> 
+                        match v with
+                        | BBoolean b ->
+                            let f ov = Some v
+                            bson.changeValueForPath options "unique" f
+                        | _ -> failwith "illegal value for unique"
+                    | None -> options
+                let options = 
+                    // TODO note that if a key appears in weights but not
+                    // in the key itself, it is indexed anyway
+                    match bson.tryGetValueForKey d "weights" with
+                    | Some v -> 
+                        match v with
+                        | BDocument _ ->
+                            let f ov = Some v
+                            bson.changeValueForPath options "weights" f
+                        | _ -> failwith "illegal value for weights"
+                    | None -> options
                 // TODO what other options might exist here?
                 {
                     db=dbName

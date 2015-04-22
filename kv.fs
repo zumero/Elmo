@@ -225,6 +225,10 @@ module kv =
                 false
             | None ->
                 //printfn "did not exist, creating it"
+                // TODO if we already have a text index (where any of its spec keys are text)
+                // then fail.
+                // TODO deal with weights
+                // TODO if weights mention keys not in spec, fix that
                 let baSpec = bson.toBinaryArray info.spec
                 let baOptions = bson.toBinaryArray info.options
                 use stmt = conn.prepare("INSERT INTO \"indexes\" (dbName,collName,ndxName,spec,options) VALUES (?,?,?,?,?)")
@@ -422,6 +426,7 @@ module kv =
                 ) words
                 stmt
             | plan.One (op,ndx,vals) ->
+                // vals are already in the same order as the keys in the index
                 let tblColl = getTableNameForCollection ndx.db ndx.coll
                 let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
                 let strop = 
@@ -437,6 +442,7 @@ module kv =
                 stmt.bind_blob(1, k)
                 stmt
             | plan.GTE_LT (ndx,minvals,maxvals) ->
+                // vals are already in the same order as the keys in the index
                 let tblColl = getTableNameForCollection ndx.db ndx.coll
                 let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
                 let sql = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k >= ? AND k < ?" tblColl tblIndex

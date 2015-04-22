@@ -18,7 +18,7 @@
 // ability to use an index for sorting
 //
 // chooseIndex should be smart enough to combine expressions to
-// use a compound index?
+// use a compound index
 //
 // chooseIndex: dive into AND?
 //
