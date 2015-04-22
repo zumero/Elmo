@@ -40,6 +40,21 @@ module plan =
         | SimpleText of index_info*string
         // TODO nothing above is quite right for a compound index involving text
 
+    type opIneq =
+        | LT
+        | GT
+        | LTE
+        | GTE
+
+    type q = 
+        | EQ of index_info*(BsonValue[])
+        | EQ_Text of index_info*(BsonValue[])*string
+        | Text of index_info*string
+        | Ineq1 of index_info*(opIneq*BsonValue)
+        | Ineq2 of index_info*(opIneq*BsonValue)*(opIneq*BsonValue)
+        | EQ_Ineq1 of index_info*(BsonValue[])*(opIneq*BsonValue)
+        | EQ_Ineq2 of index_info*(BsonValue[])*(opIneq*BsonValue)*(opIneq*BsonValue)
+
 type reader = 
     {
         docs:seq<BsonValue>

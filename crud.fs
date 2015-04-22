@@ -200,7 +200,7 @@ module crud =
     // Mongo allows stuff after so that it can be used as a covering
     // index?
 
-    let private tryFitIndexToQuery ndx comps textQuery =
+    let private tryFitIndexToQuery ndx comps_eq comps_ineq textQuery =
         match ndx.spec with
         | BDocument pairs ->
             let decoded = Array.map (fun (k,v) -> (k, bson.decodeIndexType v)) pairs
@@ -212,6 +212,8 @@ module crud =
                 None
             | _ ->
                 // if there is a text index, chop it off, along with everything after it.
+                // TODO this code assumes that everything is either scalar or text, which
+                // will be wrong when geo comes along.
                 let scalar_keys = 
                     match text with
                     | Some i -> Array.sub decoded 0 i
@@ -226,16 +228,15 @@ module crud =
                             // if there is no textQuery, give up
                             None
                         | Some tq ->
-                            (None,None,Some tq) |> Some
+                            plan.q.Text (ndx, tq) |> Some
                     | None ->
                         // er, why are we here?
                         failwith "index with no keys?"
                 else
                     // we have some scalar keys, and maybe a text index after it.
                     // for every scalar key, find comparisons from the query.
-                    let matching_comps = Array.map (fun (k,_) -> Array.choose (fun (op,km,v) -> if k=km then Some (op,v) else None) comps) scalar_keys
-                    let first_no_comps = Array.tryFindIndex (fun acomps -> 0 = Array.length acomps) matching_comps
-                    let matching_eqs = Array.map (fun acomps -> Array.choose (fun (op,v) -> if op=plan.EQ then Some v else None) acomps) matching_comps
+                    let matching_ineqs = Array.map (fun (k,_) -> Array.choose (fun (op,km,v) -> if k=km then Some (op,v) else None) comps_ineq) scalar_keys
+                    let matching_eqs = Array.map (fun (k,_) -> Array.choose (fun (km,v) -> if k=km then Some v else None) comps_eq) scalar_keys
                     let first_no_eqs = Array.tryFindIndex (fun acomps -> 0 = Array.length acomps) matching_eqs
 
                     // fail if our matcher has something like 
@@ -261,7 +262,7 @@ module crud =
                     let matching_eqs = Array.map (fun acomps -> Array.get acomps 0) matching_eqs
 
                     match textQuery with
-                    | Some _ ->
+                    | Some tq ->
                         match first_no_eqs with
                         | Some _ ->
                             // if there is a text index, we need an EQ for every scalar key.
@@ -269,7 +270,7 @@ module crud =
                             None
                         | None ->
                             // we have an EQ for every key.  this index will work.
-                            (Some matching_eqs, None, textQuery) |> Some
+                            plan.q.EQ_Text (ndx, matching_eqs, tq) |> Some
                     | None ->
                         // there is no text query.  note that this might still be a text index,
                         // but at this point we don't care.  we are considering whether we can
@@ -278,27 +279,25 @@ module crud =
                             match first_no_eqs with
                             | None -> num_scalar_keys
                             | Some num_eq -> num_eq
-                        let num_comps = 
-                            match first_no_comps with
-                            | None -> num_scalar_keys
-                            | Some num_comps -> num_comps
-                        // assert num_comps >= num_eq (since an eq is a comp)
-                        if num_comps > num_eq then
-                            // we will have one inequality
-                            let ineq = matching_comps.[num_eq]
-                            // assert ineq is an array of comparisons, but there are no EQs in it.
-                            // we will use either one or two of them in the bounds of the index scan.
-                            // TODO should we determine those bounds now?
+                        let ineq = matching_ineqs.[num_eq]
+                        let num_ineq = Array.length ineq
+                        if num_ineq = 0 then
                             if num_eq>0 then
-                                (Some matching_eqs, Some ineq, None) |> Some
-                            else
-                                (None, Some ineq, None) |> Some
-                        else
-                            if num_eq>0 then
-                                (Some matching_eqs, None, None) |> Some
+                                plan.q.EQ (ndx, matching_eqs) |> Some
                             else
                                 // we can't use this index at all.
                                 None
+                        else if num_ineq = 1 then
+                            if num_eq>0 then
+                                plan.q.EQ_Ineq1 (ndx, matching_eqs, ineq.[0]) |> Some
+                            else
+                                plan.q.Ineq1 (ndx, ineq.[0]) |> Some
+                        else
+                            // TODO figure this out properly
+                            if num_eq>0 then
+                                plan.q.EQ_Ineq2 (ndx, matching_eqs, ineq.[0], ineq.[1]) |> Some
+                            else
+                                plan.q.Ineq2 (ndx, ineq.[0], ineq.[1]) |> Some
 
         | _ -> failwith "index spec must be a doc"
 
@@ -357,6 +356,33 @@ module crud =
         else if Array.length a > 1 then failwith "only one $text in a query"
         else a.[0] |> Some
 
+    let private findComparesEQ m =
+        match m with
+        | QueryDoc a ->
+            // TODO only compares in the top level of the query?
+            // TODO dive into AND?  OR?
+            // TODO what if a Compare has multiple items in it?
+            Array.choose (fun it ->
+                match it with
+                | Compare (k, [| Pred.EQ v |]) -> Some (k,v)
+                | _ -> None
+            ) a
+
+    let private findComparesIneq m =
+        match m with
+        | QueryDoc a ->
+            // TODO only compares in the top level of the query?
+            // TODO dive into AND?  OR?
+            // TODO what if a Compare has multiple items in it?
+            Array.choose (fun it ->
+                match it with
+                | Compare (k, [| Pred.LT v |]) -> Some (plan.opIneq.LT,k,v)
+                | Compare (k, [| Pred.GT v |]) -> Some (plan.opIneq.GT,k,v)
+                | Compare (k, [| Pred.LTE v |]) -> Some (plan.opIneq.LTE,k,v)
+                | Compare (k, [| Pred.GTE v |]) -> Some (plan.opIneq.GTE,k,v)
+                | _ -> None
+            ) a
+
     let private findUsableCompares m =
         match m with
         | QueryDoc a ->
@@ -365,11 +391,11 @@ module crud =
             // TODO what if a Compare has multiple items in it?
             Array.choose (fun it ->
                 match it with
-                | Compare (k, [| Pred.EQ v |]) -> Some (plan.EQ,k,v)
-                | Compare (k, [| Pred.LT v |]) -> Some (plan.LT,k,v)
-                | Compare (k, [| Pred.GT v |]) -> Some (plan.GT,k,v)
-                | Compare (k, [| Pred.LTE v |]) -> Some (plan.LTE,k,v)
-                | Compare (k, [| Pred.GTE v |]) -> Some (plan.GTE,k,v)
+                | Compare (k, [| Pred.EQ v |]) -> Some (plan.op1.EQ,k,v)
+                | Compare (k, [| Pred.LT v |]) -> Some (plan.op1.LT,k,v)
+                | Compare (k, [| Pred.GT v |]) -> Some (plan.op1.GT,k,v)
+                | Compare (k, [| Pred.LTE v |]) -> Some (plan.op1.LTE,k,v)
+                | Compare (k, [| Pred.GTE v |]) -> Some (plan.op1.GTE,k,v)
                 | _ -> None
             ) a
 
@@ -404,9 +430,10 @@ module crud =
 
     let private findFitIndexes indexes m =
         let textQuery = findTextQuery m
-        let comps = findUsableCompares m
+        let comps_eq = findComparesEQ m
+        let comps_ineq = findComparesIneq m
         Array.choose (fun ndx ->
-            match tryFitIndexToQuery ndx comps textQuery with
+            match tryFitIndexToQuery ndx comps_eq comps_ineq textQuery with
             | Some fit -> (ndx, fit) |> Some
             | None -> None
         ) indexes
