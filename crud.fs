@@ -194,6 +194,89 @@ module crud =
                 | IndexNeed.Geo2d -> typ = bson.IndexType.Geo2d
         ) have need
 
+    // TODO:  at query time, all text indexes result
+    // in one search term, and it must be at the end.  in a compound
+    // index, nothing after a text index can be used, right?  maybe
+    // Mongo allows stuff after so that it can be used as a covering
+    // index?
+
+    let private tryFitIndexToQuery ndx comps textQuery =
+        match ndx.spec with
+        | BDocument pairs ->
+            let decoded = Array.map (fun (k,v) -> (k, bson.decodeIndexType v)) pairs
+            // see if this is a text index
+            let text = Array.tryFindIndex (fun (k,typ) -> bson.IndexType.Text = typ) decoded
+            match (text,textQuery) with
+            | (None,Some _) -> 
+                // if there is a textQuery but this is not a text index, give up now
+                None
+            | _ ->
+                // if there is a text index, chop it off, along with everything after it.
+                let scalar_keys = 
+                    match text with
+                    | Some i -> Array.sub decoded 0 i
+                    | None -> decoded
+                let num_scalar_keys = Array.length scalar_keys
+                if num_scalar_keys=0 then
+                    match text with
+                    | Some _ ->
+                        // just a text index
+                        match textQuery with
+                        | None ->
+                            // if there is no textQuery, give up
+                            None
+                        | Some tq ->
+                            (None,None,Some tq) |> Some
+                    | None ->
+                        // er, why are we here?
+                        failwith "index with no keys?"
+                else
+                    // we have some scalar keys, and maybe a text index after it.
+                    // for every scalar key, find comparisons from the query.
+                    // TODO do we really care about more than one comp per key?
+                    // TODO what if the comps have incompatible comparisons for a given key?
+                    // TODO like two EQs with different values?  or GT 0 AND LT 0?
+                    let matching_comps = Array.map (fun (k,typ) -> (k, Array.choose (fun (op,km,v) -> if k=km then Some (op,v) else None) comps)) scalar_keys
+                    let first_no_comps = Array.tryFindIndex (fun (k,acomps) -> 0 = Array.length acomps) matching_comps
+                    let matching_eqs = Array.map (fun (k,acomps) -> (k, Array.choose (fun (op,v) -> if op=plan.EQ then Some v else None) acomps)) matching_comps
+                    let first_no_eqs = Array.tryFindIndex (fun (k,acomps) -> 0 = Array.length acomps) matching_eqs
+                    match text with
+                    | Some tq ->
+                        match first_no_eqs with
+                        | Some _ ->
+                            // if there is a text index, we need an EQ for every scalar key.
+                            // so this won't work.
+                            None
+                        | None ->
+                            // we have an EQ for every key.  this index will work.
+                            (Some matching_eqs, None, Some tq) |> Some
+                    | None ->
+                        // no text index.
+                        let num_eq = 
+                            match first_no_eqs with
+                            | None -> num_scalar_keys
+                            | Some num_eq -> num_eq
+                        let num_comps = 
+                            match first_no_comps with
+                            | None -> num_scalar_keys
+                            | Some num_comps -> num_comps
+                        // assert num_comps >= num_eq (since an eq is a comp)
+                        if num_comps > num_eq then
+                            // we will have one inequality
+                            let ineq = matching_comps.[num_eq]
+                            if num_eq>0 then
+                                (Some matching_eqs, Some ineq, None) |> Some
+                            else
+                                (None, Some ineq, None) |> Some
+                        else
+                            if num_eq>0 then
+                                (Some matching_eqs, None, None) |> Some
+                            else
+                                // we can't use this index at all.
+                                None
+
+        | _ -> failwith "index spec must be a doc"
+
     let private findExactIndex indexes a =
         //printfn "indexes: %A" indexes
         //printfn "keys: %A" a
