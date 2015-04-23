@@ -21,38 +21,18 @@ type index_info =
     {
         db:string
         coll:string
-        ndx:string
+        ndx:string // TODO should be called name
         spec:BsonValue
         options:BsonValue
     }
 
 module plan =
-    type op1 =
-        | EQ
-        | LT
-        | GT
-        | LTE
-        | GTE
-
-    type t =
-        | One of op1*index_info*(BsonValue[])
-        | GTE_LT of index_info*(BsonValue[])*(BsonValue[])
-        | SimpleText of index_info*string
-        // TODO nothing above is quite right for a compound index involving text
-
-    // TODO should maybe move to the crud module
-    type opIneq =
-        | LT
-        | GT
-        | LTE
-        | GTE
-
     type bounds = 
         | EQ of BsonValue[]
         | Text of BsonValue[]*string
         | Min of BsonValue[]
         | Max of BsonValue[]
-        | Min_Max of BsonValue[]*BsonValue*BsonValue
+        | Min_Max of BsonValue[]*BsonValue[]
 
     type q =
         | Plan of index_info*bounds
@@ -70,7 +50,7 @@ type tx_write =
         insert:BsonValue->unit
         update:BsonValue->unit
         delete:BsonValue->bool
-        getSelect:(plan.t option)->reader
+        getSelect:(plan.q option)->reader
         commit:unit->unit
         rollback:unit->unit
     }
@@ -93,7 +73,7 @@ type conn_methods =
         dropDatabase:string->bool
 
         beginWrite:string->string->tx_write
-        beginRead:string->string->(plan.t option)->reader
+        beginRead:string->string->(plan.q option)->reader
 
         close:unit->unit
     }
@@ -102,58 +82,146 @@ module kv =
     open SQLitePCL
     open SQLitePCL.Ugly
 
-    let private findIndexEntryVals ndxInfo doc =
-        //printfn "ndxInfo: %A" ndxInfo
-        //printfn "doc: %A" doc
-        match ndxInfo.spec with
-        | BDocument keys ->
-            Array.map (fun (k,typ) ->
-                //printfn "k : %s" k
-                let typ = bson.decodeIndexType typ
-                let v = bson.findPath doc k
+    // TODO I'm not sure this type is worth the trouble anymore.
+    // maybe we should go back to just keeping a bool that specifies
+    // whether we need to negate or not.
+    type IndexType =
+        | Forward
+        | Backward
+        | Geo2d
 
-                // now we replace any BUndefined with BNull.  this seems, well,
-                // kinda wrong, as it effectively encodes the index entries to
-                // contain information that is slightly incorrect, since BNull
-                // means "it was present and explicitly null", whereas BUndefined
-                // means "it was absent".  Still, this appears to be the exact
-                // behavior of Mongo.  Note that this only affects index entries.
-                // The matcher can and must still distinguish between null and
-                // undefined.
-                let v = bson.replaceUndefined v
-                (v,typ)
+    let private decodeIndexType v =
+        match v with
+        | BInt32 n -> if n<0 then IndexType.Backward else IndexType.Forward
+        | BInt64 n -> if n<0L then IndexType.Backward else IndexType.Forward
+        | BDouble n -> if n<0.0 then IndexType.Backward else IndexType.Forward
+        | BString "2d" -> IndexType.Geo2d
+        | _ -> failwith (sprintf "decodeIndexType: %A" v)
+
+    // this function gets the index spec (its keys) into a form that
+    // is simplified and cleaned up.
+    //
+    // if there are text indexes in index.spec, they are removed
+    //
+    // all text indexes, including any that were in index.spec, and
+    // anything implied by options.weights, are stored in a new Map<string,int>
+    // called weights.
+    //
+    // any non-text indexes that appeared in spec AFTER any text
+    // indexes are discarded.  I *think* Mongo keeps these, but only
+    // for the purpose of grabbing their data later when used as a covering
+    // index, which we're ignoring.
+    //
+    let getNormalizedSpec info =
+        //printfn "info: %A" info
+        let keys = bson.getDocument info.spec
+        let first_text = 
+            Array.tryFindIndex (fun (k,typ) -> 
+                match typ with
+                | BString "text" -> true
+                | _ -> false
             ) keys
+        let weights = bson.tryGetValueForKey info.options "weights"
+        match (first_text, weights) with
+        | None, None ->
+            let decoded = Array.map (fun (k,v) -> (k, decodeIndexType v)) keys
+            //printfn "no text index: %A" decoded
+            (decoded, None)
+        | _ ->
+            let (scalar_keys,text_keys) = 
+                match first_text with
+                | Some i -> 
+                    let scalar_keys = Array.sub keys 0 i
+                    // note that any non-text index after the first text index is getting discarded
+                    let text_keys = 
+                        Array.choose (fun (k,typ) ->
+                            match typ with
+                            | BString "text" -> Some k
+                            | _ -> None
+                        ) keys
+                    (scalar_keys, text_keys)
+                | None -> (keys, Array.empty)
+            let weights =
+                match weights with
+                | Some (BDocument a) -> a
+                | Some _ -> failwith "weights must be a document"
+                | None -> Array.empty
+            let weights =
+                Array.fold (fun cur (k,v) ->
+                    let n = 
+                        match v with
+                        | BInt32 n -> n
+                        | BInt64 n -> int32 n
+                        | BDouble n -> int32 n
+                        | _ -> failwith "weight must be numeric"
+                    Map.add k n cur
+                ) Map.empty weights
+            let weights =
+                Array.fold (fun cur k ->
+                    if Map.containsKey k cur then cur
+                    else Map.add k 1 cur
+                ) weights text_keys
+            let decoded = Array.map (fun (k,v) -> (k, decodeIndexType v)) scalar_keys
+            let r = (decoded, Some weights)
+            //printfn "%A" r
+            r
 
-        | _ -> failwith "must be a doc"
+    let private findIndexEntryVals normspec doc =
+        //printfn "spec: %A" spec
+        //printfn "doc: %A" doc
+        Array.map (fun (k,typ) ->
+            //printfn "k : %s" k
+            let v = bson.findPath doc k
+
+            // now we replace any BUndefined with BNull.  this seems, well,
+            // kinda wrong, as it effectively encodes the index entries to
+            // contain information that is slightly incorrect, since BNull
+            // means "it was present and explicitly null", whereas BUndefined
+            // means "it was absent".  Still, this appears to be the exact
+            // behavior of Mongo.  Note that this only affects index entries.
+            // The matcher can and must still distinguish between null and
+            // undefined.
+
+            // TODO should the following be done differently if the index is sparse?
+            let v = bson.replaceUndefined v
+
+            let neg = IndexType.Backward=typ
+            (v,neg)
+        ) normspec
 
     let replaceArrayElement vals i v =
         let a = Array.copy vals
         a.[i] <- v
         a
 
-    let private doEncode vals f =
-        let hasText = Array.exists (fun (_,typ) -> typ=bson.IndexType.Text) vals
-
-        if hasText then
-            Array.iteri (fun i (v,typ) ->
-                match (v,typ) with
-                | (BString s,bson.IndexType.Text) ->
-                    // TODO put weights in here
-                    let a = s.Split(' ') // TODO tokenize properly
-                    let a = a |> Set.ofArray |> Set.toArray
-                    Array.iter (fun s ->
-                        let replaced = replaceArrayElement vals i (BString s,typ)
-                        bson.encodeMultiForIndex replaced |> f
-                    ) a
-                | (_,bson.IndexType.Text) -> () // no index entry unless it's a string
-                | _ -> ()
-            ) vals
-        else
+    let private doEncode vals newDoc weights f =
+        match weights with
+        | Some weights ->
+            Map.iter (fun k w ->
+                match bson.findPath newDoc k with
+                | BUndefined -> ()
+                | v ->
+                    match v with
+                    | BString s ->
+                        let a = s.Split(' ') // TODO tokenize properly
+                        let a = a |> Set.ofArray |> Set.toArray
+                        Array.iter (fun s ->
+                            let v = BArray [| (BString s); (BInt32 w) |]
+                            let vals = Array.append vals [| (v,false) |]
+                            bson.encodeMultiForIndex vals |> f
+                        ) a
+                    | _ -> () // no index entry unless it's a string 
+            ) weights
+        | None ->
             bson.encodeMultiForIndex vals |> f
 
-    let private encodeIndexEntries vals f =
-        doEncode vals f
-        // if any of the vals in the key are an array, we need
+    let private encodeIndexEntries newDoc normspec weights f =
+        let vals = findIndexEntryVals normspec newDoc
+
+        // first do the index entries for the document without considering arrays
+        doEncode vals newDoc weights f 
+
+        // now, if any of the vals in the key are an array, we need
         // to generate more index entries for this document, one
         // for each item in the array.  Mongo calls this a
         // multikey index.
@@ -164,7 +232,7 @@ module kv =
                 let a = a |> Set.ofArray |> Set.toArray
                 Array.iter (fun av ->
                     let replaced = replaceArrayElement vals i (av,typ)
-                    doEncode replaced f
+                    doEncode replaced newDoc weights f 
                 ) a
             | _ -> ()
         ) vals
@@ -227,6 +295,7 @@ module kv =
         let getStmtSequence (stmt:sqlite3_stmt) =
             seq {
                 while raw.SQLITE_ROW = stmt.step() do
+                    //printfn "got_SQLITE_ROW"
                     let doc = stmt.column_blob(0) |> BinReader.ReadDocument
                     yield doc
             }
@@ -235,18 +304,39 @@ module kv =
             let createdColl = createCollection info.db info.coll (BDocument Array.empty)
             ignore createdColl // TODO are we supposed to tell the caller we created the collection?
             //printfn "createIndex: %A" info
+            
+#if not
+// TODO for now we decide to leave the spec as it was provided to us.
+            let weights = bson.tryGetValueForKey info.options "weights"
+
+            // if weights mention keys not in spec, add them to the spec
+            let spec = 
+                match weights with
+                | Some (BDocument weights) ->
+                    Array.fold (fun cur (k,_) ->
+                        let f ov = 
+                            match ov with
+                            | Some _ -> ov
+                            | None -> "text" |> BString |> Some
+                        bson.changeValueForPath cur k f
+                    ) info.spec weights
+                | Some _ -> failwith "invalid weights"
+                | None ->
+                    info.spec
+#endif
+
             match getIndexInfo info.db info.coll info.ndx with
             | Some already ->
                 //printfn "it already exists: %A" already
                 if already.spec<>info.spec then
+                    // note that we do not compare the options.
+                    // I think mongo does it this way too.
                     failwith "index already exists with different keys"
                 false
             | None ->
                 //printfn "did not exist, creating it"
                 // TODO if we already have a text index (where any of its spec keys are text)
                 // then fail.
-                // TODO deal with weights
-                // TODO if weights mention keys not in spec, fix that
                 let baSpec = bson.toBinaryArray info.spec
                 let baOptions = bson.toBinaryArray info.options
                 use stmt = conn.prepare("INSERT INTO \"indexes\" (dbName,collName,ndxName,spec,options) VALUES (?,?,?,?,?)")
@@ -266,16 +356,16 @@ module kv =
                     conn.exec(sprintf "CREATE TABLE \"%s\" (k BLOB NOT NULL, doc_rowid int NOT NULL REFERENCES \"%s\"(did) ON DELETE CASCADE, PRIMARY KEY (k,doc_rowid))" ndxTable collTable)
                 conn.exec(sprintf "CREATE INDEX \"childndx_%s\" ON \"%s\" (doc_rowid)" ndxTable ndxTable)
                 // now insert index entries for every doc that already exists
+                let (normspec,weights) = getNormalizedSpec info
                 use stmt2 = conn.prepare(sprintf "SELECT did,bson FROM \"%s\"" collTable)
                 use stmt_insert = prepareIndexInsert ndxTable
                 while raw.SQLITE_ROW = stmt2.step() do
                     let doc_rowid = stmt2.column_int64(0)
                     let newDoc = stmt2.column_blob(1) |> BinReader.ReadDocument
-                    let vals = findIndexEntryVals info newDoc
 
                     let f k = indexInsertStep stmt_insert k doc_rowid
 
-                    encodeIndexEntries vals f
+                    encodeIndexEntries newDoc normspec weights f
                 true
 
         and createCollection db coll options =
@@ -417,15 +507,13 @@ module kv =
                     cur <- conn.next_stmt(cur)
                 reraise()
 
-        let getDirs spec vals =
-            match spec with
-            | BDocument pairs ->
-                let len = Array.length vals
-                let pairs = Array.sub pairs 0 len
-                let dirs = Array.map (fun (_,v) -> bson.decodeIndexType v) pairs
-                Array.zip vals dirs
-            | _ ->
-                failwith "index spec must be a doc"
+        let getDirs normspec vals =
+            //printfn "normspec: %A" normspec
+            //printfn "vals: %A" vals
+            let len = Array.length vals
+            let pairs = Array.sub normspec 0 len
+            let dirs = Array.map (fun (_,v) -> IndexType.Backward=v) pairs
+            Array.zip vals dirs
 
         let add_one ba =
             let rec f (a:byte[]) ndx =
@@ -439,9 +527,17 @@ module kv =
             f ba (ba.Length - 1)
             ba
 
-        let getStmtForIndex2 (ndx,b) =
+        let getStmtForIndex p =
+            let (ndx,b) = 
+                match p with
+                | plan.q.Plan (ndx,b) -> (ndx,b)
+
+            //printfn "ndx: %A" ndx
+            //printfn "bounds: %A" b
+
             let tblColl = getTableNameForCollection ndx.db ndx.coll
             let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
+            let (normspec,weights) = getNormalizedSpec ndx
 
             let f_min kmin = 
                 let sql_min = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k >= ?" tblColl tblIndex
@@ -464,74 +560,36 @@ module kv =
 
             match b with
             | plan.bounds.Text (eq,search) ->
-                //let BDocument [| (k,_) |] = ndx.spec
                 let words = search.Split(' ') // TODO tokenize properly
                 let words = words |> Set.ofArray |> Set.toArray
                 // TODO this is kinda wrong.  assume each index entries is a term followed by a numeric weight.
-                // calculate the bounds.  sort the words lexicographically.  the lower bound is the first
+                // calculate the bounds:  sort the words lexicographically.  the lower bound is the first
                 // word.  the upper bound is the last word.  (append low and high weight as well?)
                 // fetch all keys between those bounds and then let the matcher do the rest of the work.
+                Array.sortInPlace words // TODO wrong
                 let minword = Array.get words 0 // TODO wrong
                 let maxword = Array.get words 0 // TODO wrong
-                let kmin = [| BString minword |] |> Array.append eq |> getDirs ndx.spec |> bson.encodeMultiForIndex
-                let kmax = [| BString maxword |] |> Array.append eq |> getDirs ndx.spec |> bson.encodeMultiForIndex
+                // it is possible that minword = maxword
+                let vmin = BArray [| (BString minword); (BInt32 0) |]
+                let vmax = BArray [| (BString maxword); (BInt32 100000) |]
+                let vals = getDirs normspec eq
+                let kmin = [| (vmin,false) |] |> Array.append vals |> bson.encodeMultiForIndex
+                //printfn "kmin: %A" kmin
+                let kmax = [| (vmax,false)|] |> Array.append vals |> bson.encodeMultiForIndex
+                //printfn "kmax: %A" kmax
                 (kmin,kmax) |> f_both
             | plan.bounds.Min vals ->
-                vals |> getDirs ndx.spec |> bson.encodeMultiForIndex |> f_min
+                vals |> getDirs normspec |> bson.encodeMultiForIndex |> f_min
             | plan.bounds.Max vals ->
-                vals |> getDirs ndx.spec |> bson.encodeMultiForIndex |> f_max
+                vals |> getDirs normspec |> bson.encodeMultiForIndex |> f_max
             | plan.bounds.EQ vals ->
-                let kmin = vals |> getDirs ndx.spec |> bson.encodeMultiForIndex
+                let kmin = vals |> getDirs normspec |> bson.encodeMultiForIndex
                 let kmax = add_one kmin
                 (kmin,kmax) |> f_both
-            | plan.bounds.Min_Max (eq,vmin,vmax) ->
-                let kmin = [| vmin |] |> Array.append eq |> getDirs ndx.spec |> bson.encodeMultiForIndex
-                let kmax = [| vmax |] |> Array.append eq |> getDirs ndx.spec |> bson.encodeMultiForIndex
+            | plan.bounds.Min_Max (minvals,maxvals) ->
+                let kmin = minvals |> getDirs normspec |> bson.encodeMultiForIndex
+                let kmax = maxvals |> getDirs normspec |> bson.encodeMultiForIndex
                 (kmin,kmax) |> f_both
-
-        let getStmtForIndex ndxu =
-            match ndxu with
-            | plan.SimpleText (ndx,search) ->
-                //let BDocument [| (k,_) |] = ndx.spec
-                let tblColl = getTableNameForCollection ndx.db ndx.coll
-                let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
-                let words = search.Split(' ') // TODO tokenize properly
-                let words = words |> Set.ofArray |> Set.toArray
-                let placeholders = Array.create (Array.length words) "?" |> String.concat ","
-                let sql = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k IN (%s)" tblColl tblIndex placeholders
-                let stmt = conn.prepare(sql)
-                Array.iteri (fun i s ->
-                    let k = [| BString s |] |> getDirs ndx.spec |> bson.encodeMultiForIndex
-                    stmt.bind_blob(i+1, k)
-                ) words
-                stmt
-            | plan.One (op,ndx,vals) ->
-                // vals are already in the same order as the keys in the index
-                let tblColl = getTableNameForCollection ndx.db ndx.coll
-                let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
-                let strop = 
-                    match op with
-                    | plan.EQ -> "="
-                    | plan.LT -> "<"
-                    | plan.GT -> ">"
-                    | plan.LTE -> "<="
-                    | plan.GTE -> ">="
-                let sql = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ?" tblColl tblIndex strop
-                let stmt = conn.prepare(sql)
-                let k = vals |> getDirs ndx.spec |> bson.encodeMultiForIndex
-                stmt.bind_blob(1, k)
-                stmt
-            | plan.GTE_LT (ndx,minvals,maxvals) ->
-                // vals are already in the same order as the keys in the index
-                let tblColl = getTableNameForCollection ndx.db ndx.coll
-                let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
-                let sql = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k >= ? AND k < ?" tblColl tblIndex
-                let stmt = conn.prepare(sql)
-                let kmin = minvals |> getDirs ndx.spec |> bson.encodeMultiForIndex
-                let kmax = maxvals |> getDirs ndx.spec |> bson.encodeMultiForIndex
-                stmt.bind_blob(1, kmin)
-                stmt.bind_blob(2, kmax)
-                stmt
 
         let getSeq tx db coll plan =
             match getCollectionOptions db coll with
@@ -586,7 +644,7 @@ module kv =
             let find_rowid id =
                 match opt_stmt_find_rowid with
                 | Some stmt_find_rowid ->
-                    let idk = bson.encodeOneForIndex id bson.IndexType.Forward
+                    let idk = bson.encodeOneForIndex id false
                     stmt_find_rowid.clear_bindings()
                     stmt_find_rowid.bind_blob(1, idk)
                     let rowid = 
@@ -606,11 +664,11 @@ module kv =
                     stmt_delete.step_done()
                     stmt_delete.reset()
 
-                    let vals = findIndexEntryVals info newDoc
+                    let (normspec,weights) = getNormalizedSpec info
 
                     let f k = indexInsertStep stmt_insert k doc_rowid
 
-                    encodeIndexEntries vals f
+                    encodeIndexEntries newDoc normspec weights f
                 ) index_stmts
 
             let to_bson newDoc =

@@ -22,6 +22,12 @@ module crud =
     open System
     open System.IO
 
+    type private opIneq =
+        | LT
+        | GT
+        | LTE
+        | GTE
+
     let private validateKeys doc =
         let rec f doc depth =
             match doc with
@@ -143,142 +149,89 @@ module crud =
                 else None
               )
 
-    // this will find any text index, even if it is a compound index
-    let private findTextIndex indexes =
-        let a = 
-            Array.choose (fun ndx ->
-                //printfn "considering %A" ndx
-                match ndx.spec with
-                | BDocument pairs -> 
-                    if Array.exists (fun (_,v) -> bson.decodeIndexType v = bson.IndexType.Text) pairs then
-                        Some ndx
-                    else
-                        None
-                | _ -> failwith "index spec must be a doc"
-            ) indexes
-        if Array.length a = 0 then None
-        else if Array.length a > 1 then failwith "only one text index allowed per collection"
-        else a.[0] |> Some
-
-    // TODO:
-    // all this index find code isn't quite right yet.  which for now is
-    // fine because we can't actually figure out how to use a compound
-    // index from a query anyway.  but when we do, we'll need to, for
-    // example, not expect the index spec to be in a certain order.
-    //
-    // and currently each call to findExactIndex expects an array of
-    // (key,IndexNeed) pairs, as if we could use this code to look
-    // for compound indexes which involve both scalars and say, text
-    // or geo.  this probably isn't true, so we might end up going
-    // back to the way this code was before, which was scalar-specific
-    // and just matching on keys, while having text and geo indexes
-    // get matched in a different way.  not sure yet.
-
-    type private IndexNeed =
-        | Scalar
-        | Text
-        | Geo2d
-
-    let private indexFits have need =
-        Array.forall2 (fun (k1,typ) (k2,tneed) ->
-            if k1<>k2 then
-                false
-            else
-                match tneed with
-                | IndexNeed.Scalar ->
-                    match typ with
-                    | bson.IndexType.Forward -> true
-                    | bson.IndexType.Backward -> true
-                    | _ -> false
-                | IndexNeed.Text -> typ = bson.IndexType.Text
-                | IndexNeed.Geo2d -> typ = bson.IndexType.Geo2d
-        ) have need
-
-    // TODO:  at query time, all text indexes result
-    // in one search term, and it must be at the end.  in a compound
-    // index, nothing after a text index can be used, right?  maybe
-    // Mongo allows stuff after so that it can be used as a covering
-    // index?
-
     let private tryFitIndexToQuery ndx comps_eq comps_ineq textQuery =
-        match ndx.spec with
-        | BDocument pairs ->
-            let decoded = Array.map (fun (k,v) -> (k, bson.decodeIndexType v)) pairs
-            // see if this is a text index
-            let text = Array.tryFindIndex (fun (k,typ) -> bson.IndexType.Text = typ) decoded
-            match (text,textQuery) with
-            | (None,Some _) -> 
-                // if there is a textQuery but this is not a text index, give up now
-                None
-            | _ ->
-                // if there is a text index, chop it off, along with everything after it.
-                // TODO this code assumes that everything is either scalar or text, which
-                // will be wrong when geo comes along.
-                let scalar_keys = 
-                    match text with
-                    | Some i -> Array.sub decoded 0 i
-                    | None -> decoded
-                let num_scalar_keys = Array.length scalar_keys
-                if num_scalar_keys=0 then
-                    match text with
-                    | Some _ ->
-                        // just a text index
-                        match textQuery with
-                        | None ->
-                            // if there is no textQuery, give up
-                            None
-                        | Some tq ->
-                            (ndx, plan.bounds.Text (Array.empty,tq)) |> Some
+        let (scalar_keys,weights) = kv.getNormalizedSpec ndx
+        match (weights,textQuery) with
+        | (None,Some _) -> 
+            // if there is a textQuery but this is not a text index, give up now
+            None
+        | _ ->
+            // TODO this code assumes that everything is either scalar or text, which
+            // will be wrong when geo comes along.
+            let num_scalar_keys = Array.length scalar_keys
+            if num_scalar_keys=0 then
+                match weights with
+                | Some _ ->
+                    // just a text index
+                    match textQuery with
                     | None ->
-                        // er, why are we here?
-                        failwith "index with no keys?"
-                else
-                    // we have some scalar keys, and maybe a text index after it.
-                    // for every scalar key, find comparisons from the query.
-                    let matching_ineqs = Array.map (fun (k,_) -> Array.choose (fun (op,km,v) -> if k=km then Some (op,v) else None) comps_ineq) scalar_keys
-                    let matching_eqs = Array.map (fun (k,_) -> Array.choose (fun (km,v) -> if k=km then Some v else None) comps_eq) scalar_keys
-                    let first_no_eqs = Array.tryFindIndex (fun acomps -> 0 = Array.length acomps) matching_eqs
+                        // if there is no textQuery, give up
+                        None
+                    | Some tq ->
+                        (ndx, plan.bounds.Text (Array.empty,tq)) |> Some
+                | None ->
+                    // er, why are we here?
+                    failwith "index with no keys?"
+            else
+                // we have some scalar keys, and maybe a text index after it.
+                // for every scalar key, find comparisons from the query.
+                let matching_ineqs = Array.map (fun (k,_) -> Array.choose (fun (op,km,v) -> if k=km then Some (op,v) else None) comps_ineq) scalar_keys
+                let matching_eqs = Array.map (fun (k,_) -> Array.choose (fun (km,v) -> if k=km then Some v else None) comps_eq) scalar_keys
+                let first_no_eqs = Array.tryFindIndex (fun acomps -> 0 = Array.length acomps) matching_eqs
 
-                    // fail if our matcher has something like 
-                    // (a=3) && (a=5)
-                    // TODO this seems like the wrong place to do this check.
-                    // and we should be doing other checks, like
-                    // (a<0) && (a>0)
-                    // or
-                    // (a=5) && (a<4)
-                    // and we should maybe eliminate redundant checks like
-                    // (a<4) && (a<7)
-                    // but still, this seems like the wrong place for this.
-                    // because if it's here, then it will get checked on every
-                    // index.  and if there are no indexes, it won't get checked
-                    // at all.
+                // fail if our matcher has something like 
+                // (a=3) && (a=5)
+                // TODO this seems like the wrong place to do this check.
+                // and we should be doing other checks, like
+                // (a<0) && (a>0)
+                // or
+                // (a=5) && (a<4)
+                // and we should maybe eliminate redundant checks like
+                // (a<4) && (a<7)
+                // but still, this seems like the wrong place for this.
+                // because if it's here, then it will get checked on every
+                // index.  and if there are no indexes, it won't get checked
+                // at all.
 
-                    if Array.exists (fun acomps -> 
+                let inconsistent_eq =
+                    Array.exists (fun acomps -> 
                         let distinct = acomps |> Set.ofArray |> Set.toArray
                         (Array.length distinct > 1)
-                    ) matching_eqs then
-                        failwith "matcher has something eq multiple different values"
+                    ) matching_eqs
+                if inconsistent_eq then
+                    failwith "matcher has something eq multiple different values"
 
-                    let matching_eqs = Array.map (fun acomps -> Array.get acomps 0) matching_eqs
-
-                    match textQuery with
-                    | Some tq ->
-                        match first_no_eqs with
-                        | Some _ ->
-                            // if there is a text index, we need an EQ for every scalar key.
-                            // so this won't work.
-                            None
-                        | None ->
-                            // we have an EQ for every key.  this index will work.
-                            (ndx, plan.bounds.Text (matching_eqs, tq)) |> Some
+                // chop matching_eqs down to the stuff that actually matched, with only one item each
+                let matching_eqs = 
+                    match first_no_eqs with
+                    | Some n ->
+                        let a = Array.sub matching_eqs 0 n
+                        Array.map (fun acomps -> Array.get acomps 0) a
                     | None ->
-                        // there is no text query.  note that this might still be a text index,
-                        // but at this point we don't care.  we are considering whether we can
-                        // use the scalar keys to the left of the text index.
-                        let num_eq = 
-                            match first_no_eqs with
-                            | None -> num_scalar_keys
-                            | Some num_eq -> num_eq
+                        Array.map (fun acomps -> Array.get acomps 0) matching_eqs
+
+                match textQuery with
+                | Some tq ->
+                    match first_no_eqs with
+                    | Some _ ->
+                        // if there is a text index, we need an EQ for every scalar key.
+                        // so this won't work.
+                        None
+                    | None ->
+                        // we have an EQ for every key.  this index will work.
+                        (ndx, plan.bounds.Text (matching_eqs, tq)) |> Some
+                | None ->
+                    // there is no text query.  note that this might still be a text index,
+                    // but at this point we don't care.  we are considering whether we can
+                    // use the scalar keys to the left of the text index.
+                    match first_no_eqs with
+                    | None -> 
+                        if Array.length matching_eqs > 0 then
+                            (ndx, plan.bounds.EQ matching_eqs) |> Some
+                        else
+                            // we can't use this index at all.
+                            None
+                    | Some num_eq ->
                         let ineq = matching_ineqs.[num_eq]
                         let num_ineq = Array.length ineq
                         if num_ineq = 0 then
@@ -291,14 +244,14 @@ module crud =
                             let (op,v) = Array.get ineq 0
                             let vals = Array.append matching_eqs [| v |]
                             match op with
-                            | plan.opIneq.GT | plan.opIneq.GTE ->
+                            | opIneq.GT | opIneq.GTE ->
                                 (ndx, plan.bounds.Min vals) |> Some
-                            | plan.opIneq.LT | plan.opIneq.LTE ->
+                            | opIneq.LT | opIneq.LTE ->
                                 (ndx, plan.bounds.Max vals) |> Some
                         else
-                            // TODO figure this out properly when there are multiples
-                            let cmin = Array.tryFind (fun (op,v) -> op=plan.opIneq.GT || op=plan.opIneq.GTE) ineq
-                            let cmax = Array.tryFind (fun (op,v) -> op=plan.opIneq.LT || op=plan.opIneq.LTE) ineq
+                            // TODO figure this out properly when there are > 2 comps
+                            let cmin = Array.tryFind (fun (op,v) -> op=opIneq.GT || op=opIneq.GTE) ineq
+                            let cmax = Array.tryFind (fun (op,v) -> op=opIneq.LT || op=opIneq.LTE) ineq
                             match (cmin,cmax) with
                             | None,None ->
                                 None
@@ -309,47 +262,22 @@ module crud =
                                 let vals = Array.append matching_eqs [| vmax |]
                                 (ndx, plan.bounds.Max vals) |> Some
                             | Some (_,vmin),Some (_,vmax) ->
-                                (ndx, plan.bounds.Min_Max (matching_eqs,vmin,vmax)) |> Some
+                                let minvals = Array.append matching_eqs [| vmin |]
+                                let maxvals = Array.append matching_eqs [| vmax |]
+                                (ndx, plan.bounds.Min_Max (minvals,maxvals)) |> Some
 
-        | _ -> failwith "index spec must be a doc"
-
-    let private findExactIndex indexes a =
+    let private findIndexForMinMax indexes a =
         //printfn "indexes: %A" indexes
         //printfn "keys: %A" a
         Array.tryFind (fun ndx ->
-            //printfn "considering %A" ndx
-            match ndx.spec with
-            | BDocument pairs -> 
-                if Array.length pairs = Array.length a then
-                    let decoded =
-                        Array.map (fun (k,v) ->
-                            (k, bson.decodeIndexType v)
-                        ) pairs
-                    indexFits decoded a
-                else
-                    false
-            | _ -> failwith "index spec must be a doc"
-        ) indexes
-
-    let private findPrefixIndex indexes a =
-        //printfn "indexes: %A" indexes
-        //printfn "keys: %A" a
-        Array.tryFind (fun ndx ->
-            match ndx.spec with
-            | BDocument pairs ->
-                let len = Array.length a
-                if Array.length pairs < len then
-                    false
-                else
-                    // by trimming the index here, EQ will never match
-                    let pairs = Array.sub pairs 0 len
-                    let decoded =
-                        Array.map (fun (k,v) ->
-                            (k, bson.decodeIndexType v)
-                        ) pairs
-                    indexFits decoded a
-            | _ ->
-                failwith "index spec must be a doc"
+            let (normspec,weights) = kv.getNormalizedSpec ndx
+            let len = Array.length a
+            if Array.length normspec < len then
+                false
+            else
+                let pairs = Array.sub normspec 0 len
+                let decoded = Array.map (fun (k,v) -> k) pairs
+                decoded = a
         ) indexes
 
     let private findTextQuery m =
@@ -388,123 +316,50 @@ module crud =
             // TODO what if a Compare has multiple items in it?
             Array.choose (fun it ->
                 match it with
-                | Compare (k, [| Pred.LT v |]) -> Some (plan.opIneq.LT,k,v)
-                | Compare (k, [| Pred.GT v |]) -> Some (plan.opIneq.GT,k,v)
-                | Compare (k, [| Pred.LTE v |]) -> Some (plan.opIneq.LTE,k,v)
-                | Compare (k, [| Pred.GTE v |]) -> Some (plan.opIneq.GTE,k,v)
+                | Compare (k, [| Pred.LT v |]) -> Some (opIneq.LT,k,v)
+                | Compare (k, [| Pred.GT v |]) -> Some (opIneq.GT,k,v)
+                | Compare (k, [| Pred.LTE v |]) -> Some (opIneq.LTE,k,v)
+                | Compare (k, [| Pred.GTE v |]) -> Some (opIneq.GTE,k,v)
                 | _ -> None
             ) a
-
-    let private findUsableCompares m =
-        match m with
-        | QueryDoc a ->
-            // TODO only compares in the top level of the query?
-            // TODO dive into AND?  OR?
-            // TODO what if a Compare has multiple items in it?
-            Array.choose (fun it ->
-                match it with
-                | Compare (k, [| Pred.EQ v |]) -> Some (plan.op1.EQ,k,v)
-                | Compare (k, [| Pred.LT v |]) -> Some (plan.op1.LT,k,v)
-                | Compare (k, [| Pred.GT v |]) -> Some (plan.op1.GT,k,v)
-                | Compare (k, [| Pred.LTE v |]) -> Some (plan.op1.LTE,k,v)
-                | Compare (k, [| Pred.GTE v |]) -> Some (plan.op1.GTE,k,v)
-                | _ -> None
-            ) a
-
-    let private findIndexPreferExact indexes a =
-        //printfn "findIndexPreferExact: %A" a
-        match findExactIndex indexes a with
-        | Some ndx -> Some ndx
-        | None ->
-            //printfn "exact not found"
-            match findPrefixIndex indexes a with
-            | Some ndx -> Some ndx
-            | None -> None
-
-    let private findPossibleIndexes indexes comps =
-        Array.choose (fun (op,k,v) ->
-            match op with
-            | plan.EQ -> 
-                // only an exact index will suffice
-                match findExactIndex indexes [| (k,IndexNeed.Scalar) |] with
-                | Some ndx -> (op,k,ndx,[| v |]) |> Some
-                | None -> None
-            // TODO might need an exact index for LTE and GTE as well, right?
-            | _ ->
-                // prefer an exact index if there is one
-                match findIndexPreferExact indexes [| (k,IndexNeed.Scalar) |] with
-                | Some ndx -> (op,k,ndx,[| v |]) |> Some
-                | None ->
-                    match findPrefixIndex indexes [| (k,IndexNeed.Scalar) |] with
-                    | Some ndx -> (op,k,ndx,[| v |]) |> Some
-                    | None -> None
-        ) comps
 
     let private findFitIndexes indexes m =
         let textQuery = findTextQuery m
         let comps_eq = findComparesEQ m
         let comps_ineq = findComparesIneq m
-        Array.choose (fun ndx ->
-            match tryFitIndexToQuery ndx comps_eq comps_ineq textQuery with
-            | Some fit -> (ndx, fit) |> Some
-            | None -> None
-        ) indexes
+        Array.choose (fun ndx -> tryFitIndexToQuery ndx comps_eq comps_ineq textQuery) indexes
 
     let private chooseFromPossibles possibles =
         if Array.isEmpty possibles then 
             None
         else
             // prefer the _id index if we can use it
-            match Array.tryFind (fun (op,k,ndx,vals) -> op=plan.EQ && k="_id") possibles with
-            | Some (op,k,ndx,vals) -> (op,ndx,vals) |> Some
+            match Array.tryFind (fun (ndx,fit) -> ndx.ndx="_id_") possibles with
+            | Some r -> r |> plan.q.Plan |> Some
             | None ->
                 // TODO otherwise prefer any unique index
-                // otherwise prefer any EQ index
-                match Array.tryFind (fun (op,k,ndx,vals) -> op=plan.EQ) possibles with
-                | Some (op,k,ndx,vals) -> (op,ndx,vals) |> Some
-                | None ->
-                    // otherwise any index at all.  just take the first one.
-                    let (op,k,ndx,vals) = possibles.[0]
-                    (op,ndx,vals) |> Some
+                // TODO otherwise prefer any EQ index
+                // TODO or any index which has both min_max bounds
+                // otherwise any index at all.  just take the first one.
+                possibles.[0] |> plan.q.Plan |> Some
 
     let private chooseIndex indexes m hint =
+        let fits = findFitIndexes indexes m
+
         match findTextQuery m with
         | Some s ->
             // TODO if there is a $text query, disallow hint
-            match findTextIndex indexes with
-            | Some ndx ->
-                match ndx.spec with
-                | BDocument keys ->
-                    if Array.length keys > 1 then
-                        // docs say:
-                        // If the compound text index includes keys preceding
-                        // the text index key, to perform a $text search, the
-                        // query predicate must include equality match
-                        // conditions on the preceding keys.
-                        failwith "TODO learn how to deal with a compound index with text"
-                    else
-                        plan.SimpleText (ndx,s) |> Some
-            | None -> 
-                failwith "$text without index"
+            match fits with
+            | [|   |]  -> failwith "$text without index"
+            | [| r |] -> plan.q.Plan r |> Some
+            | _ -> failwith "should not happen"
         | None ->
-            let comps = findUsableCompares m
-            let possibles = findPossibleIndexes indexes comps
-            //printfn "m: %A" m
-            //printfn "possibles: %A" possibles
-            
             match hint with
             | Some ndxHint ->
-                match Array.tryFind (fun (op,k,ndx,vals) -> ndx.spec=ndxHint.spec) possibles with
-                | Some (op,k,ndx,vals) -> 
-                    (op,ndx,vals) |> plan.One |> Some
-                | None ->
-                    match chooseFromPossibles possibles with
-                    | Some p -> p |> plan.One |> Some
-                    | None ->  None
-            | None ->
-                match chooseFromPossibles possibles with
-                | Some p -> p |> plan.One |> Some
-                | None ->  None
+                match Array.tryFind (fun (ndx,fit) -> ndx.spec=ndxHint.spec) fits with
+                | Some r -> r |> plan.q.Plan |> Some
+                | None -> chooseFromPossibles fits
+            | None -> chooseFromPossibles fits
 
     let private getOneMatch w m =
         let {docs=s;funk=funk} = w.getSelect None // TODO choose an index
@@ -1855,9 +1710,6 @@ module crud =
             | Some desc -> tryFindIndexByNameOrSpec dbName collName indexes desc
             | None -> None
 
-        // TODO is a prefix index really okay here for the min side, which is
-        // inclusive, ie GTE?  or does it need an exact index because of the E?
-        
         let plan = 
             match (mods.min,mods.max) with
             | Some vmin, Some vmax -> 
@@ -1865,32 +1717,29 @@ module crud =
                 let amax = parseIndexMinMax vmax
                 if Array.length amin <> Array.length amax then failwith "different"
                 let keys = Array.map (fun (k,v) -> k) amin
-                let need = Array.map (fun (k,v) -> (k,IndexNeed.Scalar)) amin
                 if Array.map (fun (k,v) -> k) amax <> keys then failwith "different"
                 let minvals = Array.map (fun (k,v) -> v) amin
                 let maxvals = Array.map (fun (k,v) -> v) amax
-                match findIndexPreferExact indexes need with
-                | Some ndx -> plan.GTE_LT (ndx,minvals,maxvals) |> Some
+                match findIndexForMinMax indexes keys with
+                | Some ndx -> (ndx,plan.bounds.Min_Max(minvals,maxvals)) |> plan.q.Plan |> Some
                 | None -> failwith "index not found" // TODO or None
             | Some vmin, None ->
                 let amin = parseIndexMinMax vmin
                 let keys = Array.map (fun (k,v) -> k) amin
-                let need = Array.map (fun (k,v) -> (k,IndexNeed.Scalar)) amin
                 let minvals = Array.map (fun (k,v) -> v) amin
-                match findIndexPreferExact indexes need with
-                | Some ndx -> plan.One (plan.GTE,ndx,minvals) |> Some
+                match findIndexForMinMax indexes keys with
+                | Some ndx -> (ndx,plan.bounds.Min(minvals)) |> plan.q.Plan |> Some
                 | None -> failwith "index not found" // TODO or None
             | None, Some vmax ->
                 let amax = parseIndexMinMax vmax
                 let keys = Array.map (fun (k,v) -> k) amax
-                let need = Array.map (fun (k,v) -> (k,IndexNeed.Scalar)) amax
                 let maxvals = Array.map (fun (k,v) -> v) amax
-                match findIndexPreferExact indexes need with
-                | Some ndx -> plan.One (plan.LT,ndx,maxvals) |> Some
+                match findIndexForMinMax indexes keys with
+                | Some ndx -> (ndx,plan.bounds.Max(maxvals)) |> plan.q.Plan |> Some
                 | None -> failwith "index not found" // TODO or None
             | None,None -> 
-                chooseIndex indexes m hint
-                // None
+                // chooseIndex indexes m hint
+                None
 
         let {docs=s;funk=funk} = getSelectWithClose dbName collName plan
         try

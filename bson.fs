@@ -192,21 +192,6 @@ module bson =
 
     open System
 
-    type IndexType =
-        | Forward
-        | Backward
-        | Text
-        | Geo2d
-
-    let decodeIndexType v =
-        match v with
-        | BInt32 n -> if n<0 then IndexType.Backward else IndexType.Forward
-        | BInt64 n -> if n<0L then IndexType.Backward else IndexType.Forward
-        | BDouble n -> if n<0.0 then IndexType.Backward else IndexType.Forward
-        | BString "text" -> IndexType.Text
-        | BString "2d" -> IndexType.Geo2d
-        | _ -> failwith (sprintf "index type: %A" v)
-
     let splitname (s:string) =
         let dot = s.IndexOf('.')
         if dot<0 then failwith "bad namespace"
@@ -559,6 +544,12 @@ module bson =
         | BDateTime n -> encodeInt64ForIndexInto w n
         | BTimeStamp n -> w.WriteInt64BigEndian(n) // TODO er, how to encode this?
         | BDocument pairs ->
+            // TODO is writing the length here what we want?
+            // it means we can't match on a prefix of a document
+            //
+            // it means any document with 3 pairs will sort before 
+            // any document with 4 pairs, even if the first 3 pairs
+            // are the same in both.
             w.WriteInt32BigEndian(pairs.Length)
             Array.iter (fun (k:string,v) ->
                 w.WriteBytes(System.Text.Encoding.UTF8.GetBytes (k))
@@ -566,6 +557,8 @@ module bson =
                 encodeForIndexInto w v
             ) pairs
         | BArray a ->
+            // TODO is writing the length here what we want?
+            // see comment on BDocument just above.
             w.WriteInt32BigEndian(a.Length)
             Array.iter (fun v ->
                 encodeForIndexInto w v
@@ -589,32 +582,20 @@ module bson =
             w.WriteBytes(System.Text.Encoding.UTF8.GetBytes (s))
             w.WriteByte(0uy)
 
-    let encodeOneForIndex bv typ =
+    let encodeOneForIndex bv neg =
         let w = BinWriter()
-        match typ with
-        | IndexType.Forward ->
-            encodeForIndexInto w bv
-            w.ToArray()
-        | IndexType.Backward -> 
-            encodeForIndexInto w bv
-            let a = w.ToArray()
+        encodeForIndexInto w bv
+        let a = w.ToArray()
+        if neg then
             for i in 0 .. (Array.length a - 1) do
                 let b = a.[i]
                 a.[i] <- ~~~b
-            a
-        | IndexType.Text ->
-            // TODO could assert that bv is a string 
-            // TODO needs to be last
-            // TODO put weight in just after the term
-            encodeForIndexInto w bv
-            w.ToArray()
-        | IndexType.Geo2d -> 
-            Array.empty // TODO
+        a
 
     let encodeMultiForIndex a =
         let w = BinWriter()
-        Array.iter (fun (v,typ) -> 
-            let a = encodeOneForIndex v typ
+        Array.iter (fun (v,neg) -> 
+            let a = encodeOneForIndex v neg
             w.WriteBytes(a)
         ) a
         w.ToArray()
