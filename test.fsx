@@ -15,10 +15,15 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *)
 
-// ability to use an index for sorting
+// implement the matcher part of $text
 //
-// chooseIndex should be smart enough to combine expressions to
-// use a compound index
+// proper tokenize for text index
+//
+// probably bug: 2 text indexes, same weight, common words, unique constraint violation
+//
+// should weight be a double instead of an int?
+//
+// ability to use an index for sorting
 //
 // chooseIndex: dive into AND?
 //
