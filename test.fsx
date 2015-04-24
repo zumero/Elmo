@@ -15,8 +15,6 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *)
 
-// fix the array index n*m problem
-//
 // implement the matcher part of $text
 //
 // proper tokenize for text index
@@ -87,6 +85,9 @@
 // no test case for $orderby int?  see sortFunc.
 //
 // should count (and maybe distinct) map onto the agg pipeline?
+//
+// often it seems like this code uses arrays (instead of lists) way too much
+//
 
 open System
 open System.IO

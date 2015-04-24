@@ -448,6 +448,7 @@ module crud =
                 | BString "*" ->
                     Array.filter (fun info -> info.ndx<>"_id_") indexes    
                 | _ ->
+                    // TODO we're supposed to disallow delete of _id_, right?
                     match tryFindIndexByNameOrSpec db coll indexes index with
                     | Some info -> [| info |]
                     | None -> Array.empty

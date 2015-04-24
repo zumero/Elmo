@@ -172,82 +172,81 @@ module kv =
             //printfn "%A" r
             r
 
-    let private findIndexEntryVals normspec doc =
-        //printfn "spec: %A" spec
-        //printfn "doc: %A" doc
-        Array.map (fun (k,typ) ->
-            //printfn "k : %s" k
-            let v = bson.findPath doc k
-            //printfn "findPath: k = %A" k
-            //printfn "findPath: v = %A" v
-
-            // now we replace any BUndefined with BNull.  this seems, well,
-            // kinda wrong, as it effectively encodes the index entries to
-            // contain information that is slightly incorrect, since BNull
-            // means "it was present and explicitly null", whereas BUndefined
-            // means "it was absent".  Still, this appears to be the exact
-            // behavior of Mongo.  Note that this only affects index entries.
-            // The matcher can and must still distinguish between null and
-            // undefined.
-
-            // TODO should the following be done differently if the index is sparse?
-            let v = bson.replaceUndefined v
-
-            let neg = IndexType.Backward=typ
-            (v,neg)
-        ) normspec
-
     let replaceArrayElement vals i v =
         let a = Array.copy vals
         a.[i] <- v
         a
 
-    let private doEncode vals newDoc weights f =
-        match weights with
-        | Some weights ->
-            Map.iter (fun k w ->
-                match bson.findPath newDoc k with
-                | BUndefined -> ()
-                | v ->
-                    match v with
-                    | BString s ->
-                        let a = s.Split(' ') // TODO tokenize properly
-                        let a = a |> Set.ofArray |> Set.toArray
-                        Array.iter (fun s ->
-                            let v = BArray [| (BString s); (BInt32 w) |]
-                            let vals = Array.append vals [| (v,false) |]
-                            bson.encodeMultiForIndex vals |> f
-                        ) a
-                    | _ -> () // no index entry unless it's a string 
-            ) weights
-        | None ->
-            //printfn "doEncode: %A" vals
-            bson.encodeMultiForIndex vals |> f
+    let private getIndexEntries newDoc normspec weights f =
+        let findIndexEntryVals normspec doc =
+            //printfn "spec: %A" spec
+            //printfn "doc: %A" doc
+            Array.map (fun (k,typ) ->
+                //printfn "k : %s" k
+                let v = bson.findPath doc k
+                //printfn "findPath: k = %A" k
+                //printfn "findPath: v = %A" v
 
-    let private encodeIndexEntries newDoc normspec weights f =
+                // now we replace any BUndefined with BNull.  this seems, well,
+                // kinda wrong, as it effectively encodes the index entries to
+                // contain information that is slightly incorrect, since BNull
+                // means "it was present and explicitly null", whereas BUndefined
+                // means "it was absent".  Still, this appears to be the exact
+                // behavior of Mongo.  Note that this only affects index entries.
+                // The matcher can and must still distinguish between null and
+                // undefined.
+
+                // TODO should the following be done differently if the index is sparse?
+                let v = bson.replaceUndefined v
+
+                let neg = IndexType.Backward=typ
+                (v,neg)
+            ) normspec
+
+        let maybeText vals newDoc weights f =
+            match weights with
+            | Some weights ->
+                Map.iter (fun k w ->
+                    match bson.findPath newDoc k with
+                    | BUndefined -> ()
+                    | v ->
+                        match v with
+                        | BString s ->
+                            let a = s.Split(' ') // TODO tokenize properly
+                            let a = a |> Set.ofArray |> Set.toArray
+                            Array.iter (fun s ->
+                                let v = BArray [| (BString s); (BInt32 w) |]
+                                let vals = Array.append vals [| (v,false) |]
+                                vals |> f
+                            ) a
+                        | _ -> () // no index entry unless it's a string 
+                ) weights
+            | None ->
+                //printfn "maybeText: %A" vals
+                vals |> f
+
+        let rec maybeArray newDoc vals weights f =
+            // first do the index entries for the document without considering arrays
+            maybeText vals newDoc weights f 
+
+            // now, if any of the vals in the key are an array, we need
+            // to generate more index entries for this document, one
+            // for each item in the array.  Mongo calls this a
+            // multikey index.
+
+            Array.iteri (fun i (v,typ) ->
+                match v with
+                | BArray a ->
+                    let a = a |> Set.ofArray |> Set.toArray
+                    Array.iter (fun av ->
+                        let replaced = replaceArrayElement vals i (av,typ)
+                        maybeArray newDoc replaced weights f 
+                    ) a
+                | _ -> ()
+            ) vals
+
         let vals = findIndexEntryVals normspec newDoc
-
-        // first do the index entries for the document without considering arrays
-        doEncode vals newDoc weights f 
-
-        // now, if any of the vals in the key are an array, we need
-        // to generate more index entries for this document, one
-        // for each item in the array.  Mongo calls this a
-        // multikey index.
-
-        // TODO if there is more than one array, we need to recurse here
-        // and add an entry for all combinations as well.
-
-        Array.iteri (fun i (v,typ) ->
-            match v with
-            | BArray a ->
-                let a = a |> Set.ofArray |> Set.toArray
-                Array.iter (fun av ->
-                    let replaced = replaceArrayElement vals i (av,typ)
-                    doEncode replaced newDoc weights f 
-                ) a
-            | _ -> ()
-        ) vals
+        maybeArray newDoc vals weights f
 
 
     // TODO special type for the pair db and coll
@@ -298,6 +297,7 @@ module kv =
             conn.prepare(sprintf "INSERT INTO \"%s\" (k,doc_rowid) VALUES (?,?)" tbl)
 
         let indexInsertStep (stmt_insert:sqlite3_stmt) k doc_rowid = 
+            //printfn "index key: %A" k
             stmt_insert.clear_bindings()
             stmt_insert.bind_blob(1, k)
             stmt_insert.bind_int64(2, doc_rowid)
@@ -377,11 +377,16 @@ module kv =
                     let doc_rowid = stmt2.column_int64(0)
                     let newDoc = stmt2.column_blob(1) |> BinReader.ReadDocument
 
-                    let f k = 
-                        //printfn "index key: %A" k
-                        indexInsertStep stmt_insert k doc_rowid
+                    let entries = ResizeArray<_>()
+                    let f vals = entries.Add(vals)
 
-                    encodeIndexEntries newDoc normspec weights f
+                    getIndexEntries newDoc normspec weights f
+
+                    let entries = entries.ToArray() |> Set.ofArray |> Set.toArray
+                    Array.iter (fun vals ->
+                        let k = bson.encodeMultiForIndex vals
+                        indexInsertStep stmt_insert k doc_rowid
+                    ) entries
                 true
 
         and createCollection db coll options =
@@ -743,6 +748,10 @@ module kv =
 
             let update_indexes doc_rowid newDoc =
                 Array.iter (fun (info,stmt_insert:sqlite3_stmt,stmt_delete:sqlite3_stmt) ->
+                    // so, when we update a very large document that has lots of index
+                    // entries, we delete all of them, and then add all new ones.  if
+                    // most of the index entries are actually the same, this is sad.
+
                     stmt_delete.clear_bindings()
                     stmt_delete.bind_int64(1, doc_rowid)
                     stmt_delete.step_done()
@@ -750,11 +759,18 @@ module kv =
 
                     let (normspec,weights) = getNormalizedSpec info
 
-                    let f k = 
-                        //printfn "index key: %A" k
-                        indexInsertStep stmt_insert k doc_rowid
+                    let entries = ResizeArray<_>()
 
-                    encodeIndexEntries newDoc normspec weights f
+                    let f vals = entries.Add(vals)
+
+                    getIndexEntries newDoc normspec weights f
+
+                    let entries = entries.ToArray() |> Set.ofArray |> Set.toArray
+                    Array.iter (fun vals ->
+                        let k = bson.encodeMultiForIndex vals
+                        indexInsertStep stmt_insert k doc_rowid
+                    ) entries
+
                 ) index_stmts
 
             let to_bson newDoc =
