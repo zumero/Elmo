@@ -22,10 +22,18 @@ module crud =
     open System
     open System.IO
 
-    type private opIneq =
+    type opIneq =
         | LT
         | GT
         | LTE
+        | GTE
+
+    type opL =
+        | LT
+        | LTE
+
+    type opG =
+        | GT
         | GTE
 
     let private validateKeys doc =
@@ -175,31 +183,22 @@ module crud =
             else
                 // we have some scalar keys, and maybe a text index after it.
                 // for every scalar key, find comparisons from the query.
-                let matching_ineqs = Array.map (fun (k,_) -> Array.choose (fun (op,km,v) -> if k=km then Some (op,v) else None) comps_ineq) scalar_keys
-                let matching_eqs = Array.map (fun (k,_) -> Array.choose (fun (km,v) -> if k=km then Some v else None) comps_eq) scalar_keys
+                let matching_ineqs = 
+                    Array.map (fun (k,_) -> 
+                        match Map.tryFind k comps_ineq with
+                        | Some a -> a
+                        | None -> (None,None)
+                    ) scalar_keys
+                let matching_eqs = 
+                    // TODO now we convert this back to where each element is
+                    // either an array of one item or an empty array.  this is
+                    // dorky.
+                    Array.map (fun (k,_) -> 
+                        match Map.tryFind k comps_eq with
+                        | Some a -> [| a |]
+                        | None -> Array.empty
+                    ) scalar_keys
                 let first_no_eqs = Array.tryFindIndex (fun acomps -> 0 = Array.length acomps) matching_eqs
-
-                // fail if our matcher has something like 
-                // (a=3) && (a=5)
-                // TODO this seems like the wrong place to do this check.
-                // and we should be doing other checks, like
-                // (a<0) && (a>0)
-                // or
-                // (a=5) && (a<4)
-                // and we should maybe eliminate redundant checks like
-                // (a<4) && (a<7)
-                // but still, this seems like the wrong place for this.
-                // because if it's here, then it will get checked on every
-                // index.  and if there are no indexes, it won't get checked
-                // at all.
-
-                let inconsistent_eq =
-                    Array.exists (fun acomps -> 
-                        let distinct = acomps |> Set.ofArray |> Set.toArray
-                        (Array.length distinct > 1)
-                    ) matching_eqs
-                if inconsistent_eq then
-                    failwith "matcher has something eq multiple different values"
 
                 // chop matching_eqs down to the stuff that actually matched, with only one item each
                 let matching_eqs = 
@@ -233,60 +232,38 @@ module crud =
                             None
                     | Some num_eq ->
                         let ineq = matching_ineqs.[num_eq]
-                        let num_ineq = Array.length ineq
-                        if num_ineq = 0 then
+                        match ineq with
+                        | (None,None) ->
                             if num_eq>0 then
                                 (ndx, plan.bounds.EQ matching_eqs) |> Some
                             else
                                 // we can't use this index at all.
                                 None
-                        else if num_ineq = 1 then
-                            let (op,v) = Array.get ineq 0
+                        | (Some min,None) ->
+                            let (op,v) = min
                             let vals = Array.append matching_eqs [| v |]
                             match op with
-                            | opIneq.GT ->  (ndx, plan.bounds.GT vals) |> Some
-                            | opIneq.GTE -> (ndx, plan.bounds.GTE vals) |> Some
-                            | opIneq.LT  -> (ndx, plan.bounds.LT vals) |> Some
-                            | opIneq.LTE -> (ndx, plan.bounds.LTE vals) |> Some
-                        else
-                            // TODO figure this out properly when there are >1 comp per kind
-                            let c_gt = Array.tryFind (fun (op,v) -> op=opIneq.GT) ineq
-                            let c_gte = Array.tryFind (fun (op,v) -> op=opIneq.GTE) ineq
-                            let c_lt = Array.tryFind (fun (op,v) -> op=opIneq.LT) ineq
-                            let c_lte = Array.tryFind (fun (op,v) -> op=opIneq.LTE) ineq
+                            | opG.GT ->  (ndx, plan.bounds.GT vals) |> Some
+                            | opG.GTE -> (ndx, plan.bounds.GTE vals) |> Some
+                        | (None,Some max) ->
+                            let (op,v) = max
+                            let vals = Array.append matching_eqs [| v |]
+                            match op with
+                            | opL.LT  -> (ndx, plan.bounds.LT vals) |> Some
+                            | opL.LTE -> (ndx, plan.bounds.LTE vals) |> Some
+                        | (Some min, Some max) ->
+                            // this can probably only happen when the comps came
+                            // from an elemMatch
+                            let (gtop,vmin) = min
+                            let (ltop,vmax) = max
 
-                            match (c_gt,c_gte,c_lt,c_lte) with
-                            | None,None,None,None ->
-                                None
-                            | Some (_,vmin),None,None,None ->
-                                let vals = Array.append matching_eqs [| vmin |]
-                                (ndx, plan.bounds.GT vals) |> Some
-                            | None,Some (_,vmin),None,None ->
-                                let vals = Array.append matching_eqs [| vmin |]
-                                (ndx, plan.bounds.GTE vals) |> Some
-                            | None,None,Some (_,vmax),None ->
-                                let vals = Array.append matching_eqs [| vmax |]
-                                (ndx, plan.bounds.LT vals) |> Some
-                            | None,None,None,Some (_,vmax) ->
-                                let vals = Array.append matching_eqs [| vmax |]
-                                (ndx, plan.bounds.LTE vals) |> Some
-                            | Some (_,vmin),None,Some (_,vmax),None ->
-                                let minvals = Array.append matching_eqs [| vmin |]
-                                let maxvals = Array.append matching_eqs [| vmax |]
-                                (ndx, plan.bounds.GT_LT (minvals,maxvals)) |> Some
-                            | Some (_,vmin),None,None,Some (_,vmax) ->
-                                let minvals = Array.append matching_eqs [| vmin |]
-                                let maxvals = Array.append matching_eqs [| vmax |]
-                                (ndx, plan.bounds.GT_LTE (minvals,maxvals)) |> Some
-                            | None,Some (_,vmin),Some (_,vmax),None ->
-                                let minvals = Array.append matching_eqs [| vmin |]
-                                let maxvals = Array.append matching_eqs [| vmax |]
-                                (ndx, plan.bounds.GTE_LT (minvals,maxvals)) |> Some
-                            | None,Some (_,vmin),None,Some (_,vmax) ->
-                                let minvals = Array.append matching_eqs [| vmin |]
-                                let maxvals = Array.append matching_eqs [| vmax |]
-                                (ndx, plan.bounds.GTE_LTE (minvals,maxvals)) |> Some
-                            // TODO there are other cases above, like GT and GTE both
+                            let minvals = Array.append matching_eqs [| vmin |]
+                            let maxvals = Array.append matching_eqs [| vmax |]
+                            match (gtop,ltop) with
+                            | opG.GT, opL.LT -> (ndx, plan.bounds.GT_LT (minvals,maxvals)) |> Some
+                            | opG.GT, opL.LTE -> (ndx, plan.bounds.GT_LTE (minvals,maxvals)) |> Some
+                            | opG.GTE, opL.LT -> (ndx, plan.bounds.GTE_LT (minvals,maxvals)) |> Some
+                            | opG.GTE, opL.LTE -> (ndx, plan.bounds.GTE_LTE (minvals,maxvals)) |> Some
 
     let private findIndexForMinMax indexes a =
         //printfn "indexes: %A" indexes
@@ -314,31 +291,178 @@ module crud =
         else a.[0] |> Some
 
     let private findComparesEQ m =
-        match m with
-        | QueryDoc a ->
-            // TODO only compares in the top level of the query?
-            // TODO dive into AND?  OR?
-            // TODO what if a Compare has multiple items in it?
-            Array.choose (fun it ->
-                match it with
-                | Compare (k, [| Pred.EQ v |]) -> Some (k,v)
-                | _ -> None
-            ) a
+        let rec find m =
+            match m with
+            | QueryDoc a ->
+                Array.collect (fun it ->
+                    match it with
+                    | Compare (k, a) -> 
+                        Array.choose (fun p ->
+                            match p with
+                            | Pred.EQ v -> Some (k,v)
+                            | _ -> None
+                        ) a
+                    | AND docs ->
+                        Array.collect (fun d -> find d) docs
+                    | _ -> Array.empty
+                ) a
+
+        let comps = find m
+        let mc = 
+            Array.fold (fun cur (k,v) ->
+                match Map.tryFind k cur with
+                | Some a ->
+                    let a = v :: a
+                    Map.add k a cur
+                | None ->
+                    Map.add k [v] cur
+            ) Map.empty comps
+        // query for x=3 && x=4 is legit in mongo.
+        // it can match a doc where x is an array that contains both 3 and 4
+        // {x:[1,2,3,4,5]}
+        // in terms of choosing an index to use, we can pick either one.
+        // the index will give us, for example, "all documents where x is 3",
+        // which will include the one above, and the matcher will then also
+        // make sure that the 4 is there as well.
+        let mc =
+            Map.fold (fun mc k a ->
+                match a with
+                | [] -> failwith "should never happen"
+                | x :: xs ->
+                    if List.isEmpty xs then
+                        Map.add k x mc
+                    else
+                        let distinct = a |> Set.ofList |> Set.toArray
+                        if Array.length distinct > 1 then
+                            //failwith "conflicting $eq"
+                            Map.add k x mc
+                        else
+                            Map.add k x mc
+            ) Map.empty mc
+        //printfn "map: %A" mc
+        mc
 
     let private findComparesIneq m =
-        match m with
-        | QueryDoc a ->
-            // TODO only compares in the top level of the query?
-            // TODO dive into AND?  OR?
-            // TODO what if a Compare has multiple items in it?
-            Array.choose (fun it ->
-                match it with
-                | Compare (k, [| Pred.LT v |]) -> Some (opIneq.LT,k,v)
-                | Compare (k, [| Pred.GT v |]) -> Some (opIneq.GT,k,v)
-                | Compare (k, [| Pred.LTE v |]) -> Some (opIneq.LTE,k,v)
-                | Compare (k, [| Pred.GTE v |]) -> Some (opIneq.GTE,k,v)
-                | _ -> None
-            ) a
+        let rec find m =
+            match m with
+            | QueryDoc a ->
+                Array.collect (fun it ->
+                    match it with
+                    | Compare (k, a) -> 
+                        Array.choose (fun p ->
+                            match p with
+                            | Pred.LT v -> Some (k,opIneq.LT,v)
+                            | Pred.GT v -> Some (k,opIneq.GT,v)
+                            | Pred.LTE v -> Some (k,opIneq.LTE,v)
+                            | Pred.GTE v -> Some (k,opIneq.GTE,v)
+                            | _ -> None
+                        ) a
+                    | AND docs ->
+                        Array.collect (fun d -> find d) docs
+                    | _ -> Array.empty
+                ) a
+
+        let comps = find m
+        let mc = 
+            Array.fold (fun cur (k,op,v) ->
+                match Map.tryFind k cur with
+                | Some a ->
+                    let a = (op,v) :: a
+                    Map.add k a cur
+                | None ->
+                    Map.add k [op,v] cur
+            ) Map.empty comps
+        let mc =
+            let gtSort (op1,v1) (op2,v2) =
+                let c = Matcher.cmp v1 v2
+                if c<0 then c
+                else if c>0 then c
+                else 
+                    match (op1,op2) with
+                    | opG.GT,opG.GT -> 0
+                    | opG.GTE,opG.GTE -> 0
+                    | opG.GT,opG.GTE -> -1
+                    | opG.GTE,opG.GT -> 1
+
+            let ltSort (op1,v1) (op2,v2) =
+                let c = Matcher.cmp v1 v2
+                if c<0 then c
+                else if c>0 then c
+                else 
+                    match (op1,op2) with
+                    | opL.LT,opL.LT -> 0
+                    | opL.LTE,opL.LTE -> 0
+                    | opL.LT,opL.LTE -> -1
+                    | opL.LTE,opL.LT -> 1
+
+            let gtFix op =
+                match op with
+                | opIneq.GT -> opG.GT
+                | opIneq.GTE -> opG.GTE
+                | _ -> failwith "never"
+
+            let ltFix op =
+                match op with
+                | opIneq.LT -> opL.LT
+                | opIneq.LTE -> opL.LTE
+                | _ -> failwith "never"
+
+            Map.fold (fun mc k a ->
+                let gt = List.filter (fun (op,v) -> op=opIneq.GT || op=opIneq.GTE) a
+                let gt = List.map (fun (op,v) -> (gtFix op,v)) gt
+                let gt = List.sortWith gtSort gt |> List.rev
+                let gt = if List.isEmpty gt then None else gt |> List.head |> Some
+
+                let lt = List.filter (fun (op,v) -> op=opIneq.LT || op=opIneq.LTE) a
+                let lt = List.map (fun (op,v) -> (ltFix op,v)) lt
+                let lt = List.sortWith ltSort lt
+                let lt = if List.isEmpty lt then None else lt |> List.head |> Some
+
+#if not // mongo actually WANTS to allow this.  test find8.js
+                match (gt,lt) with
+                | (Some (gtop,gtv), Some (ltop,ltv)) ->
+                    let c = Matcher.cmp gtv ltv
+                    if c>0 then failwith "cannot be >x and <y when x>y"
+                    else if c<0 then ()
+                    else if gtop=opG.GT && ltop=opL.LT then failwith "cannot be > and < the same value"
+                    else ()
+                | _ ->
+                    ()
+#endif
+
+#if not // TODO dive into elemMatch
+                // TODO we cannot do a query with both bounds unless the two
+                // comparisons came from the same elemMatch.
+                // for example:
+                // {x:{$gt:2,$lt:5}}
+                // this query has to match the following document:
+                // {x:[1,7]}
+                // because the array x has
+                // something that matches x>2 (the 7)
+                // AND
+                // something that matches x<5 (the 1)
+                // even those two somethings are not the same thing,
+                // they came from the same x.
+                // we can choose x>2 or x<5 as our index, but we can't choose both.
+                // unless elemMatch.
+                //
+                // note that if we have to satisfy two gt on x, such as:
+                // x>5
+                // x>9
+                // it doesn't really matter which one we choose for the index.
+                // both will be correct.  but choosing x>9 will result in us reviewing
+                // fewer documents.
+                Map.add k (gt,lt) mc
+#else
+                let comp = 
+                    match gt with
+                    | Some _ -> (gt,None)
+                    | None -> (None,lt)
+                Map.add k comp mc
+#endif
+            ) Map.empty mc
+        //printfn "map: %A" mc
+        mc
 
     let private findFitIndexes indexes m =
         let textQuery = findTextQuery m

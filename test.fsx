@@ -15,6 +15,8 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *)
 
+// findCompares might need to dive into elemMatch
+//
 // implement the matcher part of $text
 //
 // proper tokenize for text index
@@ -25,13 +27,9 @@
 //
 // probably bug: 2 text indexes, same weight, common words, unique constraint violation
 //
-// should weight be a double instead of an int?
+// should weight be a double instead of an int?  docs say no, it's an int.
 //
 // ability to use an index for sorting
-//
-// chooseIndex: dive into AND?
-//
-// chooseIndex: deal with multiple items in a Compare?
 //
 // sparse indexes
 //

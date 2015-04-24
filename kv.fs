@@ -297,7 +297,7 @@ module kv =
             conn.prepare(sprintf "INSERT INTO \"%s\" (k,doc_rowid) VALUES (?,?)" tbl)
 
         let indexInsertStep (stmt_insert:sqlite3_stmt) k doc_rowid = 
-            //printfn "index key: %A" k
+            //printfn "    index key: %A" k
             stmt_insert.clear_bindings()
             stmt_insert.bind_blob(1, k)
             stmt_insert.bind_int64(2, doc_rowid)
@@ -384,6 +384,7 @@ module kv =
 
                     let entries = entries.ToArray() |> Set.ofArray |> Set.toArray
                     Array.iter (fun vals ->
+                        //printfn "for index: %A" vals
                         let k = bson.encodeMultiForIndex vals
                         indexInsertStep stmt_insert k doc_rowid
                     ) entries
@@ -624,6 +625,8 @@ module kv =
 
             let f_gte_lte (kmin,kmax) =
                 printfn "INDEX_SCAN_GTE_LTE"
+                //printfn "kmin: %A" kmin
+                //printfn "kmax: %A" kmax
                 let sql_both = f_two ">=" "<="
                 let stmt = conn.prepare(sql_both)
                 stmt.bind_blob(1, kmin)
@@ -767,6 +770,7 @@ module kv =
 
                     let entries = entries.ToArray() |> Set.ofArray |> Set.toArray
                     Array.iter (fun vals ->
+                        //printfn "for index: %A" vals
                         let k = bson.encodeMultiForIndex vals
                         indexInsertStep stmt_insert k doc_rowid
                     ) entries
