@@ -2862,10 +2862,22 @@ module crud =
     let aggregate dbName collName pipeline =
         let ops = parseAgg pipeline
 
-        // TODO check to see if the first pipeline stage is match.  if so,
+        // check to see if the first pipeline stage is match.  if so,
         // check for an index we can use.
 
-        let {docs=s;funk=funk} = getSelectWithClose dbName collName None // TODO choose an index
+        let plan =
+            if Array.length ops = 0 then
+                None
+            else
+                match Array.get ops 0 with
+                | AggMatch m ->
+                    // TODO need a list of indexes, but the conn isn't open yet
+                    let indexes = listIndexesForCollection dbName collName
+                    chooseIndex indexes m None
+                | _ ->
+                    None
+
+        let {docs=s;funk=funk} = getSelectWithClose dbName collName plan
 
         try
             let (out,ops) =

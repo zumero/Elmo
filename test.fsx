@@ -15,9 +15,15 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *)
 
+// fix the array index n*m problem
+//
 // implement the matcher part of $text
 //
 // proper tokenize for text index
+//
+// text index issue: stemming?
+//
+// textindex: search strings other than just conjined OR words
 //
 // probably bug: 2 text indexes, same weight, common words, unique constraint violation
 //
@@ -28,8 +34,6 @@
 // chooseIndex: dive into AND?
 //
 // chooseIndex: deal with multiple items in a Compare?
-//
-// use chooseIndex in agg pipeline
 //
 // use chooseIndex in distinct
 //
@@ -66,8 +70,6 @@
 // regex tests
 //
 // geo
-//
-// $text ? fts ?
 //
 // $natural query modifier
 //
