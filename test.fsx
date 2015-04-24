@@ -29,15 +29,7 @@
 //
 // chooseIndex: deal with multiple items in a Compare?
 //
-// use chooseIndex in getOneMatch
-//
-// use chooseIndex in getFirstMatch
-//
 // use chooseIndex in agg pipeline
-//
-// use chooseIndex in update/getSelect
-//
-// use chooseIndex in delete/getSelect
 //
 // use chooseIndex in distinct
 //

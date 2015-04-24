@@ -30,9 +30,14 @@ module plan =
     type bounds = 
         | EQ of BsonValue[]
         | Text of BsonValue[]*string
-        | Min of BsonValue[]
-        | Max of BsonValue[]
-        | Min_Max of BsonValue[]*BsonValue[]
+        | GT of BsonValue[]
+        | GTE of BsonValue[]
+        | LT of BsonValue[]
+        | LTE of BsonValue[]
+        | GT_LT of BsonValue[]*BsonValue[]
+        | GT_LTE of BsonValue[]*BsonValue[]
+        | GTE_LT of BsonValue[]*BsonValue[]
+        | GTE_LTE of BsonValue[]*BsonValue[]
 
     type q =
         | Plan of index_info*bounds
@@ -173,6 +178,8 @@ module kv =
         Array.map (fun (k,typ) ->
             //printfn "k : %s" k
             let v = bson.findPath doc k
+            //printfn "findPath: k = %A" k
+            //printfn "findPath: v = %A" v
 
             // now we replace any BUndefined with BNull.  this seems, well,
             // kinda wrong, as it effectively encodes the index entries to
@@ -214,6 +221,7 @@ module kv =
                     | _ -> () // no index entry unless it's a string 
             ) weights
         | None ->
+            //printfn "doEncode: %A" vals
             bson.encodeMultiForIndex vals |> f
 
     let private encodeIndexEntries newDoc normspec weights f =
@@ -226,6 +234,9 @@ module kv =
         // to generate more index entries for this document, one
         // for each item in the array.  Mongo calls this a
         // multikey index.
+
+        // TODO if there is more than one array, we need to recurse here
+        // and add an entry for all combinations as well.
 
         Array.iteri (fun i (v,typ) ->
             match v with
@@ -241,6 +252,7 @@ module kv =
 
     // TODO special type for the pair db and coll
 
+    // TODO consider having two forms of this connect() method.  one returns a read-only conn.
     let connect() =
         // TODO allow a different filename to be specified
         let conn = ugly.``open``("elmodata.db")
@@ -296,8 +308,8 @@ module kv =
         let getStmtSequence (stmt:sqlite3_stmt) =
             seq {
                 while raw.SQLITE_ROW = stmt.step() do
-                    printfn "got_SQLITE_ROW"
                     let doc = stmt.column_blob(0) |> BinReader.ReadDocument
+                    printfn "got_SQLITE_ROW"
                     yield doc
             }
 
@@ -358,13 +370,16 @@ module kv =
                 conn.exec(sprintf "CREATE INDEX \"childndx_%s\" ON \"%s\" (doc_rowid)" ndxTable ndxTable)
                 // now insert index entries for every doc that already exists
                 let (normspec,weights) = getNormalizedSpec info
+                //printfn "normspec in createIndex: %A" normspec
                 use stmt2 = conn.prepare(sprintf "SELECT did,bson FROM \"%s\"" collTable)
                 use stmt_insert = prepareIndexInsert ndxTable
                 while raw.SQLITE_ROW = stmt2.step() do
                     let doc_rowid = stmt2.column_int64(0)
                     let newDoc = stmt2.column_blob(1) |> BinReader.ReadDocument
 
-                    let f k = indexInsertStep stmt_insert k doc_rowid
+                    let f k = 
+                        //printfn "index key: %A" k
+                        indexInsertStep stmt_insert k doc_rowid
 
                     encodeIndexEntries newDoc normspec weights f
                 true
@@ -540,23 +555,71 @@ module kv =
             let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
             let (normspec,weights) = getNormalizedSpec ndx
 
-            let f_min kmin = 
-                printfn "INDEX_SCAN_MIN"
-                let sql_min = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k >= ?" tblColl tblIndex
+            // TODO it would be nice if the DISTINCT here was happening on the rowids, not on the blobs
+
+            let f_one op = 
+                sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ?" tblColl tblIndex op
+
+            let f_two op1 op2 =
+                sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ? AND k %s ?" tblColl tblIndex op1 op2
+ 
+            let f_gt kmin = 
+                printfn "INDEX_SCAN_GT"
+                let sql_min = f_one ">"
                 let stmt = conn.prepare(sql_min)
                 stmt.bind_blob(1, kmin)
                 stmt
 
-            let f_max kmax =
-                printfn "INDEX_SCAN_MAX"
-                let sql_max = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k <= ?" tblColl tblIndex
+            let f_gte kmin = 
+                printfn "INDEX_SCAN_GTE"
+                let sql_min = f_one ">="
+                let stmt = conn.prepare(sql_min)
+                stmt.bind_blob(1, kmin)
+                stmt
+
+            let f_lt kmax =
+                printfn "INDEX_SCAN_LT"
+                let sql_max = f_one "<"
                 let stmt = conn.prepare(sql_max)
                 stmt.bind_blob(1, kmax)
                 stmt
 
-            let f_both (kmin,kmax) =
-                printfn "INDEX_SCAN_BOTH"
-                let sql_both = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k >= ? AND k <= ?" tblColl tblIndex
+            let f_lte kmax =
+                printfn "INDEX_SCAN_LTE"
+                let sql_max = f_one "<="
+                let stmt = conn.prepare(sql_max)
+                stmt.bind_blob(1, kmax)
+                stmt
+
+            let f_gt_lt (kmin,kmax) =
+                printfn "INDEX_SCAN_GT_LT"
+                let sql_both = f_two ">" "<"
+                let stmt = conn.prepare(sql_both)
+                stmt.bind_blob(1, kmin)
+                stmt.bind_blob(2, kmax)
+                stmt
+
+            let f_gte_lt (kmin,kmax) =
+                printfn "INDEX_SCAN_GTE_LT"
+                //printfn "kmin: %A" kmin
+                //printfn "kmax: %A" kmax
+                let sql_both = f_two ">=" "<"
+                let stmt = conn.prepare(sql_both)
+                stmt.bind_blob(1, kmin)
+                stmt.bind_blob(2, kmax)
+                stmt
+
+            let f_gt_lte (kmin,kmax) =
+                printfn "INDEX_SCAN_GT_LTE"
+                let sql_both = f_two ">" "<="
+                let stmt = conn.prepare(sql_both)
+                stmt.bind_blob(1, kmin)
+                stmt.bind_blob(2, kmax)
+                stmt
+
+            let f_gte_lte (kmin,kmax) =
+                printfn "INDEX_SCAN_GTE_LTE"
+                let sql_both = f_two ">=" "<="
                 let stmt = conn.prepare(sql_both)
                 stmt.bind_blob(1, kmin)
                 stmt.bind_blob(2, kmax)
@@ -581,19 +644,35 @@ module kv =
                 //printfn "kmin: %A" kmin
                 let kmax = [| (vmax,false)|] |> Array.append vals |> bson.encodeMultiForIndex
                 //printfn "kmax: %A" kmax
-                (kmin,kmax) |> f_both
-            | plan.bounds.Min vals ->
-                vals |> getDirs normspec |> bson.encodeMultiForIndex |> f_min
-            | plan.bounds.Max vals ->
-                vals |> getDirs normspec |> bson.encodeMultiForIndex |> f_max
+                (kmin,kmax) |> f_gt_lt
+            | plan.bounds.GT vals ->
+                vals |> getDirs normspec |> bson.encodeMultiForIndex |> f_gt
+            | plan.bounds.GTE vals ->
+                vals |> getDirs normspec |> bson.encodeMultiForIndex |> f_gte
+            | plan.bounds.LT vals ->
+                vals |> getDirs normspec |> bson.encodeMultiForIndex |> f_lt
+            | plan.bounds.LTE vals ->
+                vals |> getDirs normspec |> bson.encodeMultiForIndex |> f_lte
             | plan.bounds.EQ vals ->
                 let kmin = vals |> getDirs normspec |> bson.encodeMultiForIndex
                 let kmax = add_one kmin
-                (kmin,kmax) |> f_both
-            | plan.bounds.Min_Max (minvals,maxvals) ->
+                (kmin,kmax) |> f_gte_lt
+            | plan.bounds.GT_LT (minvals,maxvals) ->
                 let kmin = minvals |> getDirs normspec |> bson.encodeMultiForIndex
                 let kmax = maxvals |> getDirs normspec |> bson.encodeMultiForIndex
-                (kmin,kmax) |> f_both
+                (kmin,kmax) |> f_gt_lt
+            | plan.bounds.GT_LTE (minvals,maxvals) ->
+                let kmin = minvals |> getDirs normspec |> bson.encodeMultiForIndex
+                let kmax = maxvals |> getDirs normspec |> bson.encodeMultiForIndex
+                (kmin,kmax) |> f_gt_lte
+            | plan.bounds.GTE_LT (minvals,maxvals) ->
+                let kmin = minvals |> getDirs normspec |> bson.encodeMultiForIndex
+                let kmax = maxvals |> getDirs normspec |> bson.encodeMultiForIndex
+                (kmin,kmax) |> f_gte_lt
+            | plan.bounds.GTE_LTE (minvals,maxvals) ->
+                let kmin = minvals |> getDirs normspec |> bson.encodeMultiForIndex
+                let kmax = maxvals |> getDirs normspec |> bson.encodeMultiForIndex
+                (kmin,kmax) |> f_gte_lte
 
         let getSeq tx db coll plan =
             match getCollectionOptions db coll with
@@ -671,7 +750,9 @@ module kv =
 
                     let (normspec,weights) = getNormalizedSpec info
 
-                    let f k = indexInsertStep stmt_insert k doc_rowid
+                    let f k = 
+                        //printfn "index key: %A" k
+                        indexInsertStep stmt_insert k doc_rowid
 
                     encodeIndexEntries newDoc normspec weights f
                 ) index_stmts
@@ -748,7 +829,7 @@ module kv =
             let fn_getSelect plan =
                 getSeq false db coll plan
 
-            conn.exec("BEGIN TRANSACTION")
+            conn.exec("BEGIN TRANSACTION") // TODO immediate?
 
             {
                 database = db

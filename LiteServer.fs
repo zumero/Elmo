@@ -609,7 +609,7 @@ module LiteServer =
         let index = bson.getValueForKey q "index"
         let fullColl = sprintf "%s.%s" db coll
         removeCursorsForCollection fullColl
-        crud.deleteIndex db coll index
+        let (count_indexes_before, num_indexes_deleted) = crud.deleteIndexes db coll index
         // TODO nIndexesWas
         let pairs = ResizeArray<_>()
         pairs.Add("ok", BDouble 1.0)

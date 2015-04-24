@@ -244,40 +244,57 @@ module crud =
                             let (op,v) = Array.get ineq 0
                             let vals = Array.append matching_eqs [| v |]
                             match op with
-                            | opIneq.GT | opIneq.GTE ->
-                                (ndx, plan.bounds.Min vals) |> Some
-                            | opIneq.LT | opIneq.LTE ->
-                                (ndx, plan.bounds.Max vals) |> Some
+                            | opIneq.GT ->  (ndx, plan.bounds.GT vals) |> Some
+                            | opIneq.GTE -> (ndx, plan.bounds.GTE vals) |> Some
+                            | opIneq.LT  -> (ndx, plan.bounds.LT vals) |> Some
+                            | opIneq.LTE -> (ndx, plan.bounds.LTE vals) |> Some
                         else
-                            // TODO figure this out properly when there are > 2 comps
-                            let cmin = Array.tryFind (fun (op,v) -> op=opIneq.GT || op=opIneq.GTE) ineq
-                            let cmax = Array.tryFind (fun (op,v) -> op=opIneq.LT || op=opIneq.LTE) ineq
-                            match (cmin,cmax) with
-                            | None,None ->
+                            // TODO figure this out properly when there are >1 comp per kind
+                            let c_gt = Array.tryFind (fun (op,v) -> op=opIneq.GT) ineq
+                            let c_gte = Array.tryFind (fun (op,v) -> op=opIneq.GTE) ineq
+                            let c_lt = Array.tryFind (fun (op,v) -> op=opIneq.LT) ineq
+                            let c_lte = Array.tryFind (fun (op,v) -> op=opIneq.LTE) ineq
+
+                            match (c_gt,c_gte,c_lt,c_lte) with
+                            | None,None,None,None ->
                                 None
-                            | Some (_,vmin),None ->
+                            | Some (_,vmin),None,None,None ->
                                 let vals = Array.append matching_eqs [| vmin |]
-                                (ndx, plan.bounds.Min vals) |> Some
-                            | None,Some (_,vmax) ->
+                                (ndx, plan.bounds.GT vals) |> Some
+                            | None,Some (_,vmin),None,None ->
+                                let vals = Array.append matching_eqs [| vmin |]
+                                (ndx, plan.bounds.GTE vals) |> Some
+                            | None,None,Some (_,vmax),None ->
                                 let vals = Array.append matching_eqs [| vmax |]
-                                (ndx, plan.bounds.Max vals) |> Some
-                            | Some (_,vmin),Some (_,vmax) ->
+                                (ndx, plan.bounds.LT vals) |> Some
+                            | None,None,None,Some (_,vmax) ->
+                                let vals = Array.append matching_eqs [| vmax |]
+                                (ndx, plan.bounds.LTE vals) |> Some
+                            | Some (_,vmin),None,Some (_,vmax),None ->
                                 let minvals = Array.append matching_eqs [| vmin |]
                                 let maxvals = Array.append matching_eqs [| vmax |]
-                                (ndx, plan.bounds.Min_Max (minvals,maxvals)) |> Some
+                                (ndx, plan.bounds.GT_LT (minvals,maxvals)) |> Some
+                            | Some (_,vmin),None,None,Some (_,vmax) ->
+                                let minvals = Array.append matching_eqs [| vmin |]
+                                let maxvals = Array.append matching_eqs [| vmax |]
+                                (ndx, plan.bounds.GT_LTE (minvals,maxvals)) |> Some
+                            | None,Some (_,vmin),Some (_,vmax),None ->
+                                let minvals = Array.append matching_eqs [| vmin |]
+                                let maxvals = Array.append matching_eqs [| vmax |]
+                                (ndx, plan.bounds.GTE_LT (minvals,maxvals)) |> Some
+                            | None,Some (_,vmin),None,Some (_,vmax) ->
+                                let minvals = Array.append matching_eqs [| vmin |]
+                                let maxvals = Array.append matching_eqs [| vmax |]
+                                (ndx, plan.bounds.GTE_LTE (minvals,maxvals)) |> Some
+                            // TODO there are other cases above, like GT and GTE both
 
     let private findIndexForMinMax indexes a =
         //printfn "indexes: %A" indexes
         //printfn "keys: %A" a
         Array.tryFind (fun ndx ->
             let (normspec,weights) = kv.getNormalizedSpec ndx
-            let len = Array.length a
-            if Array.length normspec < len then
-                false
-            else
-                let pairs = Array.sub normspec 0 len
-                let decoded = Array.map (fun (k,v) -> k) pairs
-                decoded = a
+            let keys = Array.map (fun (k,v) -> k) normspec
+            keys = a
         ) indexes
 
     let private findTextQuery m =
@@ -362,7 +379,9 @@ module crud =
             | None -> chooseFromPossibles fits
 
     let private getOneMatch w m =
-        let {docs=s;funk=funk} = w.getSelect None // TODO choose an index
+        let indexes = w.getIndexes()
+        let plan = chooseIndex indexes m None
+        let {docs=s;funk=funk} = w.getSelect plan
         try
             let a = s |> seqMatch m |> Seq.truncate 1 |> Seq.toList
             let d = 
@@ -418,13 +437,27 @@ module crud =
         else if Array.length a > 1 then failwith "should never happen"
         else a.[0] |> Some
 
-    let deleteIndex dbName collName index =
+    let deleteIndexes db coll index =
         let conn = kv.connect()
         try
-            let indexes = conn.listIndexes()
-            match tryFindIndexByNameOrSpec dbName collName indexes index with
-            | Some info -> conn.dropIndex info.db info.coll info.ndx
-            | None -> false
+            // TODO it would be nice to have a tx around this
+            let indexes = conn.listIndexes() |> Array.filter (fun info -> info.db=db && info.coll=coll)
+            let count_before = Array.length indexes
+            let indexes = 
+                match index with
+                | BString "*" ->
+                    Array.filter (fun info -> info.ndx<>"_id_") indexes    
+                | _ ->
+                    match tryFindIndexByNameOrSpec db coll indexes index with
+                    | Some info -> [| info |]
+                    | None -> Array.empty
+            //printfn "deleting: %A" indexes
+            let count_deleted = 
+                Array.sumBy (fun info ->
+                    let deleted = conn.dropIndex info.db info.coll info.ndx
+                    if deleted then 1 else 0
+                ) indexes
+            (count_before,count_deleted)
         finally
             conn.close()
 
@@ -1131,10 +1164,20 @@ module crud =
         let id2 = bson.getValueForKey d2 "_id"
         id1 <> id2
 
+    let private connect2() =
+        let conn = kv.connect()
+        try
+            let rconn = kv.connect()
+            (conn,rconn)
+        with
+        | _ -> 
+            conn.close()
+            reraise()
+
     let update dbName collName (updates:BsonValue[]) =
         // TODO $isolated should determine whether there is a tx around the whole operation
 
-        let conn = kv.connect()
+        let (conn,rconn) = connect2()
 
         try
             let w = conn.beginWrite dbName collName
@@ -1152,7 +1195,9 @@ module crud =
                         let ops = parseUpdateDoc u
                         let (countMatches,countModified) = 
                             if multi then
-                                let {docs=s;funk=funk} = w.getSelect None // TODO choose an index
+                                let indexes = w.getIndexes()
+                                let plan = chooseIndex indexes m None
+                                let {docs=s;funk=funk} = rconn.beginRead dbName collName plan
                                 try
                                     let mods = ref 0
                                     let matches = ref 0
@@ -1228,6 +1273,7 @@ module crud =
                 reraise()
         finally
             conn.close()
+            rconn.close()
 
     let delete dbName collName (deletes:BsonValue[]) =
         let conn = kv.connect()
@@ -1239,7 +1285,10 @@ module crud =
                     let q = bson.getValueForKey upd "q"
                     let limit = bson.tryGetValueForKey upd "limit"
                     let m = Matcher.parseQuery q
-                    let {docs=s;funk=funk} = w.getSelect None // TODO choose an index
+                    // TODO is this safe?  or do we need two-conn isolation like update?
+                    let indexes = w.getIndexes()
+                    let plan = chooseIndex indexes m None
+                    let {docs=s;funk=funk} = w.getSelect plan
                     try
                         s |> seqMatch m |> 
                             Seq.iter (fun (doc,ndx) -> 
@@ -1338,7 +1387,9 @@ module crud =
         // TODO collecting all the results and sorting and taking the first one.
         // would probably be faster to just iterate over all and keep track of what
         // the first one would be.
-        let {docs=s;funk=funk} = w.getSelect None // TODO choose an index
+        let indexes = w.getIndexes()
+        let plan = chooseIndex indexes m None
+        let {docs=s;funk=funk} = w.getSelect plan
         try
             let a = s |> seqMatch m |> seqSort ord |> Seq.truncate 1 |> Seq.toList
             // TODO list match
@@ -1700,6 +1751,7 @@ module crud =
     let find dbName collName q mods =
         // TODO need a list of indexes, but the conn isn't open yet
         let indexes = listIndexesForCollection dbName collName
+        //printfn "in find: indexes = %A" indexes
         let m = Matcher.parseQuery q
 
         // TODO tests indicate that if there is a $min and/or $max as well as a $hint,
@@ -1711,6 +1763,10 @@ module crud =
             | None -> None
 
         let plan = 
+            // unless we're going to add comparisons to the query,
+            // the bounds for min/max need to be precise, since the matcher isn't
+            // going to help if they're not.  min is inclusive.  max is
+            // exclusive.
             match (mods.min,mods.max) with
             | Some vmin, Some vmax -> 
                 let amin = parseIndexMinMax vmin
@@ -1721,25 +1777,25 @@ module crud =
                 let minvals = Array.map (fun (k,v) -> v) amin
                 let maxvals = Array.map (fun (k,v) -> v) amax
                 match findIndexForMinMax indexes keys with
-                | Some ndx -> (ndx,plan.bounds.Min_Max(minvals,maxvals)) |> plan.q.Plan |> Some
+                | Some ndx -> (ndx,plan.bounds.GTE_LT(minvals,maxvals)) |> plan.q.Plan |> Some
                 | None -> failwith "index not found" // TODO or None
             | Some vmin, None ->
                 let amin = parseIndexMinMax vmin
                 let keys = Array.map (fun (k,v) -> k) amin
                 let minvals = Array.map (fun (k,v) -> v) amin
                 match findIndexForMinMax indexes keys with
-                | Some ndx -> (ndx,plan.bounds.Min(minvals)) |> plan.q.Plan |> Some
+                | Some ndx -> (ndx,plan.bounds.GTE(minvals)) |> plan.q.Plan |> Some
                 | None -> failwith "index not found" // TODO or None
             | None, Some vmax ->
                 let amax = parseIndexMinMax vmax
                 let keys = Array.map (fun (k,v) -> k) amax
                 let maxvals = Array.map (fun (k,v) -> v) amax
                 match findIndexForMinMax indexes keys with
-                | Some ndx -> (ndx,plan.bounds.Max(maxvals)) |> plan.q.Plan |> Some
+                | Some ndx -> (ndx,plan.bounds.LT(maxvals)) |> plan.q.Plan |> Some
                 | None -> failwith "index not found" // TODO or None
             | None,None -> 
-                // chooseIndex indexes m hint
-                None
+                chooseIndex indexes m hint
+                // None
 
         let {docs=s;funk=funk} = getSelectWithClose dbName collName plan
         try
