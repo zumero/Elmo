@@ -51,6 +51,7 @@ type tx_write =
         update:BsonValue->unit
         delete:BsonValue->bool
         getSelect:(plan.q option)->reader
+        getIndexes:unit->index_info[]
         commit:unit->unit
         rollback:unit->unit
     }
@@ -295,7 +296,7 @@ module kv =
         let getStmtSequence (stmt:sqlite3_stmt) =
             seq {
                 while raw.SQLITE_ROW = stmt.step() do
-                    //printfn "got_SQLITE_ROW"
+                    printfn "got_SQLITE_ROW"
                     let doc = stmt.column_blob(0) |> BinReader.ReadDocument
                     yield doc
             }
@@ -540,18 +541,21 @@ module kv =
             let (normspec,weights) = getNormalizedSpec ndx
 
             let f_min kmin = 
+                printfn "INDEX_SCAN_MIN"
                 let sql_min = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k >= ?" tblColl tblIndex
                 let stmt = conn.prepare(sql_min)
                 stmt.bind_blob(1, kmin)
                 stmt
 
             let f_max kmax =
+                printfn "INDEX_SCAN_MAX"
                 let sql_max = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k <= ?" tblColl tblIndex
                 let stmt = conn.prepare(sql_max)
                 stmt.bind_blob(1, kmax)
                 stmt
 
             let f_both (kmin,kmax) =
+                printfn "INDEX_SCAN_BOTH"
                 let sql_both = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k >= ? AND k <= ?" tblColl tblIndex
                 let stmt = conn.prepare(sql_both)
                 stmt.bind_blob(1, kmin)
@@ -601,6 +605,7 @@ module kv =
                     | Some ndxu ->
                         getStmtForIndex ndxu
                     | None ->
+                        printfn "TABLE_SCAN"
                         let collTable = getTableNameForCollection db coll
                         conn.prepare(sprintf "SELECT bson FROM \"%s\"" collTable)
 
@@ -677,6 +682,8 @@ module kv =
                 if ba.Length > 16*1024*1024 then raise (MongoCode(10329, "document more than 16MB"))
                 ba
 
+            let fn_getIndexes() = indexes
+
             let fn_insert newDoc =
                 let ba = to_bson newDoc
                 stmt_insert.clear_bindings()
@@ -750,6 +757,7 @@ module kv =
                 update = fn_update
                 delete = fn_delete
                 getSelect = fn_getSelect
+                getIndexes = fn_getIndexes
                 commit = fn_commit
                 rollback = fn_rollback
             }
