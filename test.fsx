@@ -35,8 +35,6 @@
 //
 // chooseIndex: deal with multiple items in a Compare?
 //
-// use chooseIndex in distinct
-//
 // sparse indexes
 //
 // hint -- is this feature working?

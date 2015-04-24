@@ -1879,10 +1879,13 @@ module crud =
             match query with
             | Some q -> Matcher.parseQuery q
             | None -> [| |] |> BDocument |> Matcher.parseQuery
+        // TODO need a list of indexes, but the conn isn't open yet
+        let indexes = listIndexesForCollection dbName collName
+        let plan = chooseIndex indexes m None
 
         // TODO do we need special handling here for the case where the collection
         // does not exist?
-        let {docs=s;funk=funk} = getSelectWithClose dbName collName None // TODO choose an index
+        let {docs=s;funk=funk} = getSelectWithClose dbName collName plan
         try
             let results = ref Set.empty
             s |> seqMatch m |>
