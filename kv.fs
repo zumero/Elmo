@@ -553,11 +553,7 @@ module kv =
             f ba (ba.Length - 1)
             ba
 
-        let getStmtForIndex p =
-            let (ndx,b) = 
-                match p with
-                | plan.q.Plan (ndx,b) -> (ndx,b)
-
+        let getStmtForIndex ndx b =
             //printfn "ndx: %A" ndx
             //printfn "bounds: %A" b
 
@@ -565,106 +561,43 @@ module kv =
             let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
             let (normspec,weights) = getNormalizedSpec ndx
 
+            // note that one of the reasons we need to do DISTINCT here is because a
+            // single index in a single document can produce multiple index entries,
+            // because, for example, when a value is an array, we don't just index
+            // the array as a value, but we also index each of its elements.
+            //
             // TODO it would be nice if the DISTINCT here was happening on the rowids, not on the blobs
 
-            // for text queries, we need to grab the index entry so we can get the weight off the end.
-
-            let f_one op = 
-                sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ?" tblColl tblIndex op
-
-            let f_two op1 op2 =
-                sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ? AND k %s ?" tblColl tblIndex op1 op2
+            let f_two kmin kmax op1 op2 =
+                printfn "INDEX_SCAN_BOTH: %s %s" op1 op2
+                let sql = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ? AND k %s ?" tblColl tblIndex op1 op2
+                let stmt = conn.prepare(sql)
+                stmt.bind_blob(1, kmin)
+                stmt.bind_blob(2, kmax)
+                stmt
  
-            let f_gt kmin = 
-                printfn "INDEX_SCAN_GT"
-                let sql_min = f_one ">"
-                let stmt = conn.prepare(sql_min)
-                stmt.bind_blob(1, kmin)
+            let f_one op k = 
+                printfn "INDEX_SCAN_ONE: %s" op
+                let sql = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ?" tblColl tblIndex op
+                let stmt = conn.prepare(sql)
+                stmt.bind_blob(1, k)
                 stmt
 
-            let f_gte kmin = 
-                printfn "INDEX_SCAN_GTE"
-                let sql_min = f_one ">="
-                let stmt = conn.prepare(sql_min)
-                stmt.bind_blob(1, kmin)
-                stmt
-
-            let f_lt kmax =
-                printfn "INDEX_SCAN_LT"
-                let sql_max = f_one "<"
-                let stmt = conn.prepare(sql_max)
-                stmt.bind_blob(1, kmax)
-                stmt
-
-            let f_lte kmax =
-                printfn "INDEX_SCAN_LTE"
-                let sql_max = f_one "<="
-                let stmt = conn.prepare(sql_max)
-                stmt.bind_blob(1, kmax)
-                stmt
-
-            let f_gt_lt (kmin,kmax) =
-                printfn "INDEX_SCAN_GT_LT"
-                let sql_both = f_two ">" "<"
-                let stmt = conn.prepare(sql_both)
-                stmt.bind_blob(1, kmin)
-                stmt.bind_blob(2, kmax)
-                stmt
-
-            let f_gte_lt (kmin,kmax) =
-                printfn "INDEX_SCAN_GTE_LT"
-                //printfn "kmin: %A" kmin
-                //printfn "kmax: %A" kmax
-                let sql_both = f_two ">=" "<"
-                let stmt = conn.prepare(sql_both)
-                stmt.bind_blob(1, kmin)
-                stmt.bind_blob(2, kmax)
-                stmt
-
-            let f_gt_lte (kmin,kmax) =
-                printfn "INDEX_SCAN_GT_LTE"
-                let sql_both = f_two ">" "<="
-                let stmt = conn.prepare(sql_both)
-                stmt.bind_blob(1, kmin)
-                stmt.bind_blob(2, kmax)
-                stmt
-
-            let f_gte_lte (kmin,kmax) =
-                printfn "INDEX_SCAN_GTE_LTE"
-                //printfn "kmin: %A" kmin
-                //printfn "kmax: %A" kmax
-                let sql_both = f_two ">=" "<="
-                let stmt = conn.prepare(sql_both)
-                stmt.bind_blob(1, kmin)
-                stmt.bind_blob(2, kmax)
-                stmt
+            let f_gt_lt (kmin,kmax) = f_two kmin kmax ">" "<"
+            let f_gt_lte (kmin,kmax) = f_two kmin kmax ">" "<="
+            let f_gte_lt (kmin,kmax) = f_two kmin kmax ">=" "<"
+            let f_gte_lte (kmin,kmax) = f_two kmin kmax ">=" "<="
 
             match b with
-            | plan.bounds.Text (eq,search) ->
-                let words = search.Split(' ') // TODO tokenize properly
-                let words = words |> Set.ofArray |> Set.toArray
-                let sortme = Array.map (fun (s:string) -> (s, System.Text.Encoding.UTF8.GetBytes (s))) words
-                let fsort (s1,ba1) (s2,ba2) = bson.bcmp ba1 ba2
-                Array.sortInPlaceWith fsort sortme
-                let minword = Array.get sortme 0 |> fst
-                let maxword = Array.get sortme (Array.length words - 1) |> fst
-                // note that it is possible that minword = maxword
-                let vmin = BArray [| (BString minword); (BInt32 0) |]
-                let vmax = BArray [| (BString maxword); (BInt32 100000) |]
-                let vals = getDirs normspec eq
-                let kmin = [| (vmin,false) |] |> Array.append vals |> bson.encodeMultiForIndex
-                //printfn "kmin: %A" kmin
-                let kmax = [| (vmax,false)|] |> Array.append vals |> bson.encodeMultiForIndex
-                //printfn "kmax: %A" kmax
-                (kmin,kmax) |> f_gt_lt
+            | plan.bounds.Text (eq,search) -> failwith "this case is handled separately"
             | plan.bounds.GT vals ->
-                vals |> getDirs normspec |> bson.encodeMultiForIndex |> f_gt
+                vals |> getDirs normspec |> bson.encodeMultiForIndex |> f_one ">"
             | plan.bounds.GTE vals ->
-                vals |> getDirs normspec |> bson.encodeMultiForIndex |> f_gte
+                vals |> getDirs normspec |> bson.encodeMultiForIndex |> f_one ">="
             | plan.bounds.LT vals ->
-                vals |> getDirs normspec |> bson.encodeMultiForIndex |> f_lt
+                vals |> getDirs normspec |> bson.encodeMultiForIndex |> f_one "<"
             | plan.bounds.LTE vals ->
-                vals |> getDirs normspec |> bson.encodeMultiForIndex |> f_lte
+                vals |> getDirs normspec |> bson.encodeMultiForIndex |> f_one "<="
             | plan.bounds.EQ vals ->
                 let kmin = vals |> getDirs normspec |> bson.encodeMultiForIndex
                 let kmax = add_one kmin
@@ -702,18 +635,62 @@ module kv =
 
             {docs=s; funk=killFunc}
 
-        let getIndexScanReader tx db coll ndxu =
-            let stmt = getStmtForIndex ndxu
+        let getTextIndexReader tx ndx eq (search:string) =
+            let tblColl = getTableNameForCollection ndx.db ndx.coll
+            let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
+            let (normspec,weights) = getNormalizedSpec ndx
 
-            let s = getStmtSequence stmt
-
+            let sortme = 
+                let words = search.Split(' ') // TODO tokenize properly
+                let words = words |> Set.ofArray |> Set.toArray
+                Array.map (fun (s:string) -> (s, System.Text.Encoding.UTF8.GetBytes (s))) words
+            let fsort (s1,ba1) (s2,ba2) = bson.bcmp ba1 ba2
+            Array.sortInPlaceWith fsort sortme
+            let minword = Array.get sortme 0 |> fst
+            let maxword = Array.get sortme (Array.length sortme - 1) |> fst
+            // note that it is possible that minword = maxword
+            let vmin = BArray [| (BString minword); (BInt32 0) |]
+            let vmax = BArray [| (BString maxword); (BInt32 100000) |]
+            let vals = getDirs normspec eq
+            let kmin = [| (vmin,false) |] |> Array.append vals |> bson.encodeMultiForIndex
+            //printfn "kmin: %A" kmin
+            let kmax = [| (vmax,false)|] |> Array.append vals |> bson.encodeMultiForIndex
+            //printfn "kmax: %A" kmax
+            printfn "INDEX_SCAN_TEXT"
+            let sql = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ? AND k %s ?" tblColl tblIndex ">" "<"
+            let stmt = conn.prepare(sql)
+            stmt.bind_blob(1, kmin)
+            stmt.bind_blob(2, kmax)
+            let s = 
+                seq {
+                    while raw.SQLITE_ROW = stmt.step() do
+                        let doc = stmt.column_blob(0) |> BinReader.ReadDocument
+                        printfn "got_SQLITE_ROW"
+                        yield doc
+                }
             let killFunc() =
-                // TODO would it be possible/helpful to make sure this function
-                // can be safely called more than once?
                 if tx then conn.exec("COMMIT TRANSACTION")
                 stmt.sqlite3_finalize()
 
             {docs=s; funk=killFunc}
+
+        let getNonTextIndexReader tx ndx b =
+            let stmt = getStmtForIndex ndx b
+            let s = getStmtSequence stmt
+            let killFunc() =
+                if tx then conn.exec("COMMIT TRANSACTION")
+                stmt.sqlite3_finalize()
+
+            {docs=s; funk=killFunc}
+
+        let getIndexScanReader tx p =
+            let (ndx,b) = 
+                match p with
+                | plan.q.Plan (ndx,b) -> (ndx,b)
+
+            match b with
+            | plan.bounds.Text (eq,search) -> getTextIndexReader tx ndx eq search
+            | _ -> getNonTextIndexReader tx ndx b
 
         let getSeq tx db coll plan =
             match getCollectionOptions db coll with
@@ -721,7 +698,7 @@ module kv =
                 if tx then conn.exec("BEGIN TRANSACTION")
 
                 match plan with
-                | Some ndxu -> getIndexScanReader tx db coll ndxu
+                | Some ndxu -> getIndexScanReader tx ndxu
                 | None -> getTableScanReader tx db coll
             | None ->
                 {docs=Seq.empty; funk=(fun () -> ())}
