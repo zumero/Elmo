@@ -44,8 +44,12 @@ module plan =
 
 type reader = 
     {
+        // TODO this seq will have to change to include the text weight. :-(
+        // and maybe more later.
+        // TODO or should we just put the weight into the document with the $meta key?
         docs:seq<BsonValue>
         funk:unit->unit
+        // TODO need a method here to get the number of docs scanned
     }
 
 type tx_write =
@@ -563,6 +567,8 @@ module kv =
 
             // TODO it would be nice if the DISTINCT here was happening on the rowids, not on the blobs
 
+            // for text queries, we need to grab the index entry so we can get the weight off the end.
+
             let f_one op = 
                 sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ?" tblColl tblIndex op
 
@@ -680,29 +686,43 @@ module kv =
                 let kmax = maxvals |> getDirs normspec |> bson.encodeMultiForIndex
                 (kmin,kmax) |> f_gte_lte
 
+        let getTableScanReader tx db coll =
+            printfn "TABLE_SCAN"
+            let stmt =
+                let collTable = getTableNameForCollection db coll
+                conn.prepare(sprintf "SELECT bson FROM \"%s\"" collTable)
+
+            let s = getStmtSequence stmt
+
+            let killFunc() =
+                // TODO would it be possible/helpful to make sure this function
+                // can be safely called more than once?
+                if tx then conn.exec("COMMIT TRANSACTION")
+                stmt.sqlite3_finalize()
+
+            {docs=s; funk=killFunc}
+
+        let getIndexScanReader tx db coll ndxu =
+            let stmt = getStmtForIndex ndxu
+
+            let s = getStmtSequence stmt
+
+            let killFunc() =
+                // TODO would it be possible/helpful to make sure this function
+                // can be safely called more than once?
+                if tx then conn.exec("COMMIT TRANSACTION")
+                stmt.sqlite3_finalize()
+
+            {docs=s; funk=killFunc}
+
         let getSeq tx db coll plan =
             match getCollectionOptions db coll with
             | Some _ ->
                 if tx then conn.exec("BEGIN TRANSACTION")
 
-                let stmt =
-                    match plan with
-                    | Some ndxu ->
-                        getStmtForIndex ndxu
-                    | None ->
-                        printfn "TABLE_SCAN"
-                        let collTable = getTableNameForCollection db coll
-                        conn.prepare(sprintf "SELECT bson FROM \"%s\"" collTable)
-
-                let s = getStmtSequence stmt
-
-                let killFunc() =
-                    // TODO would it be possible/helpful to make sure this function
-                    // can be safely called more than once?
-                    if tx then conn.exec("COMMIT TRANSACTION")
-                    stmt.sqlite3_finalize()
-
-                {docs=s; funk=killFunc}
+                match plan with
+                | Some ndxu -> getIndexScanReader tx db coll ndxu
+                | None -> getTableScanReader tx db coll
             | None ->
                 {docs=Seq.empty; funk=(fun () -> ())}
 
