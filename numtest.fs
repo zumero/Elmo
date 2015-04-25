@@ -21,23 +21,6 @@ module test =
 
     open System
 
-    // lexicographic compare
-    // TODO move this somewhere else
-    let bcmp (x:byte[]) (y:byte[]) =
-        let xlen = x.Length
-        let ylen = y.Length
-        let len = if xlen<ylen then xlen else ylen
-        let mutable i = 0
-        let mutable result = 0
-        while i<len do
-            let c = (int (x.[i])) - int (y.[i])
-            if c <> 0 then
-                i <- len+1 // breaks out of the loop, and signals that result is valid
-                result <- c
-            else
-                i <- i + 1
-        if i>len then result else (xlen - ylen)
-
     let numtest() =
         let sortByNumber t1 t2 =
             let f1 = fst t1
@@ -47,7 +30,7 @@ module test =
         let sortByEncoding t1 t2 =
             let f1 = snd t1
             let f2 = snd t2
-            bcmp f1 f2
+            bson.bcmp f1 f2
 
         let r = Random(42)
         let frand() =

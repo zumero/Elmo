@@ -15,6 +15,8 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *)
 
+// text: get weights through to the matcher
+//
 // findCompares might need to dive into elemMatch
 //
 // implement the matcher part of $text

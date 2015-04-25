@@ -637,14 +637,12 @@ module kv =
             | plan.bounds.Text (eq,search) ->
                 let words = search.Split(' ') // TODO tokenize properly
                 let words = words |> Set.ofArray |> Set.toArray
-                // TODO this is kinda wrong.  assume each index entries is a term followed by a numeric weight.
-                // calculate the bounds:  sort the words lexicographically.  the lower bound is the first
-                // word.  the upper bound is the last word.  (append low and high weight as well?)
-                // fetch all keys between those bounds and then let the matcher do the rest of the work.
-                Array.sortInPlace words // TODO wrong
-                let minword = Array.get words 0 // TODO wrong
-                let maxword = Array.get words 0 // TODO wrong
-                // it is possible that minword = maxword
+                let sortme = Array.map (fun (s:string) -> (s, System.Text.Encoding.UTF8.GetBytes (s))) words
+                let fsort (s1,ba1) (s2,ba2) = bson.bcmp ba1 ba2
+                Array.sortInPlaceWith fsort sortme
+                let minword = Array.get sortme 0 |> fst
+                let maxword = Array.get sortme (Array.length words - 1) |> fst
+                // note that it is possible that minword = maxword
                 let vmin = BArray [| (BString minword); (BInt32 0) |]
                 let vmax = BArray [| (BString maxword); (BInt32 100000) |]
                 let vals = getDirs normspec eq
