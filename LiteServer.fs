@@ -692,6 +692,8 @@ module LiteServer =
             | _ -> failwith "query must be a document"
         let cmd = cmd.ToLower()
         match cmd with
+        // TODO as of 3.0, explain goes here.  
+        // and its syntax appears to be different from anything else.
         | "aggregate" -> reply_aggregate clientMsg db
         | "insert" -> reply_Insert clientMsg db
         | "delete" -> reply_Delete clientMsg db

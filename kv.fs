@@ -657,6 +657,44 @@ module kv =
             let kmax = [| (vmax,false)|] |> Array.append vals |> bson.encodeMultiForIndex
             //printfn "kmax: %A" kmax
             printfn "INDEX_SCAN_TEXT"
+#if not
+            let docs = System.Collections.Generic.Dictionary<_,_>()
+            let sql = sprintf "SELECT k, doc_rowid FROM \"%s\" i WHERE k > ? AND k < ?" tblColl tblIndex ">" "<"
+            let stmt = conn.prepare(sql)
+            // TODO try/catch to make sure stmt gets finalized
+            stmt.bind_blob(1, kmin)
+            stmt.bind_blob(2, kmax)
+            while raw.SQLITE_ROW = stmt.step() do
+                let k = stmt.column_blob(0)
+                let did = stmt.column_int64(1)
+                let aw = docs.tryFind(k)
+                if ! there aw = ResizeArray<_>()
+                let w = getWeightFromIndexEntry k
+                aw.Add(w)
+            stmt.sqlite3_finalize()
+
+            // TODO convert dict of resizearrays to something better
+            // convert list of weights to one weight per document (just sum them, right?)
+
+            let sql = sprintf "SELECT bson FROM \"%s\" WHERE did=?" tblColl
+            let stmt = conn.prepare(sql)
+            let s = 
+                seq {
+                    foreach did,weight
+                        stmt.clear_bindings()
+                        stmt.bind_int64(1, did)
+                        stmt.step_row()
+                        let doc = stmt.column_blob(0) |> BinReader.ReadDocument
+                        printfn "got_SQLITE_ROW"
+                        stmt.reset()
+                        yield doc // TODO the weight too
+                }
+            let killFunc() =
+                if tx then conn.exec("COMMIT TRANSACTION")
+                stmt.sqlite3_finalize()
+
+            {docs=s; funk=killFunc}
+#else
             let sql = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ? AND k %s ?" tblColl tblIndex ">" "<"
             let stmt = conn.prepare(sql)
             stmt.bind_blob(1, kmin)
@@ -673,6 +711,7 @@ module kv =
                 stmt.sqlite3_finalize()
 
             {docs=s; funk=killFunc}
+#endif
 
         let getNonTextIndexReader tx ndx b =
             let stmt = getStmtForIndex ndx b
