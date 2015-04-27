@@ -494,7 +494,7 @@ let tests = [
     // "jstests/core/or2.js"; // explain, analyze_plan.js
     // "jstests/core/or3.js"; // explain, analyze_plan.js
     // "jstests/core/orf.js"; // explain
-    // "jstests/core/ne2.js"; // explain
+    "jstests/core/ne2.js"; // explain
     // "jstests/core/array_match4.js"; // explain
 
     // "jstests/core/ora.js"; // js

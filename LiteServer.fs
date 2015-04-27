@@ -133,8 +133,14 @@ module LiteServer =
         pairs.Add("setVersion", BInt32 1)
         pairs.Add("ismaster", BBoolean true)
         pairs.Add("secondary", BBoolean false)
-        pairs.Add("maxWireVersion", BInt32 2)
-        pairs.Add("minWireVersion", BInt32 2) // we don't support the older fire-and-forget operations
+        pairs.Add("maxWireVersion", BInt32 3)
+        // ver >= 2:  we don't support the older fire-and-forget write operations. 
+        // ver >= 3:  we don't support the older form of explain
+        // TODO if we set minWireVersion to 3, which is what we want to do, so
+        // that we can tell the client that we don't support the older form of
+        // explain, what happens is that we start getting the old fire-and-forget
+        // write operations instead of the write commands that we want.
+        pairs.Add("minWireVersion", BInt32 2) 
         // TODO
         pairs.Add("ok", BDouble 1.0)
         let doc = BDocument (pairs.ToArray())
@@ -681,6 +687,103 @@ module LiteServer =
         let doc = reply_with_cursor (db+"."+"$cmd.listIndexes") s funk cursorOptions defaultBatchSize
         createReply clientMsg.q_requestID [| doc |] 0L
 
+    let tryGetKeyWithOrWithoutDollarSignPrefix v k =
+        match bson.tryGetValueForKey v ("$"+k) with
+        | Some r -> Some r
+        | None ->
+            // now without the dollar sign
+            match bson.tryGetValueForKey v k with
+            | Some r -> Some r
+            | None -> None
+
+    let private reply_err clientMsg (e:Exception) =
+        let pairs = ResizeArray<_>()
+        pairs.Add("$err", BString (e.ToString()))
+        let doc = BDocument (pairs.ToArray())
+        let r = createReply clientMsg.q_requestID [| doc |] 0L
+        {r with r_responseFlags=2}
+
+    let reply_explain clientMsg db = 
+        let q_query = clientMsg.q_query
+        let explain = bson.getValueForKey q_query "explain"
+        let verbosity = bson.getValueForKey q_query "verbosity" |> bson.getString
+        let coll = bson.getValueForKey explain "find" |> bson.getString
+        let filter = bson.getValueForKey explain "filter"
+        let options = bson.getValueForKey explain "options"
+        let orderby = tryGetKeyWithOrWithoutDollarSignPrefix options "orderby"
+        let ndxMin = tryGetKeyWithOrWithoutDollarSignPrefix options "min"
+        let ndxMax = tryGetKeyWithOrWithoutDollarSignPrefix options "max"
+        let ndxHint = tryGetKeyWithOrWithoutDollarSignPrefix options "hint"
+        let projection = clientMsg.q_returnFieldsSelector
+
+        let mods = 
+            {
+                crud.orderby = orderby
+                crud.projection = projection
+                crud.min = ndxMin
+                crud.max = ndxMax
+                crud.hint = ndxHint
+                crud.explain = None // TODO what to do with this?
+            }
+
+        let {docs=s;funk=kill} = crud.find db coll filter mods
+
+        try
+            let s = 
+                if clientMsg.q_numberToSkip > 0 then
+                    // TODO do we want seqSkip to be public?
+                    crud.seqSkip (clientMsg.q_numberToSkip) s
+                else if clientMsg.q_numberToSkip < 0 then
+                    failwith "negative skip"
+                else
+                    s
+
+            let num =
+                #if not // apparently explain is supposed to ignore hard limits
+                let numberToReturn = clientMsg.q_numberToReturn
+                if numberToReturn < 0 || numberToReturn = 1 then
+                    // hard limit, would not return a cursor
+                    let n = if numberToReturn < 0 then -numberToReturn else numberToReturn
+                    if n <0 then failwith "overflow"
+                    let num = Seq.truncate n s |> Seq.length
+                    kill()
+                    num
+                else
+                #endif
+                    // would return everything
+                    let num = s |> Seq.length
+                    kill()
+                    num
+
+            let set d k v =
+                let f ov = Some v
+                bson.changeValueForPath d k f
+
+            let queryPlanner = BDocument Array.empty
+            let queryPlanner = sprintf "%s.%s" db coll |> BString |> set queryPlanner "namespace" 
+            let queryPlanner = false |> BBoolean |> set queryPlanner "indexFilterSet" 
+
+            let doc = BDocument Array.empty
+            let doc = set doc "queryPlanner" queryPlanner
+
+            let doc = 
+                match verbosity with
+                | "executionStats"
+                | "allPlansExecution" ->
+                    let stats = BDocument Array.empty
+                    let stats = num |> BInt32 |> set stats "nReturned"
+                    // TODO
+                    set doc "executionStats" stats
+                | _ -> doc
+
+            let doc = set doc "ok" (BDouble 1.0)
+            createReply clientMsg.q_requestID [| doc |] 0L
+        with
+            | e -> 
+                kill()
+                reply_err clientMsg e
+
+
     let private reply_cmd clientMsg (db:string) =
         // this code assumes that the first key is always the command
         let cmd = 
@@ -692,8 +795,7 @@ module LiteServer =
             | _ -> failwith "query must be a document"
         let cmd = cmd.ToLower()
         match cmd with
-        // TODO as of 3.0, explain goes here.  
-        // and its syntax appears to be different from anything else.
+        | "explain" -> reply_explain clientMsg db
         | "aggregate" -> reply_aggregate clientMsg db
         | "insert" -> reply_Insert clientMsg db
         | "delete" -> reply_Delete clientMsg db
@@ -736,13 +838,6 @@ module LiteServer =
         let result = None |> crud.listCollections |> Array.map (fun (dbName,collName,options) -> BDocument [| "name", BString (sprintf "%s.%s" dbName collName) |])
         createReply clientMsg.q_requestID result 0L
 
-    let private reply_err clientMsg (e:Exception) =
-        let pairs = ResizeArray<_>()
-        pairs.Add("$err", BString (e.ToString()))
-        let doc = BDocument (pairs.ToArray())
-        let r = createReply clientMsg.q_requestID [| doc |] 0L
-        {r with r_responseFlags=2}
-
     let doLimit coll numberToReturn s kill =
         if numberToReturn < 0 || numberToReturn = 1 then
             // hard limit, do not return a cursor
@@ -767,15 +862,6 @@ module LiteServer =
                 kill()
                 (docs, 0L)
 
-    let tryGetKeyWithOrWithoutDollarSignPrefix v k =
-        match bson.tryGetValueForKey v ("$"+k) with
-        | Some r -> Some r
-        | None ->
-            // now without the dollar sign
-            match bson.tryGetValueForKey v k with
-            | Some r -> Some r
-            | None -> None
-
     let private reply_Query clientMsg = 
         let fullCollectionName = clientMsg.q_fullCollectionName
         let (db,coll) = bson.splitname fullCollectionName
@@ -788,8 +874,6 @@ module LiteServer =
         // along with other stuff (like orderby) as well.
         // This other stuff is called query modifiers.  
         // Sigh.
-
-        // TODO check for $explain $hint
 
         let (actualQuery, queryFormat2) = 
             match tryGetKeyWithOrWithoutDollarSignPrefix bvQuery "query" with
@@ -840,7 +924,7 @@ module LiteServer =
             }
 
         //printfn "actualQuery: %A" actualQuery
-        let (s,kill) = crud.find db coll actualQuery mods
+        let {docs=s;funk=kill} = crud.find db coll actualQuery mods
 
         try
             let s = 

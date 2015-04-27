@@ -1860,7 +1860,7 @@ module crud =
             min:BsonValue option
             max:BsonValue option
             hint:BsonValue option
-            explain:BsonValue option
+            explain:BsonValue option // TODO wire version 2?
         }
 
     let noQueryModifiers = 
@@ -1934,7 +1934,7 @@ module crud =
                 | Some proj -> seqProject proj (Some m) s
                 | None -> s
             let s = seqOnlyDoc s
-            (s,funk)
+            {docs=s;funk=funk}
         with
         | _ ->
             funk()
@@ -1942,11 +1942,11 @@ module crud =
 
     let count dbName collName q =
         // TODO should this support query modifiers $min and $max ?
-        let (s,kill) = find dbName collName q noQueryModifiers
+        let rdr = find dbName collName q noQueryModifiers
         try
-            Seq.length s
+            Seq.length rdr.docs
         finally
-            kill()
+            rdr.funk()
 
     let findandmodify dbName collName query sort remove update gnew fields upsert =
         let m = 
