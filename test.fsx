@@ -35,9 +35,11 @@
 //
 // sparse indexes
 //
+// covering indexes ?
+//
 // hint -- is this feature working?
 //
-// explain
+// explain needs more work
 //
 // bson binary subtypes
 //
