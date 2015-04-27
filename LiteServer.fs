@@ -764,9 +764,57 @@ module LiteServer =
             let queryPlanner = BDocument Array.empty
             let queryPlanner = sprintf "%s.%s" db coll |> BString |> set queryPlanner "namespace" 
             let queryPlanner = false |> BBoolean |> set queryPlanner "indexFilterSet" 
+            // TODO parsedQuery
+            // TODO winningPlan
+
+            (*
+
+                "queryPlanner" : {
+                    "plannerVersion" : 1,
+                    "namespace" : "test.foo",
+                    "indexFilterSet" : false,
+                    "parsedQuery" : {
+                        "a" : {
+                            "$eq" : 1
+                        }
+                    },
+                    "winningPlan" : {
+                        "stage" : "FETCH",
+                        "inputStage" : {
+                            "stage" : "IXSCAN",
+                            "keyPattern" : {
+                                "a" : 1
+                            },
+                            "indexName" : "a_1",
+                            "isMultiKey" : true,
+                            "direction" : "forward",
+                            "indexBounds" : {
+                                "a" : [
+                                    "[1.0, 1.0]"
+                                ]
+                            }
+                        }
+                    },
+                    "rejectedPlans" : [ ]
+                },
+                "serverInfo" : {
+                    "host" : "erics-air-2.ad.sourcegear.com",
+                    "port" : 27017,
+                    "version" : "3.0.1",
+                    "gitVersion" : "534b5a3f9d10f00cd27737fbcd951032248b5952"
+                },
+
+            *)
+
+            let serverInfo = BDocument Array.empty
+            let serverInfo = "Elmo" |> BString |> set queryPlanner "software" // TODO not really present from Mongo
+            let serverInfo = "TODO" |> BString |> set queryPlanner "version"
+            let serverInfo = "TODO" |> BString |> set queryPlanner "host" 
+            let serverInfo = 27017 |> BInt32 |> set queryPlanner "port"  // TODO
 
             let doc = BDocument Array.empty
             let doc = set doc "queryPlanner" queryPlanner
+            let doc = set doc "serverInfo" serverInfo
 
             let doc = 
                 match verbosity with
