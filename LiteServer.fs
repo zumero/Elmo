@@ -726,19 +726,20 @@ module LiteServer =
                 crud.explain = None // TODO what to do with this?
             }
 
-        let {docs=s;funk=kill} = crud.find db coll filter mods
+        let rdr = crud.find db coll filter mods
 
         try
-            let s = 
-                if clientMsg.q_numberToSkip > 0 then
-                    // TODO do we want seqSkip to be public?
-                    crud.seqSkip (clientMsg.q_numberToSkip) s
-                else if clientMsg.q_numberToSkip < 0 then
-                    failwith "negative skip"
-                else
-                    s
-
             let num =
+                let s = rdr.docs
+                let s = 
+                    if clientMsg.q_numberToSkip > 0 then
+                        // TODO do we want seqSkip to be public?
+                        crud.seqSkip (clientMsg.q_numberToSkip) s
+                    else if clientMsg.q_numberToSkip < 0 then
+                        failwith "negative skip"
+                    else
+                        s
+
                 #if not // apparently explain is supposed to ignore hard limits
                 let numberToReturn = clientMsg.q_numberToReturn
                 if numberToReturn < 0 || numberToReturn = 1 then
@@ -746,14 +747,15 @@ module LiteServer =
                     let n = if numberToReturn < 0 then -numberToReturn else numberToReturn
                     if n <0 then failwith "overflow"
                     let num = Seq.truncate n s |> Seq.length
-                    kill()
+                    rdr.funk()
                     num
                 else
                 #endif
-                    // would return everything
-                    let num = s |> Seq.length
-                    kill()
-                    num
+
+                // would return everything
+                let num = s |> Seq.length
+                rdr.funk()
+                num
 
             let set d k v =
                 let f ov = Some v
@@ -772,6 +774,8 @@ module LiteServer =
                 | "allPlansExecution" ->
                     let stats = BDocument Array.empty
                     let stats = num |> BInt32 |> set stats "nReturned"
+                    let stats = rdr.totalKeysExamined() |> BInt32 |> set stats "totalKeysExamined"
+                    let stats = rdr.totalDocsExamined() |> BInt32 |> set stats "totalDocsExamined"
                     // TODO
                     set doc "executionStats" stats
                 | _ -> doc
@@ -780,7 +784,7 @@ module LiteServer =
             createReply clientMsg.q_requestID [| doc |] 0L
         with
             | e -> 
-                kill()
+                rdr.funk()
                 reply_err clientMsg e
 
 

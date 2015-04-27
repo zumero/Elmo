@@ -1843,11 +1843,10 @@ module crud =
         Seq.map (fun (doc,_) -> doc) s
 
     let private addCloseToKillFunc conn rdr =
-        let {docs=s;funk=funk} = rdr
         let funk2() =
-            funk()
+            rdr.funk()
             conn.close()
-        {docs=s;funk=funk2}
+        {rdr with funk=funk2}
 
     let private getSelectWithClose dbName collName plan = 
         let conn = kv.connect()
@@ -1922,8 +1921,9 @@ module crud =
                 chooseIndex indexes m hint
                 // None
 
-        let {docs=s;funk=funk} = getSelectWithClose dbName collName plan
+        let rdr = getSelectWithClose dbName collName plan
         try
+            let s = rdr.docs
             let s = seqMatch m s
             let s =
                 match mods.orderby with
@@ -1934,10 +1934,10 @@ module crud =
                 | Some proj -> seqProject proj (Some m) s
                 | None -> s
             let s = seqOnlyDoc s
-            {docs=s;funk=funk}
+            {rdr with docs=s}
         with
         | _ ->
-            funk()
+            rdr.funk()
             reraise()
 
     let count dbName collName q =

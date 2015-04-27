@@ -48,6 +48,8 @@ type reader =
         // and maybe more later.
         // TODO or should we just put the weight into the document with the $meta key?
         docs:seq<BsonValue>
+        totalKeysExamined:unit->int
+        totalDocsExamined:unit->int
         funk:unit->unit
         // TODO need a method here to get the number of docs scanned
     }
@@ -309,10 +311,11 @@ module kv =
             if conn.changes()<>1 then failwith "index entry insert failed"
             stmt_insert.reset()
 
-        let getStmtSequence (stmt:sqlite3_stmt) =
+        let getStmtSequence (stmt:sqlite3_stmt) count =
             seq {
                 while raw.SQLITE_ROW = stmt.step() do
                     let doc = stmt.column_blob(0) |> BinReader.ReadDocument
+                    count := !count + 1
                     printfn "got_SQLITE_ROW"
                     yield doc
             }
@@ -625,7 +628,8 @@ module kv =
                 let collTable = getTableNameForCollection db coll
                 conn.prepare(sprintf "SELECT bson FROM \"%s\"" collTable)
 
-            let s = getStmtSequence stmt
+            let count = ref 0
+            let s = getStmtSequence stmt count
 
             let killFunc() =
                 // TODO would it be possible/helpful to make sure this function
@@ -633,7 +637,12 @@ module kv =
                 if tx then conn.exec("COMMIT TRANSACTION")
                 stmt.sqlite3_finalize()
 
-            {docs=s; funk=killFunc}
+            {
+                docs=s
+                totalKeysExamined=fun () -> 0
+                totalDocsExamined=fun () -> !count
+                funk=killFunc
+            }
 
         let getTextIndexReader tx ndx eq (search:string) =
             let tblColl = getTableNameForCollection ndx.db ndx.coll
@@ -699,10 +708,12 @@ module kv =
             let stmt = conn.prepare(sql)
             stmt.bind_blob(1, kmin)
             stmt.bind_blob(2, kmax)
+            let count = ref 0
             let s = 
                 seq {
                     while raw.SQLITE_ROW = stmt.step() do
                         let doc = stmt.column_blob(0) |> BinReader.ReadDocument
+                        count := !count + 1
                         printfn "got_SQLITE_ROW"
                         yield doc
                 }
@@ -710,17 +721,28 @@ module kv =
                 if tx then conn.exec("COMMIT TRANSACTION")
                 stmt.sqlite3_finalize()
 
-            {docs=s; funk=killFunc}
+            {
+                docs=s
+                totalKeysExamined=fun () -> 0
+                totalDocsExamined=fun () -> !count
+                funk=killFunc
+            }
 #endif
 
         let getNonTextIndexReader tx ndx b =
             let stmt = getStmtForIndex ndx b
-            let s = getStmtSequence stmt
+            let count = ref 0
+            let s = getStmtSequence stmt count
             let killFunc() =
                 if tx then conn.exec("COMMIT TRANSACTION")
                 stmt.sqlite3_finalize()
 
-            {docs=s; funk=killFunc}
+            {
+                docs=s
+                totalKeysExamined=fun () -> 0
+                totalDocsExamined=fun () -> !count
+                funk=killFunc
+            }
 
         let getIndexScanReader tx p =
             let (ndx,b) = 
@@ -740,7 +762,12 @@ module kv =
                 | Some ndxu -> getIndexScanReader tx ndxu
                 | None -> getTableScanReader tx db coll
             | None ->
-                {docs=Seq.empty; funk=(fun () -> ())}
+                {
+                    docs=Seq.empty
+                    totalKeysExamined=fun () -> 0
+                    totalDocsExamined=fun () -> 0
+                    funk=(fun () -> ())
+                }
 
         let beginWrite db coll = 
             let created = createCollection db coll (BDocument Array.empty)
