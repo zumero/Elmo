@@ -27,9 +27,13 @@ type index_info =
     }
 
 module plan =
+    type TextQueryTerm =
+        | Word of bool*string
+        | Phrase of bool*string
+
     type bounds = 
         | EQ of BsonValue[]
-        | Text of BsonValue[]*string
+        | Text of BsonValue[]*TextQueryTerm[]
         | GT of BsonValue[]
         | GTE of BsonValue[]
         | LT of BsonValue[]
@@ -632,8 +636,6 @@ module kv =
             let s = getStmtSequence stmt count
 
             let killFunc() =
-                // TODO would it be possible/helpful to make sure this function
-                // can be safely called more than once?
                 if tx then conn.exec("COMMIT TRANSACTION")
                 stmt.sqlite3_finalize()
 
@@ -644,56 +646,76 @@ module kv =
                 funk=killFunc
             }
 
-        let getTextIndexReader tx ndx eq (search:string) =
+        let getTextIndexReader tx ndx eq terms =
             let tblColl = getTableNameForCollection ndx.db ndx.coll
             let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
             let (normspec,weights) = getNormalizedSpec ndx
 
-            let sortme = 
-                let words = search.Split(' ') // TODO tokenize properly
-                let words = words |> Set.ofArray |> Set.toArray
-                Array.map (fun (s:string) -> (s, System.Text.Encoding.UTF8.GetBytes (s))) words
-            let fsort (s1,ba1) (s2,ba2) = bson.bcmp ba1 ba2
-            Array.sortInPlaceWith fsort sortme
-            let minword = Array.get sortme 0 |> fst
-            let maxword = Array.get sortme (Array.length sortme - 1) |> fst
-            // note that it is possible that minword = maxword
-            let vmin = BArray [| (BString minword); (BInt32 0) |]
-            let vmax = BArray [| (BString maxword); (BInt32 100000) |]
-            let vals = getDirs normspec eq
-            let kmin = [| (vmin,false) |] |> Array.append vals |> bson.encodeMultiForIndex
-            //printfn "kmin: %A" kmin
-            let kmax = [| (vmax,false)|] |> Array.append vals |> bson.encodeMultiForIndex
-            //printfn "kmax: %A" kmax
-            printfn "INDEX_SCAN_TEXT"
-#if not
-            let docs = System.Collections.Generic.Dictionary<_,_>()
-            let sql = sprintf "SELECT k, doc_rowid FROM \"%s\" i WHERE k > ? AND k < ?" tblColl tblIndex ">" "<"
+            let sql = sprintf "SELECT k, doc_rowid FROM \"%s\" i WHERE k > ? AND k < ?" tblIndex
             let stmt = conn.prepare(sql)
+
+            let lookup word =
+                // TODO if we just search for the word without the weight, we could
+                // use the add_one trick from EQ.  Probably need key encoding of an array
+                // to omit the array length.  See comment there.
+                let vmin = BArray [| (BString word); (BInt32 0) |]
+                let vmax = BArray [| (BString word); (BInt32 100000) |]
+                let vals = getDirs normspec eq
+                let kmin = [| (vmin,false) |] |> Array.append vals |> bson.encodeMultiForIndex
+                let kmax = [| (vmax,false)|] |> Array.append vals |> bson.encodeMultiForIndex
+                let entries = ResizeArray<_>()
+                stmt.clear_bindings()
+                stmt.bind_blob(1, kmin)
+                stmt.bind_blob(2, kmax)
+                while raw.SQLITE_ROW = stmt.step() do
+                    let k = stmt.column_blob(0)
+                    let did = stmt.column_int64(1)
+                    entries.Add(k,did)
+                stmt.reset()
+                entries.ToArray()
+
             // TODO try/catch to make sure stmt gets finalized
-            stmt.bind_blob(1, kmin)
-            stmt.bind_blob(2, kmax)
-            while raw.SQLITE_ROW = stmt.step() do
-                let k = stmt.column_blob(0)
-                let did = stmt.column_int64(1)
-                let aw = docs.tryFind(k)
-                if ! there aw = ResizeArray<_>()
-                let w = getWeightFromIndexEntry k
-                aw.Add(w)
+
+            let found = 
+                Array.map (fun term ->
+                    match term with
+                    | plan.Word (neg,s) ->
+                        let entries = lookup s
+                        (term,entries)
+                    | plan.Phrase (neg,s) ->
+                        let words = s.Split(' ') // TODO how to do this properly?  deal with punctuation.
+                        let entries = 
+                            Array.collect (fun word ->
+                                lookup word
+                            ) words
+                        (term,entries)
+                ) terms
+
             stmt.sqlite3_finalize()
 
-            // TODO convert dict of resizearrays to something better
-            // convert list of weights to one weight per document (just sum them, right?)
+            //printfn "%A" found
+
+            // TODO temp hack below.  need to deal with negations.
+            // and switch to AND mode when there is a phrase.
+            // etc.
+            let docids = 
+                found
+                |> Array.collect (fun (_,entries) ->
+                    Array.map (fun (k,did) -> did) entries
+                )
+                |> Set.ofArray |> Set.toArray
 
             let sql = sprintf "SELECT bson FROM \"%s\" WHERE did=?" tblColl
             let stmt = conn.prepare(sql)
+            let count = ref 0
             let s = 
                 seq {
-                    foreach did,weight
+                    for did in docids do
                         stmt.clear_bindings()
                         stmt.bind_int64(1, did)
                         stmt.step_row()
                         let doc = stmt.column_blob(0) |> BinReader.ReadDocument
+                        count := !count + 1
                         printfn "got_SQLITE_ROW"
                         stmt.reset()
                         yield doc // TODO the weight too
@@ -702,32 +724,12 @@ module kv =
                 if tx then conn.exec("COMMIT TRANSACTION")
                 stmt.sqlite3_finalize()
 
-            {docs=s; funk=killFunc}
-#else
-            let sql = sprintf "SELECT DISTINCT d.bson FROM \"%s\" d INNER JOIN \"%s\" i ON (d.did = i.doc_rowid) WHERE k %s ? AND k %s ?" tblColl tblIndex ">" "<"
-            let stmt = conn.prepare(sql)
-            stmt.bind_blob(1, kmin)
-            stmt.bind_blob(2, kmax)
-            let count = ref 0
-            let s = 
-                seq {
-                    while raw.SQLITE_ROW = stmt.step() do
-                        let doc = stmt.column_blob(0) |> BinReader.ReadDocument
-                        count := !count + 1
-                        printfn "got_SQLITE_ROW"
-                        yield doc
-                }
-            let killFunc() =
-                if tx then conn.exec("COMMIT TRANSACTION")
-                stmt.sqlite3_finalize()
-
             {
                 docs=s
                 totalKeysExamined=fun () -> 0
                 totalDocsExamined=fun () -> !count
                 funk=killFunc
             }
-#endif
 
         let getNonTextIndexReader tx ndx b =
             let stmt = getStmtForIndex ndx b

@@ -464,11 +464,85 @@ module crud =
         //printfn "map: %A" mc
         mc
 
+    // TODO so the following function is very non-idiomatic from a functional programming
+    // perspective.  yucky.
+    let parseTextQuery s =
+        let is_delim c =
+            match c with
+            | ' ' -> true
+            | ',' -> true
+            | ';' -> true
+            | '.' -> true
+            | _ -> false
+        let i = ref 0
+        let len = String.length s
+        let skip_delim() =
+            while !i<len && is_delim s.[!i] do
+                i := !i + 1
+        let a = ResizeArray<_>()
+        let get_token() =
+            //printfn "get_token: %s" (s.Substring(!i))
+            skip_delim()
+            //printfn "after skip_delim: %s" (s.Substring(!i))
+            if !i>=len then false
+            else
+                let neg =
+                    if '-'=s.[!i] then
+                        i := !i + 1
+                        true
+                    else
+                        false
+
+                // TODO do we allow space between the - and the word or phrase?
+
+                if !i>=len then failwith "negate of nothing"
+
+
+                if '"'=s.[!i] then
+                    let tokStart = !i + 1
+                    //printfn "in phrase"
+                    i := !i + 1
+                    while !i<len && s.[!i]<>'"' do
+                        i := !i + 1
+                    //printfn "after look for other quote: %s" (s.Substring(!i))
+                    let tokLen = 
+                        if !i<len then !i-tokStart
+                        else failwith "unmatched phrase quote"
+                    //printfn "phrase tokLen: %d" tokLen
+                    i := !i + 1
+                    // TODO need to get the individual words out of the phrase here?
+                    // TODO what if the phrase is an empty string?  error?
+                    if tokLen>0 then
+                        let term = plan.Phrase(neg, s.Substring(tokStart,tokLen))
+                        a.Add(term)
+                        true
+                    else
+                        false // TODO isn't this always an error?
+                else
+                    let tokStart = !i
+                    while !i<len && not (is_delim s.[!i]) do
+                        i := !i + 1
+                    let tokLen = !i - tokStart
+                    if tokLen>0 then
+                        let term = plan.Word(neg, s.Substring(tokStart,tokLen))
+                        a.Add(term)
+                        true
+                    else
+                        false // TODO isn't this always an error?
+        while get_token() do
+            ()
+        let terms = a.ToArray()
+        terms |> Set.ofArray |> Set.toArray
+
     let private findFitIndexes indexes m =
-        let textQuery = findTextQuery m
+        let textQuery = 
+            match findTextQuery m with
+            | Some s -> s |> parseTextQuery |> Some
+            | None -> None
         let comps_eq = findComparesEQ m
         let comps_ineq = findComparesIneq m
-        Array.choose (fun ndx -> tryFitIndexToQuery ndx comps_eq comps_ineq textQuery) indexes
+        let fits = Array.choose (fun ndx -> tryFitIndexToQuery ndx comps_eq comps_ineq textQuery) indexes
+        (fits,textQuery)
 
     let private chooseFromPossibles possibles =
         if Array.isEmpty possibles then 
@@ -485,10 +559,10 @@ module crud =
                 possibles.[0] |> plan.q.Plan |> Some
 
     let private chooseIndex indexes m hint =
-        let fits = findFitIndexes indexes m
+        let (fits,textQuery) = findFitIndexes indexes m
 
-        match findTextQuery m with
-        | Some s ->
+        match textQuery with
+        | Some _ ->
             // TODO if there is a $text query, disallow hint
             match fits with
             | [|   |]  -> failwith "$text without index"

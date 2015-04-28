@@ -832,6 +832,7 @@ module LiteServer =
             createReply clientMsg.q_requestID [| doc |] 0L
         with
             | e -> 
+                //printfn "%A" e
                 rdr.funk()
                 reply_err clientMsg e
 

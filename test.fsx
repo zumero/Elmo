@@ -227,7 +227,7 @@ let tests = [
     "jstests/core/distinct4.js"; // planFailedWithCode ?
 
     // "jstests/core/or_inexact.js"; // predicates with inexact bounds
-    // "jstests/core/mod1.js"; // explain, stats, js
+    // "jstests/core/mod1.js"; // js
     // "jstests/core/find_and_modify_where.js"; // js
     // "jstests/core/find_and_modify_concurrent_update.js"; // parallel
     // "jstests/core/write_result.js"; // write concern
