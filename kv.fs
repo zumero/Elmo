@@ -674,8 +674,8 @@ module kv =
                 // last byte of mantissa is 2*x
                 // previous bytes are 2*x+1
 
-                printfn "mantissa: %A" a
-                printfn "e: %d" e
+                //printfn "mantissa: %A" a
+                //printfn "e: %d" e
 
                 // we have an array of centimal digits here, all of
                 // which appear to the right of the decimal point.
@@ -709,9 +709,8 @@ module kv =
                             v * 100
                         ) v { 1 .. need }
 
-                printfn "weight: %d" v
+                //printfn "weight: %d" v
                 v
-
 
             let lookup word =
                 // TODO if we just search for the word without the weight, we could
@@ -728,9 +727,9 @@ module kv =
                 stmt.bind_blob(2, kmax)
                 while raw.SQLITE_ROW = stmt.step() do
                     let k = stmt.column_blob(0)
+                    let w = get_weight_from_index_entry k
                     let did = stmt.column_int64(1)
-                    get_weight_from_index_entry k
-                    entries.Add(k,did)
+                    entries.Add(did,w)
                 stmt.reset()
                 entries.ToArray()
 
@@ -775,9 +774,8 @@ module kv =
                         else has
                 ) terms
 
-            let docids = 
-                found
-                |> Array.collect (fun (term,entries) ->
+            let pos_entries = 
+                Array.collect (fun (term,entries) ->
                     let neg = 
                         match term with
                         | plan.Word (neg,_) -> neg
@@ -786,13 +784,11 @@ module kv =
                     if neg then
                         Array.empty
                     else
-                        Array.map (fun (k,did) -> did) entries
-                )
-                |> Set.ofArray
+                        entries
+                ) found
 
-            let neg_docids = 
-                found
-                |> Array.collect (fun (term,entries) ->
+            let neg_entries = 
+                Array.collect (fun (term,entries) ->
                     let neg = 
                         match term with
                         | plan.Word (neg,_) -> neg
@@ -800,20 +796,33 @@ module kv =
                         // TODO probably should not negate a doc just because it contains one of the words in a negated phrase
 
                     if neg then
-                        Array.map (fun (k,did) -> did) entries
+                        entries
                     else
                         Array.empty
-                )
-                |> Set.ofArray
+                ) found
 
-            let docs = Set.difference docids neg_docids
+            let remaining =
+                let neg_docids = neg_entries |> Array.map (fun (did,w) -> did) |> Set.ofArray
+                Array.filter (fun (did,w) ->
+                    Set.contains did neg_docids |> not
+                ) pos_entries
+
+            let doc_weights =
+                Array.fold (fun cur (did,w) ->
+                    match Map.tryFind did cur with
+                    | Some a ->
+                        let a = w :: a
+                        Map.add did a cur
+                    | None ->
+                        Map.add did [w] cur
+                ) Map.empty remaining
 
             let sql = sprintf "SELECT bson FROM \"%s\" WHERE did=?" tblColl
             let stmt = conn.prepare(sql)
             let count = ref 0
             let s = 
                 seq {
-                    for did in docids do
+                    for (did,w) in Map.toSeq doc_weights do
                         stmt.clear_bindings()
                         stmt.bind_int64(1, did)
                         stmt.step_row()
@@ -823,6 +832,7 @@ module kv =
                         stmt.reset()
                         let keep = check_phrase doc
                         if keep then
+                            printfn "weights for this doc: %A" w
                             yield doc // TODO the score too
                 }
             let killFunc() =
