@@ -15,6 +15,10 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *)
 
+// text search needs to be case insensitive
+//
+// text index: wildcard
+//
 // text: get weights through to the matcher
 //
 // findCompares might need to dive into elemMatch
@@ -25,7 +29,7 @@
 //
 // text index issue: stemming?
 //
-// textindex: search strings other than just conjined OR words
+// textindex: search strings other than just conjoined OR words
 //
 // probably bug: 2 text indexes, same weight, common words, unique constraint violation
 //

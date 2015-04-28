@@ -650,9 +650,68 @@ module kv =
             let tblColl = getTableNameForCollection ndx.db ndx.coll
             let tblIndex = getTableNameForIndex ndx.db ndx.coll ndx.ndx
             let (normspec,weights) = getNormalizedSpec ndx
+            let weights = 
+                match weights with
+                | Some a -> a
+                | None -> failwith "must be a text index"
 
             let sql = sprintf "SELECT k, doc_rowid FROM \"%s\" i WHERE k > ? AND k < ?" tblIndex
             let stmt = conn.prepare(sql)
+
+            let get_weight_from_index_entry k =
+                let len = Array.length k
+                let n = k |> Array.rev |> Array.findIndex (fun b -> b=0uy)
+                let n = len - n
+                let ord = 0 |> BInt32 |> bson.getTypeOrder |> byte
+                if k.[n] <> ord then failwith "bad type order byte"
+                let e = (k.[n+1] |> int) - 23
+                // exponent is number of times the mantissa must be multiplied times 100
+                // if we assume that all mantissa digits are to the right of the decimal point.
+                if e<=0 then failwith "bad e"
+                let n = n + 2
+                let a = Array.sub k n (len - n)
+                // remaining bytes are mantissa, base 100
+                // last byte of mantissa is 2*x
+                // previous bytes are 2*x+1
+
+                printfn "mantissa: %A" a
+                printfn "e: %d" e
+
+                // we have an array of centimal digits here, all of
+                // which appear to the right of the decimal point.
+                //
+                // we know from the context that this
+                // SHOULD be an integer.
+
+                let len = Array.length a
+
+                // chop off digits that won't matter
+                let a =
+                    if len > e then
+                        Array.sub a 0 e
+                    else
+                        a
+
+                let len = Array.length a
+                // assert len <= e
+
+                let v =
+                    Array.fold (fun v d ->
+                        let b = d >>> 1 |> int
+                        v * 100 + b
+                    ) 0 a
+
+                let need = e - len
+                let v = 
+                    if need <= 0 then v
+                    else
+                        Seq.fold (fun v _ ->
+                            v * 100
+                        ) v { 1 .. need }
+
+                printfn "weight: %d" v
+                v
+
 
             let lookup word =
                 // TODO if we just search for the word without the weight, we could
@@ -670,6 +729,7 @@ module kv =
                 while raw.SQLITE_ROW = stmt.step() do
                     let k = stmt.column_blob(0)
                     let did = stmt.column_int64(1)
+                    get_weight_from_index_entry k
                     entries.Add(k,did)
                 stmt.reset()
                 entries.ToArray()
@@ -695,15 +755,58 @@ module kv =
 
             //printfn "%A" found
 
-            // TODO temp hack below.  need to deal with negations.
-            // and switch to AND mode when there is a phrase.
-            // etc.
+            let contains_phrase doc (p:string) =
+                Map.exists (fun k _ ->
+                    match bson.findPath doc k with
+                    | BUndefined -> false
+                    | v ->
+                        match v with
+                        | BString s -> s.IndexOf(p) >= 0
+                        | _ -> false
+                ) weights
+
+            let check_phrase doc =
+                Array.forall (fun term ->
+                    match term with
+                    | plan.Word _ -> true
+                    | plan.Phrase (neg,s) ->
+                        let has = contains_phrase doc s
+                        if neg then not has
+                        else has
+                ) terms
+
             let docids = 
                 found
-                |> Array.collect (fun (_,entries) ->
-                    Array.map (fun (k,did) -> did) entries
+                |> Array.collect (fun (term,entries) ->
+                    let neg = 
+                        match term with
+                        | plan.Word (neg,_) -> neg
+                        | plan.Phrase (neg,_) -> neg
+
+                    if neg then
+                        Array.empty
+                    else
+                        Array.map (fun (k,did) -> did) entries
                 )
-                |> Set.ofArray |> Set.toArray
+                |> Set.ofArray
+
+            let neg_docids = 
+                found
+                |> Array.collect (fun (term,entries) ->
+                    let neg = 
+                        match term with
+                        | plan.Word (neg,_) -> neg
+                        | plan.Phrase (neg,_) -> false // neg 
+                        // TODO probably should not negate a doc just because it contains one of the words in a negated phrase
+
+                    if neg then
+                        Array.map (fun (k,did) -> did) entries
+                    else
+                        Array.empty
+                )
+                |> Set.ofArray
+
+            let docs = Set.difference docids neg_docids
 
             let sql = sprintf "SELECT bson FROM \"%s\" WHERE did=?" tblColl
             let stmt = conn.prepare(sql)
@@ -718,7 +821,9 @@ module kv =
                         count := !count + 1
                         printfn "got_SQLITE_ROW"
                         stmt.reset()
-                        yield doc // TODO the weight too
+                        let keep = check_phrase doc
+                        if keep then
+                            yield doc // TODO the score too
                 }
             let killFunc() =
                 if tx then conn.exec("COMMIT TRANSACTION")
@@ -835,6 +940,7 @@ module kv =
                     Array.iter (fun vals ->
                         //printfn "for index: %A" vals
                         let k = bson.encodeMultiForIndex vals
+                        //printfn "encoded: %A" k
                         indexInsertStep stmt_insert k doc_rowid
                     ) entries
 
