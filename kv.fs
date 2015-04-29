@@ -192,11 +192,16 @@ module kv =
         a.[i] <- v
         a
 
-    let private getIndexEntries newDoc normspec weights f =
+    let private getIndexEntries newDoc normspec weights options f =
+        //printfn "getIndexEntries: options = %A" options
+        let sparse =
+            match bson.tryGetValueForKey options "sparse" with
+            | Some (BBoolean b) -> b
+            | _ -> false
         let findIndexEntryVals normspec doc =
             //printfn "spec: %A" spec
             //printfn "doc: %A" doc
-            Array.map (fun (k,typ) ->
+            Array.choose (fun (k,typ) ->
                 //printfn "k : %s" k
                 let v = bson.findPath doc k
                 //printfn "findPath: k = %A" k
@@ -211,11 +216,22 @@ module kv =
                 // The matcher can and must still distinguish between null and
                 // undefined.
 
-                // TODO should the following be done differently if the index is sparse?
-                let v = bson.replaceUndefined v
+                let keep = 
+                    if sparse then
+                        match v with
+                        | BUndefined -> false
+                        | _ -> true
+                    else
+                        true
 
-                let neg = IndexType.Backward=typ
-                (v,neg)
+                if keep then
+                    //printfn "keep index entry"
+                    let v = bson.replaceUndefined v
+                    let neg = IndexType.Backward=typ
+                    Some (v,neg)
+                else
+                    //printfn "no index entry"
+                    None
             ) normspec
 
         let q vals w (s:string) =
@@ -410,7 +426,7 @@ module kv =
                     let entries = ResizeArray<_>()
                     let f vals = entries.Add(vals)
 
-                    getIndexEntries newDoc normspec weights f
+                    getIndexEntries newDoc normspec weights info.options f
 
                     let entries = entries.ToArray() |> Set.ofArray |> Set.toArray
                     //printfn "entries for index: %A" entries
@@ -965,7 +981,7 @@ module kv =
 
                     let f vals = entries.Add(vals)
 
-                    getIndexEntries newDoc normspec weights f
+                    getIndexEntries newDoc normspec weights info.options f
 
                     let entries = entries.ToArray() |> Set.ofArray |> Set.toArray
                     Array.iter (fun vals ->

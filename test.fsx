@@ -15,6 +15,8 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *)
 
+// force hint even when it doesn't fit?  what bounds?  minkey and maxkey?
+//
 // separate actual networking part of the server from the layer that
 // just takes a message and returns a reply message
 //
@@ -42,11 +44,7 @@
 //
 // ability to use an index for sorting
 //
-// sparse indexes
-//
 // covering indexes ?
-//
-// hint -- is this feature working?
 //
 // bson binary subtypes
 //
@@ -94,7 +92,10 @@ open System.Diagnostics
 let path_mongo_shell = "/Users/eric/Downloads/mongodb-osx-x86_64-3.0.1/bin/mongo"
 let path_mongo_src = "/Users/eric/m/mongo"
 let tests = [
-    "jstests/core/fts1.js";
+    "jstests/core/orh.js"; // disallow use of a sparse index on y for query {y:null}
+    "jstests/core/null.js"; // disallow use of a sparse index on y for query {y:null}
+    "jstests/core/exists9.js"; // bad index on {a.0}
+    "jstests/core/fts1.js"; // missing info from listIndexes for a text index
     "jstests/core/fts2.js";
     "jstests/core/fts3.js";
     "jstests/core/fts4.js";
@@ -274,7 +275,6 @@ let tests = [
     "jstests/core/update_blank1.js";
     "jstests/core/nin.js";
     "jstests/core/nin2.js";
-    "jstests/core/null.js";
     "jstests/core/null2.js";
     "jstests/core/numberint.js";
     "jstests/core/numberlong.js";
@@ -401,7 +401,6 @@ let tests = [
     "jstests/core/ord.js";
     "jstests/core/ore.js";
     "jstests/core/org.js";
-    "jstests/core/orh.js";
     "jstests/core/orj.js";
     "jstests/core/ork.js";
     "jstests/core/orp.js";
@@ -430,7 +429,6 @@ let tests = [
     "jstests/core/exists6.js";
     "jstests/core/exists7.js";
     "jstests/core/exists8.js";
-    "jstests/core/exists9.js";
     "jstests/core/existsb.js";
     "jstests/core/find1.js"; // snapshot , $query with dollar sign
     "jstests/core/find2.js";

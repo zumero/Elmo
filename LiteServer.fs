@@ -555,7 +555,16 @@ module LiteServer =
             match query with
             | Some q -> q
             | None -> BDocument [| |]
-        let count = crud.count db coll query
+        let mods = 
+            {
+                crud.orderby = None
+                crud.projection = None
+                crud.min = None
+                crud.max = None
+                crud.hint = bson.tryGetValueForKey q "hint"
+                crud.explain = None
+            }
+        let count = crud.count db coll query mods
         // TODO it's a little weird to do skip/limit here instead of
         // the way it's done for find.
         let skip = bson.tryGetValueForKey q "skip"

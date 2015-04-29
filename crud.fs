@@ -561,6 +561,9 @@ module crud =
             | [| r |] -> plan.q.Plan r |> Some
             | _ -> failwith "should not happen"
         | None ->
+            // TODO the jstests seem to indicate that hint will be forced
+            // even if it does not fit the query.  how does this work?
+            // what bounds are used?
             match hint with
             | Some ndxHint ->
                 match Array.tryFind (fun (ndx,fit) -> ndx.spec=ndxHint.spec) fits with
@@ -689,6 +692,15 @@ module crud =
                 let ndxKey = bson.getValueForKey d "key"
                 let ndxName = bson.getValueForKey d "name" |> bson.getString
                 let options = BDocument Array.empty
+                let options = 
+                    match bson.tryGetValueForKey d "sparse" with
+                    | Some v -> 
+                        match v with
+                        | BBoolean b ->
+                            let f ov = Some v
+                            bson.changeValueForPath options "sparse" f
+                        | _ -> failwith "illegal value for sparse"
+                    | None -> options
                 let options = 
                     match bson.tryGetValueForKey d "unique" with
                     | Some v -> 
@@ -1979,10 +1991,16 @@ module crud =
         // TODO tests indicate that if there is a $min and/or $max as well as a $hint,
         // then we need to error if they don't match each other.
 
-        let hint = 
+        let (natural,hint) = 
+            //printfn "mods: %A" mods
             match mods.hint with
-            | Some desc -> tryFindIndexByNameOrSpec dbName collName indexes desc
-            | None -> None
+            | Some (BDocument [| ("$natural",_) |]) ->
+                (true,None)
+            | Some desc -> 
+                match tryFindIndexByNameOrSpec dbName collName indexes desc with
+                | Some v -> (false,Some v)
+                | None -> failwith (sprintf "bad hint: %A" desc)
+            | None -> (false,None)
 
         let plan = 
             // unless we're going to add comparisons to the query,
@@ -2016,7 +2034,8 @@ module crud =
                 | Some ndx -> (ndx,plan.bounds.LT(maxvals)) |> plan.q.Plan |> Some
                 | None -> failwith "index not found" // TODO or None
             | None,None -> 
-                chooseIndex indexes m hint
+                if natural then None
+                else chooseIndex indexes m hint
                 // None
 
         let rdr = getSelectWithClose dbName collName plan
@@ -2037,9 +2056,8 @@ module crud =
             rdr.funk()
             reraise()
 
-    let count dbName collName q =
-        // TODO should this support query modifiers $min and $max ?
-        let rdr = find dbName collName q noQueryModifiers
+    let count dbName collName q mods =
+        let rdr = find dbName collName q mods
         try
             Seq.length rdr.docs
         finally
