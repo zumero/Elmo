@@ -15,15 +15,30 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *)
 
+// separate actual networking part of the server from the layer that
+// just takes a message and returns a reply message
+//
+// implement actual objectid, first four timestamp
+//
+// explain needs more work
+//
+// geo
+//
+// maybe use findPath more in Matcher now that it dives into arrays
+//
+// $natural query modifier
+//
 // proper tokenize for text index
+//
+// text search needs to be case insensitive
+//
+// and there is a caseSensitive modifier for $text search
 //
 // text index: stop words
 //
 // text index: language
 //
 // text index: stemming?
-//
-// text search needs to be case insensitive
 //
 // findCompares might need to dive into elemMatch
 //
@@ -35,8 +50,6 @@
 //
 // hint -- is this feature working?
 //
-// explain needs more work
-//
 // bson binary subtypes
 //
 // consider having the LiteServer layer keep the kv.conn open all the time.
@@ -45,12 +58,7 @@
 //
 // figure out why none of the parallel shell things work
 //
-// separate actual networking part of the server from the layer that
-// just takes a message and returns a reply message
-//
 // sort bindata, length, then subtype, then byte by byte
-//
-// implement actual objectid, first four timestamp
 //
 // consider implement capped collection.  size may not make sense, but
 // max probably does.
@@ -63,10 +71,6 @@
 //
 // regex tests
 //
-// geo
-//
-// $natural query modifier
-//
 // consider hacking the tests so I don't have to throw out a long test just
 // because mongolite can't pass one little part of it
 //
@@ -75,8 +79,6 @@
 // bson writer BsonValue.BJSCodeWithScope
 //
 // lots of failwiths should be mongocode
-//
-// maybe use findPath more in Matcher now that it dives into arrays
 //
 // should find and aggregate share their implementation of projection?
 // 

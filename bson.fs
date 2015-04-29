@@ -460,22 +460,22 @@ module bson =
         | BsonValue.BArray vals ->
             let start = w.Position
             w.WriteInt32(0) // placeholder for length
-            for i in 0 .. vals.Length - 1 do
-                let vsub = vals.[i]
+            Array.iteri (fun i vsub ->
                 w.WriteByte(getTypeNumber vsub |> byte)
                 w.WriteCString(i.ToString())
                 toBinary vsub w
+            ) vals
             w.WriteByte(0uy)
             let len = w.Position - start
             w.WriteInt32At(len, start)
         | BsonValue.BDocument pairs ->
             let start = w.Position
             w.WriteInt32(0) // placeholder for length
-            for i in 0 .. pairs.Length - 1 do
-                let (ksub,vsub) = pairs.[i]
+            Array.iter (fun (ksub,vsub) ->
                 w.WriteByte(getTypeNumber vsub |> byte)
                 w.WriteCString(ksub)
                 toBinary vsub w
+            ) pairs
             w.WriteByte(0uy)
             let len = w.Position - start
             w.WriteInt32At(len, start)
