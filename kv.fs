@@ -181,6 +181,7 @@ module kv =
                     if Map.containsKey k cur then cur
                     else Map.add k 1 cur
                 ) weights text_keys
+            // TODO if the wildcard is present, remove everything else?
             let decoded = Array.map (fun (k,v) -> (k, decodeIndexType v)) scalar_keys
             let r = (decoded, Some weights)
             //printfn "%A" r
@@ -217,23 +218,37 @@ module kv =
                 (v,neg)
             ) normspec
 
+        let q vals w (s:string) =
+            let a = s.Split(' ') // TODO tokenize properly
+            let a = a |> Set.ofArray |> Set.toArray
+            Array.iter (fun s ->
+                let v = BArray [| (BString s); (BInt32 w) |]
+                let vals = Array.append vals [| (v,false) |]
+                vals |> f
+            ) a
+
         let maybeText vals newDoc weights f =
             match weights with
             | Some weights ->
                 Map.iter (fun k w ->
-                    match bson.findPath newDoc k with
-                    | BUndefined -> ()
-                    | v ->
-                        match v with
-                        | BString s ->
-                            let a = s.Split(' ') // TODO tokenize properly
-                            let a = a |> Set.ofArray |> Set.toArray
-                            Array.iter (fun s ->
-                                let v = BArray [| (BString s); (BInt32 w) |]
-                                let vals = Array.append vals [| (v,false) |]
-                                vals |> f
-                            ) a
-                        | _ -> () // no index entry unless it's a string 
+                    // TODO what if k is a wildcard?
+                    if k="$**" then 
+                        // TODO find all strings?
+                        printfn "############################### wildcard"
+                    else
+                        match bson.findPath newDoc k with
+                        | BUndefined -> ()
+                        | v ->
+                            match v with
+                            | BString s -> q vals w s
+                            | BArray a ->
+                                let a = a |> Set.ofArray |> Set.toArray
+                                Array.iter (fun v ->
+                                    match v with
+                                    | BString s -> q vals w s
+                                    | _ -> () // no index entry unless it's a string 
+                                ) a
+                            | _ -> () // no index entry unless it's a string 
                 ) weights
             | None ->
                 //printfn "maybeText: %A" vals
@@ -386,6 +401,7 @@ module kv =
                 // now insert index entries for every doc that already exists
                 let (normspec,weights) = getNormalizedSpec info
                 //printfn "normspec in createIndex: %A" normspec
+                //printfn "weights in createIndex: %A" weights
                 use stmt2 = conn.prepare(sprintf "SELECT did,bson FROM \"%s\"" collTable)
                 use stmt_insert = prepareIndexInsert ndxTable
                 while raw.SQLITE_ROW = stmt2.step() do
@@ -398,6 +414,7 @@ module kv =
                     getIndexEntries newDoc normspec weights f
 
                     let entries = entries.ToArray() |> Set.ofArray |> Set.toArray
+                    //printfn "entries for index: %A" entries
                     Array.iter (fun vals ->
                         //printfn "for index: %A" vals
                         let k = bson.encodeMultiForIndex vals
@@ -756,7 +773,7 @@ module kv =
 
             stmt.sqlite3_finalize()
 
-            //printfn "%A" found
+            //printfn "found: %A" found
 
             let contains_phrase doc (p:string) =
                 Map.exists (fun k _ ->
@@ -837,7 +854,8 @@ module kv =
                         let keep = check_phrase doc
                         if keep then
                             printfn "weights for this doc: %A" w
-                            yield {doc=doc;score=None;pos=None} // TODO the score too
+                            let score = List.sum w |> float // TODO this is not the way mongo does this calculation
+                            yield {doc=doc;score=Some score;pos=None}
                 }
             let killFunc() =
                 if tx then conn.exec("COMMIT TRANSACTION")

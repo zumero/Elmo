@@ -474,7 +474,7 @@ module LiteServer =
             | Some proj ->
                 // TODO calling stuff below that seems like it should be private to the crud module
                 let prep = crud.verifyProjection proj None // TODO projection position op allowed here?
-                pairs.Add("value", crud.projectDocument v None prep) // TODO projection position op allowed here?
+                pairs.Add("value", crud.projectDocument {doc=v;score=None;pos=None} prep) // TODO projection position op allowed here?
             | None ->
                 pairs.Add("value", v)
         | None -> pairs.Add("value", BNull)

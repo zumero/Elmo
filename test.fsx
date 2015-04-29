@@ -15,25 +15,21 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *)
 
-// text search needs to be case insensitive
-//
 // text index: wildcard
-//
-// text: get weights through to the matcher
-//
-// findCompares might need to dive into elemMatch
-//
-// implement the matcher part of $text
 //
 // proper tokenize for text index
 //
-// text index issue: stemming?
+// text index: stop words
 //
-// textindex: search strings other than just conjoined OR words
+// text index: language
+//
+// text index: stemming?
+//
+// text search needs to be case insensitive
+//
+// findCompares might need to dive into elemMatch
 //
 // probably bug: 2 text indexes, same weight, common words, unique constraint violation
-//
-// should weight be a double instead of an int?  docs say no, it's an int.
 //
 // ability to use an index for sorting
 //
@@ -102,6 +98,30 @@ open System.Diagnostics
 let path_mongo_shell = "/Users/eric/Downloads/mongodb-osx-x86_64-3.0.1/bin/mongo"
 let path_mongo_src = "/Users/eric/m/mongo"
 let tests = [
+    "jstests/core/fts1.js";
+    "jstests/core/fts2.js";
+    "jstests/core/fts3.js";
+    "jstests/core/fts4.js";
+    "jstests/core/fts5.js";
+    "jstests/core/fts6.js"; // $or
+    "jstests/core/fts_blog.js"; // stemming, write vs writing
+    "jstests/core/fts_blogwild.js";
+    "jstests/core/fts_casesensitive.js";
+    "jstests/core/fts_enabled.js"; // setParameter
+    "jstests/core/fts_explain.js";
+    "jstests/core/fts_index.js"; // spanglish not recognized
+    "jstests/core/fts_index2.js"; // wildcard
+    "jstests/core/fts_index3.js"; // wildcard
+    "jstests/core/fts_index_version1.js";
+    "jstests/core/fts_mix.js";
+    "jstests/core/fts_partition1.js";
+    "jstests/core/fts_partition_no_multikey.js"; // should fail insert empty array?
+    "jstests/core/fts_phrase.js"; // score wrong?
+    "jstests/core/fts_proj.js";
+    "jstests/core/fts_projection.js";
+    "jstests/core/fts_querylang.js";
+    "jstests/core/fts_score_sort.js";
+    "jstests/core/fts_spanish.js";
     "jstests/aggregation/bugs/server11675.js"; // $text fts?
     "jstests/aggregation/bugs/server5209.js"; // group by 24 vs 24L vs 24.0
     "jstests/aggregation/bugs/server6125.js"; // sort.  test case seems wrong.  array containing 1 should sort before 2L.

@@ -550,7 +550,7 @@ module Matcher =
             let anyMatches = Array.exists (fun psub -> matchQueryDoc psub d cbArrayPos) docs
             not anyMatches
         | Text s ->
-            true // TODO this is wrong.  there is more work to do even after the index.
+            true // TODO is there more work to do here?  or does the index code deal with it all now?
         | Where _ ->
             failwith "$where is not supported" //16395 in agg
 

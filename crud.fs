@@ -581,24 +581,55 @@ module crud =
         finally
             funk()
 
+    let private sortShimOnlyDoc k dir ta tb =
+        let dir = 
+            match dir with
+            | BInt32 a -> a
+            | BInt64 a -> int32 a
+            | BDouble a -> int32 a
+            | _ -> failwith (sprintf "invalid sort: %A" dir)
+        if dir=0 then failwith "sort dir cannot be 0"
+        let dir = if dir < 0 then -1 else 1
+        // note that, apparently, mongo always treats undefined as null for sorting purposes
+        let va = bson.findPath ta k |> bson.replaceUndefined
+        let vb = bson.findPath tb k |> bson.replaceUndefined
+        (va,vb,dir)
+
+
+    let private sortShim k dir ta tb =
+        match dir with
+        | BDocument [| ("$meta",BString "textScore") |] ->
+            let va = 
+                match ta.score with
+                | Some f -> BDouble f
+                | _ -> failwith "score missing"
+            let vb = 
+                match tb.score with
+                | Some f -> BDouble f
+                | _ -> failwith "score missing"
+            let dir = -1
+            (va,vb,dir)
+        | _ ->
+            let dir = 
+                match dir with
+                | BInt32 a -> a
+                | BInt64 a -> int32 a
+                | BDouble a -> int32 a
+                | _ -> failwith (sprintf "invalid sort: %A" dir)
+            if dir=0 then failwith "sort dir cannot be 0"
+            let dir = if dir < 0 then -1 else 1
+            // note that, apparently, mongo always treats undefined as null for sorting purposes
+            let va = bson.findPath ta.doc k |> bson.replaceUndefined
+            let vb = bson.findPath tb.doc k |> bson.replaceUndefined
+            (va,vb,dir)
+
+
     let private sortFunc ord f =
         match ord with
         | BDocument keys ->
             let rec mycmp cur ta tb =
                 let (k,dir) = keys.[cur]
-                let dir1 = match dir with
-                           | BInt32 a -> a
-                           | BInt64 a -> int32 a
-                           | BDouble a -> int32 a
-                           | BDocument [| ("$meta",BString "textScore") |] -> 1 // TODO fake textScore
-                           | _ -> failwith (sprintf "invalid sort: %A" dir)
-                if dir1=0 then failwith "sort dir cannot be 0"
-                let dir = if dir1 < 0 then -1 else 1
-                let a = f ta
-                let b = f tb
-                // note that, apparently, mongo always treats undefined as null for sorting purposes
-                let va = bson.findPath a k |> bson.replaceUndefined
-                let vb = bson.findPath b k |> bson.replaceUndefined
+                let (va,vb,dir) = f k dir ta tb
                 let c = Matcher.cmpdir va vb dir
                 if c<>0 then
                     c
@@ -1253,7 +1284,7 @@ module crud =
                         let step1 = arrayInsert a each pos
                         let step2 =
                             match sort with
-                            | Some v -> sortDocumentsBy step1 v (fun x -> x)
+                            | Some v -> sortDocumentsBy step1 v sortShimOnlyDoc
                             | None -> step1
                         let step3 =
                             match slice with
@@ -1566,7 +1597,7 @@ module crud =
 
     let private seqSort ord s =
         let a1 = s |> Seq.toArray
-        let fsort = sortFunc ord (fun st -> st.doc)
+        let fsort = sortFunc ord sortShim
         Array.sortInPlaceWith fsort a1
         Array.toSeq a1
 
@@ -1587,17 +1618,20 @@ module crud =
         finally
             funk()
 
-    let private doProjectionOperator cur k (projOp:(string*BsonValue)[]) =
+    let private doProjectionOperator cur score k (projOp:(string*BsonValue)[]) =
         // TODO is it really true that the projection op document can only have one thing in it?
         if projOp.Length <> 1 then failwith (sprintf "projOp: %A" projOp)
         let (op,arg) = projOp.[0]
         match op with
         | "$meta" ->
-            let f ov =
-                match ov with
-                | Some v -> Some v // TODO overwrite?
-                | None -> 1.0 |> BDouble |> Some // TODO fake textScore
-            bson.changeValueForPath cur k f
+            match score with
+            | Some n ->
+                let f ov =
+                    match ov with
+                    | Some v -> n |> BDouble |> Some // jstests/core/fts_projection.js says yes, clobber
+                    | None -> n |> BDouble |> Some
+                bson.changeValueForPath cur k f
+            | None -> cur // tests say don't fail here
         | "$elemMatch" ->
             let f ov =
                 match ov with
@@ -1655,11 +1689,11 @@ module crud =
             bson.changeValueForPath cur k f
         | _ -> failwith (sprintf "unsupported projection operator: %A" projOp)
 
-    let private projOps doc pairs ndx =
+    let private projOps doc score pairs ndx =
         Array.fold (fun cur (k:string,inc) ->
             let k = k.Replace(".$", "") // TODO proper fix for positional here is to remove it? 
             match inc with
-            | BDocument projOp -> doProjectionOperator cur k projOp
+            | BDocument projOp -> doProjectionOperator cur score k projOp
             | _ -> failwith "not here"
             ) doc pairs
 
@@ -1817,7 +1851,8 @@ module crud =
         | _ -> failwith "projection must be a document"
 
     // TODO seems weird that the server needs access to the stuff below
-    let projectDocument d ndx proj =
+    let projectDocument st proj =
+        let {doc=d;score=score;pos=ndx} = st
         //printfn "d = %A" d
 
         // in excludeMode, everything starts out IN and has to get explicitly kicked out.
@@ -1840,7 +1875,7 @@ module crud =
         //printfn "step2: %A" step2
 
         let step3 =
-            projOps step2 proj.ops ndx
+            projOps step2 score proj.ops ndx
 
         //printfn "step3: %A" step3
 
@@ -1897,7 +1932,7 @@ module crud =
     let private seqProject proj m s =
         let prep = verifyProjection proj m
         Seq.map (fun st -> 
-            let newDoc = projectDocument st.doc st.pos prep
+            let newDoc = projectDocument st prep
             // preserve other parts of the state
             {st with doc=newDoc}
             ) s
