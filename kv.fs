@@ -233,8 +233,7 @@ module kv =
                 Map.iter (fun k w ->
                     // TODO what if k is a wildcard?
                     if k="$**" then 
-                        // TODO find all strings?
-                        printfn "############################### wildcard"
+                        bson.forAllStrings newDoc (fun s -> q vals w s)
                     else
                         match bson.findPath newDoc k with
                         | BUndefined -> ()
@@ -853,7 +852,7 @@ module kv =
                         stmt.reset()
                         let keep = check_phrase doc
                         if keep then
-                            printfn "weights for this doc: %A" w
+                            //printfn "weights for this doc: %A" w
                             let score = List.sum w |> float // TODO this is not the way mongo does this calculation
                             yield {doc=doc;score=Some score;pos=None}
                 }

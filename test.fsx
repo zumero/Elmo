@@ -15,8 +15,6 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *)
 
-// text index: wildcard
-//
 // proper tokenize for text index
 //
 // text index: stop words

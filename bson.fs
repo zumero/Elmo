@@ -485,6 +485,27 @@ module bson =
         toBinary bv w
         w.ToArray()
 
+    let rec forAllStrings bv fn =
+        match bv with
+        | BsonValue.BDouble f -> ()
+        | BsonValue.BInt32 n -> ()
+        | BsonValue.BDateTime n -> ()
+        | BsonValue.BTimeStamp n -> ()
+        | BsonValue.BInt64 n -> ()
+        | BsonValue.BString s -> fn s
+        | BsonValue.BObjectID a -> ()
+        | BsonValue.BBoolean b -> ()
+        | BsonValue.BNull -> ()
+        | BsonValue.BMinKey -> ()
+        | BsonValue.BMaxKey -> ()
+        | BsonValue.BRegex (expr,opt) -> ()
+        | BsonValue.BUndefined -> ()
+        | BsonValue.BJSCode s -> ()
+        | BsonValue.BJSCodeWithScope s -> ()
+        | BsonValue.BBinary (subtype,ba) -> ()
+        | BsonValue.BArray vals -> Array.iter (fun v -> forAllStrings v fn) vals
+        | BsonValue.BDocument pairs -> Array.iter (fun (k,v) -> forAllStrings v fn) pairs
+
 #if not
     // code to decode IEEE double
 
