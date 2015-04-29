@@ -216,10 +216,24 @@ module bson =
         (left,right)
 
     let newObjectID() =
-        // TODO make this a real object ID, not just 12 random bytes
+        // a 4-byte value representing the seconds since the Unix epoch,
+        // a 3-byte machine identifier,
+        // a 2-byte process id, and
+        // a 3-byte counter, starting with a random value.
+
         let id:byte[] = Array.zeroCreate 12
+
+        let epoch = DateTime(1970,1,1)
+        let since = DateTime.Now - epoch
+        let s = since.TotalSeconds |> int
+        id.[3] <- byte (s >>> 0)
+        id.[2] <- byte (s >>> 8)
+        id.[1] <- byte (s >>> 16)
+        id.[0] <- byte (s >>> 24)
+
+        // TODO for now, just fill the other 8 bytes with random data.
         let r = Random()
-        for i in 0 .. 11 do
+        for i in 4 .. 11 do
             id.[i] <- (r.Next() % 255) |> byte
         BObjectID id
 

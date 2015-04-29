@@ -18,8 +18,6 @@
 // separate actual networking part of the server from the layer that
 // just takes a message and returns a reply message
 //
-// implement actual objectid, first four timestamp
-//
 // explain needs more work
 //
 // geo
