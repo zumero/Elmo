@@ -27,8 +27,6 @@
 //
 // findCompares might need to dive into elemMatch
 //
-// probably bug: 2 text indexes, same weight, common words, unique constraint violation
-//
 // ability to use an index for sorting
 //
 // sparse indexes
@@ -43,7 +41,7 @@
 //
 // consider having the LiteServer layer keep the kv.conn open all the time.
 //
-// funk never gets called when the client abandons a cursor.  time it out.
+// funk never gets called when the client abandons a cursor.  need timeout.
 //
 // figure out why none of the parallel shell things work
 //
@@ -109,14 +107,14 @@ let tests = [
     "jstests/core/fts_explain.js";
     "jstests/core/fts_index.js"; // spanglish not recognized
     "jstests/core/fts_index2.js"; // wildcard
-    "jstests/core/fts_index3.js"; // wildcard
+    "jstests/core/fts_index3.js"; // stemming
     "jstests/core/fts_index_version1.js";
     "jstests/core/fts_mix.js";
     "jstests/core/fts_partition1.js";
     "jstests/core/fts_partition_no_multikey.js"; // should fail insert empty array?
     "jstests/core/fts_phrase.js"; // score wrong?
     "jstests/core/fts_proj.js";
-    "jstests/core/fts_projection.js";
+    "jstests/core/fts_projection.js"; // textScore projection not allowed for nested field?
     "jstests/core/fts_querylang.js";
     "jstests/core/fts_score_sort.js";
     "jstests/core/fts_spanish.js";
