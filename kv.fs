@@ -46,12 +46,16 @@ module plan =
     type q =
         | Plan of index_info*bounds
 
+type state =
+    {
+        doc:BsonValue
+        score:float option
+        pos:int option
+    }
+
 type reader = 
     {
-        // TODO this seq will have to change to include the text weight. :-(
-        // and maybe more later.
-        // TODO or should we just put the weight into the document with the $meta key?
-        docs:seq<BsonValue>
+        docs:seq<state>
         totalKeysExamined:unit->int
         totalDocsExamined:unit->int
         funk:unit->unit
@@ -321,7 +325,7 @@ module kv =
                     let doc = stmt.column_blob(0) |> BinReader.ReadDocument
                     count := !count + 1
                     printfn "got_SQLITE_ROW"
-                    yield doc
+                    yield {doc=doc;score=None;pos=None}
             }
 
         let rec createIndex info =
@@ -833,7 +837,7 @@ module kv =
                         let keep = check_phrase doc
                         if keep then
                             printfn "weights for this doc: %A" w
-                            yield doc // TODO the score too
+                            yield {doc=doc;score=None;pos=None} // TODO the score too
                 }
             let killFunc() =
                 if tx then conn.exec("COMMIT TRANSACTION")

@@ -143,17 +143,9 @@ module crud =
 
     let private seqMatch m s =
         s 
-        |> Seq.choose (fun doc ->
-                let (ok,ndx) = Matcher.matchQuery m doc
-                if ok then Some (doc,ndx)
-                else None
-              )
-
-    let private seqMatchNoPos m s =
-        s 
-        |> Seq.choose (fun doc ->
-                let (ok,_) = Matcher.matchQuery m doc
-                if ok then Some doc
+        |> Seq.choose (fun st ->
+                let (ok,ndx) = Matcher.matchQuery m st.doc
+                if ok then Some {st with pos=ndx}
                 else None
               )
 
@@ -1401,7 +1393,7 @@ module crud =
                                     let mods = ref 0
                                     let matches = ref 0
                                     s |> seqMatch m |> 
-                                        Seq.iter (fun (doc,ndx) -> 
+                                        Seq.iter (fun {doc=doc;pos=ndx} -> 
                                             //printfn "iter, doc = %A" doc
                                             let newDoc = applyUpdateOps doc ops false ndx
                                             if idChanged doc newDoc then failwith "cannot change _id"
@@ -1416,7 +1408,7 @@ module crud =
                                     funk()
                             else
                                 match getOneMatch w m with
-                                | Some (doc,ndx) ->
+                                | Some {doc=doc;pos=ndx} ->
                                     let newDoc = applyUpdateOps doc ops false ndx
                                     if idChanged doc newDoc then failwith "cannot change _id"
                                     //printfn "after updates: %A" newDoc
@@ -1440,7 +1432,7 @@ module crud =
                         // but it has keys which are dotted?
                         if multi then failwith "multi update requires $ update operators"
                         match getOneMatch w m with
-                        | Some (found,ndx) ->
+                        | Some {doc=found} ->
                             let id1 = bson.getValueForKey found "_id"
                             let newDoc =
                                 match bson.tryGetValueForKey u "_id" with
@@ -1490,7 +1482,7 @@ module crud =
                     let {docs=s;funk=funk} = w.getSelect plan
                     try
                         s |> seqMatch m |> 
-                            Seq.iter (fun (doc,ndx) -> 
+                            Seq.iter (fun {doc=doc} -> 
                                 // TODO is it possible to delete from an autoIndexId=false collection?
                                 let id = bson.getValueForKey doc "_id"
                                 if basicDelete w id then
@@ -1535,7 +1527,9 @@ module crud =
         let removed  = basicDelete w id
         (None,removed,None,Some doc)
 
-    let private dofam_update w (doc,ndx) query update gnew fields =
+    let private dofam_update w st query update gnew fields =
+        let doc = st.doc
+        let ndx = st.pos
         let hasUpdateOperators = Array.exists (fun (k:string,_) -> k.StartsWith("$")) (bson.getDocument update)
         let (updated,result) =
             if hasUpdateOperators then
@@ -1572,13 +1566,7 @@ module crud =
 
     let private seqSort ord s =
         let a1 = s |> Seq.toArray
-        let fsort = sortFunc ord (fun (doc,_) -> doc)
-        Array.sortInPlaceWith fsort a1
-        Array.toSeq a1
-
-    let private seqAggSort ord s =
-        let a1 = s |> Seq.toArray
-        let fsort = sortFunc ord (fun doc -> doc)
+        let fsort = sortFunc ord (fun st -> st.doc)
         Array.sortInPlaceWith fsort a1
         Array.toSeq a1
 
@@ -1908,13 +1896,14 @@ module crud =
 
     let private seqProject proj m s =
         let prep = verifyProjection proj m
-        Seq.map (fun (doc,ndx) -> 
-            let newDoc = projectDocument doc ndx prep
-            (newDoc,ndx)
+        Seq.map (fun st -> 
+            let newDoc = projectDocument st.doc st.pos prep
+            // preserve other parts of the state
+            {st with doc=newDoc}
             ) s
 
-    let private seqOnlyDoc s =
-        Seq.map (fun (doc,_) -> doc) s
+    let seqOnlyDoc s =
+        Seq.map (fun st -> st.doc) s
 
     let private addCloseToKillFunc conn rdr =
         let funk2() =
@@ -2007,7 +1996,6 @@ module crud =
                 match mods.projection with
                 | Some proj -> seqProject proj (Some m) s
                 | None -> s
-            let s = seqOnlyDoc s
             {rdr with docs=s}
         with
         | _ ->
@@ -2046,8 +2034,8 @@ module crud =
                         | None, None -> failwith "must specify either update or remove"
                         | Some u, None -> 
                             match found with
-                            | Some t ->
-                                dofam_update w t query u gnew fields
+                            | Some st ->
+                                dofam_update w st query u gnew fields
                             | None ->
                                 if upsert then
                                     dofam_upsert w query u gnew fields
@@ -2056,8 +2044,8 @@ module crud =
                         | None, Some r -> 
                             if upsert then failwith "no upsert with remove"
                             match found with
-                            | Some t ->
-                                dofam_remove w (fst t)
+                            | Some st ->
+                                dofam_remove w st.doc
                             | None ->
                                 (None,false,None,None)
                     w.commit()
@@ -2086,9 +2074,10 @@ module crud =
         // does not exist?
         let {docs=s;funk=funk} = getSelectWithClose dbName collName plan
         try
+            // TODO shouldn't this be a fold?
             let results = ref Set.empty
             s |> seqMatch m |>
-                Seq.iter (fun (doc,ndx) -> 
+                Seq.iter (fun {doc=doc} -> 
                     match bson.findPath doc key with
                     | BUndefined -> ()
                     | v -> results := Set.add v !results
@@ -2817,7 +2806,7 @@ module crud =
             ) items
 
     let private seqRedact e s =
-        Seq.choose (fun doc -> 
+        Seq.choose (fun st -> 
             let rec f doc =
                 match eval (initEval doc) e with
                 | BString "__descend__" ->
@@ -2849,14 +2838,16 @@ module crud =
                 | BString "__keep__" -> 
                     Some doc
                 | _ -> raise (MongoCode(17053, "invalid result from redact expression"))
-            match f doc with
-            | Some d -> Some d
+            // preserve other parts of the state
+            match f st.doc with
+            | Some d -> Some {st with doc=d}
             | None -> None
             ) s
 
     let private seqAggProject expressions s =
         //printfn "expressions: %A" expressions
-        Seq.map (fun d ->
+        Seq.map (fun st ->
+            let d = st.doc
             //printfn "projecting from: %A" d
             let d0 = BDocument [| |]
             let includes = 
@@ -2912,14 +2903,15 @@ module crud =
                         cur
                     ) d0 exes
             //printfn "projection result: %A" d3
-            d3
+            let d = st.doc
+            {st with doc=d3}
             ) s
 
     let private seqUnwind (path:string) s =
         // TODO strip the $ in front.  verify it?
         let path = path.Substring(1)
-        Seq.collect (fun d ->
-            match bson.findPath d path with
+        Seq.collect (fun st ->
+            match bson.findPath st.doc path with
             | BUndefined -> Seq.empty
             | BNull -> Seq.empty
             | BArray a ->
@@ -2931,17 +2923,19 @@ module crud =
                             let v=a.[i] 
                             let f ov = Some v
                             // TODO no positional operator here?
-                            let d2 = bson.changeValueForPath d path f
+                            let d2 = bson.changeValueForPath st.doc path f
                             //printfn "unwound: %A" d2
-                            yield d2
+                            // TODO should we preserve score and pos here?
+                            yield {st with doc=d2}
                     }
             | _ -> raise (MongoCode(15978, "$unwind needs array"))
             ) s
 
     let private seqGroup id ops s =
         let exprId = parseExpr id
+        // this function discards score and pos from the states
         let mapa =
-            Seq.fold (fun cur doc ->
+            Seq.fold (fun cur {doc=doc} ->
                 let idval = eval (initEval doc) exprId
                 let accums = 
                     match Map.tryFind idval cur with
@@ -3059,7 +3053,8 @@ module crud =
                 accums
                 ) mapa
         //printfn "last step: %A" mapa
-        mapa |> Map.toSeq |> Seq.map (fun (_,d) -> d )
+        // this function discards score and pos from the states
+        mapa |> Map.toSeq |> Seq.map (fun (_,d) -> {doc=d;score=None;pos=None} )
 
     let aggregate dbName collName pipeline =
         let ops = parseAgg pipeline
@@ -3091,16 +3086,13 @@ module crud =
                     | AggOut s -> (Some s, Array.sub ops 0 (len-1))
                     | _ -> (None,ops)
 
-            // the agg pipeline, AFAICT, has no way of using positional operators.
-            // so this uses seq<doc> rather than seq<doc,ndx>
-
             let s = 
                 Array.fold (fun cur op ->
                     match op with
                     | AggSkip n -> seqSkip n cur
                     | AggLimit n -> seqLimit n cur
-                    | AggSort keys -> cur |> seqAggSort keys
-                    | AggMatch m -> seqMatchNoPos m cur
+                    | AggSort keys -> cur |> seqSort keys
+                    | AggMatch m -> seqMatch m cur
                     | AggProject expressions -> seqAggProject expressions cur
                     | AggOut s -> failwith "$out can only appear at the end of the pipeline"
                     | AggUnwind s -> seqUnwind s cur
@@ -3109,13 +3101,23 @@ module crud =
                     | AggRedact e -> seqRedact e cur
                     ) s ops
 
+            let s = seqOnlyDoc s
+
             (out,s,funk)
         with
         | _ ->
             funk()
             reraise()
 
+    let private seqMatchOnlyDoc m s =
+        s 
+        |> Seq.choose (fun doc ->
+                let (ok,_) = Matcher.matchQuery m doc
+                if ok then Some doc
+                else None
+              )
+
     let doFilter a q =
         let m = Matcher.parseQuery q
-        a |> Seq.ofArray |> seqMatchNoPos m |> Seq.toArray
+        a |> Seq.ofArray |> seqMatchOnlyDoc m |> Seq.toArray
 

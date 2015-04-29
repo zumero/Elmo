@@ -979,6 +979,8 @@ module LiteServer =
         //printfn "actualQuery: %A" actualQuery
         let {docs=s;funk=kill} = crud.find db coll actualQuery mods
 
+        let s = crud.seqOnlyDoc s
+
         try
             let s = 
                 if clientMsg.q_numberToSkip > 0 then
