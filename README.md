@@ -9,16 +9,13 @@ This is *not* ready for production use.
 For more info, see the blog entry at 
 [http://www.ericsink.com/entries/mobile\_sync\_for\_mongo.html](http://www.ericsink.com/entries/mobile_sync_for_mongo.html).
 
+# Is this open source?
+
+Yes.
+
 # What's the license?
 
-GPLv3
-
-# Isn't the GPL incompatible with the App Store?
-
-Yes, that's why we're using it (for now).  
-
-Until this implementation matures, we just want this code to be
-visible, not used.  We'll revisit licensing issues later.
+Apache License v2
 
 # Why is this written in F#?
 

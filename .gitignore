@@ -2,5 +2,5 @@
 /bin/**
 /obj/**
 *.userprefs
-/packages/**
+/fsharp/packages/**
 
