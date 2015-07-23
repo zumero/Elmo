@@ -24,11 +24,12 @@ develop it.
 
 # Will this stay in F# as the only implementation?
 
-If Apple and Google deprecate all their tooling and standardize on Xamarin
-for all mobile development, yes.  :-)
+A port to Rust is in progress.  That port is happening over in
+this repo:
 
-Otherwise, this would need to get ported and/or reimplemented in something
-else so that people building apps with ObjC or Java could use it.
+https://github.com/ericsink/LSM
+
+Which is a temporary living arrangement.
 
 # Why are you building this?
 
