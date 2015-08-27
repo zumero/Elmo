@@ -2901,7 +2901,7 @@ module crud =
         Seq.map (fun st ->
             let d = st.doc
             //printfn "projecting from: %A" d
-            let d0 = BDocument [| |]
+            //let d0 = BDocument [| |]
             let includes = 
                 Array.choose (fun (k,op) ->
                     match op with

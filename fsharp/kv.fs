@@ -1017,6 +1017,7 @@ module kv =
                     stmt_delete.bind_int64(1,rowid)
                     stmt_delete.step_done()
                     stmt_delete.reset()
+                    // TODO remove from indexes?
                     true
                 | None ->
                     false

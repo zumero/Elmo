@@ -1,3 +1,3 @@
 #!/bin/sh
-lsof -c mono-sgen | grep elmodata
+lsof -c elmo_server | grep elmodata
 

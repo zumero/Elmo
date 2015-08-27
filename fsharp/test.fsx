@@ -92,6 +92,17 @@ open System.Diagnostics
 let path_mongo_shell = "/Users/eric/Downloads/mongodb-osx-x86_64-3.0.1/bin/mongo"
 let path_mongo_src = "/Users/eric/m/mongo"
 let tests = [
+    "jstests/core/basic1.js";
+    "jstests/core/basic2.js";
+    "jstests/core/basic3.js";
+    "jstests/core/basic4.js";
+    "jstests/core/basic5.js";
+    "jstests/core/basic6.js";
+    "jstests/core/basic7.js";
+    "jstests/core/basic8.js";
+    "jstests/core/basic9.js";
+    "jstests/core/basica.js";
+    "jstests/core/basicb.js";
     "jstests/core/orh.js"; // disallow use of a sparse index on y for query {y:null}
     "jstests/core/null.js"; // disallow use of a sparse index on y for query {y:null}
     "jstests/core/exists9.js"; // bad index on {a.0}
@@ -388,8 +399,6 @@ let tests = [
     "jstests/core/objid4.js";
     "jstests/core/objid6.js";
     "jstests/core/objid7.js";
-    "jstests/core/numberlong.js";
-    "jstests/core/numberint.js";
     "jstests/core/null_field_name.js";
     "jstests/core/remove.js";
     "jstests/core/or1.js"; // $or should throw if array is empty
@@ -453,17 +462,6 @@ let tests = [
     "jstests/core/arrayfind9.js";
     "jstests/core/arrayfinda.js";
     "jstests/core/arrayfindb.js";
-    "jstests/core/basic1.js";
-    "jstests/core/basic2.js";
-    "jstests/core/basic3.js";
-    "jstests/core/basic4.js";
-    "jstests/core/basic5.js";
-    "jstests/core/basic6.js";
-    "jstests/core/basic7.js";
-    "jstests/core/basic8.js";
-    "jstests/core/basic9.js";
-    "jstests/core/basica.js";
-    "jstests/core/basicb.js";
     "jstests/core/count.js";
     "jstests/core/count2.js";
     "jstests/core/count3.js";
@@ -589,7 +587,7 @@ let results =
         let t2 = DateTime.Now
         let elapsed = (t2 - t1).TotalMilliseconds
         let status = p.ExitCode
-        if status <> 0 then printfn "    failed: %s" t //else printfn "    passed"
+        if status <> 0 then printfn "    failed: %s" t else printfn "    passed: %s" t
         //lsof()
         {
             name = t
