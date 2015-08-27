@@ -906,7 +906,7 @@ impl Value {
         }
     }
 
-    fn is_null(&self) -> bool {
+    pub fn is_null(&self) -> bool {
         match self {
             &Value::BNull => true,
             _ => false,
@@ -957,10 +957,30 @@ impl Value {
         }
     }
 
-    fn isDate(&self) -> bool {
+    pub fn is_date(&self) -> bool {
         match self {
             &Value::BDateTime(_) => true,
             _ => false,
+        }
+    }
+
+    pub fn into_expr_string(self) -> Result<String> {
+        // TODO what are the rules for how/when string coercion happens?
+        // this function was written simply because the string expression
+        // functions in the aggregation pipeline are documented to require
+        // strings but their test suite has a number of cases that verify
+        // that coercion to string happens for certain types.  but I can't
+        // find a spec which explains which types get coerced and which ones
+        // do not.
+
+        match self {
+            Value::BDateTime(n) => Err(Error::Misc(String::from("TODO datetime into_expr_string"))),
+            Value::BInt32(n) => Ok(format!("{}", n)),
+            Value::BInt64(n) => Ok(format!("{}", n)),
+            Value::BDouble(n) => Ok(format!("{}", n)),
+            Value::BString(s) => Ok(s),
+            Value::BNull => Ok(String::from("")),
+            _ => Err(Error::Misc(format!("into_expr_string failed: {:?}", self))),
         }
     }
 
@@ -1021,9 +1041,21 @@ impl Value {
         }
     }
 
+    pub fn as_expr_bool(&self) -> bool {
+        match self {
+            &Value::BBoolean(b) => b,
+            &Value::BNull => false,
+            &Value::BUndefined => false,
+            &Value::BInt32(0) => false,
+            &Value::BInt64(0) => false,
+            &Value::BDouble(0.0) => false,
+            _ => true,
+        }
+    }
+
     pub fn as_bool(&self) -> Result<bool> {
         match self {
-            &Value::BBoolean(ref s) => Ok(*s),
+            &Value::BBoolean(b) => Ok(b),
             _ => Err(Error::Misc(format!("bool required, but found {:?}", self))),
         }
     }

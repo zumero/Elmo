@@ -2018,6 +2018,195 @@ impl Connection {
     fn eval(ctx: &bson::Document, e: &Expr) -> Result<bson::Value> {
         match e {
             &Expr::Literal(ref v) => Ok(v.clone()),
+            &Expr::Var(ref s) => {
+                // if the var contains an object followed by a dotted path,
+                // we need to dive into that path.
+                let dot = s.find('.');
+                let name = match dot { 
+                    None => s.as_str(),
+                    Some(i) => &s[0 .. i]
+                };
+                let v = try!(ctx.must_get(name));
+                match dot {
+                    None => Ok(v.clone()),
+                    Some(i) => {
+                        let subpath = &s[i + 1 ..];
+                        Err(Error::Misc(format!("TODO Var with dots: {:?}", s)))
+                    },
+                }
+            },
+            &Expr::Substr(ref t) => {
+                let s = try!(Self::eval(ctx, &t.0));
+                let s = try!(s.into_expr_string());
+                let start = try!(Self::eval(ctx, &t.1));
+                let start = try!(start.as_i32());
+                if start < 0 {
+                    Ok(bson::Value::BString(String::new()))
+                } else if (start as usize) >= s.len() {
+                    Ok(bson::Value::BString(String::new()))
+                } else {
+                    let start = start as usize;
+                    let len = try!(Self::eval(ctx, &t.2));
+                    let len = try!(len.as_i32());
+                    if len < 0 {
+                        let a = s.chars().collect::<Vec<char>>();
+                        let s = &a[start ..];
+                        let s = s.iter().cloned().collect::<String>();
+                        Ok(bson::Value::BString(s))
+                    } else {
+                        let len = len as usize;
+                        if (start + len) >= s.len() {
+                            let a = s.chars().collect::<Vec<char>>();
+                            let s = &a[start ..];
+                            let s = s.iter().cloned().collect::<String>();
+                            Ok(bson::Value::BString(s))
+                        } else {
+                            let a = s.chars().collect::<Vec<char>>();
+                            let s = &a[start .. start + len];
+                            let s = s.iter().cloned().collect::<String>();
+                            Ok(bson::Value::BString(s))
+                        }
+                    }
+                }
+            },
+            &Expr::Eq(ref t) => {
+                let v0 = try!(Self::eval(ctx, &t.0));
+                let v1 = try!(Self::eval(ctx, &t.1));
+                let c = matcher::cmp(&v0, &v1);
+                let b = c == Ordering::Equal;
+                Ok(bson::Value::BBoolean(b))
+            },
+            &Expr::Ne(ref t) => {
+                let v0 = try!(Self::eval(ctx, &t.0));
+                let v1 = try!(Self::eval(ctx, &t.1));
+                let c = matcher::cmp(&v0, &v1);
+                let b = c != Ordering::Equal;
+                Ok(bson::Value::BBoolean(b))
+            },
+            &Expr::Lt(ref t) => {
+                let v0 = try!(Self::eval(ctx, &t.0));
+                let v1 = try!(Self::eval(ctx, &t.1));
+                let c = matcher::cmp(&v0, &v1);
+                let b = c == Ordering::Less;
+                Ok(bson::Value::BBoolean(b))
+            },
+            &Expr::Gt(ref t) => {
+                let v0 = try!(Self::eval(ctx, &t.0));
+                let v1 = try!(Self::eval(ctx, &t.1));
+                let c = matcher::cmp(&v0, &v1);
+                let b = c == Ordering::Greater;
+                Ok(bson::Value::BBoolean(b))
+            },
+            &Expr::Lte(ref t) => {
+                let v0 = try!(Self::eval(ctx, &t.0));
+                let v1 = try!(Self::eval(ctx, &t.1));
+                let c = matcher::cmp(&v0, &v1);
+                let b = c != Ordering::Greater;
+                Ok(bson::Value::BBoolean(b))
+            },
+            &Expr::Gte(ref t) => {
+                let v0 = try!(Self::eval(ctx, &t.0));
+                let v1 = try!(Self::eval(ctx, &t.1));
+                let c = matcher::cmp(&v0, &v1);
+                let b = c != Ordering::Less;
+                Ok(bson::Value::BBoolean(b))
+            },
+            &Expr::StrCaseCmp(ref t) => {
+                let s0 = try!(Self::eval(ctx, &t.0));
+                let s1 = try!(Self::eval(ctx, &t.1));
+                let s0 = try!(s0.into_expr_string());
+                let s1 = try!(s1.into_expr_string());
+                let c = 
+                    {
+                        use std::ascii::AsciiExt;
+                        let s0 = s0.to_ascii_lowercase();
+                        let s1 = s1.to_ascii_lowercase();
+                        s0.cmp(&s1)
+                    };
+                let c = match c {
+                    Ordering::Equal => 0,
+                    Ordering::Less => -1,
+                    Ordering::Greater => 1,
+                };
+                Ok(bson::Value::BInt32(c))
+            },
+            &Expr::ToLower(ref v) => {
+                let s = try!(Self::eval(ctx, v));
+                let s = try!(s.into_expr_string());
+                let s = 
+                    {
+                        use std::ascii::AsciiExt;
+                        s.to_ascii_lowercase()
+                    };
+                Ok(bson::Value::BString(s))
+            },
+            &Expr::ToUpper(ref v) => {
+                let s = try!(Self::eval(ctx, v));
+                let s = try!(s.into_expr_string());
+                let s = 
+                    {
+                        use std::ascii::AsciiExt;
+                        s.to_ascii_uppercase()
+                    };
+                Ok(bson::Value::BString(s))
+            },
+            &Expr::Concat(ref a) => {
+                let vals = try!(a.iter().map(|e| Self::eval(ctx, e)).collect::<Result<Vec<_>>>());
+                let mut cur = bson::Value::BString(String::new());
+                for v in vals {
+                    if cur.is_null() {
+                        // do nothing
+                    } else if cur.is_undefined() {
+                        cur = bson::Value::BNull;
+                    } else if v.is_null() {
+                        cur = bson::Value::BNull;
+                    } else if v.is_undefined() {
+                        cur = bson::Value::BNull;
+                    } else {
+                        let s1 = try!(cur.into_string());
+                        let s2 = try!(v.into_string());
+                        let s = s1 + &s2;
+                        cur = bson::Value::BString(s);
+                    }
+                }
+                Ok(cur)
+            },
+            &Expr::Add(ref a) => {
+                let vals = try!(a.iter().map(|e| Self::eval(ctx, e)).collect::<Result<Vec<_>>>());
+                let count_dates = vals.iter().filter(|v| v.is_date()).count();
+                if count_dates > 1 {
+                    Err(Error::Misc(format!("16612 only one date allowed: {:?}", a)))
+                } else if count_dates == 0 {
+                    let vals = try!(vals.iter().map(|v| {
+                        let f = try!(v.numeric_to_f64());
+                        Ok(f)
+                    }).collect::<Result<Vec<_>>>());
+                    let sum = vals.iter().fold(0.0, |acc, &v| acc + v);
+                    Ok(bson::Value::BDouble(sum))
+                } else {
+                    Err(Error::Misc(format!("TODO add to date")))
+                }
+            },
+            &Expr::And(ref a) => {
+                // TODO what we actually want here is to stop on the first
+                // one that returns false.
+                let v = try!(a.iter().map(|e| {
+                    let b = try!(Self::eval(ctx, e)).as_expr_bool();
+                    Ok(b)
+                }).collect::<Result<Vec<_>>>());
+                let b = v.iter().all(|b| *b);
+                Ok(bson::Value::BBoolean(b))
+            },
+            &Expr::Or(ref a) => {
+                // TODO what we actually want here is to stop on the first
+                // one that returns true.
+                let v = try!(a.iter().map(|e| {
+                    let b = try!(Self::eval(ctx, e)).as_expr_bool();
+                    Ok(b)
+                }).collect::<Result<Vec<_>>>());
+                let b = v.iter().any(|b| *b);
+                Ok(bson::Value::BBoolean(b))
+            },
             _ => Err(Error::Misc(format!("TODO eval: {:?}", e)))
         }
     }
@@ -2165,11 +2354,11 @@ impl Connection {
                                                        ).collect::<Vec<_>>();
                         let mut d = row.doc;
                         // TODO process the includes against d
-                        // TODO ctx, move d into it as CURRENT, and a clone as ROOT.
                         let mut ctx = bson::Document::new_empty();
+                        ctx.set("CURRENT", d);
                         for (ref path, ref e) in exes {
                             let v = try!(Self::eval(&ctx, e));
-                            // TODO this should modify CURRENT, not d
+                            let d = ctx.get_mut("CURRENT").expect("gotta");
                             match try!(d.entry(path)) {
                                 bson::Entry::Found(e) => {
                                     return Err(Error::Misc(format!("16400 already: {}", path)))
@@ -2181,6 +2370,7 @@ impl Connection {
                                 },
                             }
                         }
+                        let d = ctx.remove("CURRENT").expect("gotta");
                         row.doc = d;
                         Ok(row)
                     },
