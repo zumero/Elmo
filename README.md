@@ -17,19 +17,12 @@ Yes.
 
 Apache License v2
 
-# Why is this written in F#?
+# What language is this written in?
 
-Because it's an exploratory prototype, and that was the fastest way to
-develop it.
+Rust.
 
-# Will this stay in F# as the only implementation?
-
-A port to Rust is in progress.  That port is happening over in
-this repo:
-
-https://github.com/ericsink/LSM
-
-Which is a temporary living arrangement.
+The initial prototype was written in F#.  The port to Rust is
+in progress.
 
 # Why are you building this?
 
@@ -41,55 +34,14 @@ For more info, see the blog entry mentioned near the top of this README.
 
 It stands for Embeddable Lite Mongo.
 
-# How complete is this?
-
-Most CRUD operations work just like they do in Mongo.
-
-Intentionally omitted:  Sharding, JavaScript
-
-Not done yet:  Full text search, geo, indexes
-
-Number of passing test cases in jstests:  Over 300
-
-For more info, see the blog entry mentioned near the top of this README.  
-
-# How can you be running Mongo's jstests on an "embedded" database?  
-
-Elmo has a server which was written specifically for that purpose.
-
-
-
-# Overview
-
-NOTE:  Nothing here is ready for production use.
-
-This repo contains a bunch of database stuff in Rust:
-
-## lsm
+# lsm
 
 A key-value store built on a Log Structured Merge Tree.
 
-This library was originally written in C#, and that version of the code
-exists in the history of this repo somewhere.  
+# server
 
-Then it was
-ported to F#, and that version is in the fsharp directory.
-
-Then it was ported to Rust.
-
-## elmo
-
-A NoSQL/document database aimed primarily at mobile use.
-This is a Rust port of https://github.com/zumero/Elmo
-
-## bson
-
-The BSON code from Elmo, separated out as a library.
-
-## server
-
-The server and wire protocol parts of Elmo, separated out as
-a library.  This code exists primarily for the purpose of
+The server and wire protocol parts of Elmo.
+This code exists primarily for the purpose of
 allowing the MongoDB test suite to be run against the
 Elmo database library.
 
@@ -102,15 +54,4 @@ a storage layer.
 
 A library of common utility stuff that is used by the 
 projects above.
-
-# Status
-
-For LSM, the port from F# to Rust is mostly complete.
-
-For all the ELmo stuff, the Rust port is just getting started.
-
-# License
-
-Apache v2
-
 
