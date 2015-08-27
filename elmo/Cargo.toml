@@ -1,0 +1,28 @@
+[package]
+
+name = "elmo"
+version = "0.0.1"
+authors = [ "Eric Sink <eric@zumero.com>" ]
+
+[dependencies.misc]
+path = "../misc"
+
+[dependencies.bson]
+path = "../bson"
+
+# The testing profile, used for `cargo test`
+[profile.test]
+opt-level = 3
+debug = true
+rpath = false
+lto = false
+debug-assertions = true
+
+# The testing profile, used for `cargo bench`
+[profile.bench]
+opt-level = 3
+debug = false
+rpath = false
+lto = true
+debug-assertions = false
+
