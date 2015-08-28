@@ -497,7 +497,7 @@ impl<'b> Server<'b> {
             match number_to_return {
                 None => {
                     let docs = try!(seq.collect::<Result<Vec<_>>>());
-                    (docs, None)
+                    (docs, 0)
                 },
                 Some(0) => {
                     // if 0, return nothing but keep the cursor open.
@@ -508,7 +508,7 @@ impl<'b> Server<'b> {
 
                     // TODO peek, or something
                     let cursor_id = self.store_cursor(ns, seq);
-                    (Vec::new(), Some(cursor_id))
+                    (Vec::new(), cursor_id)
                 },
                 Some(n) => {
                     let docs = try!(Self::grab(&mut seq, n));
@@ -516,23 +516,23 @@ impl<'b> Server<'b> {
                         // if we grabbed the same number we asked for, we assume the
                         // sequence has more, so we store the cursor and return it.
                         let cursor_id = self.store_cursor(ns, seq);
-                        (docs, Some(cursor_id))
+                        (docs, cursor_id)
                     } else {
                         // but if we got less than we asked for, we assume we have
                         // consumed the whole sequence.
-                        (docs, None)
+                        (docs, 0)
                     }
                 },
             };
 
-
         let mut doc = bson::Document::new_empty();
-        match cursor_id {
-            Some(cursor_id) => {
+        match cursor_options {
+            Some(_) => {
                 let mut cursor = bson::Document::new_empty();
                 cursor.set_i64("id", cursor_id);
                 cursor.set_str("ns", ns);
                 cursor.set_array("firstBatch", bson::Array { items: vec_rows_to_values(docs)});
+                doc.set_document("cursor", cursor);
             },
             None => {
                 doc.set_array("result", bson::Array { items: vec_rows_to_values(docs)});
