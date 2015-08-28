@@ -1999,7 +1999,7 @@ impl Connection {
                             },
                         }
                     } else {
-                        Err(Error::Misc(String::from("TODO no match key")))
+                        Err(Error::Misc(format!("TODO what is this? {}", k)))
                     }
                 } else {
                     // TODO any cases where this is not a literal need to have
@@ -2031,7 +2031,17 @@ impl Connection {
                     None => Ok(v.clone()),
                     Some(i) => {
                         let subpath = &s[i + 1 ..];
-                        Err(Error::Misc(format!("TODO Var with dots: {:?}", s)))
+                        // TODO ensure no null char in this string
+                        match v.find_path(subpath) {
+                            bson::Value::BUndefined => {
+                                // TODO is this right?  or should it error?
+                                Ok(bson::Value::BUndefined)
+                            },
+                            v => {
+                                // TODO remove undefined
+                                Ok(v)
+                            },
+                        }
                     },
                 }
             },
@@ -2111,6 +2121,17 @@ impl Connection {
                 let b = c != Ordering::Less;
                 Ok(bson::Value::BBoolean(b))
             },
+            &Expr::Cmp(ref t) => {
+                let v0 = try!(Self::eval(ctx, &t.0));
+                let v1 = try!(Self::eval(ctx, &t.1));
+                let c = matcher::cmp(&v0, &v1);
+                let c = match c {
+                    Ordering::Equal => 0,
+                    Ordering::Less => -1,
+                    Ordering::Greater => 1,
+                };
+                Ok(bson::Value::BInt32(c))
+            },
             &Expr::StrCaseCmp(ref t) => {
                 let s0 = try!(Self::eval(ctx, &t.0));
                 let s1 = try!(Self::eval(ctx, &t.1));
@@ -2129,6 +2150,11 @@ impl Connection {
                     Ordering::Greater => 1,
                 };
                 Ok(bson::Value::BInt32(c))
+            },
+            &Expr::Size(ref v) => {
+                let s = try!(Self::eval(ctx, v));
+                let s = try!(s.into_array());
+                Ok(bson::Value::BInt32(s.len() as i32))
             },
             &Expr::ToLower(ref v) => {
                 let s = try!(Self::eval(ctx, v));
