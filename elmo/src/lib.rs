@@ -2019,6 +2019,7 @@ impl Connection {
         match e {
             &Expr::Literal(ref v) => Ok(v.clone()),
             &Expr::Var(ref s) => {
+                println!("Var: {}", s);
                 // if the var contains an object followed by a dotted path,
                 // we need to dive into that path.
                 let dot = s.find('.');
@@ -2316,17 +2317,27 @@ impl Connection {
                             let id = id.pop();
                             let id_item =
                                 match id {
-                                    None => Some((String::from("_id"), AggProj::Include)),
+                                    None => {
+                                        // if _id is not explicitly excluded (or reset?) it is included
+                                        Some((String::from("_id"), AggProj::Include))
+                                    },
                                     Some((_,id)) => {
                                         match id {
                                             bson::Value::BInt32(0) 
                                             | bson::Value::BInt64(0) 
                                             | bson::Value::BDouble(0.0)
-                                            | bson::Value::BBoolean(false) => None,
-                                            _ => Some((String::from("_id"), AggProj::Expr(try!(Self::parse_expr(id))))),
+                                            | bson::Value::BBoolean(false) => {
+                                                // explicitly excluded
+                                                None
+                                            },
+                                            _ => {
+                                                // _id is being set to an expression
+                                                Some((String::from("_id"), AggProj::Expr(try!(Self::parse_expr(id)))))
+                                            },
                                         }
                                     },
                                 };
+                            println!("id_item: {:?}", id_item);
                             let expressions =
                                 not_id.into_iter().map(
                                     |(k,v)| match v {
@@ -2412,36 +2423,46 @@ impl Connection {
             move |rr| {
                 match rr {
                     Ok(mut row) => {
-                        let (includes, exes): (Vec<_>, Vec<_>) = expressions.iter().partition(|&&(ref s, ref a)| a.is_include());
-                        let exes = exes.into_iter().map(|&(ref path, ref a)| 
-                                                        match a {
-                                                            &AggProj::Expr(ref e) => {
-                                                                (path, e)
-                                                            },
-                                                            &AggProj::Include => {
-                                                                unreachable!();
-                                                            },
-                                                        }
-                                                       ).collect::<Vec<_>>();
-                        let mut d = row.doc;
-                        // TODO process the includes against d
+                        let mut d = bson::Value::BDocument(bson::Document::new_empty());
                         let mut ctx = bson::Document::new_empty();
-                        ctx.set("CURRENT", d);
-                        for (ref path, ref e) in exes {
-                            let v = try!(Self::eval(&ctx, e));
-                            let d = ctx.get_mut("CURRENT").expect("gotta");
-                            match try!(d.entry(path)) {
-                                bson::Entry::Found(e) => {
-                                    return Err(Error::Misc(format!("16400 already: {}", path)))
+                        ctx.set("CURRENT", row.doc);
+                        // TODO ROOT
+                        // TODO DESCEND
+                        // TODO PRUNE
+                        // TODO KEEP
+                        for &(ref path, ref op) in expressions.iter() {
+                            match op {
+                                &AggProj::Expr(ref e) => {
+                                    println!("e: {:?}", e);
+                                    let v = try!(Self::eval(&ctx, e));
+                                    println!("v: {:?}", v);
+                                    match try!(d.entry(path)) {
+                                        bson::Entry::Found(e) => {
+                                            return Err(Error::Misc(format!("16400 already: {}", path)))
+                                        },
+                                        bson::Entry::Absent(e) => {
+                                            if !v.is_undefined() {
+                                                e.insert(v);
+                                            }
+                                        },
+                                    }
                                 },
-                                bson::Entry::Absent(e) => {
-                                    if !v.is_undefined() {
-                                        e.insert(v);
+                                &AggProj::Include => {
+                                    let v = try!(ctx.must_get_document("CURRENT")).find_path(path);
+                                    // TODO DRY
+                                    match try!(d.entry(path)) {
+                                        bson::Entry::Found(e) => {
+                                            return Err(Error::Misc(format!("16400 already: {}", path)))
+                                        },
+                                        bson::Entry::Absent(e) => {
+                                            if !v.is_undefined() {
+                                                e.insert(v);
+                                            }
+                                        },
                                     }
                                 },
                             }
                         }
-                        let d = ctx.remove("CURRENT").expect("gotta");
                         row.doc = d;
                         Ok(row)
                     },

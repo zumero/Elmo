@@ -293,6 +293,11 @@ impl Document {
         v.as_array()
     }
 
+    pub fn must_get_document(&self, k: &str) -> Result<&Document> {
+        let v = try!(self.must_get(k));
+        v.as_document()
+    }
+
     pub fn set(&mut self, k: &str, v: Value) -> &mut Value {
         // TODO make this more efficient?
         for i in 0 .. self.pairs.len() {
