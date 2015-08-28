@@ -2646,6 +2646,64 @@ impl Connection {
         Ok(mapa)
     }
 
+    fn do_sort(a: &mut Vec<Row>, orderby: &bson::Value) -> Result<()> {
+        // TODO validate orderby up here so we don't have to check it for errors
+        // inside the sort loop..
+        a.sort_by(|a,b| -> Ordering {
+            match orderby {
+                &bson::Value::BDocument(ref bd) => {
+                    for &(ref path, ref dir) in &bd.pairs {
+                        if dir.is_numeric() {
+                            let dir = 
+                                match dir.numeric_to_i32() {
+                                    Ok(n) => {
+                                        if n < 0 {
+                                            -1
+                                        } else if n > 0 {
+                                            1
+                                        } else {
+                                            println!("TODO error dir is 0");
+                                            0
+                                        }
+                                    },
+                                    Err(_) => {
+                                        println!("TODO error dir not a number");
+                                        0
+                                    },
+                                };
+
+                            let va = a.doc.find_path(&path);
+                            // TODO replace undefined
+
+                            let vb = b.doc.find_path(&path);
+                            // TODO replace undefined
+
+                            let mut c = matcher::cmp(&va, &vb);
+                            if dir < 0 {
+                                c = match c {
+                                    Ordering::Equal => Ordering::Equal,
+                                    Ordering::Less => Ordering::Greater,
+                                    Ordering::Greater => Ordering::Less,
+                                }
+                            }
+                            if c != Ordering::Equal {
+                                return c;
+                            }
+                        } else {
+                            // TODO sort on textScore?
+                        }
+                    }
+                    Ordering::Equal
+                },
+                _ => {
+                    println!("TODO orderby not a document");
+                    Ordering::Equal
+                },
+            }
+        });
+        Ok(())
+    }
+
     fn agg_group(seq: Box<Iterator<Item=Result<Row>>>, id: Expr, ops: Vec<(String,GroupAccum)>) -> Box<Iterator<Item=Result<Row>>> {
         match Self::do_group(seq, id, ops) {
             Ok(mapa) => {
@@ -2739,10 +2797,10 @@ impl Connection {
                             }
                     );
                 },
-                AggOp::Sort(k) => {
+                AggOp::Sort(ref orderby) => {
                     let mut a = try!(seq.collect::<Result<Vec<_>>>());
-                    a.sort_by(cmp_row);
-                    seq = box a.into_iter().map(|d| Ok(d));
+                    try!(Self::do_sort(&mut a, orderby));
+                    seq = box a.into_iter().map(|d| Ok(d))
                 },
                 AggOp::Project(expressions) => {
                     seq = box Self::agg_project(seq, expressions);
@@ -2863,15 +2921,21 @@ impl Connection {
                 }
         );
         match orderby {
-            Some(orderby) => {
+            Some(ref orderby) => {
                 let mut a = try!(seq.collect::<Result<Vec<_>>>());
-                a.sort_by(cmp_row);
+                try!(Self::do_sort(&mut a, orderby));
                 seq = box a.into_iter().map(|d| Ok(d))
             },
             None => {
             },
         }
-        // TODO projection
+        match projection {
+            Some(projection) => {
+                println!("TODO projection: {:?}", projection);
+            },
+            None => {
+            },
+        }
         Ok(seq)
     }
 }
