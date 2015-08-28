@@ -255,6 +255,8 @@ struct Server<'a> {
 impl<'b> Server<'b> {
 
     fn reply_whatsmyuri(&self, req: &MsgQuery) -> Result<Reply> {
+        println!("----------------------------------------------------------------");
+        println!("----------------------------------------------------------------");
         let mut doc = bson::Document::new_empty();
         doc.set_str("you", "127.0.0.1:65460");
         doc.set_i32("ok", 1);
