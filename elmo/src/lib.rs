@@ -202,7 +202,7 @@ enum OpGt {
 }
 
 // TODO I dislike the name of this.  also, consider making it a trait.
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct Row {
     // TODO I wish this were bson::Document.  but when you have a reference to a
     // bson::Document and what you need is a bson::Value, you can't get there,
@@ -2336,6 +2336,51 @@ impl Connection {
             }).collect::<Result<Vec<AggOp>>>()
     }
 
+    fn agg_unwind(seq: Box<Iterator<Item=Result<Row>>>, mut path: String) -> Box<Iterator<Item=Result<Row>>> {
+        // TODO verify/strip $ in front of path
+        path.remove(0);
+        box seq.flat_map(
+            move |rr| -> Box<Iterator<Item=Result<Row>>> {
+                match rr {
+                    Ok(row) => {
+                        println!("unwind: {:?}", row);
+                        match row.doc.find_path(&path) {
+                            bson::Value::BUndefined => box std::iter::empty(),
+                            bson::Value::BNull => box std::iter::empty(),
+                            bson::Value::BArray(a) => {
+                                println!("unwind: {:?}", a);
+                                if a.len() == 0 {
+                                    box std::iter::empty()
+                                } else {
+                                    //let row = row.clone();
+                                    let unwind = a.items.into_iter().map(|v| -> Result<Row> {
+                                        let mut d = row.doc.clone();
+                                        d.set_path(&path, v.clone());
+                                        // TODO positional operator?
+                                        // TODO preserve other parts of row?
+                                        let r = Row { doc: d };
+                                        Ok(r)
+                                    }).collect::<Vec<_>>();
+                                    // TODO it should be possible to do this without collect().
+                                    // problem with lifetime of captured row
+                                    //box unwind
+                                    box unwind.into_iter()
+                                    //box std::iter::empty()
+                                }
+                            },
+                            _ => {
+                                box std::iter::once(Err(Error::Misc(format!("$unwind requires an array"))))
+                            },
+                        }
+                    },
+                    Err(e) => {
+                        box std::iter::once(Err(e))
+                    },
+                }
+            }
+            )
+    }
+
     fn agg_project(seq: Box<Iterator<Item=Result<Row>>>, expressions: Vec<(String,AggProj)>) -> Box<Iterator<Item=Result<Row>>> {
         box seq.map(
             move |rr| {
@@ -2388,7 +2433,6 @@ impl Connection {
         -> Result<(Option<String>, Box<Iterator<Item=Result<Row>> + 'static>)>
     {
         let ops = try!(Self::parse_agg(pipeline));
-        //Err(Error::Misc(format!("agg pipeline TODO: {:?}", ops)))
         // TODO check for plan
         let plan = None;
         let reader = try!(self.conn.begin_read());
@@ -2422,8 +2466,11 @@ impl Connection {
                 AggOp::Project(expressions) => {
                     seq = box Self::agg_project(seq, expressions);
                 },
+                AggOp::Unwind(path) => {
+                    seq = box Self::agg_unwind(seq, path);
+                },
                 _ => {
-                    //return Err(Error::Misc(format!("agg pipeline TODO: {:?}", ops)))
+                    return Err(Error::Misc(format!("agg pipeline TODO: {:?}", op)))
                 },
             }
         }
