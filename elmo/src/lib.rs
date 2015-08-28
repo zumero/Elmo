@@ -894,7 +894,7 @@ impl Connection {
                         //println!("ops: {:?}", ops);
                         let (count_matches, count_modified) =
                             if multi {
-                                panic!("TODO update operators multi");
+                                return Err(Error::Misc(format!("TODO update operators multi: {:?}", ops)));
                             } else {
                                 match try!(Self::get_one_match(db, coll, &*writer, &m)) {
                                     Some(row) => {

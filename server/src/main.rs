@@ -293,6 +293,22 @@ impl<'b> Server<'b> {
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
 
+    fn reply_renamecollection(&self, req: &MsgQuery) -> Result<Reply> {
+        Err(Error::Misc(format!("TODO renamecollection: {:?}", req)))
+    }
+
+    fn reply_buildinfo(&self, req: &MsgQuery) -> Result<Reply> {
+        Err(Error::Misc(format!("TODO buildinfo: {:?}", req)))
+    }
+
+    fn reply_serverstatus(&self, req: &MsgQuery) -> Result<Reply> {
+        Err(Error::Misc(format!("TODO serverstatus: {:?}", req)))
+    }
+
+    fn reply_setparameter(&self, req: &MsgQuery) -> Result<Reply> {
+        Err(Error::Misc(format!("TODO setparameter: {:?}", req)))
+    }
+
     fn reply_ismaster(&self, req: &MsgQuery) -> Result<Reply> {
         let mut doc = bson::Document::new_empty();
         doc.set_bool("ismaster", true);
@@ -329,6 +345,10 @@ impl<'b> Server<'b> {
                     "getlog" => self.reply_getlog(req),
                     "replsetgetstatus" => self.reply_replsetgetstatus(req),
                     "ismaster" => self.reply_ismaster(req),
+                    "renamecollection" => self.reply_renamecollection(req),
+                    "buildinfo" => self.reply_buildinfo(req),
+                    "serverstatus" => self.reply_serverstatus(req),
+                    "setparameter" => self.reply_setparameter(req),
                     _ => Err(Error::Misc(format!("unknown admin cmd: {}", cmd)))
                 };
             res
@@ -357,6 +377,26 @@ impl<'b> Server<'b> {
         let mut doc = bson::Document::new_empty();
         doc.set_i32("ok", 1);
         Ok(create_reply(req.req_id, vec![doc], 0))
+    }
+
+    fn reply_profile(&self, mut req: MsgQuery, db: &str) -> Result<Reply> {
+        Err(Error::Misc(format!("TODO profile: {:?}", req)))
+    }
+
+    fn reply_collstats(&self, mut req: MsgQuery, db: &str) -> Result<Reply> {
+        Err(Error::Misc(format!("TODO collstats: {:?}", req)))
+    }
+
+    fn reply_distinct(&self, mut req: MsgQuery, db: &str) -> Result<Reply> {
+        Err(Error::Misc(format!("TODO distinct: {:?}", req)))
+    }
+
+    fn reply_explain(&self, mut req: MsgQuery, db: &str) -> Result<Reply> {
+        Err(Error::Misc(format!("TODO explain: {:?}", req)))
+    }
+
+    fn reply_findandmodify(&self, mut req: MsgQuery, db: &str) -> Result<Reply> {
+        Err(Error::Misc(format!("TODO findandmodify: {:?}", req)))
     }
 
     fn reply_insert(&self, mut req: MsgQuery, db: &str) -> Result<Reply> {
@@ -913,7 +953,7 @@ impl<'b> Server<'b> {
         // TODO let s = crud.seqOnlyDoc s
 
         if number_to_skip < 0 {
-            panic!("TODO negative skip");
+            return Err(Error::Misc(format!("TODO negative skip: {}", number_to_skip)));
         }
 
         let seq = seq.skip(number_to_skip as usize);
@@ -947,13 +987,15 @@ impl<'b> Server<'b> {
             let res =
                 // TODO isMaster needs to be in here?
                 match cmd.as_str() {
-                    //"explain" => reply_explain req db
+                    "profile" => self.reply_profile(req, db),
+                    "collstats" => self.reply_collstats(req, db),
+                    "explain" => self.reply_explain(req, db),
                     "aggregate" => self.reply_aggregate(req, db),
                     "insert" => self.reply_insert(req, db),
                     "delete" => self.reply_delete(&req, db),
-                    //"distinct" => reply_distinct req db
+                    "distinct" => self.reply_distinct(req, db),
                     "update" => self.reply_update(req, db),
-                    //"findandmodify" => reply_FindAndModify req db
+                    "findandmodify" => self.reply_findandmodify(req, db),
                     "count" => self.reply_count(req, db),
                     "validate" => self.reply_validate(req, db),
                     "createindexes" => self.reply_create_indexes(req, db),

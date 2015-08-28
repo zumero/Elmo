@@ -379,6 +379,7 @@ fn index_insert_step(stmt: &mut sqlite3::PreparedStatement, k: Vec<u8>, doc_rowi
     try!(stmt.bind_int64(2, doc_rowid).map_err(elmo::wrap_err));
     try!(step_done(stmt));
     try!(verify_changes(stmt, 1));
+    stmt.reset();
     Ok(())
 }
 
@@ -545,6 +546,7 @@ impl MyConn {
                     },
                 }
             }
+            stmt.reset();
             Ok(entries)
         };
 
@@ -662,19 +664,22 @@ impl MyConn {
         let mut res = Vec::new();
         for (did, cur_weights) in doc_weights {
             try!(stmt.bind_int64(1, did).map_err(elmo::wrap_err));
-            let rdr = 
-                RefStatementBsonValueIterator {
-                    stmt: &mut stmt,
-                };
-            for r in rdr {
-                let r = try!(r);
-                let keep = check_phrase(&terms, &weights, &r.doc);
-                if keep {
-                    // TODO if keep, calc a score for each one too
-                    // let score = List.sum w |> float // TODO this is not the way mongo does this calculation
-                    res.push(Ok(r));
+            {
+                let rdr = 
+                    RefStatementBsonValueIterator {
+                        stmt: &mut stmt,
+                    };
+                for r in rdr {
+                    let r = try!(r);
+                    let keep = check_phrase(&terms, &weights, &r.doc);
+                    if keep {
+                        // TODO if keep, calc a score for each one too
+                        // let score = List.sum w |> float // TODO this is not the way mongo does this calculation
+                        res.push(Ok(r));
+                    }
                 }
             }
+            stmt.reset();
         }
 
         let rdr = 
@@ -770,21 +775,24 @@ impl MyConn {
 
 impl MyCollectionWriter {
     fn find_rowid(&mut self, v: &bson::Value) -> Result<Option<i64>> {
-                match self.stmt_find_rowid {
-                    None => Ok(None),
-                    Some(ref mut stmt) => {
-                        stmt.clear_bindings();
-                        let ba = bson::Value::encode_one_for_index(v, false);
-                        try!(stmt.bind_blob(1, &ba).map_err(elmo::wrap_err));
-                        match try!(stmt.step().map_err(elmo::wrap_err)) {
-                            None => Ok(None),
-                            Some(r) => {
-                                let rowid = r.column_int64(0);
-                                Ok(Some(rowid))
-                            },
-                        }
-                    },
-                }
+        match self.stmt_find_rowid {
+            None => Ok(None),
+            Some(ref mut stmt) => {
+                stmt.clear_bindings();
+                let ba = bson::Value::encode_one_for_index(v, false);
+                try!(stmt.bind_blob(1, &ba).map_err(elmo::wrap_err));
+                let r =
+                    match try!(stmt.step().map_err(elmo::wrap_err)) {
+                        None => Ok(None),
+                        Some(r) => {
+                            let rowid = r.column_int64(0);
+                            Ok(Some(rowid))
+                        },
+                    };
+                stmt.reset();
+                r
+            },
+        }
     }
 
     fn update_indexes_delete(indexes: &mut Vec<IndexPrep>, rowid: i64) -> Result<()> {
@@ -792,6 +800,7 @@ impl MyCollectionWriter {
             t.stmt_delete.clear_bindings();
             try!(t.stmt_delete.bind_int64(1, rowid).map_err(elmo::wrap_err));
             try!(step_done(&mut t.stmt_delete));
+            t.stmt_delete.reset();
         }
         Ok(())
     }
@@ -826,6 +835,7 @@ impl elmo::StorageCollectionWriter for MyCollectionWriter {
                                 try!(self.update.bind_int64(2, rowid).map_err(elmo::wrap_err));
                                 try!(step_done(&mut self.update));
                                 try!(verify_changes(&self.update, 1));
+                                self.update.reset();
                                 try!(Self::update_indexes_delete(&mut self.indexes, rowid));
                                 try!(Self::update_indexes_insert(&mut self.indexes, rowid, &v));
                                 Ok(())
@@ -843,6 +853,7 @@ impl elmo::StorageCollectionWriter for MyCollectionWriter {
                         self.delete.clear_bindings();
                         try!(self.delete.bind_int64(1, rowid).map_err(elmo::wrap_err));
                         try!(step_done(&mut self.delete));
+                        self.delete.reset();
                         let count = self.myconn.conn.changes();
                         if count == 1 {
                             // TODO might not need index update here.  foreign key cascade?
@@ -863,6 +874,7 @@ impl elmo::StorageCollectionWriter for MyCollectionWriter {
                 try!(self.insert.bind_blob(1,&ba).map_err(elmo::wrap_err));
                 try!(step_done(&mut self.insert));
                 try!(verify_changes(&self.insert, 1));
+                self.insert.reset();
                 let rowid = self.myconn.conn.last_insert_rowid();
                 try!(Self::update_indexes_delete(&mut self.indexes, rowid));
                 try!(Self::update_indexes_insert(&mut self.indexes, rowid, &v));
@@ -993,6 +1005,7 @@ impl MyWriter {
                 try!(stmt.bind_text(3, old_db).map_err(elmo::wrap_err));
                 try!(stmt.bind_text(4, old_coll).map_err(elmo::wrap_err));
                 try!(step_done(&mut stmt));
+                stmt.reset();
 
                 try!(self.myconn.conn.exec(&format!("ALTER TABLE \"{}\" RENAME TO \"{}\"", old_tbl, new_tbl)).map_err(elmo::wrap_err));
 
@@ -1065,6 +1078,7 @@ impl MyWriter {
                 try!(stmt.bind_text(3, name).map_err(elmo::wrap_err));
                 try!(step_done(&mut stmt));
                 try!(verify_changes(&stmt, 1));
+                stmt.reset();
                 let tbl = get_table_name_for_index(db, coll, name);
                 try!(self.myconn.conn.exec(&format!("DROP TABLE \"{}\"", tbl)).map_err(elmo::wrap_err));
                 Ok(true)
@@ -1100,6 +1114,7 @@ impl MyWriter {
                 try!(stmt.bind_text(2, coll).map_err(elmo::wrap_err));
                 try!(step_done(&mut stmt));
                 try!(verify_changes(&stmt, 1));
+                stmt.reset();
                 let tbl = get_table_name_for_collection(db, coll);
                 try!(self.myconn.conn.exec(&format!("DROP TABLE \"{}\"", tbl)).map_err(elmo::wrap_err));
                 Ok(true)
