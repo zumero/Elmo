@@ -1076,6 +1076,16 @@ impl Connection {
         Ok(deleted)
     }
 
+    pub fn rename_collection(&self, old_name: &str, new_name: &str, drop_target: bool) -> Result<bool> {
+        let done = {
+            let writer = try!(self.conn.begin_write());
+            let done = try!(writer.rename_collection(old_name, new_name, drop_target));
+            try!(writer.commit());
+            done
+        };
+        Ok(done)
+    }
+
     pub fn drop_database(&self, db: &str) -> Result<bool> {
         let deleted = {
             let writer = try!(self.conn.begin_write());

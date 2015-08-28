@@ -293,8 +293,26 @@ impl<'b> Server<'b> {
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
 
-    fn reply_renamecollection(&self, req: &MsgQuery) -> Result<Reply> {
-        Err(Error::Misc(format!("TODO renamecollection: {:?}", req)))
+    fn reply_rename_collection(&self, req: &MsgQuery) -> Result<Reply> {
+        let old_name = try!(req.query.must_get_str("renameCollection"));
+        let new_name = try!(req.query.must_get_str("to"));
+        let drop_target = 
+            match req.query.get("dropTarget") {
+                Some(v) => {
+                    match v {
+                        &bson::Value::BBoolean(b) => b,
+                        _ => false,
+                    }
+                },
+                None => {
+                    false
+                },
+            };
+        let result = try!(self.conn.rename_collection(old_name, new_name, drop_target));
+        let mut doc = bson::Document::new_empty();
+        // TODO shouldn't result get used or sent back here?
+        doc.set_i32("ok", 1);
+        Ok(create_reply(req.req_id, vec![doc], 0))
     }
 
     fn reply_buildinfo(&self, req: &MsgQuery) -> Result<Reply> {
@@ -345,7 +363,7 @@ impl<'b> Server<'b> {
                     "getlog" => self.reply_getlog(req),
                     "replsetgetstatus" => self.reply_replsetgetstatus(req),
                     "ismaster" => self.reply_ismaster(req),
-                    "renamecollection" => self.reply_renamecollection(req),
+                    "renamecollection" => self.reply_rename_collection(req),
                     "buildinfo" => self.reply_buildinfo(req),
                     "serverstatus" => self.reply_serverstatus(req),
                     "setparameter" => self.reply_setparameter(req),
