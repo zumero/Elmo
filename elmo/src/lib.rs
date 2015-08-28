@@ -2198,6 +2198,37 @@ impl Connection {
                 }
                 Ok(cur)
             },
+            &Expr::IfNull(ref t) => {
+                let v0 = try!(Self::eval(ctx, &t.0));
+                match v0 {
+                    bson::Value::BNull
+                    | bson::Value::BUndefined => {
+                        let v1 = try!(Self::eval(ctx, &t.1));
+                        Ok(v1)
+                    },
+                    _ => Ok(v0),
+                }
+            },
+            &Expr::Subtract(ref t) => {
+                let v0 = try!(Self::eval(ctx, &t.0));
+                let v1 = try!(Self::eval(ctx, &t.1));
+                match (v0,v1) {
+                    (bson::Value::BInt32(n0),bson::Value::BInt32(n1)) => Ok(bson::Value::BInt32(n0 - n1)),
+                    (bson::Value::BInt64(n0),bson::Value::BInt64(n1)) => Ok(bson::Value::BInt64(n0 - n1)),
+                    (bson::Value::BDouble(n0),bson::Value::BDouble(n1)) => Ok(bson::Value::BDouble(n0 - n1)),
+
+                    (bson::Value::BInt32(n0),bson::Value::BInt64(n1)) => Ok(bson::Value::BInt64((n0 as i64) - n1)),
+                    (bson::Value::BInt32(n0),bson::Value::BDouble(n1)) => Ok(bson::Value::BDouble((n0 as f64) - n1)),
+
+                    (bson::Value::BInt64(n0),bson::Value::BInt32(n1)) => Ok(bson::Value::BInt64(n0 - (n1 as i64))),
+                    (bson::Value::BInt64(n0),bson::Value::BDouble(n1)) => Ok(bson::Value::BDouble((n0 as f64) - n1)),
+
+                    (bson::Value::BDouble(n0),bson::Value::BInt32(n1)) => Ok(bson::Value::BDouble(n0 - (n1 as f64))),
+                    (bson::Value::BDouble(n0),bson::Value::BInt64(n1)) => Ok(bson::Value::BDouble(n0 - (n1 as f64))),
+
+                    (v0,v1) => Err(Error::Misc(format!("invalid types for subtract: {:?}, {:?}", v0, v1)))
+                }
+            },
             &Expr::Add(ref a) => {
                 let vals = try!(a.iter().map(|e| Self::eval(ctx, e)).collect::<Result<Vec<_>>>());
                 let count_dates = vals.iter().filter(|v| v.is_date()).count();
