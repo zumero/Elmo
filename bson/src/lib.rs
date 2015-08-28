@@ -1025,6 +1025,13 @@ impl Value {
         }
     }
 
+    pub fn as_document_or_panic(&self) -> &Document {
+        match self.as_document() {
+            Ok(d) => d,
+            Err(_) => panic!("must be document"),
+        }
+    }
+
     pub fn into_document(self) -> Result<Document> {
         match self {
             Value::BDocument(s) => Ok(s),
@@ -1069,6 +1076,20 @@ impl Value {
         match self {
             &Value::BDateTime(ref s) => Ok(*s),
             _ => Err(Error::Misc(String::from("must be DateTime"))),
+        }
+    }
+
+    pub fn i32_or_panic(&self) -> i32 {
+        match self {
+            &Value::BInt32(n) => n,
+            _ => panic!("must be i32"),
+        }
+    }
+
+    pub fn f64_or_panic(&self) -> f64 {
+        match self {
+            &Value::BDouble(n) => n,
+            _ => panic!("must be f64"),
         }
     }
 

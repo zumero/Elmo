@@ -457,7 +457,7 @@ enum AggOp {
     Unwind(String),
     Match(matcher::QueryDoc),
     Project(Vec<(String,AggProj)>),
-    Group(bson::Value, Vec<(String, GroupAccum)>),
+    Group(Expr, Vec<(String, GroupAccum)>),
     GeoNear(bson::Value),
     Redact(Expr),
 }
@@ -2238,6 +2238,25 @@ impl Connection {
         }
     }
 
+    fn parse_accum(v: bson::Value) -> Result<GroupAccum> {
+        let mut v = try!(v.into_document());
+        if v.pairs.len() != 1 {
+            return Err(Error::Misc(format!("$group accum invalid: {:?}", v)));
+        }
+        let (k,e) = v.pairs.remove(0);
+        match k.as_str() {
+            "$sum" => Ok(GroupAccum::Sum(try!(Self::parse_expr(e)))),
+            "$avg" => Ok(GroupAccum::Avg(try!(Self::parse_expr(e)))),
+            "$first" => Ok(GroupAccum::First(try!(Self::parse_expr(e)))),
+            "$last" => Ok(GroupAccum::Last(try!(Self::parse_expr(e)))),
+            "$max" => Ok(GroupAccum::Max(try!(Self::parse_expr(e)))),
+            "$min" => Ok(GroupAccum::Min(try!(Self::parse_expr(e)))),
+            "$push" => Ok(GroupAccum::Push(try!(Self::parse_expr(e)))),
+            "$addToSet" => Ok(GroupAccum::AddToSet(try!(Self::parse_expr(e)))),
+            _ => Err(Error::Misc(format!("$group accum op unknown: {:?}", k)))
+        }
+    }
+
     fn parse_agg(a: bson::Array) -> Result<Vec<AggOp>> {
         fn flatten_projection(d: bson::Value) -> Result<Vec<(String, bson::Value)>> {
             fn flatten(a: &mut Vec<(String, bson::Value)>, path: String, d: bson::Value) -> Result<()> {
@@ -2359,7 +2378,23 @@ impl Connection {
                             Ok(AggOp::Project(expressions))
                         },
                         "$group" => {
-                            Err(Error::Misc(format!("agg pipeline TODO: {}", k)))
+                            let mut d = try!(v.into_document());
+                            if d.pairs.len() == 0 {
+                                Err(Error::Misc(format!("$group requires args")))
+                            } else {
+                                let (id_k, id) = d.pairs.remove(0);
+                                if id_k != "_id" {
+                                    Err(Error::Misc(format!("$group requires _id as first arg")))
+                                } else {
+                                    let accums = try!(d.pairs.into_iter().map(|(k,op)| {
+                                        let a = try!(Self::parse_accum(op));
+                                        Ok((k, a))
+                                    }).collect::<Result<Vec<_>>>());
+                                    // TODO make sure 16414 no dot
+                                    let id = try!(Self::parse_expr(id));
+                                    Ok(AggOp::Group(id, accums))
+                                }
+                            }
                         },
                         "$redact" => {
                             Err(Error::Misc(format!("agg pipeline TODO: {}", k)))
@@ -2418,18 +2453,186 @@ impl Connection {
             )
     }
 
+    fn init_eval_ctx(d: bson::Value) -> bson::Document {
+        let mut ctx = bson::Document::new_empty();
+        ctx.set("CURRENT", d);
+        // TODO ROOT
+        // TODO DESCEND
+        // TODO PRUNE
+        // TODO KEEP
+        ctx
+    }
+
+    fn do_group(seq: Box<Iterator<Item=Result<Row>>>, id: Expr, ops: Vec<(String,GroupAccum)>) -> Result<HashMap<bson::Value,bson::Document>> {
+        let mut mapa = HashMap::new();
+        for rr in seq {
+            let row = try!(rr);
+            let mut ctx = Self::init_eval_ctx(row.doc);
+            let idval = try!(Self::eval(&ctx, &id));
+            // TODO see if mapa already has idval
+            let acc = match mapa.entry(idval) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(bson::Document::new_empty())
+                },
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    e.into_mut()
+                },
+            };
+            for &(ref k, ref op) in ops.iter() {
+                match op {
+                    &GroupAccum::First(ref e) => {
+                        let v = try!(Self::eval(&ctx, &e));
+                        match try!(acc.entry(k)) {
+                            bson::Entry::Found(e) => {
+                                // do nothing
+                            },
+                            bson::Entry::Absent(e) => {
+                                e.insert(v);
+                            },
+                        }
+                    },
+                    &GroupAccum::Last(ref e) => {
+                        let v = try!(Self::eval(&ctx, &e));
+                        acc.set(k, v);
+                    },
+                    &GroupAccum::Max(ref e) => {
+                        let v = try!(Self::eval(&ctx, &e));
+                        match try!(acc.entry(k)) {
+                            bson::Entry::Found(e) => {
+                                if Ordering::Greater == matcher::cmp(&v, e.get()) {
+                                    e.replace(v);
+                                }
+                            },
+                            bson::Entry::Absent(e) => {
+                                e.insert(v);
+                            },
+                        }
+                    },
+                    &GroupAccum::Min(ref e) => {
+                        let v = try!(Self::eval(&ctx, &e));
+                        match try!(acc.entry(k)) {
+                            bson::Entry::Found(e) => {
+                                if Ordering::Less == matcher::cmp(&v, e.get()) {
+                                    e.replace(v);
+                                }
+                            },
+                            bson::Entry::Absent(e) => {
+                                e.insert(v);
+                            },
+                        }
+                    },
+                    &GroupAccum::Push(ref e) => {
+                        let v = try!(Self::eval(&ctx, &e));
+                        match try!(acc.entry(k)) {
+                            bson::Entry::Found(mut e) => {
+                                let mut a = e.get_mut();
+                                match a {
+                                    &mut bson::Value::BArray(ref mut a) => {
+                                        a.items.push(v);
+                                    },
+                                    _ => {
+                                        unreachable!();
+                                    },
+                                }
+                            },
+                            bson::Entry::Absent(e) => {
+                                let mut a = bson::Array::new_empty();
+                                a.items.push(v);
+                                e.insert(bson::Value::BArray(a));
+                            },
+                        }
+                    },
+                    &GroupAccum::AddToSet(ref e) => {
+                        return Err(Error::Misc(format!("TODO AddToSet: {:?}", e)))
+                    },
+                    &GroupAccum::Avg(ref e) => {
+                        let v = try!(Self::eval(&ctx, &e));
+                        match v.numeric_to_f64() {
+                            Ok(v) => {
+                                match try!(acc.entry(k)) {
+                                    bson::Entry::Found(mut e) => {
+                                        let mut pair = e.get_mut();
+                                        match pair {
+                                            &mut bson::Value::BDocument(ref mut pair) => {
+                                                let count = pair.get("count").unwrap().i32_or_panic();
+                                                pair.set_i32("count", 1 + count);
+                                                let sum = pair.get("sum").unwrap().f64_or_panic();
+                                                pair.set_f64("sum", v + sum);
+                                            },
+                                            _ => {
+                                                unreachable!();
+                                            },
+                                        }
+                                    },
+                                    bson::Entry::Absent(e) => {
+                                        let mut pair = bson::Document::new_empty();
+                                        pair.set_i32("count", 1);
+                                        pair.set_f64("sum", v);
+                                        e.insert(bson::Value::BDocument(pair));
+                                    },
+                                }
+                            },
+                            Err(_) => {
+                                // ignore this
+                            },
+                        }
+                    },
+                    &GroupAccum::Sum(ref e) => {
+                        let v = try!(Self::eval(&ctx, &e));
+                        // TODO always double?
+                        let v = try!(v.numeric_to_f64());
+                        match try!(acc.entry(k)) {
+                            bson::Entry::Found(e) => {
+                                let cur = try!(e.get().numeric_to_f64());
+                                e.replace(bson::Value::BDouble(cur + v));
+                            },
+                            bson::Entry::Absent(e) => {
+                                e.insert(bson::Value::BDouble(v));
+                            },
+                        }
+                    },
+                }
+            }
+        }
+        for &(ref k, ref op) in ops.iter() {
+            match op {
+                &GroupAccum::Avg(_) => {
+                    for (_,ref mut acc) in mapa.iter_mut() {
+                        let (count,sum) = {
+                            let pair = acc.get(k).unwrap().as_document_or_panic();
+                            let count = pair.get("count").unwrap().i32_or_panic();
+                            let sum = pair.get("sum").unwrap().f64_or_panic();
+                            (count,sum)
+                            };
+                        acc.set_f64(k, sum / (count as f64));
+                    }
+                },
+                _ => {
+                    // nothing to do otherwise
+                },
+            }
+        }
+        Ok(mapa)
+    }
+
+    fn agg_group(seq: Box<Iterator<Item=Result<Row>>>, id: Expr, ops: Vec<(String,GroupAccum)>) -> Box<Iterator<Item=Result<Row>>> {
+        match Self::do_group(seq, id, ops) {
+            Ok(mapa) => {
+                box mapa.into_iter().map(|(k,v)| Ok(Row {doc:bson::Value::BDocument(v)}))
+            },
+            Err(e) => {
+                box std::iter::once(Err(e))
+            },
+        }
+    }
+
     fn agg_project(seq: Box<Iterator<Item=Result<Row>>>, expressions: Vec<(String,AggProj)>) -> Box<Iterator<Item=Result<Row>>> {
         box seq.map(
             move |rr| {
                 match rr {
                     Ok(mut row) => {
                         let mut d = bson::Value::BDocument(bson::Document::new_empty());
-                        let mut ctx = bson::Document::new_empty();
-                        ctx.set("CURRENT", row.doc);
-                        // TODO ROOT
-                        // TODO DESCEND
-                        // TODO PRUNE
-                        // TODO KEEP
+                        let mut ctx = Self::init_eval_ctx(row.doc);
                         for &(ref path, ref op) in expressions.iter() {
                             match op {
                                 &AggProj::Expr(ref e) => {
@@ -2512,6 +2715,9 @@ impl Connection {
                 },
                 AggOp::Project(expressions) => {
                     seq = box Self::agg_project(seq, expressions);
+                },
+                AggOp::Group(id, ops) => {
+                    seq = box Self::agg_group(seq, id, ops);
                 },
                 AggOp::Unwind(path) => {
                     seq = box Self::agg_unwind(seq, path);
