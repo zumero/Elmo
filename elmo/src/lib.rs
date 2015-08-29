@@ -415,6 +415,7 @@ pub trait StorageConnection {
 
 pub struct Connection {
     conn: Box<StorageConnection>,
+    rconn: Box<StorageConnection>,
 }
 
 // TODO this type was created so that all the projection operations
@@ -519,9 +520,10 @@ enum Expr {
 }
 
 impl Connection {
-    pub fn new(conn: Box<StorageConnection>) -> Connection {
+    pub fn new(conn: Box<StorageConnection>, rconn: Box<StorageConnection>) -> Connection {
         Connection {
             conn: conn,
+            rconn: rconn,
         }
     }
 
@@ -894,7 +896,39 @@ impl Connection {
                         //println!("ops: {:?}", ops);
                         let (count_matches, count_modified) =
                             if multi {
-                                return Err(Error::Misc(format!("TODO update operators multi: {:?}", ops)));
+                                let reader = try!(self.conn.begin_read());
+                                // TODO make the following filter DRY
+                                let indexes = try!(reader.list_indexes()).into_iter().filter(
+                                    |ndx| ndx.db == db && ndx.coll == coll
+                                    ).collect::<Vec<_>>();
+                                let plan = try!(Self::choose_index(&indexes, &m, None));
+                                let mut seq: Box<Iterator<Item=Result<Row>>> = try!(reader.into_collection_reader(db, coll, plan));
+                                // TODO it oughta be possible for this to use seq_match, if that fn
+                                // were modified to not take ownership of the matcher.
+                                seq = box seq.filter(
+                                    |r| {
+                                        if let &Ok(ref d) = r {
+                                            matcher::match_query(&m, &d.doc)
+                                        } else {
+                                            // TODO so when we have an error we just let it through?
+                                            true
+                                        }
+                                    });
+                                let mut mods = 0;
+                                let mut matches = 0;
+                                for rr in seq {
+                                    let row = try!(rr);
+                                    let mut doc = try!(row.doc.into_document());
+                                    let count_changes = try!(Self::apply_update_ops(&mut doc, &ops, false, None));
+                                    // TODO make sure _id did not change
+                                    matches = matches + 1;
+                                    // TODO only do the actual update if a change happened.  clone and compare?
+                                    try!(Self::validate_for_storage(&mut doc));
+                                    // TODO error in the following line?
+                                    collwriter.update(&doc);
+                                    mods = mods + 1;
+                                }
+                                (matches, mods)
                             } else {
                                 match try!(Self::get_one_match(db, coll, &*writer, &m)) {
                                     Some(row) => {
@@ -2725,6 +2759,20 @@ impl Connection {
         }
     }
 
+    fn seq_match(seq: Box<Iterator<Item=Result<Row>>>, m: matcher::QueryDoc) -> Box<Iterator<Item=Result<Row>>> {
+        box seq
+            .filter(
+                move |r| {
+                    if let &Ok(ref d) = r {
+                        matcher::match_query(&m, &d.doc)
+                    } else {
+                        // TODO so when we have an error we just let it through?
+                        true
+                    }
+                }
+        )
+    }
+
     fn agg_project(seq: Box<Iterator<Item=Result<Row>>>, expressions: Vec<(String,AggProj)>) -> Box<Iterator<Item=Result<Row>>> {
         box seq.map(
             move |rr| {
@@ -2795,17 +2843,7 @@ impl Connection {
                     seq = box seq.take(n as usize);
                 },
                 AggOp::Match(m) => {
-                    seq = box seq
-                        .filter(
-                            move |r| {
-                                if let &Ok(ref d) = r {
-                                    matcher::match_query(&m, &d.doc)
-                                } else {
-                                    // TODO so when we have an error we just let it through?
-                                    true
-                                }
-                            }
-                    );
+                    seq = Self::seq_match(seq, m);
                 },
                 AggOp::Sort(ref orderby) => {
                     let mut a = try!(seq.collect::<Result<Vec<_>>>());
@@ -2813,13 +2851,13 @@ impl Connection {
                     seq = box a.into_iter().map(|d| Ok(d))
                 },
                 AggOp::Project(expressions) => {
-                    seq = box Self::agg_project(seq, expressions);
+                    seq = Self::agg_project(seq, expressions);
                 },
                 AggOp::Group(id, ops) => {
-                    seq = box Self::agg_group(seq, id, ops);
+                    seq = Self::agg_group(seq, id, ops);
                 },
                 AggOp::Unwind(path) => {
-                    seq = box Self::agg_unwind(seq, path);
+                    seq = Self::agg_unwind(seq, path);
                 },
                 _ => {
                     return Err(Error::Misc(format!("agg pipeline TODO: {:?}", op)))
@@ -2919,17 +2957,7 @@ impl Connection {
             };
 
         let mut seq: Box<Iterator<Item=Result<Row>>> = try!(reader.into_collection_reader(db, coll, plan));
-        seq = box seq
-            .filter(
-                move |r| {
-                    if let &Ok(ref d) = r {
-                        matcher::match_query(&m, &d.doc)
-                    } else {
-                        // TODO so when we have an error we just let it through?
-                        true
-                    }
-                }
-        );
+        seq = Self::seq_match(seq, m);
         match orderby {
             Some(ref orderby) => {
                 let mut a = try!(seq.collect::<Result<Vec<_>>>());

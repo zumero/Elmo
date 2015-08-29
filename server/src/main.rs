@@ -1188,7 +1188,8 @@ pub fn serve() {
                     // connection succeeded
                     // TODO how to use filename arg.  lifetime problem.
                     let conn = elmo_sqlite3::connect("elmodata.db").expect("TODO");
-                    let conn = elmo::Connection::new(conn);
+                    let rconn = elmo_sqlite3::connect("elmodata.db").expect("TODO");
+                    let conn = elmo::Connection::new(conn,rconn);
                     let mut s = Server {
                         conn: conn,
                         cursors: std::collections::HashMap::new(),
