@@ -1549,7 +1549,7 @@ module crud =
         finally
             conn.close()
 
-    let private dofam_upsert w query update gnew fields =
+    let private dofam_upsert w query update gnew =
         let hasUpdateOperators = Array.exists (fun (k:string,_) -> k.StartsWith("$")) (bson.getDocument update)
         let q =
             match query with
@@ -1569,7 +1569,7 @@ module crud =
         let removed  = basicDelete w id
         (None,removed,None,Some doc)
 
-    let private dofam_update w st query update gnew fields =
+    let private dofam_update w st query update gnew =
         let doc = st.doc
         let ndx = st.pos
         let hasUpdateOperators = Array.exists (fun (k:string,_) -> k.StartsWith("$")) (bson.getDocument update)
@@ -2062,7 +2062,7 @@ module crud =
         finally
             rdr.funk()
 
-    let findandmodify dbName collName query sort remove update gnew fields upsert =
+    let findandmodify dbName collName query sort remove update gnew upsert =
         let m = 
             match query with
             | Some q -> Matcher.parseQuery q
@@ -2087,10 +2087,10 @@ module crud =
                         | Some u, None -> 
                             match found with
                             | Some st ->
-                                dofam_update w st query u gnew fields
+                                dofam_update w st query u gnew 
                             | None ->
                                 if upsert then
-                                    dofam_upsert w query u gnew fields
+                                    dofam_upsert w query u gnew 
                                 else
                                     (None,false,None,None)
                         | None, Some r -> 

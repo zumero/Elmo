@@ -1012,6 +1012,10 @@ impl Connection {
         Ok(results)
     }
 
+    pub fn find_and_modify(&self, db: &str, coll: &str, filter: Option<bson::Value>, sort: Option<bson::Value>, remove: Option<bson::Value>, update: Option<bson::Value>, new: bool, upsert: bool) -> Result<(Option<String>,Option<String>,bool,Option<bson::Value>,Option<bson::Value>)> {
+        Err(Error::Misc(String::from("TODO find_and_modify")))
+    }
+
     pub fn insert(&self, db: &str, coll: &str, docs: &mut Vec<bson::Document>) -> Result<Vec<Result<()>>> {
         // make sure every doc has an _id
         for d in docs.iter_mut() {

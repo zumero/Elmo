@@ -98,6 +98,7 @@ pub struct Document {
 }
 
 impl Document {
+    // TODO change name to new()
     pub fn new_empty() -> Self {
         Document {
             pairs: vec![],
@@ -450,6 +451,7 @@ pub struct Array {
 }
 
 impl Array {
+    // TODO change name to new()
     pub fn new_empty() -> Self {
         Array {
             items: vec![],

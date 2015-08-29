@@ -415,8 +415,105 @@ impl<'b> Server<'b> {
         Err(Error::Misc(format!("TODO explain: {:?}", req)))
     }
 
-    fn reply_findandmodify(&self, mut req: MsgQuery, db: &str) -> Result<Reply> {
-        Err(Error::Misc(format!("TODO findandmodify: {:?}", req)))
+    fn reply_find_and_modify(&self, mut req: MsgQuery, db: &str) -> Result<Reply> {
+        let MsgQuery {
+            req_id,
+            flags,
+            full_collection_name,
+            number_to_skip,
+            number_to_return,
+            mut query,
+            return_fields_selector,
+        } = req;
+        // TODO the following must be nocase
+        let coll = try!(query.must_remove_string("findandmodify"));
+        let filter = query.remove("query");
+        let sort = query.remove("sort");
+        let remove = query.remove("remove");
+        let update = query.remove("update");
+        let new = query.remove("new");
+        let new = match new {
+            Some(bson::Value::BBoolean(b)) => b,
+            //Some(_) => TODO error?
+            _ => false,
+        };
+        let fields = query.remove("fields");
+        let upsert = query.remove("upsert");
+        let upsert = match upsert {
+            Some(bson::Value::BBoolean(b)) => b,
+            //Some(_) => TODO error?
+            _ => false,
+        };
+
+        let was_update = update.is_some();
+        let (found,err,changed,upserted,result) = try!(self.conn.find_and_modify(db, &coll, filter, sort, remove, update, new, upsert));
+
+        let mut last_error_object = bson::Document::new_empty();
+        let mut doc = bson::Document::new_empty();
+
+        // TODO docs say: The updatedExisting field only appears if the command specifies an update or an update 
+        // with upsert: true; i.e. the field does not appear for a remove.
+
+        // TODO always 1 ?  appears for every op?
+        last_error_object.set_i32("n", if changed {1} else {0});
+
+        match upserted {
+            Some(id) => {
+                last_error_object.set("upserted", id);
+            },
+            _ => (),
+        }
+
+        match (was_update,found,upsert) {
+            (bool,None,_) => last_error_object.set_bool("updatedExisting", false),
+            (bool,Some(_),false) => last_error_object.set_bool("updatedExisting", changed),
+            _ => last_error_object.set_bool("updatedExisting", changed),
+        }
+
+        // TODO docs say: if not found, for update or remove (but not upsert), then
+        // lastErrorObject does not appear in the return document and the value field holds a null.
+
+        // TODO docs say: for update with upsert: true operation that results in an insertion, if the command 
+        // also specifies new is false and specifies a sort, the return document has a lastErrorObject, value, 
+        // and ok fields, but the value field holds an empty document {}.
+
+        // TODO docs say: for update with upsert: true operation that results in an insertion, if the command 
+        // also specifies new is false but does not specify a sort, the return document has a lastErrorObject, value, 
+        // and ok fields, but the value field holds a null.
+
+        match err {
+            Some(s) => {
+                // TODO is this right?  docs don't say this.
+                last_error_object.set_string("errmsg", s);
+                doc.set_i32("ok", 0);
+            },
+            None => {
+                doc.set_i32("ok", 1);
+            },
+        }
+
+        match result {
+            Some(v) => {
+                match fields {
+                    Some(proj) => {
+                        // TODO calling stuff below that seems like it should be private to the crud module
+                        // TODO projection position op allowed here?
+                        //let prep = crud.verifyProjection proj None 
+                        // TODO projection position op allowed here?
+                        //doc.set("value", crud.projectDocument {doc=v;score=None;pos=None} prep) 
+                    },
+                    None => {
+                        doc.set("value", v);
+                    },
+                }
+            },
+            None => {
+                doc.set("value", bson::Value::BNull);
+            },
+        }
+
+        doc.set_document("lastErrorObject", last_error_object);
+        Ok(create_reply(req.req_id, vec![doc], 0))
     }
 
     fn reply_insert(&self, mut req: MsgQuery, db: &str) -> Result<Reply> {
@@ -1015,7 +1112,7 @@ impl<'b> Server<'b> {
                     "delete" => self.reply_delete(&req, db),
                     "distinct" => self.reply_distinct(req, db),
                     "update" => self.reply_update(req, db),
-                    "findandmodify" => self.reply_findandmodify(req, db),
+                    "findandmodify" => self.reply_find_and_modify(req, db),
                     "count" => self.reply_count(req, db),
                     "validate" => self.reply_validate(req, db),
                     "createindexes" => self.reply_create_indexes(req, db),

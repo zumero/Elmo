@@ -430,7 +430,7 @@ module LiteServer =
             | _ -> false
 
         // TODO remove needs to return number removed?  or is it always 1 or 0?
-        let (found,err,changed,upserted,result) = crud.findandmodify db coll query sort remove update gnew fields upsert
+        let (found,err,changed,upserted,result) = crud.findandmodify db coll query sort remove update gnew upsert
 
         let lastErrorObject = ResizeArray<_>()
         let pairs = ResizeArray<_>()
