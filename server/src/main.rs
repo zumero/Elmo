@@ -219,7 +219,7 @@ fn create_reply(req_id: i32, docs: Vec<bson::Document>, cursor_id: i64) -> Reply
 }
 
 fn reply_code(req_id: i32, err: Error) -> Reply {
-    let mut doc = bson::Document::new_empty();
+    let mut doc = bson::Document::new();
     doc.set_string("errmsg", format!("{:?}", err));
     // TODO pairs.push(("code", BInt32(code)));
     doc.set_i32("ok", 0);
@@ -227,7 +227,7 @@ fn reply_code(req_id: i32, err: Error) -> Reply {
 }
 
 fn reply_err(req_id: i32, err: Error) -> Reply {
-    let mut doc = bson::Document::new_empty();
+    let mut doc = bson::Document::new();
     doc.set_string("$err", format!("{:?}", err));
     doc.set_i32("ok", 0);
     let mut r = create_reply(req_id, vec![doc], 0);
@@ -236,7 +236,7 @@ fn reply_err(req_id: i32, err: Error) -> Reply {
 }
 
 fn reply_errmsg(req_id: i32, err: Error) -> Reply {
-    let mut doc = bson::Document::new_empty();
+    let mut doc = bson::Document::new();
     doc.set_string("errmsg", format!("{:?}", err));
     doc.set_i32("ok", 0);
     create_reply(req_id, vec![doc], 0)
@@ -257,22 +257,22 @@ impl<'b> Server<'b> {
     fn reply_whatsmyuri(&self, req: &MsgQuery) -> Result<Reply> {
         println!("----------------------------------------------------------------");
         println!("----------------------------------------------------------------");
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         doc.set_str("you", "127.0.0.1:65460");
         doc.set_i32("ok", 1);
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
 
     fn reply_getlog(&self, req: &MsgQuery) -> Result<Reply> {
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         doc.set_i32("totalLinesWritten", 1);
-        doc.set_array("log", bson::Array::new_empty());
+        doc.set_array("log", bson::Array::new());
         doc.set_i32("ok", 1);
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
 
     fn reply_replsetgetstatus(&self, req: &MsgQuery) -> Result<Reply> {
-        let mut mine = bson::Document::new_empty();
+        let mut mine = bson::Document::new();
         mine.set_i32("_id", 0);
         mine.set_str("name", "whatever");
         mine.set_i32("state", 1);
@@ -285,7 +285,7 @@ impl<'b> Server<'b> {
         mine.set_timestamp("electionDate", 0);
         mine.set_bool("self", true);
 
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         doc.set_document("mine", mine);
         doc.set_str("set", "TODO");
         doc.set_datetime("date", 0);
@@ -311,7 +311,7 @@ impl<'b> Server<'b> {
                 },
             };
         let result = try!(self.conn.rename_collection(old_name, new_name, drop_target));
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         // TODO shouldn't result get used or sent back here?
         doc.set_i32("ok", 1);
         Ok(create_reply(req.req_id, vec![doc], 0))
@@ -330,7 +330,7 @@ impl<'b> Server<'b> {
     }
 
     fn reply_ismaster(&self, req: &MsgQuery) -> Result<Reply> {
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         doc.set_bool("ismaster", true);
         doc.set_bool("secondary", false);
         doc.set_i32("maxWireVersion", 3);
@@ -346,8 +346,8 @@ impl<'b> Server<'b> {
     }
 
     fn reply_cmd_sys_inprog(&self, req: &MsgQuery, db: &str) -> Result<Reply> {
-        let mut doc = bson::Document::new_empty();
-        doc.set_array("inprog", bson::Array::new_empty());
+        let mut doc = bson::Document::new();
+        doc.set_array("inprog", bson::Array::new());
         doc.set_i32("ok", 1);
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
@@ -382,7 +382,7 @@ impl<'b> Server<'b> {
         // TODO limit
         // TODO ordered
         let result = try!(self.conn.delete(db, coll, &deletes.items));
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         doc.set_i32("ok", result as i32);
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
@@ -394,7 +394,7 @@ impl<'b> Server<'b> {
         // TODO ordered
         // TODO do we need to keep ownership of updates?
         let results = try!(self.conn.update(db, &coll, &mut updates));
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         doc.set_i32("ok", 1);
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
@@ -448,8 +448,8 @@ impl<'b> Server<'b> {
         let was_update = update.is_some();
         let (found,err,changed,upserted,result) = try!(self.conn.find_and_modify(db, &coll, filter, sort, remove, update, new, upsert));
 
-        let mut last_error_object = bson::Document::new_empty();
-        let mut doc = bson::Document::new_empty();
+        let mut last_error_object = bson::Document::new();
+        let mut doc = bson::Document::new();
 
         // TODO docs say: The updatedExisting field only appears if the command specifies an update or an update 
         // with upsert: true; i.e. the field does not appear for a remove.
@@ -533,7 +533,7 @@ impl<'b> Server<'b> {
                 errors.push(err);
             }
         }
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         doc.set_i32("n", ((results.len() - errors.len()) as i32));
         if errors.len() > 0 {
             doc.set_array("writeErrors", bson::Array {items: errors});
@@ -682,10 +682,10 @@ impl<'b> Server<'b> {
                 },
             };
 
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         match cursor_options {
             Some(_) => {
-                let mut cursor = bson::Document::new_empty();
+                let mut cursor = bson::Document::new();
                 cursor.set_i64("id", cursor_id);
                 cursor.set_str("ns", ns);
                 cursor.set_array("firstBatch", bson::Array { items: vec_rows_to_values(docs)});
@@ -702,7 +702,7 @@ impl<'b> Server<'b> {
     fn reply_create_collection(&self, req: &MsgQuery, db: &str) -> Result<Reply> {
         let q = &req.query;
         let coll = try!(req.query.must_get_str("create"));
-        let mut options = bson::Document::new_empty();
+        let mut options = bson::Document::new();
         // TODO maybe just pass everything through instead of looking for specific options
         match q.get("autoIndexId") {
             Some(&bson::Value::BBoolean(b)) => options.set_bool("autoIndexId", b),
@@ -735,7 +735,7 @@ impl<'b> Server<'b> {
         }
         // TODO more options here ?
         let result = try!(self.conn.create_collection(db, coll, options));
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         doc.set_i32("ok", 1);
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
@@ -765,7 +765,7 @@ impl<'b> Server<'b> {
         // TODO createdCollectionAutomatically
         // TODO numIndexesBefore
         // TODO numIndexesAfter
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         doc.set_i32("ok", 1);
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
@@ -779,7 +779,7 @@ impl<'b> Server<'b> {
         }
         let index = try!(req.query.must_get("index"));
         let (count_indexes_before, num_indexes_deleted) = try!(self.conn.delete_indexes(db, coll, index));
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         doc.set_i32("ok", 1);
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
@@ -792,7 +792,7 @@ impl<'b> Server<'b> {
             self.remove_cursors_for_collection(&full_coll);
         }
         let deleted = try!(self.conn.drop_collection(db, coll));
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         if deleted {
             doc.set_i32("ok", 1);
         } else {
@@ -806,7 +806,7 @@ impl<'b> Server<'b> {
     fn reply_drop_database(&mut self, req: &MsgQuery, db: &str) -> Result<Reply> {
         // TODO remove cursors?
         let deleted = try!(self.conn.drop_database(db));
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         if deleted {
             doc.set_i32("ok", 1);
         } else {
@@ -827,7 +827,7 @@ impl<'b> Server<'b> {
             let results = results.into_iter().filter_map(
                 move |c| {
                     if db.as_str() == c.db {
-                        let mut doc = bson::Document::new_empty();
+                        let mut doc = bson::Document::new();
                         doc.set_string("name", c.coll);
                         doc.set_document("options", c.options);
                         let r = elmo::Row {
@@ -864,7 +864,7 @@ impl<'b> Server<'b> {
             let results = results.into_iter().filter_map(
                 move |ndx| {
                     if ndx.db.as_str() == db {
-                        let mut doc = bson::Document::new_empty();
+                        let mut doc = bson::Document::new();
                         doc.set_string("ns", ndx.full_collection_name());
                         doc.set_string("name", ndx.name);
                         doc.set_document("key", ndx.spec);
@@ -937,7 +937,7 @@ impl<'b> Server<'b> {
         } = req;
         let coll = try!(query.must_remove_string("validate"));
         // TODO what is this supposed to actually do?
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         doc.set_bool("valid", true);
         doc.set_i32("ok", 1);
         Ok(create_reply(req.req_id, vec![doc], 0))
@@ -1002,7 +1002,7 @@ impl<'b> Server<'b> {
                 ));
         let count = seq.count();
         // TODO skip/limit
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         doc.set_i32("n", count as i32);
         doc.set_i32("ok", 1);
         Ok(create_reply(req.req_id, vec![doc], 0))

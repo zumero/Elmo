@@ -98,8 +98,7 @@ pub struct Document {
 }
 
 impl Document {
-    // TODO change name to new()
-    pub fn new_empty() -> Self {
+    pub fn new() -> Self {
         Document {
             pairs: vec![],
         }
@@ -451,8 +450,7 @@ pub struct Array {
 }
 
 impl Array {
-    // TODO change name to new()
-    pub fn new_empty() -> Self {
+    pub fn new() -> Self {
         Array {
             items: vec![],
         }
@@ -858,11 +856,11 @@ impl<'v,'p> EntryAbsent<'v,'p> {
                 let subpath = &path[dot + 1 ..];
                 match name.parse::<usize>() {
                     Ok(n) => {
-                        let sub = bd.set_array(name, Array::new_empty());
+                        let sub = bd.set_array(name, Array::new());
                         try!(sub.set_path(subpath, v));
                     },
                     Err(_) => {
-                        let sub = bd.set_document(name, Document::new_empty());
+                        let sub = bd.set_document(name, Document::new());
                         try!(sub.set_path(subpath, v));
                     },
                 }

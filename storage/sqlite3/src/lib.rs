@@ -890,7 +890,7 @@ impl MyWriter {
     }
 
     fn create_index(&self, info: elmo::IndexInfo) -> Result<bool> {
-        let _created = try!(self.base_create_collection(&info.db, &info.coll, bson::Document::new_empty()));
+        let _created = try!(self.base_create_collection(&info.db, &info.coll, bson::Document::new()));
         match try!(self.myconn.get_index_info(&info.db, &info.coll, &info.name)) {
             Some(already) => {
                 if already.spec != info.spec {
@@ -961,7 +961,7 @@ impl MyWriter {
     fn base_clear_collection(&self, db: &str, coll: &str) -> Result<bool> {
         match try!(self.myconn.get_collection_options(db, coll)) {
             None => {
-                let created = try!(self.base_create_collection(db, coll, bson::Document::new_empty()));
+                let created = try!(self.base_create_collection(db, coll, bson::Document::new()));
                 Ok(created)
             },
             Some(_) => {
@@ -992,7 +992,7 @@ impl MyWriter {
 
         match try!(self.myconn.get_collection_options(old_db, old_coll)) {
             None => {
-                let created = try!(self.base_create_collection(new_db, new_coll, bson::Document::new_empty()));
+                let created = try!(self.base_create_collection(new_db, new_coll, bson::Document::new()));
                 Ok(created)
             },
             Some(_) => {
@@ -1126,7 +1126,7 @@ impl MyWriter {
 
 impl elmo::StorageWriter for MyWriter {
     fn get_collection_writer(&self, db: &str, coll: &str) -> Result<Box<elmo::StorageCollectionWriter + 'static>> {
-        let _created = try!(self.base_create_collection(db, coll, bson::Document::new_empty()));
+        let _created = try!(self.base_create_collection(db, coll, bson::Document::new()));
         let tbl = get_table_name_for_collection(db, coll);
         let stmt_insert = try!(self.myconn.conn.prepare(&format!("INSERT INTO \"{}\" (bson) VALUES (?)", tbl)).map_err(elmo::wrap_err));
         let stmt_delete = try!(self.myconn.conn.prepare(&format!("DELETE FROM \"{}\" WHERE rowid=?", tbl)).map_err(elmo::wrap_err));

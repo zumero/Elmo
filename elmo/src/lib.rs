@@ -815,7 +815,7 @@ impl Connection {
 
     fn build_upsert_with_update_operators(m: &matcher::QueryDoc, ops: &Vec<UpdateOp>) -> Result<bson::Document> {
         let a = matcher::get_eqs(m);
-        let mut doc = bson::Document::new_empty();
+        let mut doc = bson::Document::new();
         for (path, v) in a {
             try!(doc.set_path(&path, v.clone()));
         }
@@ -2533,7 +2533,7 @@ impl Connection {
     }
 
     fn init_eval_ctx(d: bson::Value) -> bson::Document {
-        let mut ctx = bson::Document::new_empty();
+        let mut ctx = bson::Document::new();
         ctx.set("CURRENT", d);
         // TODO ROOT
         // TODO DESCEND
@@ -2551,7 +2551,7 @@ impl Connection {
             // TODO see if mapa already has idval
             let acc = match mapa.entry(idval) {
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(bson::Document::new_empty())
+                    e.insert(bson::Document::new())
                 },
                 std::collections::hash_map::Entry::Occupied(e) => {
                     e.into_mut()
@@ -2615,7 +2615,7 @@ impl Connection {
                                 }
                             },
                             bson::Entry::Absent(e) => {
-                                let mut a = bson::Array::new_empty();
+                                let mut a = bson::Array::new();
                                 a.items.push(v);
                                 e.insert(bson::Value::BArray(a));
                             },
@@ -2644,7 +2644,7 @@ impl Connection {
                                         }
                                     },
                                     bson::Entry::Absent(e) => {
-                                        let mut pair = bson::Document::new_empty();
+                                        let mut pair = bson::Document::new();
                                         pair.set_i32("count", 1);
                                         pair.set_f64("sum", v);
                                         e.insert(bson::Value::BDocument(pair));
@@ -2782,7 +2782,7 @@ impl Connection {
             move |rr| {
                 match rr {
                     Ok(mut row) => {
-                        let mut d = bson::Value::BDocument(bson::Document::new_empty());
+                        let mut d = bson::Value::BDocument(bson::Document::new());
                         let mut ctx = Self::init_eval_ctx(row.doc);
                         for &(ref path, ref op) in expressions.iter() {
                             match op {
