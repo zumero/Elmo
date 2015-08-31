@@ -1259,33 +1259,39 @@ impl Connection {
         Ok(deleted)
     }
 
-    pub fn delete(&self, db: &str, coll: &str, items: &Vec<bson::Value>) -> Result<usize> {
+    pub fn delete(&self, db: &str, coll: &str, items: Vec<bson::Document>) -> Result<usize> {
         let mut count = 0;
         {
             let writer = try!(self.conn.begin_write());
             {
                 let mut collwriter = try!(writer.get_collection_writer(db, coll));
-                for del in items {
-                    // TODO
-                    /*
-                    let q = bson.getValueForKey upd "q"
-                    let limit = bson.tryGetValueForKey upd "limit"
-                    let m = Matcher.parseQuery q
+                for mut del in items {
+                    let q = try!(del.must_remove_document("q"));
+                    let limit = del.get("limit");
+                    let m = try!(matcher::parse_query(q));
+                    let indexes = try!(writer.list_indexes()).into_iter().filter(
+                        |ndx| ndx.db == db && ndx.coll == coll
+                        ).collect::<Vec<_>>();
+                    //println!("indexes: {:?}", indexes);
+                    let plan = try!(Self::choose_index(&indexes, &m, None));
+                    //println!("plan: {:?}", plan);
                     // TODO is this safe?  or do we need two-conn isolation like update?
-                    let indexes = w.getIndexes()
-                    let plan = chooseIndex indexes m None
-                    let {docs=s;funk=funk} = w.getSelect plan
-                    try
-                        s |> seqMatch m |> 
-                            Seq.iter (fun {doc=doc} -> 
-                                // TODO is it possible to delete from an autoIndexId=false collection?
-                                let id = bson.getValueForKey doc "_id"
-                                if basicDelete w id then
-                                    count := !count + 1
-                                )
-                    finally
-                        funk()
-                    */
+                    let mut seq: Box<Iterator<Item=Result<Row>>> = try!(writer.get_collection_reader(db, coll, plan));
+                    seq = Self::seq_match(seq, m);
+                    for rr in seq {
+                        let row = try!(rr);
+                        let d = try!(row.doc.into_document());
+                        match d.get("_id") {
+                            Some(id) => {
+                                if try!(collwriter.delete(id)) {
+                                    count = count + 1;
+                                }
+                            },
+                            None => {
+                                return Err(Error::Misc(String::from("delete: invalid. no _id.")))
+                            },
+                        }
+                    }
                 }
             }
             try!(writer.commit());

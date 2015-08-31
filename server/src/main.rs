@@ -377,15 +377,16 @@ impl<'b> Server<'b> {
         }
     }
 
-    fn reply_delete(&self, req: &MsgQuery, db: &str) -> Result<Reply> {
-        let q = &req.query;
-        let coll = try!(q.must_get_str("delete"));
-        let deletes = try!(q.must_get_array("deletes"));
+    fn reply_delete(&self, mut req: MsgQuery, db: &str) -> Result<Reply> {
+        let coll = try!(req.query.must_remove_string("update"));
+        let deletes = try!(req.query.must_remove_array("deletes"));
+        let deletes = try!(vec_values_to_docs(deletes.items));
         // TODO limit
         // TODO ordered
-        let result = try!(self.conn.delete(db, coll, &deletes.items));
+        let result = try!(self.conn.delete(db, &coll, deletes));
         let mut doc = bson::Document::new();
-        doc.set_i32("ok", result as i32);
+        doc.set_i32("n", result as i32);
+        doc.set_i32("ok", 1);
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
 
@@ -1110,7 +1111,7 @@ impl<'b> Server<'b> {
                     "explain" => self.reply_explain(req, db),
                     "aggregate" => self.reply_aggregate(req, db),
                     "insert" => self.reply_insert(req, db),
-                    "delete" => self.reply_delete(&req, db),
+                    "delete" => self.reply_delete(req, db),
                     "distinct" => self.reply_distinct(req, db),
                     "update" => self.reply_update(req, db),
                     "findandmodify" => self.reply_find_and_modify(req, db),
