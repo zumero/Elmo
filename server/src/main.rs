@@ -1004,8 +1004,33 @@ impl<'b> Server<'b> {
                 hint,
                 None
                 ));
-        let count = seq.count();
-        // TODO skip/limit
+        let mut count = seq.count() as i32;
+        match query.remove("skip") {
+            None => (),
+            Some(n) => {
+                let n = try!(n.numeric_to_i32());
+                if n < 0 {
+                    return Err(Error::Misc(format!("negative skip: {}", n)));
+                }
+                if count >= n {
+                    count = count - n;
+                } else {
+                    count = 0;
+                }
+            },
+        }
+        match query.remove("limit") {
+            None => (),
+            Some(n) => {
+                let mut n = try!(n.numeric_to_i32());
+                if n < 0 {
+                    n = -n;
+                }
+                if n > 0 && count > n {
+                    count = n;
+                }
+            },
+        }
         let mut doc = bson::Document::new();
         doc.set_i32("n", count as i32);
         doc.set_i32("ok", 1);
@@ -1072,7 +1097,7 @@ impl<'b> Server<'b> {
             };
 
         if number_to_skip < 0 {
-            return Err(Error::Misc(format!("TODO negative skip: {}", number_to_skip)));
+            return Err(Error::Misc(format!("negative skip: {}", number_to_skip)));
         }
 
         let seq = seq.skip(number_to_skip as usize);
