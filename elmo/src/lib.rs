@@ -535,8 +535,7 @@ impl Connection {
     }
 
     // TODO maybe this could/should take ownership of ops?
-    fn apply_update_ops(doc: &mut bson::Document, ops: &Vec<UpdateOp>, is_upsert: bool, pos: Option<usize>) -> Result<usize> {
-        let mut count = 0;
+    fn apply_update_ops(doc: &mut bson::Document, ops: &Vec<UpdateOp>, is_upsert: bool, pos: Option<usize>) -> Result<()> {
         for op in ops {
             match op {
                 &UpdateOp::Min(ref path, ref v) => {
@@ -546,13 +545,11 @@ impl Connection {
                             let c = matcher::cmp(v, e.get());
                             if c == Ordering::Less {
                                 e.replace(v.clone());
-                                count = count + 1;
                             }
                         },
                         bson::Entry::Absent(e) => {
                             // when the key isn't found, this works like $set
                             e.insert(v.clone());
-                            count = count + 1;
                         },
                     }
                 },
@@ -563,13 +560,11 @@ impl Connection {
                             let c = matcher::cmp(v, e.get());
                             if c == Ordering::Greater {
                                 e.replace(v.clone());
-                                count = count + 1;
                             }
                         },
                         bson::Entry::Absent(e) => {
                             // when the key isn't found, this works like $set
                             e.insert(v.clone());
-                            count = count + 1;
                         },
                     }
                 },
@@ -593,13 +588,11 @@ impl Connection {
                                     },
                                     _ => return Err(Error::Misc(format!("can't $inc to this type"))),
                                 }
-                                count = count + 1;
                             }
                         },
                         bson::Entry::Absent(e) => {
                             // when the key isn't found, this works like $set
                             e.insert(v.clone());
-                            count = count + 1;
                         },
                     }
                 },
@@ -622,22 +615,16 @@ impl Connection {
                                 },
                                 _ => return Err(Error::Misc(format!("can't $mul to this type"))),
                             }
-                            count = count + 1;
                         },
                         bson::Entry::Absent(e) => {
                             // when the key isn't found, this works like $set
                             e.insert(v.clone());
-                            count = count + 1;
                         },
                     }
                 },
                 &UpdateOp::Set(ref path, ref v) => {
                     let path = Self::fix_positional(path, pos);
                     try!(doc.set_path(&path, v.clone()));
-                    // TODO this is an example of a place where we increment the counter
-                    // but we don't actually know if the document changed, since we might
-                    // have set the same value as was already there.
-                    count = count + 1;
                 },
                 &UpdateOp::PullValue(ref path, ref v) => {
                     panic!("TODO UpdateOp::PullValue");
@@ -658,7 +645,6 @@ impl Connection {
                                 },
                                 _ => return Err(Error::Misc(format!("can't $bit.and to this type"))),
                             }
-                            count = count + 1;
                         },
                         bson::Entry::Absent(e) => {
                             return Err(Error::Misc(format!("$bit.and path not found")));
@@ -678,7 +664,6 @@ impl Connection {
                                 },
                                 _ => return Err(Error::Misc(format!("can't $bit.or to this type"))),
                             }
-                            count = count + 1;
                         },
                         bson::Entry::Absent(e) => {
                             return Err(Error::Misc(format!("$bit.or path not found")));
@@ -698,7 +683,6 @@ impl Connection {
                                 },
                                 _ => return Err(Error::Misc(format!("can't $bit.xor to this type"))),
                             }
-                            count = count + 1;
                         },
                         bson::Entry::Absent(e) => {
                             return Err(Error::Misc(format!("$bit.xor path not found")));
@@ -710,7 +694,6 @@ impl Connection {
                     match try!(doc.entry(&path)) {
                         bson::Entry::Found(e) => {
                             e.remove();
-                            count = count + 1;
                         },
                         bson::Entry::Absent(e) => {
                         },
@@ -742,9 +725,7 @@ impl Connection {
                 },
             }
         }
-        // TODO not sure if the housekeeping necessary to return an accurate
-        // change count is worth the trouble.
-        Ok(count)
+        Ok(())
     }
 
     fn parse_update_doc(d: bson::Document) -> Result<Vec<UpdateOp>> {
@@ -820,7 +801,7 @@ impl Connection {
             try!(doc.set_path(&path, v.clone()));
         }
         // TODO save the id so we can make sure it didn't change
-        let count_changes = try!(Self::apply_update_ops(&mut doc, ops, true, None));
+        try!(Self::apply_update_ops(&mut doc, ops, true, None));
         // TODO make sure the id didn't change
         doc.ensure_id();
         Ok(doc)
@@ -858,12 +839,11 @@ impl Connection {
         }
     }
 
-    fn validate_for_storage(d: &mut bson::Document) -> Result<()> {
-        try!(d.validate_id());
+    fn validate_for_storage(d: &mut bson::Document) -> Result<bson::Value> {
+        let id = try!(d.validate_id());
         try!(d.validate_keys(0));
         // TODO validate depth
-        // TODO return id?
-        Ok(())
+        Ok(id)
     }
 
     // TODO this func needs to return the 4-tuple
@@ -918,30 +898,35 @@ impl Connection {
                                 let mut matches = 0;
                                 for rr in seq {
                                     let row = try!(rr);
-                                    let mut doc = try!(row.doc.into_document());
-                                    let count_changes = try!(Self::apply_update_ops(&mut doc, &ops, false, None));
+                                    let old_doc = try!(row.doc.into_document());
+                                    let mut new_doc = old_doc.clone();
+                                    try!(Self::apply_update_ops(&mut new_doc, &ops, false, None));
                                     // TODO make sure _id did not change
                                     matches = matches + 1;
-                                    // TODO only do the actual update if a change happened.  clone and compare?
-                                    try!(Self::validate_for_storage(&mut doc));
-                                    // TODO error in the following line?
-                                    collwriter.update(&doc);
-                                    mods = mods + 1;
+                                    if new_doc != old_doc {
+                                        let id = try!(Self::validate_for_storage(&mut new_doc));
+                                        // TODO error in the following line?
+                                        collwriter.update(&new_doc);
+                                        mods = mods + 1;
+                                    }
                                 }
                                 (matches, mods)
                             } else {
                                 match try!(Self::get_one_match(db, coll, &*writer, &m)) {
                                     Some(row) => {
                                         //println!("row found for update: {:?}", row);
-                                        let mut doc = try!(row.doc.into_document());
-                                        let count_changes = try!(Self::apply_update_ops(&mut doc, &ops, false, None));
+                                        let old_doc = try!(row.doc.into_document());
+                                        let mut new_doc = old_doc.clone();
+                                        try!(Self::apply_update_ops(&mut new_doc, &ops, false, None));
                                         // TODO make sure _id did not change
-                                        // TODO only do the actual update if a change happened.  clone and compare?
-                                        try!(Self::validate_for_storage(&mut doc));
-                                        // TODO error in the following line?
-                                        collwriter.update(&doc);
-                                        // TODO return (1, 0) if the change didn't happen
-                                        (1, 1)
+                                        if new_doc != old_doc {
+                                            let id = try!(Self::validate_for_storage(&mut new_doc));
+                                            // TODO error in the following line?
+                                            collwriter.update(&new_doc);
+                                            (1, 1)
+                                        } else {
+                                            (1, 0)
+                                        }
                                     },
                                     None => {
                                         //println!("get_one_match found nothing");
@@ -952,7 +937,7 @@ impl Connection {
                         if count_matches == 0 {
                             if upsert {
                                 let mut doc = try!(Self::build_upsert_with_update_operators(&m, &ops));
-                                try!(Self::validate_for_storage(&mut doc));
+                                let id = try!(Self::validate_for_storage(&mut doc));
                                 // TODO handle error in following line
                                 collwriter.insert(&doc);
                                 // TODO return something
@@ -973,12 +958,12 @@ impl Connection {
                         }
                         match try!(Self::get_one_match(db, coll, &*writer, &m)) {
                             Some(row) => {
-                                let doc = try!(row.doc.as_document());
-                                let id1 = try!(doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated"))));
+                                let old_doc = try!(row.doc.as_document());
+                                let id1 = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated"))));
                                 let id1 = try!(id1.as_objectid());
                                 // TODO if u has _id, make sure it's the same
                                 u.set_objectid("_id", id1);
-                                try!(Self::validate_for_storage(&mut u));
+                                let id = try!(Self::validate_for_storage(&mut u));
                                 // TODO handle error in following line
                                 collwriter.update(&u);
                                 // TODO return something
@@ -987,7 +972,7 @@ impl Connection {
                             None => {
                                 if upsert {
                                     try!(Self::build_simple_upsert(q_id, &mut u));
-                                    try!(Self::validate_for_storage(&mut u));
+                                    let id = try!(Self::validate_for_storage(&mut u));
                                     // TODO handle error in following line
                                     collwriter.insert(&u);
                                     // TODO return something
@@ -1066,33 +1051,42 @@ impl Connection {
                     let ops = try!(Self::parse_update_doc(u));
                     let old_doc = try!(row.doc.into_document());
                     let mut new_doc = old_doc.clone();
-                    let count_changes = try!(Self::apply_update_ops(&mut new_doc, &ops, false, None));
+                    try!(Self::apply_update_ops(&mut new_doc, &ops, false, None));
                     // TODO make sure _id did not change
                     if old_doc != new_doc {
-                        try!(Self::validate_for_storage(&mut new_doc));
+                        let id = try!(Self::validate_for_storage(&mut new_doc));
                         // TODO error in the following line?
                         collwriter.update(&new_doc);
                         changed = true;
-                        result = 
-                            if new {
-                                Some(new_doc)
-                            } else {
-                                Some(old_doc)
-                            };
                     }
+                    result = 
+                        if new {
+                            Some(new_doc)
+                        } else {
+                            Some(old_doc)
+                        };
                 } else {
                     let old_doc = try!(row.doc.into_document());
-                    let id1 = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated"))));
-                    let id1 = try!(id1.as_objectid());
+                    let id1 = {
+                        let v = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated"))));
+                        let id = try!(v.as_objectid());
+                        id
+                    };
                     // TODO if u has _id, make sure it's the same
                     let mut new_doc = u;
                     new_doc.set_objectid("_id", id1);
                     if old_doc != new_doc {
-                        try!(Self::validate_for_storage(&mut new_doc));
+                        let id = try!(Self::validate_for_storage(&mut new_doc));
                         // TODO handle error in following line
                         collwriter.update(&new_doc);
                         changed = true;
                     }
+                    result = 
+                        if new {
+                            Some(new_doc)
+                        } else {
+                            Some(old_doc)
+                        };
                 }
             },
             (Some(u), None, None) => {
@@ -1102,19 +1096,26 @@ impl Connection {
                     let has_update_operators = u.pairs.iter().any(|&(ref k, _)| k.starts_with("$"));
                     if has_update_operators {
                         let ops = try!(Self::parse_update_doc(u));
-                        let mut doc = try!(Self::build_upsert_with_update_operators(&m, &ops));
-                        try!(Self::validate_for_storage(&mut doc));
+                        let mut new_doc = try!(Self::build_upsert_with_update_operators(&m, &ops));
+                        let id = try!(Self::validate_for_storage(&mut new_doc));
                         // TODO handle error in following line
-                        collwriter.insert(&doc);
-                        // TODO changed = true;
-                        // TODO id upserted = Some(doc);
+                        collwriter.insert(&new_doc);
+                         changed = true;
+                        upserted = Some(id);
+                        if new {
+                            result = Some(new_doc);
+                        }
                     } else {
-                        try!(Self::build_simple_upsert(q_id, &mut u));
-                        try!(Self::validate_for_storage(&mut u));
+                        let mut new_doc = u;
+                        try!(Self::build_simple_upsert(q_id, &mut new_doc));
+                        let id = try!(Self::validate_for_storage(&mut new_doc));
                         // TODO handle error in following line
-                        collwriter.insert(&u);
-                        // TODO changed = true;
-                        // TODO id upserted = Some(u);
+                        collwriter.insert(&new_doc);
+                        changed = true;
+                        upserted = Some(id);
+                        if new {
+                            result = Some(new_doc);
+                        }
                     }
                 }
             },
@@ -1152,7 +1153,7 @@ impl Connection {
             {
                 let mut collwriter = try!(writer.get_collection_writer(db, coll));
                 for mut doc in docs {
-                    try!(Self::validate_for_storage(&mut doc));
+                    let id = try!(Self::validate_for_storage(&mut doc));
                     let r = collwriter.insert(doc);
                     results.push(r);
                 }

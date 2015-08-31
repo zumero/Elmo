@@ -138,15 +138,15 @@ impl Document {
         }
     }
 
-    pub fn validate_id(&mut self) -> Result<()> {
+    pub fn validate_id(&mut self) -> Result<Value> {
         match self.pairs.iter().position(|&(ref k, ref v)| k == "_id") {
             Some(i) => {
                 if self.pairs[i].1.is_array() {
-                    Err(Error::Misc(String::from("_id cannot be an array")))
+                    return Err(Error::Misc(String::from("_id cannot be an array")));
                 } else if self.pairs[i].1.is_undefined() {
-                    Err(Error::Misc(String::from("_id cannot be undefined")))
+                    return Err(Error::Misc(String::from("_id cannot be undefined")));
                 } else if i == 0{
-                    Ok(())
+                    // fine
                 } else {
                     // when the _id is not the first thing in the document, we must
                     // move it to the front.  it is important that we do this by
@@ -154,8 +154,8 @@ impl Document {
                     // with whatever was first.
                     let id = self.pairs.remove(i);
                     self.pairs.insert(0, id);
-                    Ok(())
                 }
+                Ok(self.pairs[0].1.clone())
             },
             None => {
                 Err(Error::Misc(String::from("no id")))
