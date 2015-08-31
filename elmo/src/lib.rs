@@ -769,7 +769,7 @@ impl Connection {
         Ok(result)
     }
 
-    fn get_one_match(db: &str, coll: &str, w: &StorageWriter, m: &matcher::QueryDoc) -> Result<Option<Row>> {
+    fn get_one_match(db: &str, coll: &str, w: &StorageWriter, m: &matcher::QueryDoc, orderby: Option<&bson::Value>) -> Result<Option<Row>> {
         let indexes = try!(w.list_indexes()).into_iter().filter(
             |ndx| ndx.db == db && ndx.coll == coll
             ).collect::<Vec<_>>();
@@ -788,6 +788,14 @@ impl Connection {
                     }
                 }
         );
+        match orderby {
+            None => (),
+            Some(orderby) => {
+                let mut a = try!(seq.collect::<Result<Vec<_>>>());
+                try!(Self::do_sort(&mut a, orderby));
+                seq = box a.into_iter().map(|d| Ok(d));
+            },
+        }
         match seq.next() {
             None => Ok(None),
             Some(Ok(v)) => Ok(Some(v)),
@@ -913,7 +921,7 @@ impl Connection {
                                 }
                                 (matches, mods)
                             } else {
-                                match try!(Self::get_one_match(db, coll, &*writer, &m)) {
+                                match try!(Self::get_one_match(db, coll, &*writer, &m, None)) {
                                     Some(row) => {
                                         //println!("row found for update: {:?}", row);
                                         let old_doc = try!(row.doc.into_document());
@@ -957,7 +965,7 @@ impl Connection {
                         if multi {
                             return Err(Error::Misc(String::from("multi update requires $ update operators")));
                         }
-                        match try!(Self::get_one_match(db, coll, &*writer, &m)) {
+                        match try!(Self::get_one_match(db, coll, &*writer, &m, None)) {
                             Some(row) => {
                                 let old_doc = try!(row.doc.as_document());
                                 let id1 = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated"))));
@@ -1020,16 +1028,7 @@ impl Connection {
         };
         let writer = try!(self.conn.begin_write());
         let mut collwriter = try!(writer.get_collection_writer(db, coll));
-        let found = {
-            match sort {
-                Some(ord) => {
-                    return Err(Error::Misc(String::from("TODO find_and_modify get_first_match")))
-                },
-                None => {
-                    try!(Self::get_one_match(db, coll, &*writer, &m))
-                },
-            }
-        };
+        let found = try!(Self::get_one_match(db, coll, &*writer, &m, sort.as_ref()));
         let was_found = found.is_some();
         if remove.is_some() && upsert {
             return Err(Error::Misc(String::from("find_and_modify: invalid. no upsert with remove.")))
