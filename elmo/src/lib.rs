@@ -788,10 +788,11 @@ impl Connection {
                     }
                 }
         );
-        // TODO is take() the right thing here?
-        let mut a = try!(seq.take(1).collect::<Result<Vec<_>>>());
-        let d = misc::remove_first_if_exists(&mut a);
-        Ok(d)
+        match seq.next() {
+            None => Ok(None),
+            Some(Ok(v)) => Ok(Some(v)),
+            Some(Err(e)) => Err(e),
+        }
     }
 
     fn build_upsert_with_update_operators(m: &matcher::QueryDoc, ops: &Vec<UpdateOp>) -> Result<bson::Document> {
