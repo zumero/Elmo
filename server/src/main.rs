@@ -331,6 +331,8 @@ impl<'b> Server<'b> {
 
     fn reply_ismaster(&self, req: &MsgQuery) -> Result<Reply> {
         let mut doc = bson::Document::new();
+        doc.set_str("setName", "TODO");
+        doc.set_i32("setVersion", 1);
         doc.set_bool("ismaster", true);
         doc.set_bool("secondary", false);
         doc.set_i32("maxWireVersion", 3);
@@ -394,6 +396,7 @@ impl<'b> Server<'b> {
         // TODO ordered
         // TODO do we need to keep ownership of updates?
         let results = try!(self.conn.update(db, &coll, &mut updates));
+        // TODO there is a bunch of code missing here to process the results
         let mut doc = bson::Document::new();
         doc.set_i32("ok", 1);
         Ok(create_reply(req.req_id, vec![doc], 0))
@@ -964,7 +967,7 @@ impl<'b> Server<'b> {
         let (out, seq) = try!(self.conn.aggregate(db, &coll, pipeline));
         match out {
             Some(new_coll_name) => {
-                panic!("TODO aggregate out");
+                return Err(Error::Misc(format!("agg $out")))
             },
             None => {
                 let default_batch_size = 100;
@@ -1067,8 +1070,6 @@ impl<'b> Server<'b> {
                 },
             };
 
-        // TODO let s = crud.seqOnlyDoc s
-
         if number_to_skip < 0 {
             return Err(Error::Misc(format!("TODO negative skip: {}", number_to_skip)));
         }
@@ -1137,8 +1138,7 @@ impl<'b> Server<'b> {
         let req_id = req.req_id;
         let r = 
             if parts.len() < 2 {
-                // TODO failwith (sprintf "bad collection name: %s" (req.full_collection_name))
-                Err(Error::Misc(String::from("bad collection name")))
+                Err(Error::Misc(format!("bad collection name: {}", req.full_collection_name)))
             } else {
                 let db = &parts[0];
                 if db == "admin" {
@@ -1153,7 +1153,6 @@ impl<'b> Server<'b> {
                     if parts[1] == "$cmd" {
                         if parts.len() == 4 && parts[2]=="sys" && parts[3]=="inprog" {
                             self.reply_cmd_sys_inprog(&req, db)
-                            //Err(Error::Misc(format!("TODO: {:?}", req)))
                         } else {
                             self.reply_cmd(req, db)
                         }

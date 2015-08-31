@@ -777,6 +777,7 @@ impl Connection {
         let plan = try!(Self::choose_index(&indexes, &m, None));
         //println!("plan: {:?}", plan);
         let mut seq: Box<Iterator<Item=Result<Row>>> = try!(w.get_collection_reader(db, coll, plan));
+        // TODO dry
         seq = box seq
             .filter(
                 move |r| {
@@ -858,8 +859,6 @@ impl Connection {
     // TODO this func needs to return the 4-tuple
     // (count_matches, count_modified, Option<TODO>, Option<TODO>)
     pub fn update(&self, db: &str, coll: &str, updates: &mut Vec<bson::Document>) -> Result<Vec<Result<()>>> {
-        //println!("in update: {:?}", updates);
-        // TODO need separate conn?
         let mut results = Vec::new();
         {
             let writer = try!(self.conn.begin_write());
@@ -886,7 +885,7 @@ impl Connection {
                         let (count_matches, count_modified) =
                             if multi {
                                 let reader = try!(self.conn.begin_read());
-                                // TODO make the following filter DRY
+                                // TODO DRY
                                 let indexes = try!(reader.list_indexes()).into_iter().filter(
                                     |ndx| ndx.db == db && ndx.coll == coll
                                     ).collect::<Vec<_>>();
@@ -1138,7 +1137,7 @@ impl Connection {
             },
         }
         try!(writer.commit());
-        // TODO error
+        // TODO error return here?
         Ok((was_found, None, changed, upserted, result))
     }
 
@@ -1195,7 +1194,7 @@ impl Connection {
 
     pub fn delete_indexes(&self, db: &str, coll: &str, index: &bson::Value) -> Result<(usize, usize)> {
         let writer = try!(self.conn.begin_write());
-        // TODO make the following filter DRY
+        // TODO DRY
         let indexes = try!(writer.list_indexes()).into_iter().filter(
             |ndx| ndx.db == db && ndx.coll == coll
             ).collect::<Vec<_>>();
@@ -1306,7 +1305,7 @@ impl Connection {
         let matcher::QueryDoc::QueryDoc(items) = try!(matcher::parse_query(v));
         items.into_iter().map(
             |it| match it {
-                // TODO wish we could pattern match on the vec.  can we?
+                // TODO wish we could pattern match on the vec.
                 matcher::QueryItem::Compare(k, mut preds) => {
                     if preds.len() == 1 {
                         match preds.pop().expect("just checked") {
@@ -3011,7 +3010,7 @@ impl Connection {
         -> Result<Box<Iterator<Item=Result<Row>> + 'static>>
     {
         let reader = try!(self.conn.begin_read());
-        // TODO make the following filter DRY
+        // TODO DRY
         let indexes = try!(reader.list_indexes()).into_iter().filter(
             |ndx| ndx.db == db && ndx.coll == coll
             ).collect::<Vec<_>>();
