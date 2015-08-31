@@ -1012,8 +1012,133 @@ impl Connection {
         Ok(results)
     }
 
-    pub fn find_and_modify(&self, db: &str, coll: &str, filter: Option<bson::Value>, sort: Option<bson::Value>, remove: Option<bson::Value>, update: Option<bson::Value>, new: bool, upsert: bool) -> Result<(Option<String>,Option<String>,bool,Option<bson::Value>,Option<bson::Value>)> {
-        Err(Error::Misc(String::from("TODO find_and_modify")))
+    pub fn find_and_modify(&self, db: &str, coll: &str, filter: Option<bson::Value>, sort: Option<bson::Value>, remove: Option<bson::Value>, update: Option<bson::Value>, new: bool, upsert: bool) -> Result<(bool,Option<String>,bool,Option<bson::Value>,Option<bson::Document>)> {
+        let (m, q_id) = {
+            let (q, id) =
+                match filter {
+                    Some(q) => {
+                        let q = try!(q.into_document());
+                        let id =
+                            match q.get("_id") {
+                                Some(id) => Some(id.clone()),
+                                None => None,
+                            };
+                        (q,id)
+                    },
+                    None => {
+                        (bson::Document::new(), None)
+                    },
+                };
+            let m = try!(matcher::parse_query(q));
+            (m, id)
+        };
+        let writer = try!(self.conn.begin_write());
+        let mut collwriter = try!(writer.get_collection_writer(db, coll));
+        let found = {
+            match sort {
+                Some(ord) => {
+                    return Err(Error::Misc(String::from("TODO find_and_modify get_first_match")))
+                },
+                None => {
+                    try!(Self::get_one_match(db, coll, &*writer, &m))
+                },
+            }
+        };
+        let was_found = found.is_some();
+        if remove.is_some() && upsert {
+            return Err(Error::Misc(String::from("find_and_modify: invalid. no upsert with remove.")))
+        }
+        let mut changed = false;
+        let mut upserted = None;
+        let mut result = None;
+        match (update, remove, found) {
+            (Some(_), Some(_), _) => {
+                return Err(Error::Misc(String::from("find_and_modify: invalid. both update and remove.")))
+            },
+            (None, None, _) => {
+                return Err(Error::Misc(String::from("find_and_modify: invalid. neither update nor remove.")))
+            },
+            (Some(u), None, Some(row)) => {
+                // update, found
+                let u = try!(u.into_document());
+                let has_update_operators = u.pairs.iter().any(|&(ref k, _)| k.starts_with("$"));
+                if has_update_operators {
+                    let ops = try!(Self::parse_update_doc(u));
+                    let old_doc = try!(row.doc.into_document());
+                    let mut new_doc = old_doc.clone();
+                    let count_changes = try!(Self::apply_update_ops(&mut new_doc, &ops, false, None));
+                    // TODO make sure _id did not change
+                    if old_doc != new_doc {
+                        try!(Self::validate_for_storage(&mut new_doc));
+                        // TODO error in the following line?
+                        collwriter.update(&new_doc);
+                        changed = true;
+                        result = 
+                            if new {
+                                Some(new_doc)
+                            } else {
+                                Some(old_doc)
+                            };
+                    }
+                } else {
+                    let old_doc = try!(row.doc.into_document());
+                    let id1 = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated"))));
+                    let id1 = try!(id1.as_objectid());
+                    // TODO if u has _id, make sure it's the same
+                    let mut new_doc = u;
+                    new_doc.set_objectid("_id", id1);
+                    if old_doc != new_doc {
+                        try!(Self::validate_for_storage(&mut new_doc));
+                        // TODO handle error in following line
+                        collwriter.update(&new_doc);
+                        changed = true;
+                    }
+                }
+            },
+            (Some(u), None, None) => {
+                // update, not found, maybe upsert
+                let mut u = try!(u.into_document());
+                if upsert {
+                    let has_update_operators = u.pairs.iter().any(|&(ref k, _)| k.starts_with("$"));
+                    if has_update_operators {
+                        let ops = try!(Self::parse_update_doc(u));
+                        let mut doc = try!(Self::build_upsert_with_update_operators(&m, &ops));
+                        try!(Self::validate_for_storage(&mut doc));
+                        // TODO handle error in following line
+                        collwriter.insert(&doc);
+                        // TODO changed = true;
+                        // TODO id upserted = Some(doc);
+                    } else {
+                        try!(Self::build_simple_upsert(q_id, &mut u));
+                        try!(Self::validate_for_storage(&mut u));
+                        // TODO handle error in following line
+                        collwriter.insert(&u);
+                        // TODO changed = true;
+                        // TODO id upserted = Some(u);
+                    }
+                }
+            },
+            (None, Some(_), Some(rr)) => {
+                // remove, found
+                let d = try!(rr.doc.as_document());
+                match d.get("_id") {
+                    Some(id) => {
+                        if try!(collwriter.delete(id)) {
+                            changed = true;
+                        }
+                    },
+                    None => {
+                        return Err(Error::Misc(String::from("find_and_modify: invalid. no _id.")))
+                    },
+                }
+            },
+            (None, Some(_), None) => {
+                // remove, not found, nothing to do
+            },
+        }
+        try!(writer.commit());
+        // TODO error
+        Ok((was_found, None, changed, upserted, result))
     }
 
     pub fn insert(&self, db: &str, coll: &str, docs: &mut Vec<bson::Document>) -> Result<Vec<Result<()>>> {

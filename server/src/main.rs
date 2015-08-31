@@ -465,8 +465,8 @@ impl<'b> Server<'b> {
         }
 
         match (was_update,found,upsert) {
-            (bool,None,_) => last_error_object.set_bool("updatedExisting", false),
-            (bool,Some(_),false) => last_error_object.set_bool("updatedExisting", changed),
+            (bool,false,_) => last_error_object.set_bool("updatedExisting", false),
+            (bool,true,false) => last_error_object.set_bool("updatedExisting", changed),
             _ => last_error_object.set_bool("updatedExisting", changed),
         }
 
@@ -503,7 +503,7 @@ impl<'b> Server<'b> {
                         //doc.set("value", crud.projectDocument {doc=v;score=None;pos=None} prep) 
                     },
                     None => {
-                        doc.set("value", v);
+                        doc.set_document("value", v);
                     },
                 }
             },
