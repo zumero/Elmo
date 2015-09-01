@@ -874,7 +874,7 @@ impl Connection {
                         //println!("ops: {:?}", ops);
                         let (count_matches, count_modified) =
                             if multi {
-                                let reader = try!(self.conn.begin_read());
+                                let reader = try!(self.rconn.begin_read());
                                 // TODO DRY
                                 let indexes = try!(reader.list_indexes()).into_iter().filter(
                                     |ndx| ndx.db == db && ndx.coll == coll
@@ -888,6 +888,7 @@ impl Connection {
                                 let mut matches = 0;
                                 for rr in seq {
                                     let row = try!(rr);
+                                    //println!("matching row for update: {:?}", row);
                                     let old_doc = try!(row.doc.into_document());
                                     let mut new_doc = old_doc.clone();
                                     try!(Self::apply_update_ops(&mut new_doc, &ops, false, row.pos));
@@ -2895,6 +2896,7 @@ impl Connection {
     fn guts_matcher_filter_map(rr: Result<Row>, m: &matcher::QueryDoc) -> Option<Result<Row>> {
         match rr {
             Ok(row) => {
+                //println!("looking at row: {:?}", row);
                 let (b, pos) = matcher::match_query(&m, &row.doc);
                 if b {
                     // TODO pos

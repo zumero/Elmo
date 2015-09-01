@@ -378,7 +378,7 @@ impl<'b> Server<'b> {
     }
 
     fn reply_delete(&self, mut req: MsgQuery, db: &str) -> Result<Reply> {
-        let coll = try!(req.query.must_remove_string("update"));
+        let coll = try!(req.query.must_remove_string("delete"));
         let deletes = try!(req.query.must_remove_array("deletes"));
         let deletes = try!(vec_values_to_docs(deletes.items));
         // TODO limit
