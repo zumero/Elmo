@@ -1058,14 +1058,10 @@ impl Connection {
                         };
                 } else {
                     let old_doc = try!(row.doc.into_document());
-                    let id1 = {
-                        let v = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated"))));
-                        let id = try!(v.as_objectid());
-                        id
-                    };
+                    let old_id = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated")))).clone();
                     // TODO if u has _id, make sure it's the same
                     let mut new_doc = u;
-                    new_doc.set_objectid("_id", id1);
+                    new_doc.set("_id", old_id);
                     if old_doc != new_doc {
                         let id = try!(Self::validate_for_storage(&mut new_doc));
                         // TODO handle error in following line
