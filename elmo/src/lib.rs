@@ -724,7 +724,7 @@ impl Connection {
                             try!(doc.set_path(&new_path, v));
                         },
                         None => {
-                            return Err(Error::Misc(format!("UpdateOp::Rename, path not found: {}", old_path)));
+                            //return Err(Error::Misc(format!("UpdateOp::Rename, path not found: {}", old_path)));
                         },
                     }
                 },
@@ -754,6 +754,71 @@ impl Connection {
         Ok(())
     }
 
+    // this function is used to check two paths to see if one of them
+    // is a prefix of the other, which, for example, in the case of two
+    // update operators, is a conflict.
+    //
+    // the check cannot be done correctly with simple string.StartsWith()
+    // calls, because x.fu is not actually a prefix of x.fubar, since x
+    // can happily have both fu and fubar as a key.
+
+    fn check_prefix(a: &str, b: &str) -> bool {
+        let a_parts = a.split('.').collect::<Vec<_>>();
+        let b_parts = b.split('.').collect::<Vec<_>>();
+        let len = std::cmp::min(a_parts.len(), b_parts.len());
+        let a_sub = &a_parts[0 .. len];
+        let b_sub = &b_parts[0 .. len];
+        a_sub == b_sub
+    }
+
+    fn any_prefix(a: &[&str], s: &str) -> bool {
+        a.iter().any(|a| Self::check_prefix(a,s))
+    }
+
+    fn check_update_doc_for_conflicts(ops: &Vec<UpdateOp>) -> Result<()> {
+        let mut a = vec![];
+        for op in ops {
+            match op {
+                &UpdateOp::Min(ref path, _)
+                | &UpdateOp::Max(ref path, _)
+                | &UpdateOp::Inc(ref path, _)
+                | &UpdateOp::Mul(ref path, _)
+                | &UpdateOp::Set(ref path, _)
+                | &UpdateOp::Push(ref path, _, _, _, _)
+                | &UpdateOp::PullValue(ref path, _)
+                | &UpdateOp::SetOnInsert(ref path, _)
+                | &UpdateOp::BitAnd(ref path, _)
+                | &UpdateOp::BitOr(ref path, _)
+                | &UpdateOp::BitXor(ref path, _)
+                | &UpdateOp::Unset(ref path)
+                | &UpdateOp::Date(ref path)
+                | &UpdateOp::TimeStamp(ref path)
+                | &UpdateOp::AddToSet(ref path, _)
+                | &UpdateOp::PullAll(ref path, _)
+                | &UpdateOp::PullQuery(ref path, _)
+                | &UpdateOp::PullPredicates(ref path, _)
+                | &UpdateOp::Pop(ref path, _)
+                    => {
+                    if Self::any_prefix(&a, path) {
+                        return Err(Error::Misc(format!("update op path conflict: {}", path)));
+                    }
+                    a.push(path);
+                },
+                &UpdateOp::Rename(ref old_path, ref new_path) => {
+                    if Self::any_prefix(&a, old_path) {
+                        return Err(Error::Misc(format!("update op path conflict: {}", old_path)));
+                    }
+                    a.push(old_path);
+                    if Self::any_prefix(&a, new_path) {
+                        return Err(Error::Misc(format!("update op path conflict: {}", new_path)));
+                    }
+                    a.push(new_path);
+                },
+            }
+        }
+        Ok(())
+    }
+
     fn any_part_starts_with_dollar_sign(s: &str) -> bool {
         let parts = s.split('.').collect::<Vec<_>>();
         parts.into_iter().any(|s| s.starts_with("$"))
@@ -763,7 +828,7 @@ impl Connection {
         // TODO benefit of map/collect over for loop is that it forces something for every item
         let mut result = vec![];
         for (k, v) in d.pairs {
-            // TODO consider v.into_document() here
+            // TODO consider v.into_document() up here instead of in every case below
             match k.as_str() {
                 "$min" => {
                     for (path, v) in try!(v.into_document()).pairs {
@@ -842,6 +907,10 @@ impl Connection {
                         // TODO even mongo has problems in this area.  it seems to have
                         // different rules for key/path names in its rename code than in
                         // other places.
+
+                        // TODO it may be problematic that all these checks here are being
+                        // done before the positional operator is applied to the paths.
+
                         if old_path.as_str() == "" {
                             // TODO why not?
                             return Err(Error::Misc(format!("empty key cannot be renamed")));
@@ -945,7 +1014,7 @@ impl Connection {
                 _ => return Err(Error::Misc(format!("unknown update op: {}", k))),
             }
         }
-        // TODO check update doc for conflicts
+        try!(Self::check_update_doc_for_conflicts(&result));
         Ok(result)
     }
 
