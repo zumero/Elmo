@@ -770,6 +770,7 @@ impl Connection {
     }
 
     fn get_one_match(db: &str, coll: &str, w: &StorageWriter, m: &matcher::QueryDoc, orderby: Option<&bson::Value>) -> Result<Option<Row>> {
+        // TODO dry
         let indexes = try!(w.list_indexes()).into_iter().filter(
             |ndx| ndx.db == db && ndx.coll == coll
             ).collect::<Vec<_>>();
@@ -777,20 +778,9 @@ impl Connection {
         let plan = try!(Self::choose_index(&indexes, &m, None));
         //println!("plan: {:?}", plan);
         let mut seq: Box<Iterator<Item=Result<Row>>> = try!(w.get_collection_reader(db, coll, plan));
-        // TODO dry
-        seq = box seq
-            .filter(
-                move |r| {
-                    if let &Ok(ref d) = r {
-                        let (b,pos) = matcher::match_query(&m, &d.doc);
-                        // TODO pos
-                        b
-                    } else {
-                        // TODO so when we have an error we just let it through?
-                        true
-                    }
-                }
-        );
+        // TODO we shadow-let here because the type from seq_match_ref() doesn't match the original
+        // type because of its explicit lifetime.
+        let mut seq = Self::seq_match_ref(seq, &m);
         match orderby {
             None => (),
             Some(orderby) => {
@@ -891,19 +881,9 @@ impl Connection {
                                     ).collect::<Vec<_>>();
                                 let plan = try!(Self::choose_index(&indexes, &m, None));
                                 let mut seq: Box<Iterator<Item=Result<Row>>> = try!(reader.into_collection_reader(db, coll, plan));
-                                // TODO it oughta be possible for this to use seq_match, if that fn
-                                // were modified to not take ownership of the matcher.
-                                seq = box seq.filter(
-                                    |r| {
-                                        if let &Ok(ref d) = r {
-                                            let (b,pos) = matcher::match_query(&m, &d.doc);
-                                            // TODO pos
-                                            b
-                                        } else {
-                                            // TODO so when we have an error we just let it through?
-                                            true
-                                        }
-                                    });
+                                // TODO we shadow-let here because the type from seq_match_ref() doesn't match the original
+                                // type because of its explicit lifetime.
+                                let seq = Self::seq_match_ref(seq, &m);
                                 let mut mods = 0;
                                 let mut matches = 0;
                                 for rr in seq {
@@ -2905,20 +2885,23 @@ impl Connection {
         }
     }
 
+    fn seq_match_filter_guts(r: &Result<Row>, m: &matcher::QueryDoc) -> bool {
+        if let &Ok(ref d) = r {
+            let (b,pos) = matcher::match_query(&m, &d.doc);
+            // TODO pos
+            b
+        } else {
+            // TODO so when we have an error we just let it through?
+            true
+        }
+    }
+
     fn seq_match(seq: Box<Iterator<Item=Result<Row>>>, m: matcher::QueryDoc) -> Box<Iterator<Item=Result<Row>>> {
-        box seq
-            .filter(
-                move |r| {
-                    if let &Ok(ref d) = r {
-                        let (b,pos) = matcher::match_query(&m, &d.doc);
-                        // TODO pos
-                        b
-                    } else {
-                        // TODO so when we have an error we just let it through?
-                        true
-                    }
-                }
-        )
+        box seq.filter(move |r| Self::seq_match_filter_guts(r, &m))
+    }
+
+    fn seq_match_ref<'a>(seq: Box<Iterator<Item=Result<Row>>>, m: &'a matcher::QueryDoc) -> Box<Iterator<Item=Result<Row>> + 'a> {
+        box seq.filter(move |r| Self::seq_match_filter_guts(r, m))
     }
 
     fn agg_project(seq: Box<Iterator<Item=Result<Row>>>, expressions: Vec<(String,AggProj)>) -> Box<Iterator<Item=Result<Row>>> {
