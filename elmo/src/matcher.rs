@@ -753,15 +753,17 @@ pub fn get_eqs(q: &QueryDoc) -> Vec<(&str, &bson::Value)> {
     a
 }
 
-fn is_query_doc(v: &bson::Value) -> bool {
+pub fn doc_is_query_doc(bd: &bson::Document) -> bool {
+    let has_path = bd.pairs.iter().any(|&(ref k, _)| !k.starts_with("$"));
+    let has_and = bd.pairs.iter().any(|&(ref k, _)| k == "$and");
+    let has_or = bd.pairs.iter().any(|&(ref k, _)| k == "$or");
+    let has_nor = bd.pairs.iter().any(|&(ref k, _)| k == "$nor");
+    has_path || has_and || has_or || has_nor
+}
+
+pub fn value_is_query_doc(v: &bson::Value) -> bool {
     match v {
-        &bson::Value::BDocument(ref bd) => {
-            let has_path = bd.pairs.iter().any(|&(ref k, _)| !k.starts_with("$"));
-            let has_and = bd.pairs.iter().any(|&(ref k, _)| k == "$and");
-            let has_or = bd.pairs.iter().any(|&(ref k, _)| k == "$or");
-            let has_nor = bd.pairs.iter().any(|&(ref k, _)| k == "$nor");
-            has_path || has_and || has_or || has_nor
-        },
+        &bson::Value::BDocument(ref bd) => doc_is_query_doc(bd),
         _ => {
             // TODO or panic?
             false
@@ -903,7 +905,7 @@ fn parse_pred(k: &str, v: bson::Value) -> Result<Pred> {
             }
         },
         "$elemMatch" => {
-            if is_query_doc(&v) {
+            if value_is_query_doc(&v) {
                 let bd = try!(v.into_document());
                 let d = try!(parse_query_doc(&bd));
                 let d = QueryDoc::QueryDoc(d);
@@ -922,7 +924,7 @@ fn parse_pred(k: &str, v: bson::Value) -> Result<Pred> {
     }
 }
 
-fn parse_pred_list(pairs: Vec<(String,bson::Value)>) -> Result<Vec<Pred>> {
+pub fn parse_pred_list(pairs: Vec<(String,bson::Value)>) -> Result<Vec<Pred>> {
     let (regex, other): (Vec<_>, Vec<_>) = pairs.into_iter().partition(|&(ref k,_)| k == "$regex" || k == "$options");
     let preds = try!(other.into_iter().map(|(k,v)| parse_pred(&k,v)).collect::<Result<Vec<_>>>());
     let expr = regex.iter().find(|&&(ref k, _)| k == "$regex");

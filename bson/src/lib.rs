@@ -110,6 +110,10 @@ impl Document {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.pairs.len()
+    }
+
     pub fn into_value(self) -> Value {
         Value::BDocument(self)
     }
@@ -1145,6 +1149,14 @@ impl Value {
             &Value::BInt64(ref s) => Ok((*s) as i32),
             &Value::BDouble(ref s) => Ok((*s) as i32),
             _ => Err(Error::Misc(format!("numeric required, but found {:?}", self))),
+        }
+    }
+
+    pub fn integer_to_i64(&self) -> Result<i64> {
+        match self {
+            &Value::BInt32(ref s) => Ok((*s) as i64),
+            &Value::BInt64(ref s) => Ok((*s) as i64),
+            _ => Err(Error::Misc(format!("integer required, but found {:?}", self))),
         }
     }
 

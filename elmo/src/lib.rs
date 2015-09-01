@@ -234,9 +234,9 @@ enum UpdateOp {
     Date(String),
     TimeStamp(String),
     Rename(String, String),
-    AddToSet(String, Vec<bson::Value>),
-    PullAll(String, Vec<bson::Value>),
-    // TODO push
+    AddToSet(String, bson::Array),
+    PullAll(String, bson::Array),
+    Push(String, bson::Array, Option<i32>, Option<bson::Value>, Option<usize>),
     PullQuery(String, matcher::QueryDoc),
     PullPredicates(String, Vec<matcher::Pred>),
     Pop(String, i32),
@@ -626,11 +626,27 @@ impl Connection {
                     let path = Self::fix_positional(path, pos);
                     try!(doc.set_path(&path, v.clone()));
                 },
+                &UpdateOp::Push(ref path, ref each, ref slice, ref sort, ref pos) => {
+                    return Err(Error::Misc(format!("TODO UpdateOp::Push")));
+                },
                 &UpdateOp::PullValue(ref path, ref v) => {
-                    panic!("TODO UpdateOp::PullValue");
+                    let path = Self::fix_positional(path, pos);
+                    match try!(doc.entry(&path)) {
+                        bson::Entry::Found(mut e) => {
+                            match e.get_mut() {
+                                &mut bson::Value::BArray(ref mut a) => {
+                                    // TODO remove anything that matches v
+                                },
+                                _ => return Err(Error::Misc(format!("$pull not an array: {}", path))),
+                            }
+                        },
+                        bson::Entry::Absent(e) => {
+                            return Err(Error::Misc(format!("$pull path not found: {}", path)));
+                        },
+                    }
                 },
                 &UpdateOp::SetOnInsert(ref path, ref v) => {
-                    panic!("TODO UpdateOp::SetOnInsert");
+                    return Err(Error::Misc(format!("TODO UpdateOp::SetOnInsert")));
                 },
                 &UpdateOp::BitAnd(ref path, v) => {
                     let path = Self::fix_positional(path, pos);
@@ -700,38 +716,44 @@ impl Connection {
                     }
                 },
                 &UpdateOp::Date(ref path) => {
-                    panic!("TODO UpdateOp::Date");
+                    return Err(Error::Misc(format!("TODO UpdateOp::Date")));
                 },
                 &UpdateOp::TimeStamp(ref path) => {
-                    panic!("TODO UpdateOp::Timestamp");
+                    return Err(Error::Misc(format!("TODO UpdateOp::Timestamp")));
                 },
                 &UpdateOp::Rename(ref path, ref name) => {
-                    panic!("TODO UpdateOp::Rename");
+                    return Err(Error::Misc(format!("TODO UpdateOp::Rename")));
                 },
                 &UpdateOp::AddToSet(ref path, ref v) => {
-                    panic!("TODO UpdateOp::AddToSet");
+                    return Err(Error::Misc(format!("TODO UpdateOp::AddToSet")));
                 },
                 &UpdateOp::PullAll(ref path, ref v) => {
-                    panic!("TODO UpdateOp::PullAll");
+                    return Err(Error::Misc(format!("TODO UpdateOp::PullAll")));
                 },
                 &UpdateOp::PullQuery(ref path, ref qd) => {
-                    panic!("TODO UpdateOp::PullQuery");
+                    return Err(Error::Misc(format!("TODO UpdateOp::PullQuery")));
                 },
                 &UpdateOp::PullPredicates(ref path, ref preds) => {
-                    panic!("TODO UpdateOp::PullPredicates");
+                    return Err(Error::Misc(format!("TODO UpdateOp::PullPredicates")));
                 },
                 &UpdateOp::Pop(ref path, i) => {
-                    panic!("TODO UpdateOp::Pop");
+                    return Err(Error::Misc(format!("TODO UpdateOp::Pop")));
                 },
             }
         }
         Ok(())
     }
 
+    fn any_part_starts_with_dollar_sign(s: &str) -> bool {
+        let parts = s.split('.').collect::<Vec<_>>();
+        parts.into_iter().any(|s| s.starts_with("$"))
+    }
+
     fn parse_update_doc(d: bson::Document) -> Result<Vec<UpdateOp>> {
         // TODO benefit of map/collect over for loop is that it forces something for every item
         let mut result = vec![];
         for (k, v) in d.pairs {
+            // TODO consider v.into_document() here
             match k.as_str() {
                 "$min" => {
                     for (path, v) in try!(v.into_document()).pairs {
@@ -763,9 +785,157 @@ impl Connection {
                         result.push(UpdateOp::Unset(path));
                     }
                 },
+                "$setOnInsert" => {
+                    for (path, v) in try!(v.into_document()).pairs {
+                        result.push(UpdateOp::SetOnInsert(path,v));
+                    }
+                },
+                "$pop" => {
+                    for (path, v) in try!(v.into_document()).pairs {
+                        result.push(UpdateOp::Pop(path,try!(v.numeric_to_i32())));
+                    }
+                },
+                "$pushAll" => {
+                    for (path, v) in try!(v.into_document()).pairs {
+                        result.push(UpdateOp::Push(path, try!(v.into_array()), None, None, None));
+                    }
+                },
+                "$push" => {
+                    return Err(Error::Misc(format!("TODO parse update op: {}", k)));
+                },
+                "$pull" => {
+                    for (path, v) in try!(v.into_document()).pairs {
+                        match v {
+                            bson::Value::BDocument(bd) => {
+                                if matcher::doc_is_query_doc(&bd) {
+                                    let qd = try!(matcher::parse_query(bd));
+                                    result.push(UpdateOp::PullQuery(path, qd));
+                                } else {
+                                    let preds = try!(matcher::parse_pred_list(bd.pairs));
+                                    result.push(UpdateOp::PullPredicates(path, preds));
+                                }
+                            },
+                            _ => {
+                                result.push(UpdateOp::PullValue(path, v));
+                            },
+                        }
+                    }
+                },
+                "$pullAll" => {
+                    for (path, v) in try!(v.into_document()).pairs {
+                        result.push(UpdateOp::PullAll(path, try!(v.into_array())));
+                    }
+                },
+                "$rename" => {
+                    for (old_path, v) in try!(v.into_document()).pairs {
+                        let new_path = try!(v.into_string());
+                        // TODO even mongo has problems in this area.  it seems to have
+                        // different rules for key/path names in its rename code than in
+                        // other places.
+                        if old_path.as_str() == "" {
+                            // TODO why not?
+                            return Err(Error::Misc(format!("empty key cannot be renamed")));
+                        }
+                        if new_path.as_str() == "" {
+                            // TODO why not?
+                            return Err(Error::Misc(format!("cannot rename to empty key")));
+                        }
+                        if old_path.as_str() == "_id" {
+                            return Err(Error::Misc(format!("_id cannot be renamed")));
+                        }
+                        // TODO what about rename something to _id?
+                        if old_path.starts_with(".") {
+                            return Err(Error::Misc(format!("bad path")));
+                        }
+                        if new_path.starts_with(".") {
+                            return Err(Error::Misc(format!("bad path")));
+                        }
+                        if old_path.ends_with(".") {
+                            return Err(Error::Misc(format!("bad path")));
+                        }
+                        if new_path.ends_with(".") {
+                            return Err(Error::Misc(format!("bad path")));
+                        }
+                        if old_path == new_path {
+                            return Err(Error::Misc(format!("cannot rename to same path")));
+                        }
+                        if old_path.starts_with(new_path.as_str()) {
+                            // TODO use correct prefix func
+                            return Err(Error::Misc(format!("overlap rename path")));
+                        }
+                        if new_path.starts_with(old_path.as_str()) {
+                            // TODO use correct prefix func
+                            return Err(Error::Misc(format!("overlap rename path")));
+                        }
+                        if Self::any_part_starts_with_dollar_sign(&old_path) {
+                            return Err(Error::Misc(format!("key starts with dollar sign: {}", old_path)));
+                        }
+                        if Self::any_part_starts_with_dollar_sign(&new_path) {
+                            return Err(Error::Misc(format!("key starts with dollar sign: {}", new_path)));
+                        }
+                        result.push(UpdateOp::Rename(old_path, new_path));
+                    }
+                },
+                "$bit" => {
+                    for (path, v) in try!(v.into_document()).pairs {
+                        match v {
+                            bson::Value::BDocument(bd) => {
+                                if bd.len() != 1 {
+                                    return Err(Error::Misc(format!("invalid $bit: {:?}", bd)));
+                                }
+                                let num = try!(bd.pairs[0].1.integer_to_i64());
+                                match bd.pairs[0].0.as_str() {
+                                    "and" => result.push(UpdateOp::BitAnd(path, num)),
+                                    "or" => result.push(UpdateOp::BitOr(path, num)),
+                                    "xor" => result.push(UpdateOp::BitXor(path, num)),
+                                    _ => return Err(Error::Misc(format!("invalid $bit op: {:?}", k))),
+                                }
+                            },
+                            _ => {
+                                return Err(Error::Misc(format!("invalid $bit: {:?}", v)));
+                            },
+                        }
+                    }
+                },
+                "$currentDate" => {
+                    return Err(Error::Misc(format!("TODO parse update op: {}", k)));
+                },
+                "$addToSet" => {
+                    for (path, v) in try!(v.into_document()).pairs {
+                        let each = 
+                            match v {
+                                bson::Value::BDocument(mut bd) => {
+                                    if bd.len() == 1 {
+                                        if bd.pairs[0].0 == "$each" {
+                                            let (_,v) = bd.pairs.remove(0);
+                                            try!(v.into_array())
+                                        } else {
+                                            // TODO dry
+                                            let mut a = bson::Array::new();
+                                            a.push(bd.into_value());
+                                            a
+                                        }
+                                    } else {
+                                        // TODO dry
+                                        let mut a = bson::Array::new();
+                                        a.push(bd.into_value());
+                                        a
+                                    }
+                                },
+                                _ => {
+                                    // TODO dry
+                                    let mut a = bson::Array::new();
+                                    a.push(v);
+                                    a
+                                },
+                            };
+                        result.push(UpdateOp::AddToSet(path, each));
+                    }
+                },
                 _ => return Err(Error::Misc(format!("unknown update op: {}", k))),
             }
         }
+        // TODO check update doc for conflicts
         Ok(result)
     }
 

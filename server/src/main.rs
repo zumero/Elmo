@@ -331,7 +331,8 @@ impl<'b> Server<'b> {
 
     fn reply_ismaster(&self, req: &MsgQuery) -> Result<Reply> {
         let mut doc = bson::Document::new();
-        doc.set_str("setName", "TODO");
+        // TODO setName
+        doc.set_str("setName", "foo");
         doc.set_i32("setVersion", 1);
         doc.set_bool("ismaster", true);
         doc.set_bool("secondary", false);
@@ -962,6 +963,7 @@ impl<'b> Server<'b> {
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
 
+    // TODO isn't this the same as bson::split_whatever?
     fn splitname(s: &str) -> Result<(&str, &str)> {
         match s.find('.') {
             None => Err(Error::Misc(String::from("bad namespace"))),
