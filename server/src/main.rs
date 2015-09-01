@@ -848,12 +848,8 @@ impl<'b> Server<'b> {
         // TODO remove cursors?
         let deleted = try!(self.conn.drop_database(db));
         let mut doc = bson::Document::new();
-        if deleted {
-            doc.set_i32("ok", 1);
-        } else {
-            doc.set_str("errmsg", "database not found");
-            doc.set_i32("ok", 0);
-        }
+        // apparently this is supposed to return ok=1 whether the db existed or not
+        doc.set_i32("ok", 1);
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
 
