@@ -2885,7 +2885,24 @@ impl Connection {
         }
     }
 
-    fn seq_match_filter_guts(r: &Result<Row>, m: &matcher::QueryDoc) -> bool {
+    fn guts_matcher_filter_map(rr: Result<Row>, m: &matcher::QueryDoc) -> Option<Result<Row>> {
+        match rr {
+            Ok(row) => {
+                let (b, pos) = matcher::match_query(&m, &row.doc);
+                if b {
+                    // TODO pos
+                    Some(Ok(row))
+                } else {
+                    None
+                }
+            },
+            Err(e) => {
+                Some(Err(e))
+            },
+        }
+    }
+
+    fn guts_matcher_filter(r: &Result<Row>, m: &matcher::QueryDoc) -> bool {
         if let &Ok(ref d) = r {
             let (b,pos) = matcher::match_query(&m, &d.doc);
             // TODO pos
@@ -2897,11 +2914,11 @@ impl Connection {
     }
 
     fn seq_match(seq: Box<Iterator<Item=Result<Row>>>, m: matcher::QueryDoc) -> Box<Iterator<Item=Result<Row>>> {
-        box seq.filter(move |r| Self::seq_match_filter_guts(r, &m))
+        box seq.filter_map(move |r| Self::guts_matcher_filter_map(r, &m))
     }
 
     fn seq_match_ref<'a>(seq: Box<Iterator<Item=Result<Row>>>, m: &'a matcher::QueryDoc) -> Box<Iterator<Item=Result<Row>> + 'a> {
-        box seq.filter(move |r| Self::seq_match_filter_guts(r, m))
+        box seq.filter_map(move |r| Self::guts_matcher_filter_map(r, m))
     }
 
     fn agg_project(seq: Box<Iterator<Item=Result<Row>>>, expressions: Vec<(String,AggProj)>) -> Box<Iterator<Item=Result<Row>>> {
