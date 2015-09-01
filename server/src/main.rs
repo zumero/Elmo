@@ -1122,7 +1122,7 @@ impl<'b> Server<'b> {
                             coll, 
                             query,
                             None,
-                            None,
+                            return_fields_selector,
                             None,
                             None,
                             None,
