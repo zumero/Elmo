@@ -82,9 +82,15 @@ impl From<std::str::Utf8Error> for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 // TODO this function doesn't seem to go here
-pub fn split_name(s: &str) -> (&str, &str) {
-    // TODO
-    (&s[0 .. 2], &s[2 .. 4])
+pub fn split_name(s: &str) -> Result<(&str, &str)> {
+    match s.find('.') {
+        None => Err(Error::Misc(format!("bad collection name: {}", s))),
+        Some(i) => {
+            let a = &s[0 .. i];
+            let b = &s[i+1 ..];
+            Ok((a, b))
+        },
+    }
 }
 
 // TODO is it sufficient to derive PartialEq?

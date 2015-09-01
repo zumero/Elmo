@@ -975,8 +975,8 @@ impl MyWriter {
     }
 
     fn base_rename_collection(&self, old_name: &str, new_name: &str, drop_target: bool) -> Result<bool> {
-        let (old_db, old_coll) = bson::split_name(old_name);
-        let (new_db, new_coll) = bson::split_name(new_name);
+        let (old_db, old_coll) = try!(bson::split_name(old_name));
+        let (new_db, new_coll) = try!(bson::split_name(new_name));
 
         // jstests/core/rename8.js seems to think that renaming to/from a system collection is illegal unless
         // that collection is system.users, which is "whitelisted".  for now, we emulate this behavior, even
