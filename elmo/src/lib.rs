@@ -997,7 +997,7 @@ impl Connection {
         Ok(results)
     }
 
-    pub fn find_and_modify(&self, db: &str, coll: &str, filter: Option<bson::Value>, sort: Option<bson::Value>, remove: Option<bson::Value>, update: Option<bson::Value>, new: bool, upsert: bool) -> Result<(bool,Option<String>,bool,Option<bson::Value>,Option<bson::Document>)> {
+    pub fn find_and_modify(&self, db: &str, coll: &str, filter: Option<bson::Value>, sort: Option<bson::Value>, remove: Option<bson::Value>, update: Option<bson::Value>, new: bool, upsert: bool) -> Result<(bool,Option<Error>,bool,Option<bson::Value>,Option<bson::Document>)> {
         let (m, q_id) = {
             let (q, id) =
                 match filter {
@@ -1019,10 +1019,12 @@ impl Connection {
         };
         let writer = try!(self.conn.begin_write());
         let mut collwriter = try!(writer.get_collection_writer(db, coll));
-        // TODO catch the following error
-        let found = try!(Self::get_one_match(db, coll, &*writer, &m, sort.as_ref()));
+        let found = match Self::get_one_match(db, coll, &*writer, &m, sort.as_ref()) {
+            Ok(v) => v,
+            Err(e) => return Ok((false,Some(e),false,None,None)),
+        };
         let was_found = found.is_some();
-        // TODO begin anything below should be caught
+        let inner = || -> Result<(bool,Option<bson::Value>,Option<bson::Document>)> {
         if remove.is_some() && upsert {
             return Err(Error::Misc(String::from("find_and_modify: invalid. no upsert with remove.")))
         }
@@ -1124,9 +1126,17 @@ impl Connection {
             },
         }
         try!(writer.commit());
-        // TODO end anything above should be caught
-        // TODO error return here?
-        Ok((was_found, None, changed, upserted, result))
+        Ok((changed, upserted, result))
+        };
+
+        match inner() {
+            Ok((changed,upserted,result)) => {
+                Ok((was_found, None, changed, upserted, result))
+            },
+            Err(e) => {
+                Ok((was_found, Some(e), false, None, None))
+            },
+        }
     }
 
     pub fn insert(&self, db: &str, coll: &str, docs: &mut Vec<bson::Document>) -> Result<Vec<Result<()>>> {

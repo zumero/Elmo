@@ -484,7 +484,9 @@ impl<'b> Server<'b> {
         };
 
         let was_update = update.is_some();
-        let (found,err,changed,upserted,result) = try!(self.conn.find_and_modify(db, &coll, filter, sort, remove, update, new, upsert));
+        let t = try!(self.conn.find_and_modify(db, &coll, filter, sort, remove, update, new, upsert));
+        //println!("result of find_and_modify: {:?}", t);
+        let (found,err,changed,upserted,result) = t;
 
         let mut last_error_object = bson::Document::new();
         let mut doc = bson::Document::new();
@@ -520,9 +522,9 @@ impl<'b> Server<'b> {
         // and ok fields, but the value field holds a null.
 
         match err {
-            Some(s) => {
+            Some(e) => {
                 // TODO is this right?  docs don't say this.
-                last_error_object.set_string("errmsg", s);
+                last_error_object.set_string("errmsg", format!("{}", e));
                 doc.set_i32("ok", 0);
             },
             None => {
@@ -534,6 +536,7 @@ impl<'b> Server<'b> {
             Some(v) => {
                 match fields {
                     Some(proj) => {
+                        println!("TODO find_and_modify projection: {:?}", proj);
                         // TODO calling stuff below that seems like it should be private to the crud module
                         // TODO projection position op allowed here?
                         //let prep = crud.verifyProjection proj None 
