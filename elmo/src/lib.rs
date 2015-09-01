@@ -707,11 +707,24 @@ impl Connection {
                 },
                 &UpdateOp::Unset(ref path) => {
                     let path = Self::fix_positional(path, pos);
-                    match try!(doc.entry(&path)) {
-                        bson::Entry::Found(e) => {
-                            e.remove();
+                    let _ = try!(doc.unset_path(&path));
+                },
+                &UpdateOp::Rename(ref old_path, ref new_path) => {
+                    // TODO so we use the same positional op for both paths?
+                    let old_path = Self::fix_positional(old_path, pos);
+                    let new_path = Self::fix_positional(new_path, pos);
+                    if doc.dives_into_any_array(&old_path) {
+                        return Err(Error::Misc(format!("UpdateOp::Rename, array path: {}", old_path)));
+                    }
+                    if doc.dives_into_any_array(&new_path) {
+                        return Err(Error::Misc(format!("UpdateOp::Rename, array path: {}", new_path)));
+                    }
+                    match try!(doc.unset_path(&old_path)) {
+                        Some(v) => {
+                            try!(doc.set_path(&new_path, v));
                         },
-                        bson::Entry::Absent(e) => {
+                        None => {
+                            return Err(Error::Misc(format!("UpdateOp::Rename, path not found: {}", old_path)));
                         },
                     }
                 },
@@ -720,9 +733,6 @@ impl Connection {
                 },
                 &UpdateOp::TimeStamp(ref path) => {
                     return Err(Error::Misc(format!("TODO UpdateOp::Timestamp")));
-                },
-                &UpdateOp::Rename(ref path, ref name) => {
-                    return Err(Error::Misc(format!("TODO UpdateOp::Rename")));
                 },
                 &UpdateOp::AddToSet(ref path, ref v) => {
                     return Err(Error::Misc(format!("TODO UpdateOp::AddToSet")));

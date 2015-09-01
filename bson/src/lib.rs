@@ -222,6 +222,37 @@ impl Document {
         v.into_array()
     }
 
+    pub fn dives_into_any_array(&self, path: &str) -> bool {
+        let dot = path.find('.');
+        let name = match dot { 
+            None => path,
+            Some(ndx) => &path[0 .. ndx]
+        };
+        match self.get(name) {
+            None => false,
+            Some(v) => {
+                match dot {
+                    None => false,
+                    Some(dot) => {
+                        let subpath = &path[dot + 1 ..];
+                        match v {
+                            &Value::BArray(_) => {
+                                true
+                            },
+                            &Value::BDocument(ref bd) => {
+                                bd.dives_into_any_array(subpath)
+                            },
+                            _ => {
+                                // TODO wants to dive into something that is not a container
+                                false
+                            },
+                        }
+                    },
+                }
+            }
+        }
+    }
+
     pub fn entry<'v,'p>(&'v mut self, path: &'p str) -> Result<Entry<'v,'p>> {
         let dot = path.find('.');
         let name = match dot { 
@@ -364,6 +395,17 @@ impl Document {
             Entry::Absent(e) => try!(e.insert(v)),
         }
         Ok(())
+    }
+
+    pub fn unset_path(&mut self, path: &str) -> Result<Option<Value>> {
+        match try!(self.entry(path)) {
+            Entry::Found(e) => {
+                Ok(Some(e.remove()))
+            },
+            Entry::Absent(e) => {
+                Ok(None)
+            },
+        }
     }
 
     pub fn set_objectid(&mut self, k: &str, v: [u8; 12]) {
@@ -522,6 +564,17 @@ impl Array {
             Entry::Absent(e) => try!(e.insert(v)),
         }
         Ok(())
+    }
+
+    pub fn unset_path(&mut self, path: &str) -> Result<Option<Value>> {
+        match try!(self.entry(path)) {
+            Entry::Found(e) => {
+                Ok(Some(e.remove()))
+            },
+            Entry::Absent(e) => {
+                Ok(None)
+            },
+        }
     }
 
     pub fn entry<'v,'p>(&'v mut self, path: &'p str) -> Result<Entry<'v,'p>> {
@@ -926,6 +979,15 @@ impl Value {
         match self {
             &mut Value::BDocument(ref mut bd) => bd.set_path(path, v),
             &mut Value::BArray(ref mut ba) => ba.set_path(path, v),
+            // TODO the following line should probably be Err
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn unset_path(&mut self, path: &str) -> Result<Option<Value>> {
+        match self {
+            &mut Value::BDocument(ref mut bd) => bd.unset_path(path),
+            &mut Value::BArray(ref mut ba) => ba.unset_path(path),
             // TODO the following line should probably be Err
             _ => unreachable!(),
         }
