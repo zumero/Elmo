@@ -464,8 +464,7 @@ impl<'b> Server<'b> {
             mut query,
             return_fields_selector,
         } = req;
-        // TODO the following must be nocase
-        let coll = try!(query.must_remove_string("findandmodify"));
+        let coll = try!(query.must_removenocase_string("findandmodify"));
         let filter = query.remove("query");
         let sort = query.remove("sort");
         let remove = query.remove("remove");
@@ -504,8 +503,8 @@ impl<'b> Server<'b> {
         }
 
         match (was_update,found,upsert) {
-            (bool,false,_) => last_error_object.set_bool("updatedExisting", false),
-            (bool,true,false) => last_error_object.set_bool("updatedExisting", changed),
+            (true,false,_) => last_error_object.set_bool("updatedExisting", false),
+            (true,true,false) => last_error_object.set_bool("updatedExisting", changed),
             _ => last_error_object.set_bool("updatedExisting", changed),
         }
 

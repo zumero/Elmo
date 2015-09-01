@@ -121,6 +121,18 @@ impl Document {
         }
     }
 
+    pub fn removenocase(&mut self, k: &str) -> Option<Value> {
+        match self.pairs.iter().position(|&(ref ksub, _)| std::ascii::AsciiExt::eq_ignore_ascii_case(ksub.as_str(), k)) {
+            Some(i) => {
+                let (_, v) = self.pairs.remove(i);
+                return Some(v);
+            },
+            None => {
+                return None;
+            },
+        }
+    }
+
     pub fn validate_keys(&self, depth: usize) -> Result<()> {
         if depth > 0 && self.is_dbref() {
             Ok(())
@@ -171,6 +183,10 @@ impl Document {
         self.remove(k).ok_or(Error::Misc(format!("required key not found: {}", k)))
     }
 
+    pub fn must_removenocase(&mut self, k: &str) -> Result<Value> {
+        self.removenocase(k).ok_or(Error::Misc(format!("required key not found: {}", k)))
+    }
+
     pub fn must_remove_bool(&mut self, k: &str) -> Result<bool> {
         let v = try!(self.must_remove(k));
         v.as_bool()
@@ -178,6 +194,11 @@ impl Document {
 
     pub fn must_remove_string(&mut self, k: &str) -> Result<String> {
         let v = try!(self.must_remove(k));
+        v.into_string()
+    }
+
+    pub fn must_removenocase_string(&mut self, k: &str) -> Result<String> {
+        let v = try!(self.must_removenocase(k));
         v.into_string()
     }
 
