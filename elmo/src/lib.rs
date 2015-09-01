@@ -3022,6 +3022,37 @@ impl Connection {
         Ok((None, seq))
     }
 
+    pub fn distinct(&self, db: &str, coll: &str, key: &str, query: bson::Document) -> Result<bson::Array> {
+        let reader = try!(self.conn.begin_read());
+        // TODO dry
+        let indexes = try!(reader.list_indexes()).into_iter().filter(
+            |ndx| ndx.db == db && ndx.coll == coll
+            ).collect::<Vec<_>>();
+        //println!("indexes: {:?}", indexes);
+        let m = try!(matcher::parse_query(query));
+        let plan = try!(Self::choose_index(&indexes, &m, None));
+        //println!("plan: {:?}", plan);
+        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(reader.get_collection_reader(db, coll, plan));
+        // TODO we shadow-let here because the type from seq_match_ref() doesn't match the original
+        // type because of its explicit lifetime.
+        let mut seq = Self::seq_match_ref(seq, &m);
+        let mut results = HashSet::new();
+        for rr in seq {
+            let row = try!(rr);
+            match row.doc.find_path(key) {
+                bson::Value::BUndefined => (),
+                v => {
+                    results.insert(v);
+                },
+            }
+        }
+        let mut a = bson::Array::new();
+        for v in results {
+            a.push(v);
+        }
+        Ok(a)
+    }
+
     pub fn find(&self,
                 db: &str,
                 coll: &str,

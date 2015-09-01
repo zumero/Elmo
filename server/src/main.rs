@@ -447,7 +447,17 @@ impl<'b> Server<'b> {
     }
 
     fn reply_distinct(&self, mut req: MsgQuery, db: &str) -> Result<Reply> {
-        Err(Error::Misc(format!("TODO distinct: {:?}", req)))
+        let coll = try!(req.query.must_remove_string("distinct"));
+        // TODO invalid type in the following line wants to be 18510
+        let key = try!(req.query.must_remove_string("key"));
+        // TODO invalid type in the following line wants to be 18511
+        let query = try!(req.query.must_remove_document("query"));
+
+        let values = try!(self.conn.distinct(db, &coll, &key, query));
+        let mut doc = bson::Document::new();
+        doc.set_array("values", values);
+        doc.set_i32("ok", 1);
+        Ok(create_reply(req.req_id, vec![doc], 0))
     }
 
     fn reply_explain(&self, mut req: MsgQuery, db: &str) -> Result<Reply> {
