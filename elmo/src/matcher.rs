@@ -656,11 +656,14 @@ fn match_query_doc<F: Fn(usize)>(q: &QueryDoc, d: &bson::Value, cb_array_pos: &F
     true
 }
 
-pub fn match_query(m: &QueryDoc, d: &bson::Value) -> bool {
-    // TODO
-    let cb = |_| ();
+pub fn match_query(m: &QueryDoc, d: &bson::Value) -> (bool,Option<usize>) {
+    let pos = std::cell::Cell::new(None);
+    let cb = |n: usize| {
+        // TODO error if it is already set?
+        pos.set(Some(n));
+    };
     let b = match_query_doc(m, d, &cb);
-    b
+    (b,pos.get())
 }
 
 fn contains_no_dollar_keys(v: &bson::Value) -> bool {

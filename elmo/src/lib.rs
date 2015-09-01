@@ -782,7 +782,9 @@ impl Connection {
             .filter(
                 move |r| {
                     if let &Ok(ref d) = r {
-                        matcher::match_query(&m, &d.doc)
+                        let (b,pos) = matcher::match_query(&m, &d.doc);
+                        // TODO pos
+                        b
                     } else {
                         // TODO so when we have an error we just let it through?
                         true
@@ -894,7 +896,9 @@ impl Connection {
                                 seq = box seq.filter(
                                     |r| {
                                         if let &Ok(ref d) = r {
-                                            matcher::match_query(&m, &d.doc)
+                                            let (b,pos) = matcher::match_query(&m, &d.doc);
+                                            // TODO pos
+                                            b
                                         } else {
                                             // TODO so when we have an error we just let it through?
                                             true
@@ -2906,7 +2910,9 @@ impl Connection {
             .filter(
                 move |r| {
                     if let &Ok(ref d) = r {
-                        matcher::match_query(&m, &d.doc)
+                        let (b,pos) = matcher::match_query(&m, &d.doc);
+                        // TODO pos
+                        b
                     } else {
                         // TODO so when we have an error we just let it through?
                         true
