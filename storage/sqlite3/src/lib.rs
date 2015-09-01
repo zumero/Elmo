@@ -58,6 +58,7 @@ impl StatementBsonValueIterator {
                 let v = bson::Value::BDocument(v);
                 let row = elmo::Row {
                     doc: v,
+                    pos: None,
                 };
                 Ok(Some(row))
             },
@@ -107,6 +108,7 @@ impl<'a> RefStatementBsonValueIterator<'a> {
                 let v = bson::Value::BDocument(v);
                 let row = elmo::Row {
                     doc: v,
+                    pos: None,
                 };
                 Ok(Some(row))
             },

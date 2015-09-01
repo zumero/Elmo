@@ -209,8 +209,8 @@ pub struct Row {
     // because you need ownership and you don't have it.  So clone.  Which is
     // awful.
     pub doc: bson::Value,
+    pub pos: Option<usize>,
     // TODO score
-    // TODO pos
     // TODO stats for explain
 }
 
@@ -890,7 +890,7 @@ impl Connection {
                                     let row = try!(rr);
                                     let old_doc = try!(row.doc.into_document());
                                     let mut new_doc = old_doc.clone();
-                                    try!(Self::apply_update_ops(&mut new_doc, &ops, false, None));
+                                    try!(Self::apply_update_ops(&mut new_doc, &ops, false, row.pos));
                                     // TODO make sure _id did not change
                                     matches = matches + 1;
                                     if new_doc != old_doc {
@@ -906,7 +906,7 @@ impl Connection {
                                         //println!("row found for update: {:?}", row);
                                         let old_doc = try!(row.doc.into_document());
                                         let mut new_doc = old_doc.clone();
-                                        try!(Self::apply_update_ops(&mut new_doc, &ops, false, None));
+                                        try!(Self::apply_update_ops(&mut new_doc, &ops, false, row.pos));
                                         // TODO make sure _id did not change
                                         if new_doc != old_doc {
                                             let id = try!(Self::validate_for_storage(&mut new_doc));
@@ -1041,7 +1041,7 @@ impl Connection {
                     let ops = try!(Self::parse_update_doc(u));
                     let old_doc = try!(row.doc.into_document());
                     let mut new_doc = old_doc.clone();
-                    try!(Self::apply_update_ops(&mut new_doc, &ops, false, None));
+                    try!(Self::apply_update_ops(&mut new_doc, &ops, false, row.pos));
                     // TODO make sure _id did not change
                     if old_doc != new_doc {
                         let id = try!(Self::validate_for_storage(&mut new_doc));
@@ -2629,9 +2629,10 @@ impl Connection {
                                     let unwind = a.items.into_iter().map(|v| -> Result<Row> {
                                         let mut d = row.doc.clone();
                                         d.set_path(&path, v.clone());
-                                        // TODO positional operator?
-                                        // TODO preserve other parts of row?
-                                        let r = Row { doc: d };
+                                        let r = Row { 
+                                            doc: d,
+                                            pos: row.pos,
+                                        };
                                         Ok(r)
                                     }).collect::<Vec<_>>();
                                     // TODO it should be possible to do this without collect().
@@ -2877,7 +2878,13 @@ impl Connection {
     fn agg_group(seq: Box<Iterator<Item=Result<Row>>>, id: Expr, ops: Vec<(String,GroupAccum)>) -> Box<Iterator<Item=Result<Row>>> {
         match Self::do_group(seq, id, ops) {
             Ok(mapa) => {
-                box mapa.into_iter().map(|(k,v)| Ok(Row {doc:bson::Value::BDocument(v)}))
+                box mapa.into_iter().map(|(k,v)| {
+                    let row = Row {
+                        doc: bson::Value::BDocument(v),
+                        pos: None,
+                    };
+                    Ok(row)
+                })
             },
             Err(e) => {
                 box std::iter::once(Err(e))

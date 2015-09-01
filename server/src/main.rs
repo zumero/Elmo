@@ -871,6 +871,7 @@ impl<'b> Server<'b> {
                         doc.set_document("options", c.options);
                         let r = elmo::Row {
                             doc: bson::Value::BDocument(doc),
+                            pos: None,
                         };
                         Some(Ok(r))
                     } else {
@@ -911,6 +912,7 @@ impl<'b> Server<'b> {
                         // TODO if unique && ndxInfo.ndx<>"_id_" then pairs.Add("unique", BBoolean unique)
                         let r = elmo::Row {
                             doc: bson::Value::BDocument(doc),
+                            pos: None,
                         };
                         Some(Ok(r))
                     } else {
