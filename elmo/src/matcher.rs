@@ -786,8 +786,7 @@ fn parse_pred(k: &str, v: bson::Value) -> Result<Pred> {
         "$lte" => Ok(Pred::LTE(try!(not_regex(v)))),
         "$regex" => panic!("TODO parse_pred regex"),
         "$exists" => Ok(Pred::Exists(try!(v.as_bool()))),
-        // TODO as_i32 below: should probably allow conversion
-        "$type" => Ok(Pred::Type(try!(v.as_i32()))),
+        "$type" => Ok(Pred::Type(try!(v.numeric_to_i32()))),
         "$size" => {
             match v {
                 bson::Value::BInt32(n) => Ok(Pred::Size(n)),
