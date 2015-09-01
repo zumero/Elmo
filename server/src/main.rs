@@ -650,7 +650,7 @@ impl<'b> Server<'b> {
             match cursor_options {
                 Some(&bson::Value::BDocument(ref bd)) => {
                     if bd.pairs.iter().any(|&(ref k, _)| k != "batchSize") {
-                        return Err(Error::Misc(String::from("invalid cursor option")));
+                        return Err(Error::Misc(format!("invalid cursor option: {:?}", bd)));
                     }
                     match bd.pairs.iter().find(|&&(ref k, ref _v)| k == "batchSize") {
                         Some(&(_, bson::Value::BInt32(n))) => {
@@ -679,8 +679,8 @@ impl<'b> Server<'b> {
                         },
                     }
                 },
-                Some(_) => {
-                    return Err(Error::Misc(String::from("invalid cursor option")));
+                Some(v) => {
+                    return Err(Error::Misc(format!("invalid cursor option: {:?}", v)));
                 },
                 None => {
                     // TODO in the case where the cursor is not requested, how
@@ -898,7 +898,11 @@ impl<'b> Server<'b> {
     }
 
     fn reply_list_indexes(&mut self, mut req: MsgQuery, db: &str) -> Result<Reply> {
-        // TODO check coll
+        let coll = try!(req.query.must_remove_string("listIndexes"));
+        if coll.as_str() == "" {
+            return Err(Error::Misc(String::from("empty string for argument of listIndexes")));
+        }
+        // TODO this need to error when giving a coll that does not exist
         let results = try!(self.conn.list_indexes());
         let seq = {
             // we need db to get captured by this closure which outlives
@@ -908,13 +912,21 @@ impl<'b> Server<'b> {
             let db = String::from(db);
             let results = results.into_iter().filter_map(
                 move |ndx| {
-                    if ndx.db.as_str() == db {
+                    if ndx.db.as_str() == db && ndx.coll.as_str() == coll {
                         let mut doc = bson::Document::new();
                         doc.set_string("ns", ndx.full_collection_name());
+                        let unique = {
+                            match ndx.options.get("unique") {
+                                Some(&bson::Value::BBoolean(true)) => true,
+                                _ => false,
+                            }
+                        };
+                        // TODO it seems the automatic index on _id is NOT supposed to be marked unique
+                        if unique && ndx.name != "_id_" {
+                            doc.set_bool("unique", unique);
+                        }
                         doc.set_string("name", ndx.name);
                         doc.set_document("key", ndx.spec);
-                        // TODO it seems the automatic index on _id is NOT supposed to be marked unique
-                        // TODO if unique && ndxInfo.ndx<>"_id_" then pairs.Add("unique", BBoolean unique)
                         let r = elmo::Row {
                             doc: bson::Value::BDocument(doc),
                             pos: None,
@@ -1250,6 +1262,9 @@ impl<'b> Server<'b> {
             Some((ns, mut seq)) => {
                 match Self::do_limit(&ns, &mut seq, req.number_to_return) {
                     Ok((docs, more)) => {
+                        //println!("GetMore: docs = {:?}", docs);
+                        //println!("GetMore: docs.len() = {:?}", docs.len());
+                        //println!("GetMore: more = {:?}", more);
                         if more {
                             // put the cursor back for next time
                             self.cursors.insert(req.cursor_id, (ns, box seq));
@@ -1257,20 +1272,20 @@ impl<'b> Server<'b> {
                         let docs = vec_rows_to_values(docs);
                         match vec_values_to_docs(docs) {
                             Ok(docs) => {
-                                create_reply(req.req_id, docs, 0)
+                                create_reply(req.req_id, docs, if more { req.cursor_id } else { 0 })
                             },
                             Err(e) => {
-                                reply_err(req.req_id, Error::Misc(String::from("TODO")))
+                                reply_err(req.req_id, e)
                             },
                         }
                     },
                     Err(e) => {
-                        reply_err(req.req_id, Error::Misc(String::from("TODO")))
+                        reply_err(req.req_id, e)
                     },
                 }
             },
             None => {
-                reply_err(req.req_id, Error::Misc(String::from("TODO")))
+                reply_err(req.req_id, Error::Misc(String::from("cursor not found")))
             },
         }
     }
