@@ -635,7 +635,7 @@ impl Connection {
                         bson::Entry::Found(mut e) => {
                             match e.get_mut() {
                                 &mut bson::Value::BArray(ref mut a) => {
-                                    // TODO remove anything that matches v
+                                    a.items.retain(|va| va != v)
                                 },
                                 _ => return Err(Error::Misc(format!("$pull not an array: {}", path))),
                             }
@@ -734,17 +734,75 @@ impl Connection {
                 &UpdateOp::TimeStamp(ref path) => {
                     return Err(Error::Misc(format!("TODO UpdateOp::Timestamp")));
                 },
-                &UpdateOp::AddToSet(ref path, ref v) => {
-                    return Err(Error::Misc(format!("TODO UpdateOp::AddToSet")));
+                &UpdateOp::AddToSet(ref path, ref vals) => {
+                    let path = Self::fix_positional(path, pos);
+                    for v in vals.items.iter() {
+                        match try!(doc.entry(&path)) {
+                            bson::Entry::Found(mut e) => {
+                                match e.get_mut() {
+                                    &mut bson::Value::BArray(ref mut a) => {
+                                        if !a.items.iter().any(|va| va == v) {
+                                            a.push(v.clone());
+                                        }
+                                    },
+                                    _ => return Err(Error::Misc(format!("$pull not an array: {}", path))),
+                                }
+                            },
+                            bson::Entry::Absent(e) => {
+                                return Err(Error::Misc(format!("$pull path not found: {}", path)));
+                            },
+                        }
+                    }
                 },
-                &UpdateOp::PullAll(ref path, ref v) => {
-                    return Err(Error::Misc(format!("TODO UpdateOp::PullAll")));
+                &UpdateOp::PullAll(ref path, ref vals) => {
+                    let path = Self::fix_positional(path, pos);
+                    for v in vals.items.iter() {
+                        match try!(doc.entry(&path)) {
+                            bson::Entry::Found(mut e) => {
+                                match e.get_mut() {
+                                    &mut bson::Value::BArray(ref mut a) => {
+                                        a.items.retain(|va| va != v)
+                                    },
+                                    _ => return Err(Error::Misc(format!("$pull not an array: {}", path))),
+                                }
+                            },
+                            bson::Entry::Absent(e) => {
+                                return Err(Error::Misc(format!("$pull path not found: {}", path)));
+                            },
+                        }
+                    }
                 },
-                &UpdateOp::PullQuery(ref path, ref qd) => {
-                    return Err(Error::Misc(format!("TODO UpdateOp::PullQuery")));
+                &UpdateOp::PullQuery(ref path, ref m) => {
+                    let path = Self::fix_positional(path, pos);
+                    match try!(doc.entry(&path)) {
+                        bson::Entry::Found(mut e) => {
+                            match e.get_mut() {
+                                &mut bson::Value::BArray(ref mut a) => {
+                                    a.items.retain(|va| !matcher::match_query(m, &va).0)
+                                },
+                                _ => return Err(Error::Misc(format!("$pull not an array: {}", path))),
+                            }
+                        },
+                        bson::Entry::Absent(e) => {
+                            return Err(Error::Misc(format!("$pull path not found: {}", path)));
+                        },
+                    }
                 },
                 &UpdateOp::PullPredicates(ref path, ref preds) => {
-                    return Err(Error::Misc(format!("TODO UpdateOp::PullPredicates")));
+                    let path = Self::fix_positional(path, pos);
+                    match try!(doc.entry(&path)) {
+                        bson::Entry::Found(mut e) => {
+                            match e.get_mut() {
+                                &mut bson::Value::BArray(ref mut a) => {
+                                    a.items.retain(|va| !matcher::match_pred_list(preds, &va).0)
+                                },
+                                _ => return Err(Error::Misc(format!("$pull not an array: {}", path))),
+                            }
+                        },
+                        bson::Entry::Absent(e) => {
+                            return Err(Error::Misc(format!("$pull path not found: {}", path)));
+                        },
+                    }
                 },
                 &UpdateOp::Pop(ref path, i) => {
                     return Err(Error::Misc(format!("TODO UpdateOp::Pop")));

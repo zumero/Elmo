@@ -668,6 +668,16 @@ fn match_query_doc<F: Fn(usize)>(q: &QueryDoc, d: &bson::Value, cb_array_pos: &F
     true
 }
 
+pub fn match_pred_list(preds: &Vec<Pred>, d: &bson::Value) -> (bool,Option<usize>) {
+    let pos = std::cell::Cell::new(None);
+    let cb = |n: usize| {
+        // TODO error if it is already set?
+        pos.set(Some(n));
+    };
+    let b = preds.iter().all(|p| match_predicate(p, d, &cb));
+    (b, pos.get())
+}
+
 pub fn match_query(m: &QueryDoc, d: &bson::Value) -> (bool,Option<usize>) {
     let pos = std::cell::Cell::new(None);
     let cb = |n: usize| {
