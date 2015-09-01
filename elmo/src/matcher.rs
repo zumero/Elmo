@@ -348,6 +348,8 @@ fn do_elem_match_objects<F: Fn(usize)>(doc: &QueryDoc, d: &bson::Value, cb_array
 }
 
 fn match_predicate<F: Fn(usize)>(pred: &Pred, d: &bson::Value, cb_array_pos: &F) -> bool {
+    //println!("match_predicate: pred = {:?}", pred);
+    //println!("match_predicate: d = {:?}", d);
     match pred {
         &Pred::Exists(b) => {
             unreachable!();
@@ -497,13 +499,18 @@ fn match_pair_exists(pred: &Pred, path: &str, start: &bson::Value) -> bool {
 }
 
 fn match_pair_other<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, arr: bool, cb_array_pos: &F) -> bool {
+    //println!("match_pair_other: pred = {:?}", pred);
+    //println!("match_pair_other: path = {:?}", path);
+    //println!("match_pair_other: start = {:?}", start);
     let dot = path.find('.');
     let name = match dot { 
         None => path,
         Some(ndx) => &path[0 .. ndx]
     };
+    //println!("match_pair_other: name = {:?}", name);
     match start.tryGetValueEither(name) {
         Some(v) => {
+            //println!("name found: {:?}", v);
             match dot {
                 None => {
                     if match_predicate(pred, v, cb_array_pos) {
@@ -516,6 +523,7 @@ fn match_pair_other<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, 
                             _ => {
                                 match v {
                                     &bson::Value::BArray(ref ba) => {
+                                        //println!("match_pair_other: diving");
                                         match ba.items.iter().position(|vsub| match_predicate(pred, vsub, cb_array_pos)) {
                                             Some(ndx) => {
                                                 cb_array_pos(ndx);
@@ -533,19 +541,22 @@ fn match_pair_other<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, 
                     }
                 },
                 Some(dot) => {
+                    //println!("subpath");
                     let subpath = &path[dot+1 ..];
                     match v {
                         &bson::Value::BDocument(_) => {
                             match_pair_other(pred, subpath, v, false, cb_array_pos)
                         },
                         &bson::Value::BArray(ref ba) => {
+                            //println!("it's an array");
                             let b = match_pair_other(pred, subpath, v, true, cb_array_pos);
                             if b {
                                 true
                             } else {
+                                //println!("diving into the array");
                                 let f = |vsub| {
                                     match vsub {
-                                        &bson::Value::BDocument(_) => match_pair_other(pred, subpath, v, false, cb_array_pos),
+                                        &bson::Value::BDocument(_) => match_pair_other(pred, subpath, vsub, false, cb_array_pos),
                                         _ => false,
                                     }
                                 };
@@ -569,6 +580,7 @@ fn match_pair_other<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, 
             }
         },
         None => {
+            //println!("name not found");
             if arr {
                 false
             } else {

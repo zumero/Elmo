@@ -2903,28 +2903,20 @@ impl Connection {
         match rr {
             Ok(row) => {
                 //println!("looking at row: {:?}", row);
+                //println!("matcher is: {:?}", m);
                 let (b, pos) = matcher::match_query(&m, &row.doc);
                 if b {
+                    //println!("    matched");
                     // TODO pos
                     Some(Ok(row))
                 } else {
+                    //println!("    no");
                     None
                 }
             },
             Err(e) => {
                 Some(Err(e))
             },
-        }
-    }
-
-    fn guts_matcher_filter(r: &Result<Row>, m: &matcher::QueryDoc) -> bool {
-        if let &Ok(ref d) = r {
-            let (b,pos) = matcher::match_query(&m, &d.doc);
-            // TODO pos
-            b
-        } else {
-            // TODO so when we have an error we just let it through?
-            true
         }
     }
 
