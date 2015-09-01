@@ -853,7 +853,7 @@ impl<'b> Server<'b> {
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
 
-    fn reply_list_collections(&mut self, req: &MsgQuery, db: &str) -> Result<Reply> {
+    fn reply_list_collections(&mut self, mut req: MsgQuery, db: &str) -> Result<Reply> {
         let results = try!(self.conn.list_collections());
         let seq = {
             // we need db to get captured by this closure which outlives
@@ -880,17 +880,24 @@ impl<'b> Server<'b> {
             results
         };
 
-        // TODO filter in query?
+        match req.query.get("filter") {
+            Some(_) => println!("TODO list_collections filter"),
+            None => (),
+        }
 
         let default_batch_size = 100;
-        let cursor_options = req.query.get("cursor");
+        let cursor_options = 
+            match req.query.remove("cursor") {
+                Some(v) => Some(v),
+                None => Some(bson::Document::new().into_value()),
+            };
         let ns = format!("{}.$cmd.listCollections", db);
-        let doc = try!(self.reply_with_cursor(&ns, seq, cursor_options, default_batch_size));
+        let doc = try!(self.reply_with_cursor(&ns, seq, cursor_options.as_ref(), default_batch_size));
         // note that this uses the newer way of returning a cursor ID, so we pass 0 below
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
 
-    fn reply_list_indexes(&mut self, req: &MsgQuery, db: &str) -> Result<Reply> {
+    fn reply_list_indexes(&mut self, mut req: MsgQuery, db: &str) -> Result<Reply> {
         // TODO check coll
         let results = try!(self.conn.list_indexes());
         let seq = {
@@ -921,12 +928,14 @@ impl<'b> Server<'b> {
             results
         };
 
-        // TODO filter in query?
-
         let default_batch_size = 100;
-        let cursor_options = req.query.get("cursor");
+        let cursor_options = 
+            match req.query.remove("cursor") {
+                Some(v) => Some(v),
+                None => Some(bson::Document::new().into_value()),
+            };
         let ns = format!("{}.$cmd.listIndexes", db);
-        let doc = try!(self.reply_with_cursor(&ns, seq, cursor_options, default_batch_size));
+        let doc = try!(self.reply_with_cursor(&ns, seq, cursor_options.as_ref(), default_batch_size));
         // note that this uses the newer way of returning a cursor ID, so we pass 0 below
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
@@ -1181,8 +1190,8 @@ impl<'b> Server<'b> {
                     "deleteindexes" => self.reply_delete_indexes(&req, db),
                     "drop" => self.reply_drop_collection(&req, db),
                     "dropdatabase" => self.reply_drop_database(&req, db),
-                    "listcollections" => self.reply_list_collections(&req, db),
-                    "listindexes" => self.reply_list_indexes(&req, db),
+                    "listcollections" => self.reply_list_collections(req, db),
+                    "listindexes" => self.reply_list_indexes(req, db),
                     "create" => self.reply_create_collection(&req, db),
                     //"features" => reply_features &req db
                     _ => Err(Error::Misc(format!("unknown cmd: {}", cmd)))
