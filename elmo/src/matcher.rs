@@ -398,7 +398,7 @@ fn match_predicate<F: Fn(usize)>(pred: &Pred, d: &bson::Value, cb_array_pos: &F)
         &Pred::AllElemMatchObjects(ref docs) => {
             // for each elemMatch doc in the $all array, run it against
             // the candidate array.  if any elemMatch doc fails, false.
-            docs.iter().any(|doc| !do_elem_match_objects(doc, d, cb_array_pos))
+            docs.iter().all(|doc| do_elem_match_objects(doc, d, cb_array_pos))
         },
         &Pred::All(ref lits) => {
             // TODO does this ever happen, now that it is handled earlier?
