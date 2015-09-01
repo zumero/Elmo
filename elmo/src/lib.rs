@@ -1019,8 +1019,10 @@ impl Connection {
         };
         let writer = try!(self.conn.begin_write());
         let mut collwriter = try!(writer.get_collection_writer(db, coll));
+        // TODO catch the following error
         let found = try!(Self::get_one_match(db, coll, &*writer, &m, sort.as_ref()));
         let was_found = found.is_some();
+        // TODO begin anything below should be caught
         if remove.is_some() && upsert {
             return Err(Error::Misc(String::from("find_and_modify: invalid. no upsert with remove.")))
         }
@@ -1106,25 +1108,23 @@ impl Connection {
                     }
                 }
             },
-            (None, Some(_), Some(rr)) => {
+            (None, Some(_), Some(row)) => {
                 // remove, found
-                let d = try!(rr.doc.as_document());
-                match d.get("_id") {
-                    Some(id) => {
-                        if try!(collwriter.delete(id)) {
-                            changed = true;
-                        }
-                    },
-                    None => {
-                        return Err(Error::Misc(String::from("find_and_modify: invalid. no _id.")))
-                    },
+                let old_doc = try!(row.doc.into_document());
+                {
+                    let id = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated"))));
+                    if try!(collwriter.delete(id)) {
+                        changed = true;
+                    }
                 }
+                result = Some(old_doc);
             },
             (None, Some(_), None) => {
                 // remove, not found, nothing to do
             },
         }
         try!(writer.commit());
+        // TODO end anything above should be caught
         // TODO error return here?
         Ok((was_found, None, changed, upserted, result))
     }
