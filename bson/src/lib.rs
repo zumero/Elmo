@@ -104,6 +104,10 @@ impl Document {
         }
     }
 
+    pub fn into_value(self) -> Value {
+        Value::BDocument(self)
+    }
+
     // TODO consider calling this extract
     pub fn remove(&mut self, k: &str) -> Option<Value> {
         match self.pairs.iter().position(|&(ref ksub, _)| ksub == k) {
@@ -454,6 +458,14 @@ impl Array {
         Array {
             items: vec![],
         }
+    }
+
+    pub fn into_value(self) -> Value {
+        Value::BArray(self)
+    }
+
+    pub fn push(&mut self, v: Value) {
+        self.items.push(v);
     }
 
     pub fn len(&self) -> usize {

@@ -397,8 +397,43 @@ impl<'b> Server<'b> {
         // TODO ordered
         // TODO do we need to keep ownership of updates?
         let results = try!(self.conn.update(db, &coll, &mut updates));
-        // TODO there is a bunch of code missing here to process the results
+        let mut matches = 0;
+        let mut mods = 0;
+        let mut upserts = bson::Array::new();
+        let mut errors = bson::Array::new();
+        for (i,r) in results.into_iter().enumerate() {
+            match r {
+                Ok((count_matched, count_modified, upserted)) => {
+                    matches = matches + count_matched;
+                    mods = mods + count_modified;
+                    match upserted{
+                        Some(id) => {
+                            let mut doc = bson::Document::new();
+                            doc.set_i32("index", i as i32);
+                            doc.set("_id", id);
+                            upserts.push(doc.into_value());
+                        },
+                        None => {
+                        },
+                    }
+                },
+                Err(e) => {
+                    let mut doc = bson::Document::new();
+                    doc.set_i32("index", i as i32);
+                    doc.set_string("errmsg", format!("{}", e));
+                    errors.push(doc.into_value());
+                },
+            }
+        }
         let mut doc = bson::Document::new();
+        doc.set_i32("n", matches + (upserts.len() as i32));
+        doc.set_i32("modified", mods);
+        if upserts.len() > 0 {
+            doc.set_array("upserted", upserts);
+        }
+        if errors.len() > 0 {
+            doc.set_array("writeErrors", errors);
+        }
         doc.set_i32("ok", 1);
         Ok(create_reply(req.req_id, vec![doc], 0))
     }

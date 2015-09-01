@@ -856,19 +856,17 @@ impl Connection {
         Ok(id)
     }
 
-    // TODO this func needs to return the 4-tuple
-    // (count_matches, count_modified, Option<TODO>, Option<TODO>)
-    pub fn update(&self, db: &str, coll: &str, updates: &mut Vec<bson::Document>) -> Result<Vec<Result<()>>> {
+    pub fn update(&self, db: &str, coll: &str, updates: &mut Vec<bson::Document>) -> Result<Vec<Result<(i32, i32, Option<bson::Value>)>>> {
         let mut results = Vec::new();
         {
             let writer = try!(self.conn.begin_write());
             {
                 let mut collwriter = try!(writer.get_collection_writer(db, coll));
                 // TODO why does this closure need to be mut?
-                let mut one_update_or_upsert = |upd: &mut bson::Document| -> Result<()> {
+                let mut one_update_or_upsert = |upd: &mut bson::Document| -> Result<(i32, i32, Option<bson::Value>)> {
                     //println!("in closure: {:?}", upd);
                     let q = try!(upd.must_remove_document("q"));
-                    let mut u = try!(upd.must_remove_document("u"));
+                    let u = try!(upd.must_remove_document("u"));
                     let multi = try!(upd.must_remove_bool("multi"));
                     let upsert = try!(upd.must_remove_bool("upsert"));
                     // rescue _id from q if possible
@@ -913,8 +911,7 @@ impl Connection {
                                     matches = matches + 1;
                                     if new_doc != old_doc {
                                         let id = try!(Self::validate_for_storage(&mut new_doc));
-                                        // TODO error in the following line?
-                                        collwriter.update(&new_doc);
+                                        try!(collwriter.update(&new_doc));
                                         mods = mods + 1;
                                     }
                                 }
@@ -929,8 +926,7 @@ impl Connection {
                                         // TODO make sure _id did not change
                                         if new_doc != old_doc {
                                             let id = try!(Self::validate_for_storage(&mut new_doc));
-                                            // TODO error in the following line?
-                                            collwriter.update(&new_doc);
+                                            try!(collwriter.update(&new_doc));
                                             (1, 1)
                                         } else {
                                             (1, 0)
@@ -946,17 +942,13 @@ impl Connection {
                             if upsert {
                                 let mut doc = try!(Self::build_upsert_with_update_operators(&m, &ops));
                                 let id = try!(Self::validate_for_storage(&mut doc));
-                                // TODO handle error in following line
-                                collwriter.insert(&doc);
-                                // TODO return something
-                                Ok(())
+                                try!(collwriter.insert(&doc));
+                                Ok((0,0,Some(id)))
                             } else {
-                                Ok(())
-                                //Ok((count_matches, count_modified, None, None))
+                                Ok((0,0,None))
                             }
                         } else {
-                            Ok(())
-                            //Ok((count_matches, count_modified, None, None))
+                            Ok((count_matches, count_modified, None))
                         }
                     } else {
                         // TODO what happens if the update document has no update operators
@@ -966,29 +958,44 @@ impl Connection {
                         }
                         match try!(Self::get_one_match(db, coll, &*writer, &m, None)) {
                             Some(row) => {
-                                let old_doc = try!(row.doc.as_document());
-                                let id1 = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated"))));
-                                let id1 = try!(id1.as_objectid());
+                                let old_doc = try!(row.doc.into_document());
                                 // TODO if u has _id, make sure it's the same
-                                u.set_objectid("_id", id1);
-                                let id = try!(Self::validate_for_storage(&mut u));
-                                // TODO handle error in following line
-                                collwriter.update(&u);
-                                // TODO return something
-                                Ok(())
+                                let old_id = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated")))).clone();
+                                let mut new_doc = u;
+                                let new_id = {
+                                    match new_doc.get("_id") {
+                                        Some(new_id) => Some(new_id.clone()),
+                                        None => None,
+                                    }
+                                };
+                                match new_id {
+                                    Some(new_id) => {
+                                        if old_id != new_id {
+                                            return Err(Error::Misc(format!("Cannot change _id")));
+                                        }
+                                    },
+                                    None => {
+                                        new_doc.set("_id", old_id);
+                                    },
+                                }
+                                if new_doc != old_doc {
+                                    let id = try!(Self::validate_for_storage(&mut new_doc));
+                                    try!(collwriter.update(&new_doc));
+                                    Ok((1,1,None))
+                                } else {
+                                    Ok((1,0,None))
+                                }
                             },
                             None => {
                                 if upsert {
-                                    try!(Self::build_simple_upsert(q_id, &mut u));
-                                    let id = try!(Self::validate_for_storage(&mut u));
-                                    // TODO handle error in following line
-                                    collwriter.insert(&u);
-                                    // TODO return something
-                                    Ok(())
+                                    let mut new_doc = u;
+                                    try!(Self::build_simple_upsert(q_id, &mut new_doc));
+                                    // TODO what if this doesn't have an id yet?
+                                    let id = try!(Self::validate_for_storage(&mut new_doc));
+                                    try!(collwriter.insert(&new_doc));
+                                    Ok((0, 0, Some(id)))
                                 } else {
-                                    // TODO (0,0,None,None)
-                                    //panic!("TODO nothing updated");
-                                    Ok(())
+                                    Ok((0, 0, None))
                                 }
                             },
                         }
