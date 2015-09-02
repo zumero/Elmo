@@ -299,7 +299,7 @@ let tests = [
     "jstests/core/pullall.js";
     "jstests/core/pullall2.js";
     "jstests/core/push.js";
-    "jstests/core/push2.js"; // huge
+    // "jstests/core/push2.js"; // huge
     "jstests/core/distinct2.js";
     "jstests/core/error2.js";
     "jstests/core/error5.js";

@@ -626,8 +626,51 @@ impl Connection {
                     let path = Self::fix_positional(path, pos);
                     try!(doc.set_path(&path, v.clone()));
                 },
-                &UpdateOp::Push(ref path, ref each, ref slice, ref sort, ref pos) => {
-                    return Err(Error::Misc(format!("TODO UpdateOp::Push")));
+                &UpdateOp::Push(ref path, ref each, slice, ref sort, position) => {
+                    let path = Self::fix_positional(path, pos);
+                    match try!(doc.entry(&path)) {
+                        bson::Entry::Found(mut e) => {
+                            match e.get_mut() {
+                                &mut bson::Value::BArray(ref mut a) => {
+                                    let pos = match position {
+                                        Some(n) => n,
+                                        None => a.len(),
+                                    };
+                                    for i in 0 .. each.len() {
+                                        let v = each.items[each.len() - i - 1].clone();
+                                        a.items.insert(pos, v);
+                                    }
+                                    match sort {
+                                        &None => (),
+                                        &Some(ref ord) => {
+                                            try!(Self::do_sort_docs(&mut a.items, ord));
+                                        },
+                                    }
+                                    match slice {
+                                        None => (),
+                                        Some(n) => {
+                                            if n == 0 {
+                                                a.items.clear();
+                                            } else if n > 0 {
+                                                let len = std::cmp::min(a.items.len(), n as usize);
+                                                a.items.truncate(len);
+                                            } else {
+                                                let n = -n;
+                                                let len = std::cmp::min(a.items.len(), n as usize);
+                                                a.items.reverse();
+                                                a.items.truncate(len);
+                                                a.items.reverse();
+                                            }
+                                        },
+                                    }
+                                },
+                                _ => return Err(Error::Misc(format!("$push not an array: {}", path))),
+                            }
+                        },
+                        bson::Entry::Absent(e) => {
+                            e.insert(each.clone().into_value());
+                        },
+                    }
                 },
                 &UpdateOp::PullValue(ref path, ref v) => {
                     let path = Self::fix_positional(path, pos);
@@ -805,7 +848,28 @@ impl Connection {
                     }
                 },
                 &UpdateOp::Pop(ref path, i) => {
-                    return Err(Error::Misc(format!("TODO UpdateOp::Pop")));
+                    let path = Self::fix_positional(path, pos);
+                    match try!(doc.entry(&path)) {
+                        bson::Entry::Found(mut e) => {
+                            match e.get_mut() {
+                                &mut bson::Value::BArray(ref mut a) => {
+                                    if a.len() == 0 {
+                                        // do nothing
+                                    } else {
+                                        if i > 0 {
+                                            a.items.pop();
+                                        } else {
+                                            a.items.remove(0);
+                                        }
+                                    }
+                                },
+                                _ => return Err(Error::Misc(format!("$pop not an array: {}", path))),
+                            }
+                        },
+                        bson::Entry::Absent(e) => {
+                            // do nothing
+                        },
+                    }
                 },
             }
         }
@@ -934,7 +998,63 @@ impl Connection {
                     }
                 },
                 "$push" => {
-                    return Err(Error::Misc(format!("TODO parse update op: {}", k)));
+                    for (path, v) in try!(v.into_document()).pairs {
+                        match v {
+                            bson::Value::BDocument(mut bd) => {
+                                fn extract(bd: &mut bson::Document, s: &str) -> Option<bson::Value> {
+                                    match bd.pairs.iter().position(|&(ref k, ref v)| k == s) {
+                                        Some(i) => {
+                                            let (_,v) = bd.pairs.remove(i);
+                                            Some(v)
+                                        },
+                                        None => {
+                                            None
+                                        },
+                                    }
+                                }
+
+                                match extract(&mut bd, "$each") {
+                                    Some(v) => {
+                                        let a = try!(v.into_array());
+                                        let slice = match extract(&mut bd, "$slice") {
+                                            Some(v) => Some(try!(v.numeric_to_i32())),
+                                            None => None,
+                                        };
+                                        let sort = match extract(&mut bd, "$sort") {
+                                            Some(v) => {
+                                                if v.is_numeric() {
+                                                    let n = try!(v.numeric_to_i32());
+                                                    Some(bson::Value::BInt32(n))
+                                                } else if v.is_document() {
+                                                    Some(v)
+                                                } else {
+                                                    return Err(Error::Misc(format!("$sort must be number or document")));
+                                                }
+                                            },
+                                            None => None,
+                                        };
+                                        let position = match extract(&mut bd, "$position") {
+                                            Some(v) => Some(try!(v.numeric_to_i32()) as usize),
+                                            None => None,
+                                        };
+                                        result.push(UpdateOp::Push(path, a, slice, sort, position));
+                                    },
+                                    None => {
+                                        // TODO dry
+                                        let mut a = bson::Array::new();
+                                        a.push(bd.into_value());
+                                        result.push(UpdateOp::Push(path, a, None, None, None));
+                                    },
+                                }
+                            },
+                            _ => {
+                                // TODO dry
+                                let mut a = bson::Array::new();
+                                a.push(v);
+                                result.push(UpdateOp::Push(path, a, None, None, None));
+                            },
+                        }
+                    }
                 },
                 "$pull" => {
                     for (path, v) in try!(v.into_document()).pairs {
@@ -1042,16 +1162,9 @@ impl Connection {
                         let each = 
                             match v {
                                 bson::Value::BDocument(mut bd) => {
-                                    if bd.len() == 1 {
-                                        if bd.pairs[0].0 == "$each" {
-                                            let (_,v) = bd.pairs.remove(0);
-                                            try!(v.into_array())
-                                        } else {
-                                            // TODO dry
-                                            let mut a = bson::Array::new();
-                                            a.push(bd.into_value());
-                                            a
-                                        }
+                                    if bd.len() == 1 &&  bd.pairs[0].0 == "$each" {
+                                        let (_,v) = bd.pairs.remove(0);
+                                        try!(v.into_array())
                                     } else {
                                         // TODO dry
                                         let mut a = bson::Array::new();
@@ -3129,6 +3242,65 @@ impl Connection {
             }
         }
         Ok(mapa)
+    }
+
+    // TODO dry. this func duplicates do_sort()
+    fn do_sort_docs(a: &mut Vec<bson::Value>, orderby: &bson::Value) -> Result<()> {
+        // TODO validate orderby up here so we don't have to check it for errors
+        // inside the sort loop..
+        a.sort_by(|a,b| -> Ordering {
+            match orderby {
+                &bson::Value::BDocument(ref bd) => {
+                    for &(ref path, ref dir) in &bd.pairs {
+                        if dir.is_numeric() {
+                            let dir = 
+                                match dir.numeric_to_i32() {
+                                    Ok(n) => {
+                                        if n < 0 {
+                                            -1
+                                        } else if n > 0 {
+                                            1
+                                        } else {
+                                            println!("TODO error dir is 0");
+                                            0
+                                        }
+                                    },
+                                    Err(_) => {
+                                        println!("TODO error dir not a number");
+                                        0
+                                    },
+                                };
+
+                            let va = a.find_path(&path);
+                            // TODO replace undefined
+
+                            let vb = b.find_path(&path);
+                            // TODO replace undefined
+
+                            let mut c = matcher::cmp(&va, &vb);
+                            if dir < 0 {
+                                c = match c {
+                                    Ordering::Equal => Ordering::Equal,
+                                    Ordering::Less => Ordering::Greater,
+                                    Ordering::Greater => Ordering::Less,
+                                }
+                            }
+                            if c != Ordering::Equal {
+                                return c;
+                            }
+                        } else {
+                            // TODO sort on textScore?
+                        }
+                    }
+                    Ordering::Equal
+                },
+                _ => {
+                    println!("TODO orderby not a document");
+                    Ordering::Equal
+                },
+            }
+        });
+        Ok(())
     }
 
     fn do_sort(a: &mut Vec<Row>, orderby: &bson::Value) -> Result<()> {
