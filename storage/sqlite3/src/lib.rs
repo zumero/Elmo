@@ -17,6 +17,7 @@
 #![feature(box_syntax)]
 #![feature(associated_consts)]
 #![feature(vec_push_all)]
+#![feature(iter_arith)]
 
 extern crate bson;
 
@@ -59,6 +60,7 @@ impl StatementBsonValueIterator {
                 let row = elmo::Row {
                     doc: v,
                     pos: None,
+                    score: None,
                 };
                 Ok(Some(row))
             },
@@ -109,6 +111,7 @@ impl<'a> RefStatementBsonValueIterator<'a> {
                 let row = elmo::Row {
                     doc: v,
                     pos: None,
+                    score: None,
                 };
                 Ok(Some(row))
             },
@@ -672,11 +675,12 @@ impl MyConn {
                         stmt: &mut stmt,
                     };
                 for r in rdr {
-                    let r = try!(r);
+                    let mut r = try!(r);
                     let keep = check_phrase(&terms, &weights, &r.doc);
                     if keep {
-                        // TODO if keep, calc a score for each one too
-                        // let score = List.sum w |> float // TODO this is not the way mongo does this calculation
+                        // TODO this is not the way mongo does this calculation
+                        let score = cur_weights.iter().sum::<i32>() as f64;
+                        r.score = Some(score);
                         res.push(Ok(r));
                     }
                 }

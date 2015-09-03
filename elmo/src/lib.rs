@@ -211,11 +211,11 @@ pub struct Row {
     // awful.
     pub doc: bson::Value,
     pub pos: Option<usize>,
-    // TODO score
+    pub score: Option<f64>,
     // TODO stats for explain
 }
 
-#[derive(Debug)]
+#[derive(Copy,Clone,Debug)]
 pub enum ProjectionMode {
     Include,
     Exclude,
@@ -229,12 +229,23 @@ pub enum ProjectionOperator {
     ElemMatch(matcher::QueryDoc),
 }
 
+fn fix_positional(s: &str, pos: Option<usize>) -> String {
+    match pos {
+        None => String::from(s),
+        Some(i) => {
+            // TODO is format!() really the best way to convert
+            // a usize to a string?
+            s.replace(".$", &format!(".{}", i))
+        },
+    }
+}
+
 #[derive(Debug)]
 pub struct Projection {
     mode: ProjectionMode,
     paths: Vec<String>,
     ops: Vec<(String, ProjectionOperator)>,
-    // TODO need id thingie here
+    id: Option<bool>,
 }
 
 impl Projection {
@@ -277,6 +288,7 @@ impl Projection {
     }
 
     pub fn parse(proj: bson::Document) -> Result<Projection> {
+        println!("parsing projection: {:?}", proj);
         let pairs = proj.pairs;
 
         let (paths, pairs, maybe_mode) = {
@@ -362,13 +374,20 @@ impl Projection {
             };
             r
         };
-        // TODO check posop against matcher query paths, etc
+        // TODO now check posop against matcher query paths
+
         let id = id.into_iter().map(|(_,v)| v).collect::<Vec<_>>();
         assert!(id.len() <= 1);
         let id = {
             let mut id = id;
-            id.pop();
+            match id.pop() {
+                None => None,
+                Some(v) => {
+                    Some(try!(v.to_bool()))
+                },
+            }
         };
+
         let ops = try!(ops.into_iter()
             .map(|(k,d)|
                  match d {
@@ -397,6 +416,7 @@ impl Projection {
                                             if ba.len() == 2 {
                                                 let n0 = try!(ba.items[0].numeric_to_i32());
                                                 let n1 = try!(ba.items[1].numeric_to_i32());
+                                                // TODO range checking on the ints?
                                                 Ok(ProjectionOperator::Slice2(n0, n1))
                                             } else {
                                                 Err(Error::Misc(format!("invalid arg to projection op $slice: {:?}", ba)))
@@ -428,15 +448,25 @@ impl Projection {
             match maybe_mode {
                 Some(m) => m,
                 None => {
+                    //return Err(Error::Misc(format!("TODO what projection mode to use? id={:?} ops={:?}", id, ops)));
                     // TODO what mode to use?
+
+                    // TODO maybe we should leave the projection object with mode None and let the
+                    // later code decide how to handle that.  but the projection code
+                    // needs to know whether to start with an empty document or the incoming
+                    // document.  it's one or the other.
+
+                    // TODO actual question is whether the code to make this decision should live
+                    // here, during parsing, or later, during the actual projection.
 
                     // mongo's rules for deciding whether to use exclude mode or include mode seem
                     // inconsistent for cases where there are no explicit includes or excludes.
                     // elemMatchProjection.js has one test where a projection has only a $slice,
                     // and another test where the projection has only an $elemMatch, and these
-                    // two cases end up in different modes.  So...
+                    // two cases end up in different modes.  So... what mode to use?
 
                     ProjectionMode::Exclude
+                    //ProjectionMode::Include
                 },
             };
 
@@ -444,9 +474,196 @@ impl Projection {
             mode: mode,
             paths: paths,
             ops: ops,
+            id: id,
         };
         Ok(proj)
     }
+
+    pub fn project(&self, r: Row) -> Result<Row> {
+        let Row {
+            doc,
+            pos,
+            score,
+        } = r;
+
+        let doc = try!(doc.into_document());
+        let original_id = try!(doc.must_get("_id")).clone();
+
+        let mut d;
+        match self.mode {
+            ProjectionMode::Include => {
+                d = bson::Document::new();
+                for path in self.paths.iter() {
+                    let path = fix_positional(path, pos);
+                    let v = doc.find_path(&path);
+                    match try!(d.entry(&path)) {
+                        bson::Entry::Found(e) => {
+                            return Err(Error::Misc(format!("projection error, include, should not be here yet")));
+                        },
+                        bson::Entry::Absent(e) => {
+                            e.insert(v);
+                        },
+                    }
+                }
+            },
+            ProjectionMode::Exclude => {
+                d = doc;
+                for path in self.paths.iter() {
+                    match try!(d.entry(&path)) {
+                        bson::Entry::Found(e) => {
+                            e.remove();
+                        },
+                        bson::Entry::Absent(e) => {
+                            return Err(Error::Misc(format!("projection error, exclude, should be here")));
+                        },
+                    }
+                }
+            },
+        }
+
+        // TODO projIncludeOps?
+
+        for &(ref path, ref op) in self.ops.iter() {
+            match op {
+                &ProjectionOperator::Slice1(n) => {
+                    match try!(d.entry(&path)) {
+                        bson::Entry::Found(mut e) => {
+                            match e.get_mut() {
+                                &mut bson::Value::BArray(ref mut ba) => {
+                                    return Err(Error::Misc(format!("TODO projection $slice.1")));
+                                },
+                                _ => {
+                                    return Err(Error::Misc(format!("projection $slice.1 got a non-array")));
+                                },
+                            }
+                        },
+                        bson::Entry::Absent(e) => {
+                            return Err(Error::Misc(format!("projection $slice.1 got an absent")));
+                        },
+                    }
+                },
+                &ProjectionOperator::Slice2(_,_) => {
+                    match try!(d.entry(&path)) {
+                        bson::Entry::Found(mut e) => {
+                            match e.get_mut() {
+                                &mut bson::Value::BArray(ref mut ba) => {
+                                    return Err(Error::Misc(format!("TODO projection $slice.2")));
+                                },
+                                _ => {
+                                    return Err(Error::Misc(format!("projection $slice.2 got a non-array")));
+                                },
+                            }
+                        },
+                        bson::Entry::Absent(e) => {
+                            return Err(Error::Misc(format!("projection $slice.2 got an absent")));
+                        },
+                    }
+                },
+                &ProjectionOperator::MetaTextScore => {
+                    let score = score.unwrap_or(0.0);
+                    match try!(d.entry(&path)) {
+                        bson::Entry::Found(e) => {
+                            // jstests/core/fts_projection.js says yes, clobber
+                            e.replace(bson::Value::BDouble(score));
+                        },
+                        bson::Entry::Absent(e) => {
+                            e.insert(bson::Value::BDouble(score));
+                        },
+                    }
+                },
+                &ProjectionOperator::ElemMatch(ref m) => {
+                    match try!(d.entry(&path)) {
+                        bson::Entry::Found(mut e) => {
+                            match e.get_mut() {
+                                &mut bson::Value::BArray(ref mut ba) => {
+                                    return Err(Error::Misc(format!("TODO projection $elemMatch")));
+                                },
+                                _ => {
+                                    return Err(Error::Misc(format!("projection $elemMatch got a non-array")));
+                                },
+                            }
+                        },
+                        bson::Entry::Absent(e) => {
+                            return Err(Error::Misc(format!("projection $elemMatch got an absent")));
+                        },
+                    }
+                },
+            }
+        }
+
+        match (self.id, self.mode) {
+            (Some(true), ProjectionMode::Include) => {
+                match try!(d.entry("_id")) {
+                    bson::Entry::Found(e) => {
+                        return Err(Error::Misc(format!("projection error: _id should not be here yet")));
+                    },
+                    bson::Entry::Absent(e) => {
+                        e.insert(original_id);
+                    },
+                }
+            },
+            (Some(false), ProjectionMode::Include) => {
+                match try!(d.entry("_id")) {
+                    bson::Entry::Found(e) => {
+                        return Err(Error::Misc(format!("projection error: _id should not be here yet")));
+                    },
+                    bson::Entry::Absent(e) => {
+                        // not there.  good.
+                    },
+                }
+            },
+            (Some(true), ProjectionMode::Exclude) => {
+                match try!(d.entry("_id")) {
+                    bson::Entry::Found(e) => {
+                        // already there.  as it should be.
+                    },
+                    bson::Entry::Absent(e) => {
+                        return Err(Error::Misc(format!("projection error: _id should be here")));
+                    },
+                }
+            },
+            (Some(false), ProjectionMode::Exclude) => {
+                match try!(d.entry("_id")) {
+                    bson::Entry::Found(e) => {
+                        e.remove();
+                    },
+                    bson::Entry::Absent(e) => {
+                        return Err(Error::Misc(format!("projection error: _id should be here")));
+                    },
+                }
+            },
+            (None, ProjectionMode::Include) => {
+                // if a projection for the _id was not specified, and if the mode
+                // is Include, the _id gets included.
+                match try!(d.entry("_id")) {
+                    bson::Entry::Found(e) => {
+                        return Err(Error::Misc(format!("projection error: _id should not be here yet")));
+                    },
+                    bson::Entry::Absent(e) => {
+                        e.insert(original_id);
+                    },
+                }
+            },
+            (None, ProjectionMode::Exclude) => {
+                match try!(d.entry("_id")) {
+                    bson::Entry::Found(e) => {
+                        // the id is here, as we expect, but should it be?
+                    },
+                    bson::Entry::Absent(e) => {
+                        return Err(Error::Misc(format!("projection error: _id should be here")));
+                    },
+                }
+            },
+        }
+
+        let result = Row {
+            doc: d.into_value(),
+            pos: pos,
+            score: score,
+        };
+        Ok(result)
+    }
+
 }
 
 pub fn cmp_row(d: &Row, lit: &Row) -> Ordering {
@@ -762,19 +979,12 @@ impl Connection {
         }
     }
 
-    fn fix_positional(s: &str, pos: Option<usize>) -> String {
-        match pos {
-            None => String::from(s),
-            Some(i) => s.replace(".$", &format!(".{}", i)),
-        }
-    }
-
     // TODO maybe this could/should take ownership of ops?
     fn apply_update_ops(doc: &mut bson::Document, ops: &Vec<UpdateOp>, is_upsert: bool, pos: Option<usize>) -> Result<()> {
         for op in ops {
             match op {
                 &UpdateOp::Min(ref path, ref v) => {
-                    let path = Self::fix_positional(path, pos);
+                    let path = fix_positional(path, pos);
                     match try!(doc.entry(&path)) {
                         bson::Entry::Found(e) => {
                             let c = matcher::cmp(v, e.get());
@@ -789,7 +999,7 @@ impl Connection {
                     }
                 },
                 &UpdateOp::Max(ref path, ref v) => {
-                    let path = Self::fix_positional(path, pos);
+                    let path = fix_positional(path, pos);
                     match try!(doc.entry(&path)) {
                         bson::Entry::Found(e) => {
                             let c = matcher::cmp(v, e.get());
@@ -804,7 +1014,7 @@ impl Connection {
                     }
                 },
                 &UpdateOp::Inc(ref path, ref v) => {
-                    let path = Self::fix_positional(path, pos);
+                    let path = fix_positional(path, pos);
                     if !v.is_numeric() {
                         return Err(Error::Misc(format!("argument to $inc must be numeric")));
                     }
@@ -832,7 +1042,7 @@ impl Connection {
                     }
                 },
                 &UpdateOp::Mul(ref path, ref v) => {
-                    let path = Self::fix_positional(path, pos);
+                    let path = fix_positional(path, pos);
                     if !v.is_numeric() {
                         return Err(Error::Misc(format!("argument to $mul must be numeric")));
                     }
@@ -858,11 +1068,11 @@ impl Connection {
                     }
                 },
                 &UpdateOp::Set(ref path, ref v) => {
-                    let path = Self::fix_positional(path, pos);
+                    let path = fix_positional(path, pos);
                     try!(doc.set_path(&path, v.clone()));
                 },
                 &UpdateOp::Push(ref path, ref each, slice, ref sort, position) => {
-                    let path = Self::fix_positional(path, pos);
+                    let path = fix_positional(path, pos);
                     match try!(doc.entry(&path)) {
                         bson::Entry::Found(mut e) => {
                             match e.get_mut() {
@@ -908,7 +1118,7 @@ impl Connection {
                     }
                 },
                 &UpdateOp::PullValue(ref path, ref v) => {
-                    let path = Self::fix_positional(path, pos);
+                    let path = fix_positional(path, pos);
                     match try!(doc.entry(&path)) {
                         bson::Entry::Found(mut e) => {
                             match e.get_mut() {
@@ -927,7 +1137,7 @@ impl Connection {
                     return Err(Error::Misc(format!("TODO UpdateOp::SetOnInsert")));
                 },
                 &UpdateOp::BitAnd(ref path, v) => {
-                    let path = Self::fix_positional(path, pos);
+                    let path = fix_positional(path, pos);
                     match try!(doc.entry(&path)) {
                         bson::Entry::Found(mut e) => {
                             match e.get_mut() {
@@ -946,7 +1156,7 @@ impl Connection {
                     }
                 },
                 &UpdateOp::BitOr(ref path, v) => {
-                    let path = Self::fix_positional(path, pos);
+                    let path = fix_positional(path, pos);
                     match try!(doc.entry(&path)) {
                         bson::Entry::Found(mut e) => {
                             match e.get_mut() {
@@ -965,7 +1175,7 @@ impl Connection {
                     }
                 },
                 &UpdateOp::BitXor(ref path, v) => {
-                    let path = Self::fix_positional(path, pos);
+                    let path = fix_positional(path, pos);
                     match try!(doc.entry(&path)) {
                         bson::Entry::Found(mut e) => {
                             match e.get_mut() {
@@ -984,13 +1194,13 @@ impl Connection {
                     }
                 },
                 &UpdateOp::Unset(ref path) => {
-                    let path = Self::fix_positional(path, pos);
+                    let path = fix_positional(path, pos);
                     let _ = try!(doc.unset_path(&path));
                 },
                 &UpdateOp::Rename(ref old_path, ref new_path) => {
                     // TODO so we use the same positional op for both paths?
-                    let old_path = Self::fix_positional(old_path, pos);
-                    let new_path = Self::fix_positional(new_path, pos);
+                    let old_path = fix_positional(old_path, pos);
+                    let new_path = fix_positional(new_path, pos);
                     if doc.dives_into_any_array(&old_path) {
                         return Err(Error::Misc(format!("UpdateOp::Rename, array path: {}", old_path)));
                     }
@@ -1013,7 +1223,7 @@ impl Connection {
                     return Err(Error::Misc(format!("TODO UpdateOp::Timestamp")));
                 },
                 &UpdateOp::AddToSet(ref path, ref vals) => {
-                    let path = Self::fix_positional(path, pos);
+                    let path = fix_positional(path, pos);
                     for v in vals.items.iter() {
                         match try!(doc.entry(&path)) {
                             bson::Entry::Found(mut e) => {
@@ -1033,7 +1243,7 @@ impl Connection {
                     }
                 },
                 &UpdateOp::PullAll(ref path, ref vals) => {
-                    let path = Self::fix_positional(path, pos);
+                    let path = fix_positional(path, pos);
                     for v in vals.items.iter() {
                         match try!(doc.entry(&path)) {
                             bson::Entry::Found(mut e) => {
@@ -1051,7 +1261,7 @@ impl Connection {
                     }
                 },
                 &UpdateOp::PullQuery(ref path, ref m) => {
-                    let path = Self::fix_positional(path, pos);
+                    let path = fix_positional(path, pos);
                     match try!(doc.entry(&path)) {
                         bson::Entry::Found(mut e) => {
                             match e.get_mut() {
@@ -1067,7 +1277,7 @@ impl Connection {
                     }
                 },
                 &UpdateOp::PullPredicates(ref path, ref preds) => {
-                    let path = Self::fix_positional(path, pos);
+                    let path = fix_positional(path, pos);
                     match try!(doc.entry(&path)) {
                         bson::Entry::Found(mut e) => {
                             match e.get_mut() {
@@ -1083,7 +1293,7 @@ impl Connection {
                     }
                 },
                 &UpdateOp::Pop(ref path, i) => {
-                    let path = Self::fix_positional(path, pos);
+                    let path = fix_positional(path, pos);
                     match try!(doc.entry(&path)) {
                         bson::Entry::Found(mut e) => {
                             match e.get_mut() {
@@ -3294,6 +3504,7 @@ impl Connection {
                                         let r = Row { 
                                             doc: d,
                                             pos: row.pos,
+                                            score: row.score,
                                         };
                                         Ok(r)
                                     }).collect::<Vec<_>>();
@@ -3603,6 +3814,7 @@ impl Connection {
                     let row = Row {
                         doc: bson::Value::BDocument(v),
                         pos: None,
+                        score: None,
                     };
                     Ok(row)
                 })
@@ -3634,6 +3846,19 @@ impl Connection {
         }
     }
 
+    fn seq_project(seq: Box<Iterator<Item=Result<Row>>>, proj: Projection) -> Box<Iterator<Item=Result<Row>>> {
+        box seq.map(
+            move |rr| {
+                match rr {
+                    Ok(mut row) => {
+                        proj.project(row)
+                    },
+                    Err(e) => Err(e),
+                }
+            }
+            )
+    }
+
     fn seq_match(seq: Box<Iterator<Item=Result<Row>>>, m: matcher::QueryDoc) -> Box<Iterator<Item=Result<Row>>> {
         box seq.filter_map(move |r| Self::guts_matcher_filter_map(r, &m))
     }
@@ -3643,6 +3868,8 @@ impl Connection {
     }
 
     fn agg_project(seq: Box<Iterator<Item=Result<Row>>>, expressions: Vec<(String,AggProj)>) -> Box<Iterator<Item=Result<Row>>> {
+        // TODO would it be possible to parse these expressions into a Projection object
+        // and re-use the other project code for this case as well?
         box seq.map(
             move |rr| {
                 match rr {
@@ -3870,7 +4097,7 @@ impl Connection {
         match projection {
             Some(projection) => {
                 let projection = try!(Projection::parse(projection));
-                println!("TODO projection: {:?}", projection);
+                seq = Self::seq_project(seq, projection);
             },
             None => {
             },

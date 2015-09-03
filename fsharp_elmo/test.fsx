@@ -614,3 +614,7 @@ printfn "Passed (%d): %A" (List.length passed) passed_names
 
 printfn "Failed (%d): %A" (List.length failed) failed_names
 
+printfn "Passed (%d)" (List.length passed)
+
+printfn "Failed (%d)" (List.length failed)
+

@@ -881,6 +881,7 @@ impl<'b> Server<'b> {
                         let r = elmo::Row {
                             doc: bson::Value::BDocument(doc),
                             pos: None,
+                            score: None,
                         };
                         Some(Ok(r))
                     } else {
@@ -941,6 +942,7 @@ impl<'b> Server<'b> {
                         let r = elmo::Row {
                             doc: bson::Value::BDocument(doc),
                             pos: None,
+                            score: None,
                         };
                         Some(Ok(r))
                     } else {

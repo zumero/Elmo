@@ -1179,6 +1179,20 @@ impl Value {
         }
     }
 
+    // TODO need a naming convention for the difference between this func and the one above.
+    // TODO "must be exactly a BBoolean"
+    // TODO vs
+    // TODO "must be convertible to a bool"
+    pub fn to_bool(&self) -> Result<bool> {
+        match self {
+            &Value::BBoolean(b) => Ok(b),
+            &Value::BInt32(n) => Ok(n != 0),
+            &Value::BInt64(n) => Ok(n != 0),
+            &Value::BDouble(f) => Ok(f != 0.0),
+            _ => Err(Error::Misc(format!("need something convertible to bool, but found {:?}", self))),
+        }
+    }
+
     fn getDate(&self) -> Result<i64> {
         match self {
             &Value::BDateTime(ref s) => Ok(*s),
