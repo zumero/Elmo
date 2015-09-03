@@ -1095,6 +1095,8 @@ impl Value {
     }
 
     pub fn into_string(self) -> Result<String> {
+        // TODO consider having this (and similar functions) accept a string to use
+        // as the error message.
         match self {
             Value::BString(s) => Ok(s),
             _ => Err(Error::Misc(format!("string required, but found {:?}", self))),

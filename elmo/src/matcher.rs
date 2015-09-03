@@ -719,6 +719,7 @@ fn get_paths(q: &QueryDoc) -> Vec<String> {
                         f(a, d);
                     }
                 },
+                // TODO why don't we dive into OR and others?
                 _ => {
                 },
             }

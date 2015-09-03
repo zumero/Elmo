@@ -17,6 +17,7 @@
 #![feature(convert)]
 #![feature(box_syntax)]
 #![feature(associated_consts)]
+#![feature(append)]
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -212,6 +213,240 @@ pub struct Row {
     pub pos: Option<usize>,
     // TODO score
     // TODO stats for explain
+}
+
+#[derive(Debug)]
+pub enum ProjectionMode {
+    Include,
+    Exclude,
+}
+
+#[derive(Debug)]
+pub enum ProjectionOperator {
+    Slice1(i32),
+    Slice2(i32, i32),
+    MetaTextScore,
+    ElemMatch(matcher::QueryDoc),
+}
+
+#[derive(Debug)]
+pub struct Projection {
+    mode: ProjectionMode,
+    paths: Vec<String>,
+    ops: Vec<(String, ProjectionOperator)>,
+    // TODO need id thingie here
+}
+
+impl Projection {
+    fn is_explicit_include(v: &bson::Value) -> bool {
+        match v {
+            &bson::Value::BBoolean(b) => b == true,
+            &bson::Value::BInt32(n) => n != 0,
+            &bson::Value::BInt64(n) => n != 0,
+            &bson::Value::BDouble(n) => n != 0.0,
+            _ => false,
+        }
+    }
+
+    fn is_explicit_exclude(v: &bson::Value) -> bool {
+        match v {
+            &bson::Value::BBoolean(b) => b == false,
+            &bson::Value::BInt32(n) => n == 0,
+            &bson::Value::BInt64(n) => n == 0,
+            &bson::Value::BDouble(n) => n == 0.0,
+            _ => false,
+        }
+    }
+
+    fn has_position_operator(s: &str) -> Result<bool> {
+        let parts = s.split('.').collect::<Vec<_>>();
+        let len_parts = parts.len();
+        let mut posops = parts.into_iter().enumerate().filter(|&(i,s)| s == "$").collect::<Vec<_>>();
+        if posops.len() == 0 {
+            Ok(false)
+        } else if posops.len() > 1 {
+            Err(Error::Misc(format!("invalid projection: only one position operator allowed: {:?}", s)))
+        } else {
+            let (i,_) = posops.remove(0);
+            if i == len_parts - 1 {
+                Ok(true)
+            } else {
+                Err(Error::Misc(format!("invalid projection: position operator must appear at the end of the path: {:?}", s)))
+            }
+        }
+    }
+
+    pub fn parse(proj: bson::Document) -> Result<Projection> {
+        let pairs = proj.pairs;
+
+        let (paths, pairs, maybe_mode) = {
+            let (excludes, pairs): (Vec<_>, Vec<_>) = pairs.into_iter().partition(|&(ref k, ref v)| k != "_id" && Self::is_explicit_exclude(v));
+            let (includes, pairs): (Vec<_>, Vec<_>) = pairs.into_iter().partition(|&(ref k, ref v)| k != "_id" && Self::is_explicit_include(v));
+            let (paths, maybe_mode) = 
+                if includes.len() > 0 {
+                    if excludes.len() > 0 {
+                        return Err(Error::Misc(format!("invalid projection: cannot have both includes and excludes {:?}, {:?}", includes, excludes)));
+                    } else {
+                        (includes, Some(ProjectionMode::Include))
+                    }
+                } else if excludes.len() > 0 {
+                    (excludes, Some(ProjectionMode::Exclude))
+                } else {
+                    // we have no explicit includes or excludes.
+                    // the two empty vecs are the same.  pick one.
+                    (includes, None)
+                };
+            (paths, pairs, maybe_mode)
+        };
+
+        let (id, pairs): (Vec<_>, Vec<_>) = pairs.into_iter().partition(|&(ref k, ref v)| k == "_id");
+        let (ops, pairs): (Vec<_>, Vec<_>) = pairs.into_iter().partition(|&(ref k, ref v)| 
+                                         match v {
+                                             &bson::Value::BDocument(ref bd) => {
+                                                 bd.len() == 1 && bd.pairs[0].0.starts_with("$")
+                                             },
+                                             _ => false,
+                                         }
+                                        );
+        if pairs.len() > 0 {
+            return Err(Error::Misc(format!("invalid stuff in projection: {:?}", pairs)));
+        }
+
+        let paths = paths.into_iter().map(|(k,_)| k).collect::<Vec<_>>();
+        let posop = {
+            fn fetch_paths(a: Vec<bool>, paths: &Vec<String>) -> Vec<&str> {
+                a
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i,b)| 
+                                if b {
+                                    Some(paths[i].as_str())
+                                } else {
+                                    None
+                                }
+                                )
+                    .collect::<Vec<_>>()
+            }
+
+            let paths_with_posop = try!(paths
+                                        .iter()
+                                        .map(|p| Self::has_position_operator(p))
+                                        .collect::<Result<Vec<_>>>());
+            let ops_with_posop = try!(ops
+                                        .iter()
+                                        .map(|&(ref p,_)| Self::has_position_operator(p))
+                                        .collect::<Result<Vec<_>>>());
+            let mut paths_with_posop = fetch_paths(paths_with_posop, &paths);
+            if paths_with_posop.len() > 0 {
+                match maybe_mode {
+                    Some(ProjectionMode::Exclude) => {
+                        return Err(Error::Misc(format!("projection posop not allowed in exclude: {:?}", paths)));
+                    },
+                    _ => {
+                        // okay
+                    },
+                }
+            }
+            let mut ops_with_posop = fetch_paths(ops_with_posop, &paths);
+            paths_with_posop.append(&mut ops_with_posop);
+            let r =
+            if paths_with_posop.len() > 1 {
+                return Err(Error::Misc(format!("only one posop allowed")));
+            } else {
+                match paths_with_posop.pop() {
+                    None => None,
+                    Some(s) => {
+                        Some(String::from(s))
+                    },
+                }
+            };
+            r
+        };
+        // TODO check posop against matcher query paths, etc
+        let id = id.into_iter().map(|(_,v)| v).collect::<Vec<_>>();
+        assert!(id.len() <= 1);
+        let id = {
+            let mut id = id;
+            id.pop();
+        };
+        let ops = try!(ops.into_iter()
+            .map(|(k,d)|
+                 match d {
+                    bson::Value::BDocument(mut bd) => {
+                        let (op, arg) = bd.pairs.remove(0);
+                        let op =
+                            match op.as_str() {
+                                "$meta" => {
+                                    let arg = try!(arg.into_string());
+                                    if arg.as_str() == "textScore" {
+                                        Ok(ProjectionOperator::MetaTextScore)
+                                    } else {
+                                        Err(Error::Misc(format!("invalid projection op $meta keyword: {:?}", arg)))
+                                    }
+                                },
+                                "$slice" => {
+                                    match arg {
+                                        bson::Value::BInt32(_) 
+                                        | bson::Value::BInt64(_) 
+                                        | bson::Value::BDouble(_) 
+                                        => {
+                                            let n = try!(arg.numeric_to_i32());
+                                            Ok(ProjectionOperator::Slice1(n))
+                                        },
+                                        bson::Value::BArray(ba) => {
+                                            if ba.len() == 2 {
+                                                let n0 = try!(ba.items[0].numeric_to_i32());
+                                                let n1 = try!(ba.items[1].numeric_to_i32());
+                                                Ok(ProjectionOperator::Slice2(n0, n1))
+                                            } else {
+                                                Err(Error::Misc(format!("invalid arg to projection op $slice: {:?}", ba)))
+                                            }
+                                        },
+                                        _ => {
+                                            Err(Error::Misc(format!("invalid arg to projection op $slice: {:?}", arg)))
+                                        },
+                                    }
+                                },
+                                "$elemMatch" => {
+                                    let m = try!(matcher::parse_query(try!(arg.into_document())));
+                                    Ok(ProjectionOperator::ElemMatch(m))
+                                },
+                                _ => Err(Error::Misc(format!("invalid projection op: {:?}", op)))
+                            };
+                        let op = try!(op);
+                        Ok((k,op))
+                    },
+                    _ => {
+                        // because we already checked this above
+                        unreachable!();
+                    },
+                 }
+            )
+            .collect::<Result<Vec<_>>>());
+
+        let mode = 
+            match maybe_mode {
+                Some(m) => m,
+                None => {
+                    // TODO what mode to use?
+
+                    // mongo's rules for deciding whether to use exclude mode or include mode seem
+                    // inconsistent for cases where there are no explicit includes or excludes.
+                    // elemMatchProjection.js has one test where a projection has only a $slice,
+                    // and another test where the projection has only an $elemMatch, and these
+                    // two cases end up in different modes.  So...
+
+                    ProjectionMode::Exclude
+                },
+            };
+
+        let proj = Projection {
+            mode: mode,
+            paths: paths,
+            ops: ops,
+        };
+        Ok(proj)
+    }
 }
 
 pub fn cmp_row(d: &Row, lit: &Row) -> Ordering {
@@ -3634,6 +3869,7 @@ impl Connection {
         }
         match projection {
             Some(projection) => {
+                let projection = try!(Projection::parse(projection));
                 println!("TODO projection: {:?}", projection);
             },
             None => {
