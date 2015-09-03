@@ -229,6 +229,13 @@ fn reply_code(req_id: i32, err: Error) -> Reply {
 fn reply_err(req_id: i32, err: Error) -> Reply {
     let mut doc = bson::Document::new();
     doc.set_string("$err", format!("{:?}", err));
+    match err {
+        elmo::Error::MongoCode(code, _) => {
+            doc.set_i32("code", code);
+        },
+        _ => {
+        },
+    }
     doc.set_i32("ok", 0);
     let mut r = create_reply(req_id, vec![doc], 0);
     r.flags = 2;
@@ -238,6 +245,13 @@ fn reply_err(req_id: i32, err: Error) -> Reply {
 fn reply_errmsg(req_id: i32, err: Error) -> Reply {
     let mut doc = bson::Document::new();
     doc.set_string("errmsg", format!("{:?}", err));
+    match err {
+        elmo::Error::MongoCode(code, _) => {
+            doc.set_i32("code", code);
+        },
+        _ => {
+        },
+    }
     doc.set_i32("ok", 0);
     create_reply(req_id, vec![doc], 0)
 }

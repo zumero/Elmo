@@ -36,6 +36,8 @@ pub enum Error {
     // TODO remove Misc
     Misc(String),
 
+    MongoCode(i32, String),
+
     // TODO more detail within CorruptFile
     CorruptFile(&'static str),
 
@@ -53,6 +55,7 @@ impl std::fmt::Display for Error {
             Error::Utf8(ref err) => write!(f, "Utf8 error: {}", err),
             Error::Whatever(ref err) => write!(f, "Other error: {}", err),
             Error::Misc(ref s) => write!(f, "Misc error: {}", s),
+            Error::MongoCode(code, ref s) => write!(f, "Mongo error code {}: {}", code, s),
             Error::CorruptFile(s) => write!(f, "Corrupt file: {}", s),
         }
     }
@@ -66,6 +69,7 @@ impl std::error::Error for Error {
             Error::Utf8(ref err) => std::error::Error::description(err),
             Error::Whatever(ref err) => std::error::Error::description(&**err),
             Error::Misc(ref s) => s.as_str(),
+            Error::MongoCode(code, ref s) => s.as_str(),
             Error::CorruptFile(s) => s,
         }
     }
@@ -3251,6 +3255,25 @@ impl Connection {
                     _ => Ok(v0),
                 }
             },
+            &Expr::Mod(ref t) => {
+                let v0 = try!(Self::eval(ctx, &t.0));
+                let v1 = try!(Self::eval(ctx, &t.1));
+                if !v0.is_numeric() || !v1.is_numeric() {
+                    return Err(Error::MongoCode(16611, format!("16611 numeric types only: {:?}", t)));
+                }
+                match (v0,v1) {
+                    (bson::Value::BInt32(n0),bson::Value::BInt32(n1)) => Ok(bson::Value::BInt32(n0 % n1)),
+                    (bson::Value::BInt64(n0),bson::Value::BInt64(n1)) => Ok(bson::Value::BInt64(n0 % n1)),
+                    (bson::Value::BDouble(n0),bson::Value::BDouble(n1)) => Ok(bson::Value::BDouble(n0 % n1)),
+
+                    (bson::Value::BInt64(n0),bson::Value::BInt32(n1)) => Ok(bson::Value::BInt64(n0 % (n1 as i64))),
+                    (bson::Value::BInt32(n0),bson::Value::BInt64(n1)) => Ok(bson::Value::BInt64((n0 as i64) % n1)),
+
+                    // TODO mixtures of double and int
+
+                    (v0,v1) => Err(Error::Misc(format!("invalid types for mod: {:?}, {:?}", v0, v1)))
+                }
+            }
             &Expr::Subtract(ref t) => {
                 let v0 = try!(Self::eval(ctx, &t.0));
                 let v1 = try!(Self::eval(ctx, &t.1));
@@ -3275,7 +3298,7 @@ impl Connection {
                 let vals = try!(a.iter().map(|e| Self::eval(ctx, e)).collect::<Result<Vec<_>>>());
                 let count_dates = vals.iter().filter(|v| v.is_date()).count();
                 if count_dates > 1 {
-                    Err(Error::Misc(format!("16612 only one date allowed: {:?}", a)))
+                    Err(Error::MongoCode(16612, format!("only one date allowed: {:?}", a)))
                 } else if count_dates == 0 {
                     let vals = try!(vals.iter().map(|v| {
                         let f = try!(v.numeric_to_f64());
@@ -3307,7 +3330,78 @@ impl Connection {
                 let b = v.iter().any(|b| *b);
                 Ok(bson::Value::BBoolean(b))
             },
-            _ => Err(Error::Misc(format!("TODO eval: {:?}", e)))
+            &Expr::AnyElementTrue(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::AllElementsTrue(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::DayOfMonth(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::DayOfWeek(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::DayOfYear(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::Hour(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::Minute(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::Second(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::Millisecond(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::Week(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::Month(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::Year(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::Not(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::Divide(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::SetDifference(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::SetIsSubset(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::SetEquals(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::SetIntersection(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::SetUnion(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::Cond(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::Multiply(_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::Map(_,_,_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::Let(_,_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
+            &Expr::DateToString(_,_) => {
+                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            },
         }
     }
 
@@ -3337,7 +3431,7 @@ impl Connection {
                     bson::Value::BDocument(bd) => {
                         if  bd.pairs.iter().any(|&(ref k, _)| k.starts_with("$")) {
                             if path.as_str() == "" {
-                                return Err(Error::Misc(String::from("16404 $project key begins with $")))
+                                return Err(Error::MongoCode(16404, String::from("$project key begins with $")))
                             } else {
                                 a.push((path, bson::Value::BDocument(bd)));
                             }
@@ -3400,7 +3494,7 @@ impl Connection {
                             let args = try!(flatten_projection(v));
                             // TODO is this $ check needed here again?  It's also done in flatten_projection().
                             if args.iter().any(|&(ref k, _)| k.starts_with("$")) {
-                                return Err(Error::Misc(String::from("16404 $project key begins with $")))
+                                return Err(Error::MongoCode(16404, String::from("16404 $project key begins with $")))
                             }
                             let (mut id, not_id): (Vec<_>, Vec<_>) = args.into_iter().partition(|&(ref k, _)| k=="_id");
                             if id.len() > 1 {
