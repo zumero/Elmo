@@ -83,6 +83,12 @@ impl From<std::str::Utf8Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+pub enum FoundPath<'a> {
+    NotFound,
+    Value(&'a Value),
+    Dive(Vec<FoundPath<'a>>),
+}
+
 // TODO this function doesn't seem to go here
 pub fn split_name(s: &str) -> Result<(&str, &str)> {
     match s.find('.') {
@@ -482,6 +488,24 @@ impl Document {
         }
     }
 
+    pub fn find_path2<'a>(&'a self, path: &str) -> Result<FoundPath<'a>> {
+        let dot = path.find('.');
+        let name = match dot { 
+            None => path,
+            Some(ndx) => &path[0 .. ndx]
+        };
+        match slice_find(&self.pairs, name) {
+            Some(ndx) => {
+                let v = &self.pairs[ndx].1;
+                match dot {
+                    None => Ok(FoundPath::Value(v)),
+                    Some(dot) => v.find_path2(&path[dot+1..])
+                }
+            },
+            None => Ok(FoundPath::NotFound),
+        }
+    }
+
     pub fn find_path(&self, path: &str) -> Value {
         let dot = path.find('.');
         let name = match dot { 
@@ -557,6 +581,63 @@ impl Array {
             }
         }
         Ok(())
+    }
+
+    pub fn find_path2<'a>(&'a self, path: &str) -> Result<FoundPath<'a>> {
+        let dot = path.find('.');
+        let name = match dot { 
+            None => path,
+            Some(ndx) => &path[0 .. ndx]
+        };
+        // TODO why not parse as usize?  
+        // what should happen if an element of the path is a
+        // negative number?
+        match name.parse::<i32>() {
+            Err(_) => {
+                // when we have an array and the next step of the path is not
+                // an integer index, we search any subdocs in that array for
+                // that path and construct an array of the matches.
+
+                // document : { a:1, b:[ { c:1 }, { c:2 } ] }
+                // path : b.c
+                // needs to get: [ 1, 2 ]
+
+                // TODO are there any functions in the matcher which could be
+                // simplified by using this function? 
+                let a = self.items.iter().filter_map(|subv| 
+                        match subv {
+                        &Value::BDocument(_) => {
+                            Some(subv.find_path2(path))
+                        },
+                        _ => {
+                            // child of the array is not a document.
+                            // TODO should this be an error?
+                            None
+                        },
+                        }
+                                               ).collect::<Result<Vec<_>>>();
+                let a = try!(a);
+                // if nothing matched, return None instead of an empty array.
+                // TODO is this right?
+                if a.len()==0 { Ok(FoundPath::NotFound) } else { Ok(FoundPath::Dive(a)) }
+            }, 
+            Ok(ndx) => {
+                if ndx<0 {
+                    // TODO or we could return something like FoundPath::NegativeArrayIndex
+                    return Err(Error::Misc(format!("invalid path, negative array index: {}", path)));
+                } else if (ndx as usize)>=self.items.len() {
+                    // FoundPath::ArrayIndexTooLarge
+                    // TODO useless panic.  need to return Result.
+                    panic!( "array index too large");
+                } else {
+                    let v = &self.items[ndx as usize];
+                    match dot {
+                        None => Ok(FoundPath::Value(v)),
+                        Some(dot) => v.find_path2(&path[dot+1..])
+                    }
+                }
+            }
+        }
     }
 
     pub fn set_path(&mut self, path: &str, v: Value) -> Result<()> {
@@ -1341,6 +1422,15 @@ impl Value {
         &Value::BInt64(a) => Ok(a as f64),
         &Value::BDouble(a) => Ok(a),
         _ => Err(Error::Misc(String::from("must be convertible to f64"))),
+        }
+    }
+
+    pub fn find_path2<'a>(&'a self, path: &str) -> Result<FoundPath<'a>> {
+        match self {
+            &Value::BDocument(ref bd) => bd.find_path2(path),
+            &Value::BArray(ref ba) => ba.find_path2(path),
+            // TODO or maybe FoundPath::NotContainer
+            _ => Ok(FoundPath::NotFound)
         }
     }
 
