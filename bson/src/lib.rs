@@ -1217,42 +1217,52 @@ impl Value {
 
     pub fn as_i32(&self) -> Result<i32> {
         match self {
-            &Value::BInt32(ref s) => Ok(*s),
+            &Value::BInt32(s) => Ok(s),
             _ => Err(Error::Misc(String::from("must be i32"))),
         }
     }
 
     pub fn numeric_to_i32(&self) -> Result<i32> {
         match self {
-            &Value::BInt32(ref s) => Ok((*s) as i32),
-            &Value::BInt64(ref s) => Ok((*s) as i32),
-            &Value::BDouble(ref s) => Ok((*s) as i32),
+            &Value::BInt32(s) => Ok(s as i32),
+            &Value::BInt64(s) => Ok(s as i32),
+            &Value::BDouble(s) => Ok(s as i32),
             _ => Err(Error::Misc(format!("numeric required, but found {:?}", self))),
         }
     }
 
     pub fn integer_to_i64(&self) -> Result<i64> {
         match self {
-            &Value::BInt32(ref s) => Ok((*s) as i64),
-            &Value::BInt64(ref s) => Ok((*s) as i64),
+            &Value::BInt32(s) => Ok(s as i64),
+            &Value::BInt64(s) => Ok(s as i64),
             _ => Err(Error::Misc(format!("integer required, but found {:?}", self))),
         }
     }
 
     pub fn numeric_to_i64(&self) -> Result<i64> {
         match self {
-            &Value::BInt32(ref s) => Ok((*s) as i64),
-            &Value::BInt64(ref s) => Ok((*s) as i64),
-            &Value::BDouble(ref s) => Ok((*s) as i64),
+            &Value::BInt32(s) => Ok(s as i64),
+            &Value::BInt64(s) => Ok(s as i64),
+            &Value::BDouble(s) => Ok(s as i64),
+            _ => Err(Error::Misc(format!("numeric required, but found {:?}", self))),
+        }
+    }
+
+    pub fn numeric_or_datetime_to_i64(&self) -> Result<i64> {
+        match self {
+            &Value::BInt32(s) => Ok(s as i64),
+            &Value::BInt64(s) => Ok(s as i64),
+            &Value::BDateTime(s) => Ok(s as i64),
+            &Value::BDouble(s) => Ok(s as i64),
             _ => Err(Error::Misc(format!("numeric required, but found {:?}", self))),
         }
     }
 
     pub fn numeric_to_f64(&self) -> Result<f64> {
         match self {
-            &Value::BInt32(ref s) => Ok((*s) as f64),
-            &Value::BInt64(ref s) => Ok((*s) as f64),
-            &Value::BDouble(ref s) => Ok((*s) as f64),
+            &Value::BInt32(s) => Ok(s as f64),
+            &Value::BInt64(s) => Ok(s as f64),
+            &Value::BDouble(s) => Ok(s as f64),
             _ => Err(Error::Misc(format!("numeric required, but found {:?}", self))),
         }
     }

@@ -629,6 +629,7 @@ impl Projection {
                         e.insert(original_id);
                     },
                 }
+                let _ = try!(d.validate_id());
             },
             (Some(false), ProjectionMode::Include) => {
                 match try!(d.entry("_id")) {
@@ -671,6 +672,7 @@ impl Projection {
                         e.insert(original_id);
                     },
                 }
+                let _ = try!(d.validate_id());
             },
             (None, ProjectionMode::Exclude) => {
                 match try!(d.entry("_id")) {
@@ -1916,6 +1918,7 @@ impl Connection {
             Ok(v) => v,
             Err(e) => return Ok((false,Some(e),false,None,None)),
         };
+        //println!("find_and_modify: {:?}", found);
         let was_found = found.is_some();
         let inner = || -> Result<(bool,Option<bson::Value>,Option<bson::Document>)> {
         if remove.is_some() && upsert {
@@ -3078,7 +3081,7 @@ impl Connection {
                             },
                         }
                     } else {
-                        Err(Error::Misc(format!("TODO what is this? {}", k)))
+                        Ok(Expr::Literal(bson::Value::BDocument(bd)))
                     }
                 } else {
                     // TODO any cases where this is not a literal need to have
@@ -3370,11 +3373,28 @@ impl Connection {
                         let f = try!(v.numeric_to_f64());
                         Ok(f)
                     }).collect::<Result<Vec<_>>>());
+                    // TODO use iter.sum
                     let sum = vals.iter().fold(0.0, |acc, &v| acc + v);
                     Ok(bson::Value::BDouble(sum))
                 } else {
-                    Err(Error::Misc(format!("TODO add to date")))
+                    let vals = try!(vals.iter().map(|v| {
+                        let f = try!(v.numeric_or_datetime_to_i64());
+                        Ok(f)
+                    }).collect::<Result<Vec<_>>>());
+                    // TODO use iter.sum
+                    let sum = vals.iter().fold(0, |acc, &v| acc + v);
+                    Ok(bson::Value::BDateTime(sum))
                 }
+            },
+            &Expr::Multiply(ref a) => {
+                let vals = try!(a.iter().map(|e| Self::eval(ctx, e)).collect::<Result<Vec<_>>>());
+                let vals = try!(vals.iter().map(|v| {
+                    let f = try!(v.numeric_to_f64());
+                    Ok(f)
+                }).collect::<Result<Vec<_>>>());
+                // TODO use iter.product
+                let product = vals.iter().fold(1.0, |acc, &v| acc * v);
+                Ok(bson::Value::BDouble(product))
             },
             &Expr::And(ref a) => {
                 // TODO what we actually want here is to stop on the first
@@ -3453,9 +3473,6 @@ impl Connection {
             &Expr::Cond(_) => {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
-            &Expr::Multiply(_) => {
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
-            },
             &Expr::Map(_,_,_) => {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
@@ -3525,7 +3542,7 @@ impl Connection {
             |d| {
                 let mut d = try!(d.into_document());
                 if d.pairs.len() != 1 {
-                    Err(Error::Misc(String::from("agg pipeline stage spec must have one item in it")))
+                    Err(Error::MongoCode(16435, String::from("agg pipeline stage spec must have one item in it")))
                 } else {
                     let (k, v) = d.pairs.pop().expect("just checked this");
                     match k.as_str() {
@@ -3632,7 +3649,7 @@ impl Connection {
                         "$geoNear" => {
                             Err(Error::Misc(format!("agg pipeline TODO: {}", k)))
                         },
-                        _ => Err(Error::Misc(format!("16435 invalid agg pipeline stage name: {}", k)))
+                        _ => Err(Error::MongoCode(16435, format!("invalid agg pipeline stage name: {}", k)))
                     }
                 }
             }).collect::<Result<Vec<AggOp>>>()
@@ -3990,8 +4007,12 @@ impl Connection {
                 let (b, pos) = matcher::match_query(&m, &row.doc);
                 if b {
                     //println!("    matched");
-                    // TODO pos
-                    Some(Ok(row))
+                    let r = Row {
+                        doc: row.doc,
+                        pos: pos,
+                        score: row.score,
+                    };
+                    Some(Ok(r))
                 } else {
                     //println!("    no");
                     None

@@ -686,7 +686,7 @@ pub fn match_query(m: &QueryDoc, d: &bson::Value) -> (bool,Option<usize>) {
         pos.set(Some(n));
     };
     let b = match_query_doc(m, d, &cb);
-    (b,pos.get())
+    (b, pos.get())
 }
 
 fn contains_no_dollar_keys(v: &bson::Value) -> bool {
@@ -799,7 +799,7 @@ fn parse_pred(k: &str, v: bson::Value) -> Result<Pred> {
         "$gte" => Ok(Pred::GTE(try!(not_regex(v)))),
         "$lte" => Ok(Pred::LTE(try!(not_regex(v)))),
         "$regex" => panic!("TODO parse_pred regex"),
-        "$exists" => Ok(Pred::Exists(try!(v.as_bool()))),
+        "$exists" => Ok(Pred::Exists(try!(v.to_bool()))),
         "$type" => Ok(Pred::Type(try!(v.numeric_to_i32()))),
         "$size" => {
             match v {
