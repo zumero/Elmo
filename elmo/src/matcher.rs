@@ -6,6 +6,7 @@ use super::Result;
 
 extern crate misc;
 extern crate bson;
+extern crate regex;
 
 #[derive(Debug)]
 pub enum QueryDoc {
@@ -42,8 +43,7 @@ pub enum Pred {
     LT(bson::Value),
     GTE(bson::Value),
     LTE(bson::Value),
-    // TODO regex should be in compiled form, not a string
-    REGEX(String),
+    REGEX(regex::Regex),
     Near(bson::Value),
     NearSphere(bson::Value),
     GeoWithin(bson::Value),
@@ -256,8 +256,10 @@ fn cmp_in(d: &bson::Value, lit: &bson::Value) -> bool {
         &bson::Value::BRegex(ref expr, ref options) => {
             match d {
                 &bson::Value::BString(ref s) => {
-                    // TODO use expr and options to construct a regex and match s
-                    panic!("TODO regex");
+                    // TODO need to propagate this error, not unwrap/panic
+                    // TODO options
+                    let re = regex::Regex::new(expr).unwrap();
+                    re.is_match(s)
                 },
                 _ => {
                     false
@@ -428,11 +430,10 @@ fn match_predicate<F: Fn(usize)>(pred: &Pred, d: &bson::Value, cb_array_pos: &F)
         &Pred::GT(ref lit) => cmp_gt(d, lit),
         &Pred::LTE(ref lit) => cmp_lte(d, lit),
         &Pred::GTE(ref lit) => cmp_gte(d, lit),
-        &Pred::REGEX(_) => {
+        &Pred::REGEX(ref re) => {
             match d {
                 &bson::Value::BString(ref s) => {
-                    // TODO use regex to match s
-                    panic!("TODO regex");
+                    re.is_match(s)
                 },
                 _ => false,
             }
@@ -798,9 +799,13 @@ fn parse_pred(k: &str, v: bson::Value) -> Result<Pred> {
         "$lt" => Ok(Pred::LT(try!(not_regex(v)))),
         "$gte" => Ok(Pred::GTE(try!(not_regex(v)))),
         "$lte" => Ok(Pred::LTE(try!(not_regex(v)))),
-        "$regex" => panic!("TODO parse_pred regex"),
         "$exists" => Ok(Pred::Exists(try!(v.to_bool()))),
         "$type" => Ok(Pred::Type(try!(v.numeric_to_i32()))),
+        "$regex" => {
+            let v = try!(v.into_string());
+            let re = try!(regex::Regex::new(&v).map_err(super::wrap_err));
+            Ok(Pred::REGEX(re))
+        },
         "$size" => {
             match v {
                 bson::Value::BInt32(n) => Ok(Pred::Size(n)),
@@ -938,19 +943,25 @@ fn parse_pred(k: &str, v: bson::Value) -> Result<Pred> {
 
 pub fn parse_pred_list(pairs: Vec<(String,bson::Value)>) -> Result<Vec<Pred>> {
     let (regex, other): (Vec<_>, Vec<_>) = pairs.into_iter().partition(|&(ref k,_)| k == "$regex" || k == "$options");
-    let preds = try!(other.into_iter().map(|(k,v)| parse_pred(&k,v)).collect::<Result<Vec<_>>>());
-    let expr = regex.iter().find(|&&(ref k, _)| k == "$regex");
-    let options = regex.iter().find(|&&(ref k, _)| k == "$options");
+    let mut preds = try!(other.into_iter().map(|(k,v)| parse_pred(&k,v)).collect::<Result<Vec<_>>>());
+    let (mut expr, mut options): (Vec<_>, Vec<_>) = regex.into_iter().partition(|&(ref k,_)| k == "$regex");
+    // TODO need a function which takes a vector of len 0 or 1 and consumes it in Option<T>
+    let expr = expr.pop();
+    let options = options.pop();
     match (expr, options) {
-        (Some(expr), None) => {
-            panic!("TODO regex");
+        (Some((_,expr)), None) => {
+            let expr = try!(expr.into_string());
+            let re = try!(regex::Regex::new(&expr).map_err(super::wrap_err));
+            preds.push(Pred::REGEX(re));
         },
-        (Some(expr), Some(options)) => {
-            panic!("TODO regex");
+        (Some((_,expr)), Some((_,options))) => {
+            // TODO options
+            let expr = try!(expr.into_string());
+            let re = try!(regex::Regex::new(&expr).map_err(super::wrap_err));
+            preds.push(Pred::REGEX(re));
         },
         (None, Some(_)) => {
-            // TODO error
-            panic!("TODO regex");
+            return Err(super::Error::Misc(String::from("regex options with expression")));
         },
         (None, None) => {
             // nothing to do here
@@ -977,7 +988,9 @@ fn parse_compare(k: &str, v: &bson::Value) -> Result<QueryItem> {
                 }
             },
             &bson::Value::BRegex(ref expr, ref options) => {
-                QueryItem::Compare(String::from(k), vec![Pred::REGEX(String::from("TODO"))])
+                // TODO options
+                let re = try!(regex::Regex::new(expr).map_err(super::wrap_err));
+                QueryItem::Compare(String::from(k), vec![Pred::REGEX(re)])
             },
             _ => {
                 // TODO clone

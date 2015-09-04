@@ -12,6 +12,7 @@ path = "../bson"
 
 [dependencies]
 time = "*"
+regex = "*"
 
 # The testing profile, used for `cargo test`
 [profile.test]
