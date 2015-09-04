@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::cmp::Ordering;
 
+extern crate time;
+
 extern crate misc;
 
 use misc::endian;
@@ -1247,10 +1249,17 @@ impl Connection {
                     }
                 },
                 &UpdateOp::Date(ref path) => {
-                    return Err(Error::Misc(format!("TODO UpdateOp::Date")));
+                    let path = fix_positional(path, pos);
+                    let ts = time::get_time();
+                    let v = bson::Value::BDateTime(ts.sec * 1000);
+                    try!(doc.set_path(&path, v));
                 },
                 &UpdateOp::TimeStamp(ref path) => {
-                    return Err(Error::Misc(format!("TODO UpdateOp::Timestamp")));
+                    // TODO a timestamp is a little different, actually
+                    let path = fix_positional(path, pos);
+                    let ts = time::get_time();
+                    let v = bson::Value::BTimeStamp(ts.sec * 1000);
+                    try!(doc.set_path(&path, v));
                 },
                 &UpdateOp::AddToSet(ref path, ref vals) => {
                     let path = fix_positional(path, pos);
@@ -1630,7 +1639,29 @@ impl Connection {
                     }
                 },
                 "$currentDate" => {
-                    return Err(Error::Misc(format!("TODO parse update op: {}", k)));
+                    for (path, v) in try!(v.into_document()).pairs {
+                        match v {
+                            bson::Value::BBoolean(true) => {
+                                result.push(UpdateOp::Date(path));
+                            },
+                            bson::Value::BDocument(bd) => {
+                                if bd.len() != 1 {
+                                    return Err(Error::Misc(format!("invalid $currentDate: {:?}", bd)));
+                                }
+                                if bd.pairs[0].0.as_str() != "$type" {
+                                    return Err(Error::Misc(format!("invalid $currentDate: {:?}", bd)));
+                                }
+                                match try!(bd.pairs[0].1.as_str()) {
+                                    "date" => result.push(UpdateOp::Date(path)),
+                                    "timestamp" => result.push(UpdateOp::TimeStamp(path)),
+                                    s => return Err(Error::Misc(format!("invalid $currentDate: {:?}", s))),
+                                }
+                            },
+                            _ => {
+                                return Err(Error::Misc(format!("invalid $currentDate: {:?}", v)));
+                            },
+                        }
+                    }
                 },
                 "$addToSet" => {
                     for (path, v) in try!(v.into_document()).pairs {
@@ -3098,6 +3129,14 @@ impl Connection {
     }
 
     fn eval(ctx: &bson::Document, e: &Expr) -> Result<bson::Value> {
+        let eval_tm = |v: &Expr| -> Result<time::Tm> {
+            let d = try!(Self::eval(ctx, v));
+            let sec = try!(d.datetime_to_i64()) / 1000;
+            let ts = time::Timespec::new(sec, 0);
+            let tm = time::at(ts);
+            Ok(tm)
+        };
+
         match e {
             &Expr::Literal(ref v) => Ok(v.clone()),
             &Expr::Var(ref s) => {
@@ -3422,35 +3461,60 @@ impl Connection {
             &Expr::AllElementsTrue(_) => {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
-            &Expr::DayOfMonth(_) => {
+            &Expr::DayOfMonth(ref v) => {
+                let tm = try!(eval_tm(v));
+                // mongo wants 1 thru 31
+                // tm is same
+                Ok(bson::Value::BInt32(tm.tm_mday))
+            },
+            &Expr::DayOfWeek(ref v) => {
+                let tm = try!(eval_tm(v));
+                // mongo wants 1 thru 7
+                // tm is 0 thru 6
+                Ok(bson::Value::BInt32(tm.tm_wday + 1))
+            },
+            &Expr::DayOfYear(ref v) => {
+                let tm = try!(eval_tm(v));
+                // mongo wants 1 thru 366
+                // tm is 0 thru 365
+                Ok(bson::Value::BInt32(tm.tm_yday + 1))
+            },
+            &Expr::Hour(ref v) => {
+                let tm = try!(eval_tm(v));
+                // mongo wants 0 thru 23
+                // tm is same
+                Ok(bson::Value::BInt32(tm.tm_hour))
+            },
+            &Expr::Minute(ref v) => {
+                let tm = try!(eval_tm(v));
+                // mongo wants 0 thru 59
+                // tm is same
+                Ok(bson::Value::BInt32(tm.tm_min))
+            },
+            &Expr::Second(ref v) => {
+                let tm = try!(eval_tm(v));
+                // mongo wants 0 thru 59
+                // tm is same
+                Ok(bson::Value::BInt32(tm.tm_sec))
+            },
+            &Expr::Millisecond(ref v) => {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
-            &Expr::DayOfWeek(_) => {
+            &Expr::Week(ref v) => {
+                // mongo wants 0 thru 53
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
-            &Expr::DayOfYear(_) => {
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            &Expr::Month(ref v) => {
+                let tm = try!(eval_tm(v));
+                // mongo wants 1 thru 12
+                // tm is 0 thru 11
+                Ok(bson::Value::BInt32(tm.tm_mon + 1))
             },
-            &Expr::Hour(_) => {
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
-            },
-            &Expr::Minute(_) => {
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
-            },
-            &Expr::Second(_) => {
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
-            },
-            &Expr::Millisecond(_) => {
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
-            },
-            &Expr::Week(_) => {
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
-            },
-            &Expr::Month(_) => {
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
-            },
-            &Expr::Year(_) => {
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            &Expr::Year(ref v) => {
+                let tm = try!(eval_tm(v));
+                // mongo wants full 4 digits
+                // tm is since 1900
+                Ok(bson::Value::BInt32(tm.tm_year + 1900))
             },
             &Expr::Not(_) => {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))

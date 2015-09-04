@@ -10,6 +10,9 @@ path = "../misc"
 [dependencies.bson]
 path = "../bson"
 
+[dependencies]
+time = "*"
+
 # The testing profile, used for `cargo test`
 [profile.test]
 opt-level = 3

@@ -1248,6 +1248,13 @@ impl Value {
         }
     }
 
+    pub fn datetime_to_i64(&self) -> Result<i64> {
+        match self {
+            &Value::BDateTime(s) => Ok(s as i64),
+            _ => Err(Error::Misc(format!("datetime required, but found {:?}", self))),
+        }
+    }
+
     pub fn numeric_or_datetime_to_i64(&self) -> Result<i64> {
         match self {
             &Value::BInt32(s) => Ok(s as i64),
