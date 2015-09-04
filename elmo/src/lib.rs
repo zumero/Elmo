@@ -233,6 +233,18 @@ pub enum ProjectionOperator {
     ElemMatch(matcher::QueryDoc),
 }
 
+fn f64_can_be_i32(f: f64) -> bool {
+    let n = f as i32;
+    let f2 = n as f64;
+    f == f2
+}
+
+fn f64_can_be_i64(f: f64) -> bool {
+    let n = f as i64;
+    let f2 = n as f64;
+    f == f2
+}
+
 fn fix_positional(s: &str, pos: Option<usize>) -> String {
     match pos {
         None => String::from(s),
@@ -452,25 +464,37 @@ impl Projection {
             match maybe_mode {
                 Some(m) => m,
                 None => {
-                    //return Err(Error::Misc(format!("TODO what projection mode to use? id={:?} ops={:?}", id, ops)));
-                    // TODO what mode to use?
+                    match id {
+                        Some(true) => {
+                            // TODO what if ops is not empty?
+                            ProjectionMode::Include
+                        },
+                        Some(false) => {
+                            // TODO what if ops is not empty?
+                            ProjectionMode::Exclude
+                        },
+                        None => {
+                            //return Err(Error::Misc(format!("TODO what projection mode to use? id={:?} ops={:?}", id, ops)));
+                            // TODO what mode to use?
 
-                    // TODO maybe we should leave the projection object with mode None and let the
-                    // later code decide how to handle that.  but the projection code
-                    // needs to know whether to start with an empty document or the incoming
-                    // document.  it's one or the other.
+                            // TODO maybe we should leave the projection object with mode None and let the
+                            // later code decide how to handle that.  but the projection code
+                            // needs to know whether to start with an empty document or the incoming
+                            // document.  it's one or the other.
 
-                    // TODO actual question is whether the code to make this decision should live
-                    // here, during parsing, or later, during the actual projection.
+                            // TODO actual question is whether the code to make this decision should live
+                            // here, during parsing, or later, during the actual projection.
 
-                    // mongo's rules for deciding whether to use exclude mode or include mode seem
-                    // inconsistent for cases where there are no explicit includes or excludes.
-                    // elemMatchProjection.js has one test where a projection has only a $slice,
-                    // and another test where the projection has only an $elemMatch, and these
-                    // two cases end up in different modes.  So... what mode to use?
+                            // mongo's rules for deciding whether to use exclude mode or include mode seem
+                            // inconsistent for cases where there are no explicit includes or excludes.
+                            // elemMatchProjection.js has one test where a projection has only a $slice,
+                            // and another test where the projection has only an $elemMatch, and these
+                            // two cases end up in different modes.  So... what mode to use?
 
-                    ProjectionMode::Exclude
-                    //ProjectionMode::Include
+                            ProjectionMode::Exclude
+                            //ProjectionMode::Include
+                        },
+                    }
                 },
             };
 
@@ -2853,7 +2877,7 @@ impl Connection {
             match v {
                 bson::Value::BArray(mut a) => {
                     if a.len() != 2 {
-                        Err(Error::Misc(String::from("16020 wrong number of args")))
+                        Err(Error::MongoCode(16020, String::from("16020 wrong number of args")))
                     } else {
                         let v1 = a.items.remove(1);
                         let v0 = a.items.remove(0);
@@ -2870,7 +2894,7 @@ impl Connection {
             match v {
                 bson::Value::BArray(mut a) => {
                     if a.len() != 3 {
-                        Err(Error::Misc(String::from("16020 wrong number of args")))
+                        Err(Error::MongoCode(16020, String::from("16020 wrong number of args")))
                     } else {
                         let v2 = a.items.remove(2);
                         let v1 = a.items.remove(1);
@@ -3003,7 +3027,7 @@ impl Connection {
 
                             "$cond" => {
                                 if v.is_array() {
-                                    Ok(Expr::Substr(box try!(get_three_args(v))))
+                                    Ok(Expr::Cond(box try!(get_three_args(v))))
                                 } else if v.is_document() {
                                     Err(Error::Misc(format!("TODO $cond document: {:?}", v)))
                                 } else {
@@ -3035,10 +3059,19 @@ impl Connection {
                             "$setUnion" => {
                                 Ok(Expr::SetUnion(try!(parse_vec(v))))
                             },
+                            "$dateToString" => {
+                                let mut v = try!(v.into_document());
+                                if v.len() != 2 {
+                                    return Err(Error::Misc(format!("invalid $dateToString: {:?}", v)))
+                                }
+                                let date = try!(v.must_remove("date"));
+                                let format = try!(v.must_remove_string("format"));
+                                let date = try!(Self::parse_expr(date));
+                                Ok(Expr::DateToString(format, box date))
+                            },
 
                             // TODO let
                             // TODO map
-                            // TODO dateToString
 
                             _ => {
                                 Err(Error::Misc(format!("invalid expression operator: {}", k)))
@@ -3096,7 +3129,7 @@ impl Connection {
                 let s = try!(Self::eval(ctx, &t.0));
                 let s = try!(s.into_expr_string());
                 let start = try!(Self::eval(ctx, &t.1));
-                let start = try!(start.as_i32());
+                let start = try!(start.numeric_to_i32());
                 if start < 0 {
                     Ok(bson::Value::BString(String::new()))
                 } else if (start as usize) >= s.len() {
@@ -3104,7 +3137,7 @@ impl Connection {
                 } else {
                     let start = start as usize;
                     let len = try!(Self::eval(ctx, &t.2));
-                    let len = try!(len.as_i32());
+                    let len = try!(len.numeric_to_i32());
                     if len < 0 {
                         let a = s.chars().collect::<Vec<char>>();
                         let s = &a[start ..];
@@ -3200,6 +3233,7 @@ impl Connection {
             },
             &Expr::Size(ref v) => {
                 let s = try!(Self::eval(ctx, v));
+                // TODO 17124 on non-array
                 let s = try!(s.into_array());
                 Ok(bson::Value::BInt32(s.len() as i32))
             },
@@ -3269,7 +3303,15 @@ impl Connection {
                     (bson::Value::BInt64(n0),bson::Value::BInt32(n1)) => Ok(bson::Value::BInt64(n0 % (n1 as i64))),
                     (bson::Value::BInt32(n0),bson::Value::BInt64(n1)) => Ok(bson::Value::BInt64((n0 as i64) % n1)),
 
-                    // TODO mixtures of double and int
+                    (bson::Value::BDouble(n0),bson::Value::BInt32(n1)) if f64_can_be_i32(n0) => Ok(bson::Value::BInt32((n0 as i32) % n1)),
+                    (bson::Value::BDouble(n0),bson::Value::BInt64(n1)) if f64_can_be_i64(n0) => Ok(bson::Value::BInt64((n0 as i64) % n1)),
+                    (bson::Value::BInt32(n0),bson::Value::BDouble(n1)) if f64_can_be_i32(n1) => Ok(bson::Value::BInt32(n0 % (n1 as i32))),
+                    (bson::Value::BInt64(n0),bson::Value::BDouble(n1)) if f64_can_be_i32(n1) => Ok(bson::Value::BInt64(n0 % (n1 as i64))),
+
+                    (bson::Value::BDouble(n0),bson::Value::BInt32(n1)) => Ok(bson::Value::BDouble(n0 % (n1 as f64))),
+                    (bson::Value::BDouble(n0),bson::Value::BInt64(n1)) => Ok(bson::Value::BDouble(n0 % (n1 as f64))),
+                    (bson::Value::BInt32(n0),bson::Value::BDouble(n1)) => Ok(bson::Value::BDouble((n0 as f64) % n1)),
+                    (bson::Value::BInt64(n0),bson::Value::BDouble(n1)) => Ok(bson::Value::BDouble((n0 as f64) % n1)),
 
                     (v0,v1) => Err(Error::Misc(format!("invalid types for mod: {:?}, {:?}", v0, v1)))
                 }
@@ -3291,8 +3333,32 @@ impl Connection {
                     (bson::Value::BDouble(n0),bson::Value::BInt32(n1)) => Ok(bson::Value::BDouble(n0 - (n1 as f64))),
                     (bson::Value::BDouble(n0),bson::Value::BInt64(n1)) => Ok(bson::Value::BDouble(n0 - (n1 as f64))),
 
-                    (v0,v1) => Err(Error::Misc(format!("invalid types for subtract: {:?}, {:?}", v0, v1)))
+                    (bson::Value::BDateTime(n0),bson::Value::BDateTime(n1)) => Ok(bson::Value::BInt64(n0 - n1)),
+                    (bson::Value::BDateTime(n0),bson::Value::BInt32(n1)) => Ok(bson::Value::BDateTime(n0 - (n1 as i64))),
+                    (bson::Value::BDateTime(n0),bson::Value::BInt64(n1)) => Ok(bson::Value::BDateTime(n0 - (n1 as i64))),
+                    (bson::Value::BDateTime(n0),bson::Value::BDouble(n1)) => Ok(bson::Value::BDateTime(n0 - (n1 as i64))),
+
+                    (v0,v1) => Err(Error::MongoCode(16556, format!("invalid types for subtract: {:?}, {:?}", v0, v1)))
                 }
+            },
+            &Expr::Divide(ref t) => {
+                let v0 = try!(Self::eval(ctx, &t.0));
+                let v1 = try!(Self::eval(ctx, &t.1));
+                if !v0.is_numeric() || !v1.is_numeric() {
+                    return Err(Error::MongoCode(16609, format!("numeric types only: {:?}", t)));
+                }
+                match v1 {
+                    bson::Value::BInt32(0)
+                    | bson::Value::BInt64(0)
+                    | bson::Value::BDouble(0.0) => {
+                        return Err(Error::MongoCode(16608, format!("division by 0: {:?}", t)));
+                    },
+                    _ => {
+                    },
+                }
+                let v0 = try!(v0.numeric_to_f64());
+                let v1 = try!(v1.numeric_to_f64());
+                Ok(bson::Value::BDouble(v0 / v1))
             },
             &Expr::Add(ref a) => {
                 let vals = try!(a.iter().map(|e| Self::eval(ctx, e)).collect::<Result<Vec<_>>>());
@@ -3367,9 +3433,6 @@ impl Connection {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
             &Expr::Not(_) => {
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
-            },
-            &Expr::Divide(_) => {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
             &Expr::SetDifference(_) => {

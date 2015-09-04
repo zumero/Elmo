@@ -199,7 +199,8 @@ impl Document {
 
     pub fn must_remove_bool(&mut self, k: &str) -> Result<bool> {
         let v = try!(self.must_remove(k));
-        v.as_bool()
+        // TODO note that we are calling the one that converts
+        v.to_bool()
     }
 
     pub fn must_remove_string(&mut self, k: &str) -> Result<String> {

@@ -566,7 +566,8 @@ let lsof() =
 
 let results =
     List.map (fun t -> 
-        //printfn "%s" t
+        printfn "----------------------------------------------------------------"
+        printfn "%s" t
         let t1 = DateTime.Now
         let ps = ProcessStartInfo()
         ps.CreateNoWindow <- true

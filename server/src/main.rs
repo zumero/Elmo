@@ -561,12 +561,16 @@ impl<'b> Server<'b> {
             Some(v) => {
                 match fields {
                     Some(proj) => {
-                        println!("TODO find_and_modify projection: {:?}", proj);
                         // TODO calling stuff below that seems like it should be private to the crud module
+                        let projection = try!(elmo::Projection::parse(try!(proj.into_document())));
                         // TODO projection position op allowed here?
-                        //let prep = crud.verifyProjection proj None 
-                        // TODO projection position op allowed here?
-                        //doc.set("value", crud.projectDocument {doc=v;score=None;pos=None} prep) 
+                        let row = elmo::Row {
+                            doc: v.into_value(),
+                            pos: None,
+                            score: None,
+                        };
+                        let row = try!(projection.project(row));
+                        doc.set("value", row.doc);
                     },
                     None => {
                         doc.set_document("value", v);

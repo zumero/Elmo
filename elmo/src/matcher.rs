@@ -48,6 +48,7 @@ pub enum Pred {
     NearSphere(bson::Value),
     GeoWithin(bson::Value),
     GeoIntersects(bson::Value),
+    // TODO $within?
 }
 
 fn cmp_f64(m: f64, litv: f64) -> Ordering {
@@ -909,7 +910,7 @@ fn parse_pred(k: &str, v: bson::Value) -> Result<Pred> {
                 let div = try!(a.items[0].numeric_to_i64());
                 let rem = try!(a.items[0].numeric_to_i64());
                 if div == 0 {
-                    Err(super::Error::Misc(format!("$mod div by 0, error 16810: {:?}", a)))
+                    Err(super::Error::MongoCode(16810, format!("$mod div by 0: {:?}", a)))
                 } else {
                     Ok(Pred::Mod(div, rem))
                 }
