@@ -650,6 +650,7 @@ fn match_query_item<F: Fn(usize)>(qit: &QueryItem, d: &bson::Value, cb_array_pos
             !qd.iter().any(|v| match_query_doc(v, d, cb_array_pos))
         },
         &QueryItem::Where(ref v) => {
+            // TODO no panic here.  need to return Result.
             panic!("TODO $where is not supported"); //16395 in agg
         },
         &QueryItem::Text(ref s) => {
@@ -899,8 +900,11 @@ fn parse_pred(k: &str, v: bson::Value) -> Result<Pred> {
                         Ok(Pred::Not(preds))
                     }
                 },
-                bson::Value::BRegex(_,_) => {
-                    panic!("TODO regex");
+                bson::Value::BRegex(ref expr, ref options) => {
+                    // TODO options
+                    let re = try!(regex::Regex::new(&expr).map_err(super::wrap_err));
+                    let p = Pred::REGEX(re);
+                    Ok(Pred::Not(vec![p]))
                 },
                 _ => {
                     Err(super::Error::Misc(format!("invalid $not: {:?}", v)))

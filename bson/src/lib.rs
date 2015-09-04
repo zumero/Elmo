@@ -947,7 +947,7 @@ impl<'v,'p> EntryAbsent<'v,'p> {
                 bd.pairs.push((String::from(k), v));
             },
             EntryAbsent::ArrayParent(ba, i) => {
-                panic!("TODO EntryAbsent::ArrayParent insert: len={}, i={}", ba.len(), i);
+                return Err(Error::Misc(format!("TODO EntryAbsent::ArrayParent insert: len={}, i={}", ba.len(), i)));
             },
             EntryAbsent::DocumentAncestor(bd, path) => {
                 let dot = path.find('.').expect("should not be here if no dot");
@@ -965,7 +965,7 @@ impl<'v,'p> EntryAbsent<'v,'p> {
                 }
             },
             EntryAbsent::ArrayAncestor(ba, path) => {
-                panic!("TODO EntryAbsent::ArrayAncestor insert: len={}, path={}", ba.len(), path);
+                return Err(Error::Misc(format!("TODO EntryAbsent::ArrayAncestor insert: len={}, path={}", ba.len(), path)));
             },
         }
         Ok(())
@@ -1356,6 +1356,9 @@ impl Value {
             &Value::BDocument(ref bd) => bd.find_path(path),
             &Value::BArray(ref ba) => {
                 // TODO move into array and call from here?
+                // TODO why not parse as usize?  
+                // what should happen if an element of the path is a
+                // negative number?
                 match name.parse::<i32>() {
                     Err(_) => {
                         // when we have an array and the next step of the path is not
@@ -1380,8 +1383,10 @@ impl Value {
                     }, 
                     Ok(ndx) => {
                         if ndx<0 {
+                            // TODO useless panic.  need to return Result.
                             panic!( "array index < 0");
                         } else if (ndx as usize)>=ba.items.len() {
+                            // TODO useless panic.  need to return Result.
                             panic!( "array index too large");
                         } else {
                             let v = &ba.items[ndx as usize];

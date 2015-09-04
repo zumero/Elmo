@@ -4350,7 +4350,7 @@ impl Connection {
                                 unreachable!();
                             },
                             (Some(min), Some(max)) => {
-                                panic!("TODO query bounds min and max");
+                                return Err(Error::Misc(String::from("TODO query bounds min and max")));
                             },
                             (Some(min), None) => {
                                 let min = try!(Self::parse_index_min_max(min));
@@ -4366,7 +4366,7 @@ impl Connection {
                                 }
                             },
                             (None, Some(max)) => {
-                                panic!("TODO query bounds max");
+                                return Err(Error::Misc(String::from("TODO query bounds max")));
                             },
                         };
 
