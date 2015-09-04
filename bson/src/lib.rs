@@ -31,6 +31,8 @@ extern crate misc;
 use misc::endian::*;
 use misc::bufndx;
 
+extern crate time;
+
 #[derive(Debug)]
 pub enum Error {
     // TODO remove Misc
@@ -1085,7 +1087,21 @@ impl Value {
         // do not.
 
         match self {
-            Value::BDateTime(n) => Err(Error::Misc(String::from("TODO datetime into_expr_string"))),
+            Value::BDateTime(n) => {
+                let sec = n / 1000;
+                let ts = time::Timespec::new(sec, 0);
+                let tm = time::at(ts);
+                // yyyy-MM-ddTHH:mm:ss
+                match time::strftime("%Y-%m-%dT%H:%M:%S", &tm) {
+                    Ok(s) => {
+                        Ok(s)
+                    },
+                    Err(_) => {
+                        // TODO get the actual error into this
+                        Err(Error::Misc(format!("strftime failed")))
+                    },
+                }
+            },
             Value::BInt32(n) => Ok(format!("{}", n)),
             Value::BInt64(n) => Ok(format!("{}", n)),
             Value::BDouble(n) => Ok(format!("{}", n)),
@@ -1251,7 +1267,11 @@ impl Value {
     pub fn datetime_to_i64(&self) -> Result<i64> {
         match self {
             &Value::BDateTime(s) => Ok(s as i64),
-            _ => Err(Error::Misc(format!("datetime required, but found {:?}", self))),
+            &Value::BTimeStamp(s) => {
+                let ms = (s >> 32) * 1000;
+                Ok(ms)
+            },
+            _ => Err(Error::Misc(format!("datetime or timestamp required, but found {:?}", self))),
         }
     }
 
@@ -1639,6 +1659,9 @@ impl Value {
 
     pub fn replace_undefined(&mut self) {
         match self {
+            &mut Value::BUndefined => {
+                *self = Value::BNull;
+            },
             &mut Value::BArray(ref mut ba) => {
                 for i in 0 .. ba.items.len() {
                     match &ba.items[i] {
@@ -1654,6 +1677,7 @@ impl Value {
                 for i in 0 .. bd.pairs.len() {
                     match &bd.pairs[i].1 {
                         &Value::BUndefined => {
+                            // TODO we just want to replace the snd half of the tuple
                             bd.pairs[i] = (bd.pairs[i].0.clone(), Value::BNull)
                         },
                         _ => {

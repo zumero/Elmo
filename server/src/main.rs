@@ -340,7 +340,10 @@ impl<'b> Server<'b> {
     }
 
     fn reply_setparameter(&self, req: &MsgQuery) -> Result<Reply> {
-        Err(Error::Misc(format!("TODO setparameter: {:?}", req)))
+        // TODO what is this for?
+        let mut doc = bson::Document::new();
+        doc.set_i32("ok", 1);
+        Ok(create_reply(req.req_id, vec![doc], 0))
     }
 
     fn reply_ismaster(&self, req: &MsgQuery) -> Result<Reply> {

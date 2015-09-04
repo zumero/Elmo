@@ -230,7 +230,7 @@ pub enum ProjectionMode {
 #[derive(Debug)]
 pub enum ProjectionOperator {
     Slice1(i32),
-    Slice2(i32, i32),
+    Slice2(i32, usize),
     MetaTextScore,
     ElemMatch(matcher::QueryDoc),
 }
@@ -434,8 +434,11 @@ impl Projection {
                                             if ba.len() == 2 {
                                                 let n0 = try!(ba.items[0].numeric_to_i32());
                                                 let n1 = try!(ba.items[1].numeric_to_i32());
-                                                // TODO range checking on the ints?
-                                                Ok(ProjectionOperator::Slice2(n0, n1))
+                                                if n1 < 0 {
+                                                    Err(Error::Misc(format!("invalid arg to projection op $slice: {:?}", ba)))
+                                                } else {
+                                                    Ok(ProjectionOperator::Slice2(n0, n1 as usize))
+                                                }
                                             } else {
                                                 Err(Error::Misc(format!("invalid arg to projection op $slice: {:?}", ba)))
                                             }
@@ -560,7 +563,20 @@ impl Projection {
                         bson::Entry::Found(mut e) => {
                             match e.get_mut() {
                                 &mut bson::Value::BArray(ref mut ba) => {
-                                    return Err(Error::Misc(format!("TODO projection $slice.1")));
+                                    if n > 0 {
+                                        let n = n as usize;
+                                        if ba.len() > n {
+                                            ba.items.truncate(n);
+                                        }
+                                    } else {
+                                        let n = -n;
+                                        let n = n as usize;
+                                        if ba.len() > n {
+                                            ba.items.reverse();
+                                            ba.items.truncate(n);
+                                            ba.items.reverse();
+                                        }
+                                    }
                                 },
                                 _ => {
                                     return Err(Error::Misc(format!("projection $slice.1 got a non-array")));
@@ -572,12 +588,37 @@ impl Projection {
                         },
                     }
                 },
-                &ProjectionOperator::Slice2(_,_) => {
+                &ProjectionOperator::Slice2(skip,limit) => {
                     match try!(d.entry(&path)) {
                         bson::Entry::Found(mut e) => {
                             match e.get_mut() {
                                 &mut bson::Value::BArray(ref mut ba) => {
-                                    return Err(Error::Misc(format!("TODO projection $slice.2")));
+                                    if skip >= 0 {
+                                        let skip = skip as usize;
+                                        if skip >= ba.items.len() {
+                                            ba.items.clear();
+                                        } else {
+                                            for _ in 0 .. skip {
+                                                ba.items.remove(0);
+                                            }
+                                            if limit > ba.items.len() {
+                                                ba.items.truncate(limit);
+                                            }
+                                        }
+                                    } else {
+                                        let skip = -skip;
+                                        let skip = skip as usize;
+                                        if skip >= ba.items.len() {
+                                            ba.items.clear();
+                                        } else {
+                                            for _ in 0 .. ba.items.len() - skip {
+                                                ba.items.remove(0);
+                                            }
+                                            if limit > ba.items.len() {
+                                                ba.items.truncate(limit);
+                                            }
+                                        }
+                                    }
                                 },
                                 _ => {
                                     return Err(Error::Misc(format!("projection $slice.2 got a non-array")));
@@ -1166,7 +1207,10 @@ impl Connection {
                     }
                 },
                 &UpdateOp::SetOnInsert(ref path, ref v) => {
-                    return Err(Error::Misc(format!("TODO UpdateOp::SetOnInsert")));
+                    if is_upsert {
+                        let path = fix_positional(path, pos);
+                        try!(doc.set_path(&path, v.clone()));
+                    }
                 },
                 &UpdateOp::BitAnd(ref path, v) => {
                     let path = fix_positional(path, pos);
@@ -3108,7 +3152,7 @@ impl Connection {
                             // TODO map
 
                             _ => {
-                                Err(Error::Misc(format!("invalid expression operator: {}", k)))
+                                Err(Error::MongoCode(15999, format!("invalid expression operator: {}", k)))
                             },
                         }
                     } else {
@@ -3498,7 +3542,8 @@ impl Connection {
                 Ok(bson::Value::BInt32(tm.tm_sec))
             },
             &Expr::Millisecond(ref v) => {
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
+                let tm = try!(eval_tm(v));
+                Ok(bson::Value::BInt32(tm.tm_nsec / 1000000))
             },
             &Expr::Week(ref v) => {
                 // mongo wants 0 thru 53
@@ -3515,6 +3560,18 @@ impl Connection {
                 // mongo wants full 4 digits
                 // tm is since 1900
                 Ok(bson::Value::BInt32(tm.tm_year + 1900))
+            },
+            &Expr::DateToString(ref format, ref v) => {
+                let tm = try!(eval_tm(v));
+                match time::strftime(&format, &tm) {
+                    Ok(s) => {
+                        Ok(bson::Value::BString(s))
+                    },
+                    Err(_) => {
+                        // TODO get the actual error into this
+                        Err(Error::Misc(format!("strftime failed: {}", format)))
+                    },
+                }
             },
             &Expr::Not(_) => {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
@@ -3541,9 +3598,6 @@ impl Connection {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
             &Expr::Let(_,_) => {
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
-            },
-            &Expr::DateToString(_,_) => {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
         }
@@ -3713,7 +3767,7 @@ impl Connection {
                         "$geoNear" => {
                             Err(Error::Misc(format!("agg pipeline TODO: {}", k)))
                         },
-                        _ => Err(Error::MongoCode(16435, format!("invalid agg pipeline stage name: {}", k)))
+                        _ => Err(Error::MongoCode(16436, format!("invalid agg pipeline stage name: {}", k)))
                     }
                 }
             }).collect::<Result<Vec<AggOp>>>()
@@ -3782,6 +3836,9 @@ impl Connection {
             let row = try!(rr);
             let mut ctx = Self::init_eval_ctx(row.doc);
             let idval = try!(Self::eval(&ctx, &id));
+            // TODO if the idval is numeric, we are apparently supposed to collapse them.
+            // for example the same value in i32 and i64 are a match.  double too, if it's
+            // an integral value.  server5209
             // TODO see if mapa already has idval
             let acc = match mapa.entry(idval) {
                 std::collections::hash_map::Entry::Vacant(e) => {
