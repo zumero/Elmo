@@ -2501,7 +2501,21 @@ impl Connection {
             // both will be correct.  but choosing x>9 will result in us reviewing
             // fewer documents.
 
-            m2.insert(k, (gt, lt));
+            // suppose there are three records:
+            // {a: [1,2]}
+            // {a: [1,2,6]}
+            // {a: [1,4,6]}
+            // this query:
+            // find( {a:{$gte:3, $lte: 5}} )
+            // cannot use either comparison for the bounds of the index
+            // arrayfind3.js
+
+            // TODO can't do this unless same elemMatch: m2.insert(k, (gt, lt));
+            if gt.is_some() {
+                m2.insert(k, (gt, None));
+            } else {
+                m2.insert(k, (None, lt));
+            }
         }
 
 

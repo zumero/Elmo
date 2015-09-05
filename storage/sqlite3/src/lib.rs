@@ -267,6 +267,7 @@ fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::Ind
     }
 
     fn maybe_text(vals: &Vec<(bson::Value, bool)>, new_doc: &bson::Document, weights: &Option<std::collections::HashMap<String,i32>>, entries: &mut Vec<Vec<(bson::Value,bool)>>) {
+        //println!("in maybe_text: {:?}", vals);
         match weights {
             &Some(ref weights) => {
                 for k in weights.keys() {
@@ -301,18 +302,21 @@ fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::Ind
             },
             &None => {
                 // TODO clone is ugly
+                //println!("in maybe_text, pushing to entries: {:?}", vals);
                 entries.push(vals.clone());
             },
         }
     }
 
     fn replace_array_element<T:Clone>(vals: &Vec<T>, i: usize, v: T) -> Vec<T> {
+        // TODO horrifying clone
         let mut v2 = vals.clone();
         v2[i] = v;
         v2
     }
 
     fn maybe_array(vals: &Vec<(bson::Value, bool)>, new_doc: &bson::Document, weights: &Option<std::collections::HashMap<String,i32>>, entries: &mut Vec<Vec<(bson::Value,bool)>>) {
+        //println!("in maybe_array: {:?}", vals);
         // first do the index entries for the document without considering arrays
         maybe_text(vals, new_doc, weights, entries);
 
@@ -331,6 +335,7 @@ fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::Ind
                     for av in a {
                         // TODO clone is ugly
                         let replaced = replace_array_element(vals, i, (av.clone(), typ));
+                        //println!("replaced for index: {:?}", replaced);
                         maybe_array(&replaced, new_doc, weights, entries);
                     }
                 },
@@ -346,6 +351,8 @@ fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::Ind
 
     let vals = find_index_entry_vals(normspec, new_doc, sparse);
     maybe_array(&vals, new_doc, weights, entries);
+
+    //println!("entries: {:?}", entries);
 
     Ok(())
 }
@@ -404,6 +411,7 @@ impl MyConn {
     }
 
     fn get_stmt_for_index_scan(myconn: &MyConn, plan: elmo::QueryPlan) -> Result<sqlite3::PreparedStatement> {
+        //println!("using plan in index scan: {:?}", plan);
         let tbl_coll = get_table_name_for_collection(&plan.ndx.db, &plan.ndx.coll);
         let tbl_ndx = get_table_name_for_index(&plan.ndx.db, &plan.ndx.coll, &plan.ndx.name);
 
@@ -439,6 +447,7 @@ impl MyConn {
 
         let f_twok = |kmin: Vec<u8>, kmax: Vec<u8>, op1: &str, op2: &str| -> Result<sqlite3::PreparedStatement> {
             let sql = format!("SELECT DISTINCT d.bson FROM \"{}\" d INNER JOIN \"{}\" i ON (d.did = i.doc_rowid) WHERE k {} ? AND k {} ?", tbl_coll, tbl_ndx, op1, op2);
+            //println!("using sql: {}", sql);
             let mut stmt = try!(myconn.conn.prepare(&sql).map_err(elmo::wrap_err));
             try!(stmt.bind_blob(1, &kmin).map_err(elmo::wrap_err));
             try!(stmt.bind_blob(2, &kmax).map_err(elmo::wrap_err));
@@ -948,6 +957,7 @@ impl MyWriter {
                                     try!(get_index_entries(&new_doc, &normspec, &weights, &info.options, &mut entries));
                                     let entries = entries.into_iter().collect::<std::collections::HashSet<_>>();
                                     for vals in entries {
+                                        //println!("index entry: {:?}", vals);
                                         let k = bson::Value::encode_multi_for_index(vals);
                                         try!(index_insert_step(&mut stmt_insert, k, doc_rowid));
                                     }
