@@ -386,7 +386,7 @@ fn match_predicate<F: Fn(usize)>(pred: &Pred, d: &bson::Value, cb_array_pos: &F)
             match d {
                 &bson::Value::BArray(ref ba) => {
                     let found = 
-                        ba.items.iter().position(|vsub| preds.iter().any(|p| !match_predicate(p, vsub, cb_array_pos)));
+                        ba.items.iter().position(|vsub| preds.iter().all(|p| match_predicate(p, vsub, cb_array_pos)));
                     match found {
                         Some(n) => {
                             cb_array_pos(n);
@@ -612,8 +612,8 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
             b == match_pair_exists(pred, path, start)
         },
         &Pred::Not(ref a) => {
-            let any_matches = a.iter().any(|p| !match_pair(p, path, start, cb_array_pos));
-            any_matches
+            let any_matches = a.iter().any(|p| match_pair(p, path, start, cb_array_pos));
+            !any_matches
         },
         &Pred::NE(ref a) => {
             // TODO since this is implemented in matchPredicate, it seems like we should
@@ -934,7 +934,7 @@ fn parse_pred(k: &str, v: bson::Value) -> Result<Pred> {
             } else {
                 let bd = try!(v.into_document());
                 let preds = try!(parse_pred_list(bd.pairs));
-                Ok(Pred::Not(preds))
+                Ok(Pred::ElemMatchPreds(preds))
             }
         },
         "$near" => panic!("TODO parse_pred $near"),

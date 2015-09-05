@@ -4313,16 +4313,28 @@ impl Connection {
             ).collect::<Vec<_>>();
         // TODO maybe we should get normalized index specs for all the indexes now.
         let m = try!(matcher::parse_query(query));
+        fn is_hint_natural(v: &bson::Value) -> bool {
+            match v {
+                &bson::Value::BDocument(ref bd) => {
+                    if bd.pairs.len() == 1 && bd.pairs[0].0 == "$natural" {
+                        return true;
+                    } else {
+                        return false;
+                    }
+                },
+                _ => false,
+            }
+        }
         let (natural, hint) = 
             match hint {
                 Some(ref v) => {
-                    if v.is_string() && try!(v.as_str()) == "$natural" {
+                    if is_hint_natural(v) {
                         (true, None)
                     } else {
                         if let Some(ndx) = Self::try_find_index_by_name_or_spec(&indexes, v) {
                             (false, Some(ndx))
                         } else {
-                            return Err(Error::Misc(String::from("bad hint")));
+                            return Err(Error::Misc(format!("bad hint: {:?}", v)));
                         }
                     }
                 },
