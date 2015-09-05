@@ -463,6 +463,7 @@ fn match_predicate<F: Fn(usize)>(pred: &Pred, d: &bson::Value, cb_array_pos: &F)
 }
 
 fn match_pair_exists(pred: &Pred, path: &str, start: &bson::Value) -> bool {
+    // TODO pred is not used
     let dot = path.find('.');
     let name = match dot { 
         None => path,
@@ -485,7 +486,7 @@ fn match_pair_exists(pred: &Pred, path: &str, start: &bson::Value) -> bool {
                             } else {
                                 ba.items.iter().any(|vsub| {
                                     match vsub {
-                                        &bson::Value::BDocument(_) => match_pair_exists(pred, subpath, v),
+                                        &bson::Value::BDocument(_) => match_pair_exists(pred, subpath, vsub),
                                         _ => false,
                                     }
                                 })
