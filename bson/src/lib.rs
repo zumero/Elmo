@@ -1028,7 +1028,14 @@ impl<'v,'p> EntryAbsent<'v,'p> {
                 bd.pairs.push((String::from(k), v));
             },
             EntryAbsent::ArrayParent(ba, i) => {
-                return Err(Error::Misc(format!("TODO EntryAbsent::ArrayParent insert: len={}, i={}", ba.len(), i)));
+                if i > 1500000 {
+                    return Err(Error::Misc(format!("EntryAbsent::ArrayParent insert: len={}, i={} too big", ba.len(), i)));
+                }
+                let empties = i - ba.len();
+                for _ in 0 .. empties {
+                    ba.items.push(Value::BNull);
+                }
+                ba.items.push(v);
             },
             EntryAbsent::DocumentAncestor(bd, path) => {
                 let dot = path.find('.').expect("should not be here if no dot");
