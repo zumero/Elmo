@@ -271,7 +271,7 @@ fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::Ind
         match weights {
             &Some(ref weights) => {
                 for k in weights.keys() {
-                    if k == "&**" {
+                    if k == "$**" {
                         let mut a = Vec::new();
                         new_doc.find_all_strings(& mut a);
                         let w = weights[k];

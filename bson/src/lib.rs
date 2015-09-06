@@ -151,6 +151,17 @@ impl Document {
         }
     }
 
+    pub fn validate_depth(&self, depth: usize, max: usize) -> Result<()> {
+        for &(ref k, ref v) in &self.pairs {
+            match v {
+                &Value::BDocument(ref bd) => try!(bd.validate_depth(1 + depth, max)),
+                &Value::BArray(ref ba) => try!(ba.validate_depth(1 + depth, max)),
+                _ => ()
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_keys(&self, depth: usize) -> Result<()> {
         if depth > 0 && self.is_dbref() {
             Ok(())
@@ -577,6 +588,20 @@ impl Array {
             match v {
                 &Value::BDocument(ref bd) => try!(bd.validate_keys(1 + depth)),
                 &Value::BArray(ref ba) => try!(ba.validate_keys(1 + depth)),
+                _ => ()
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_depth(&self, depth: usize, max: usize) -> Result<()> {
+        if depth > max {
+            return Err(Error::Misc(format!("too much nesting")));
+        }
+        for v in &self.items {
+            match v {
+                &Value::BDocument(ref bd) => try!(bd.validate_depth(1 + depth, max)),
+                &Value::BArray(ref ba) => try!(ba.validate_depth(1 + depth, max)),
                 _ => ()
             }
         }

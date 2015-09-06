@@ -824,20 +824,18 @@ pub enum IndexType {
     Geo2d,
 }
 
-fn decode_index_type(v: &bson::Value) -> IndexType {
+fn decode_index_type(v: &bson::Value) -> Result<IndexType> {
     match v {
-        &bson::Value::BInt32(n) => if n<0 { IndexType::Backward } else { IndexType::Forward },
-        &bson::Value::BInt64(n) => if n<0 { IndexType::Backward } else { IndexType::Forward },
-        &bson::Value::BDouble(n) => if n<0.0 { IndexType::Backward } else { IndexType::Forward },
+        &bson::Value::BInt32(n) => if n<0 { Ok(IndexType::Backward) } else { Ok(IndexType::Forward) },
+        &bson::Value::BInt64(n) => if n<0 { Ok(IndexType::Backward) } else { Ok(IndexType::Forward) },
+        &bson::Value::BDouble(n) => if n<0.0 { Ok(IndexType::Backward) } else { Ok(IndexType::Forward) },
         &bson::Value::BString(ref s) => 
             if s == "2d" { 
-                IndexType::Geo2d 
-            } else if s == "text" {
-                panic!("decode_index_type: text")
+                Ok(IndexType::Geo2d)
             } else {
-                panic!("decode_index_type: unknown type")
+                Err(Error::Misc(format!("invalid index type: {:?}", v)))
             },
-        _ => panic!("decode_index_type")
+        _ => Err(Error::Misc(format!("invalid index type: {:?}", v)))
     }
 }
 
@@ -876,7 +874,7 @@ pub fn get_normalized_spec(info: &IndexInfo) -> Result<(Vec<(String,IndexType)>,
     let w1 = info.options.get("weights");
     match (first_text, w1) {
         (None, None) => {
-            let decoded = info.spec.pairs.iter().map(|&(ref k, ref v)| (k.clone(), decode_index_type(v))).collect::<Vec<(String,IndexType)>>();
+            let decoded = try!(info.spec.pairs.iter().map(|&(ref k, ref v)| Ok((k.clone(), try!(decode_index_type(v))))).collect::<Result<Vec<(String,IndexType)>>>());
             //printfn "no text index: %A" decoded
             Ok((decoded, None))
         },
@@ -925,7 +923,7 @@ pub fn get_normalized_spec(info: &IndexInfo) -> Result<(Vec<(String,IndexType)>,
             }
             // TODO if the wildcard is present, remove everything else?
             //println!("scalar_keys: {:?}", scalar_keys);
-            let decoded = scalar_keys.iter().map(|&(ref k, ref v)| (k.clone(), decode_index_type(v))).collect::<Vec<(String,IndexType)>>();
+            let decoded = try!(scalar_keys.iter().map(|&(ref k, ref v)| Ok((k.clone(), try!(decode_index_type(v))))).collect::<Result<Vec<(String,IndexType)>>>());
             let r = Ok((decoded, Some(weights)));
             //printfn "%A" r
             r
@@ -1819,7 +1817,7 @@ impl Connection {
     fn validate_for_storage(d: &mut bson::Document) -> Result<bson::Value> {
         let id = try!(d.validate_id());
         try!(d.validate_keys(0));
-        // TODO validate depth
+        try!(d.validate_depth(0, 100));
         Ok(id)
     }
 
