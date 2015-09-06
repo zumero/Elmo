@@ -557,6 +557,7 @@ impl Projection {
         // TODO projIncludeOps?
 
         for &(ref path, ref op) in self.ops.iter() {
+            //println!("op: {:?}", op);
             match op {
                 &ProjectionOperator::Slice1(n) => {
                     match try!(d.entry(&path)) {
@@ -584,7 +585,8 @@ impl Projection {
                             }
                         },
                         bson::Entry::Absent(e) => {
-                            return Err(Error::Misc(format!("projection $slice.1 got an absent")));
+                            // test slice1.js thinks this should not be an error
+                            // return Err(Error::Misc(format!("projection $slice.1 got an absent")));
                         },
                     }
                 },
@@ -595,16 +597,19 @@ impl Projection {
                                 &mut bson::Value::BArray(ref mut ba) => {
                                     if skip >= 0 {
                                         let skip = skip as usize;
+                                        //println!("before slice2: {:?}", ba.items);
                                         if skip >= ba.items.len() {
                                             ba.items.clear();
                                         } else {
                                             for _ in 0 .. skip {
                                                 ba.items.remove(0);
                                             }
-                                            if limit > ba.items.len() {
+                                            //println!("after slice2 skip: {:?}", ba.items);
+                                            if limit < ba.items.len() {
                                                 ba.items.truncate(limit);
                                             }
                                         }
+                                        //println!("after slice2: {:?}", ba.items);
                                     } else {
                                         let skip = -skip;
                                         let skip = skip as usize;
@@ -614,7 +619,7 @@ impl Projection {
                                             for _ in 0 .. ba.items.len() - skip {
                                                 ba.items.remove(0);
                                             }
-                                            if limit > ba.items.len() {
+                                            if limit < ba.items.len() {
                                                 ba.items.truncate(limit);
                                             }
                                         }
@@ -1818,6 +1823,13 @@ impl Connection {
         Ok(id)
     }
 
+    fn id_changed(d1: &bson::Document, d2: &bson::Document) -> Result<bool> {
+        let id1 = try!(d1.must_get("_id"));
+        let id2 = try!(d2.must_get("_id"));
+        let b = id1 != id2;
+        Ok(b)
+    }
+
     pub fn update(&self, db: &str, coll: &str, updates: &mut Vec<bson::Document>) -> Result<Vec<Result<(i32, i32, Option<bson::Value>)>>> {
         let mut results = Vec::new();
         {
@@ -1862,7 +1874,9 @@ impl Connection {
                                     let old_doc = try!(row.doc.into_document());
                                     let mut new_doc = old_doc.clone();
                                     try!(Self::apply_update_ops(&mut new_doc, &ops, false, row.pos));
-                                    // TODO make sure _id did not change
+                                    if try!(Self::id_changed(&old_doc, &new_doc)) {
+                                        return Err(Error::Misc(String::from("cannot change _id")));
+                                    }
                                     matches = matches + 1;
                                     if new_doc != old_doc {
                                         let id = try!(Self::validate_for_storage(&mut new_doc));
@@ -1878,7 +1892,9 @@ impl Connection {
                                         let old_doc = try!(row.doc.into_document());
                                         let mut new_doc = old_doc.clone();
                                         try!(Self::apply_update_ops(&mut new_doc, &ops, false, row.pos));
-                                        // TODO make sure _id did not change
+                                        if try!(Self::id_changed(&old_doc, &new_doc)) {
+                                            return Err(Error::Misc(String::from("cannot change _id")));
+                                        }
                                         if new_doc != old_doc {
                                             let id = try!(Self::validate_for_storage(&mut new_doc));
                                             try!(collwriter.update(&new_doc));
@@ -1914,7 +1930,6 @@ impl Connection {
                         match try!(Self::get_one_match(db, coll, &*writer, &m, None)) {
                             Some(row) => {
                                 let old_doc = try!(row.doc.into_document());
-                                // TODO if u has _id, make sure it's the same
                                 let old_id = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated")))).clone();
                                 let mut new_doc = u;
                                 let new_id = {
