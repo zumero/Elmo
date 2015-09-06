@@ -479,7 +479,104 @@ impl<'b> Server<'b> {
     }
 
     fn reply_explain(&self, mut req: MsgQuery, db: &str) -> Result<Reply> {
-        Err(Error::Misc(format!("TODO explain: {:?}", req)))
+        let MsgQuery {
+            req_id,
+            flags,
+            full_collection_name,
+            number_to_skip,
+            number_to_return,
+            mut query,
+            return_fields_selector,
+        } = req;
+        let mut explain = try!(query.must_remove_document("explain"));
+        let verbosity = try!(query.must_remove_string("verbosity"));
+
+        let coll = try!(explain.must_remove_string("find"));
+        let filter = try!(explain.must_remove_document("filter"));
+        let mut options = try!(explain.must_remove_document("options"));
+
+        let orderby = Self::try_remove_optional_prefix(&mut options, "$orderby");
+        let min = Self::try_remove_optional_prefix(&mut options, "$min");
+        let max = Self::try_remove_optional_prefix(&mut options, "$max");
+        let hint = Self::try_remove_optional_prefix(&mut options, "$hint");
+        let explain = Self::try_remove_optional_prefix(&mut options, "$explain");
+
+        let mut seq = try!(self.conn.find(
+                db, 
+                &coll, 
+                filter,
+                orderby,
+                return_fields_selector,
+                min,
+                max,
+                hint,
+                None
+                ));
+
+        if number_to_skip < 0 {
+            return Err(Error::Misc(format!("negative skip: {}", number_to_skip)));
+        } else if number_to_skip > 0 {
+            seq = box seq.skip(number_to_skip as usize);
+        }
+
+        let num = seq.count();
+
+        /*
+
+            "queryPlanner" : {
+                "plannerVersion" : 1,
+                "namespace" : "test.foo",
+                "indexFilterSet" : false,
+                "parsedQuery" : {
+                    "a" : {
+                        "$eq" : 1
+                    }
+                },
+                "winningPlan" : {
+                    "stage" : "FETCH",
+                    "inputStage" : {
+                        "stage" : "IXSCAN",
+                        "keyPattern" : {
+                            "a" : 1
+                        },
+                        "indexName" : "a_1",
+                        "isMultiKey" : true,
+                        "direction" : "forward",
+                        "indexBounds" : {
+                            "a" : [
+                                "[1.0, 1.0]"
+                            ]
+                        }
+                    }
+                },
+                "rejectedPlans" : [ ]
+            },
+            "serverInfo" : {
+                "host" : "erics-air-2.ad.sourcegear.com",
+                "port" : 27017,
+                "version" : "3.0.1",
+                "gitVersion" : "534b5a3f9d10f00cd27737fbcd951032248b5952"
+            },
+
+        */
+
+        let mut doc = bson::Document::new();
+        try!(doc.set_path("queryPlanner.namespace", bson::Value::BString(format!("{}.{}", db, &coll))));
+        try!(doc.set_path("queryPlanner.indexFilterSet", bson::Value::BBoolean(false)));
+
+        try!(doc.set_path("serverInfo.software", bson::Value::BString(format!("Elmo"))));
+        try!(doc.set_path("serverInfo.version", bson::Value::BString(format!("TODO"))));
+        try!(doc.set_path("serverInfo.host", bson::Value::BString(format!("TODO"))));
+        // TODO port
+        try!(doc.set_path("serverInfo.port", bson::Value::BString(format!("27017"))));
+
+        try!(doc.set_path("executionStats.nReturned", bson::Value::BInt32(num as i32)));
+        // TODO fake values below
+        try!(doc.set_path("executionStats.totalKeysExamined", bson::Value::BInt32(0)));
+        try!(doc.set_path("executionStats.totalDocsExamined", bson::Value::BInt32(0)));
+
+        doc.set_i32("ok", 1);
+        Ok(create_reply(req.req_id, vec![doc], 0))
     }
 
     fn reply_find_and_modify(&self, mut req: MsgQuery, db: &str) -> Result<Reply> {

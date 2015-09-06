@@ -4331,6 +4331,7 @@ impl Connection {
                 min: Option<bson::Value>,
                 max: Option<bson::Value>,
                 hint: Option<bson::Value>,
+                // TODO explain is never used in latest wire protocol
                 explain: Option<bson::Value>
                 ) 
         -> Result<Box<Iterator<Item=Result<Row>> + 'static>>
