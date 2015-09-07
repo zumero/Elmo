@@ -528,10 +528,33 @@ impl Projection {
                 d = bson::Document::new();
                 for path in self.paths.iter() {
                     let path = fix_positional(path, pos);
+                    // TODO for a path which dives through an array, this will
+                    // be wrong.  
+                    // {comments: [{id:0, text:'a'},{id:1, text:'b'},{id:2, text:'c'},{id:3, text:'d'}]}
+                    // comments.id should be
+                    // {comments: [{id:0},{id:1},{id:2},{id:3}]}
+                    // not
+                    // {comments.id: [0,1,2,3]}
+                    // We could use the new find_path code and simply project it properly.
                     let v = doc.find_path(&path);
                     match try!(d.entry(&path)) {
                         bson::Entry::Found(e) => {
                             return Err(Error::Misc(format!("projection error, include, should not be here yet")));
+                        },
+                        bson::Entry::Absent(e) => {
+                            e.insert(v);
+                        },
+                    }
+                }
+                // we need to include things that are in ops so we can modify them.
+                for &(ref path, _) in self.ops.iter() {
+                    let path = fix_positional(path, pos);
+                    let v = doc.find_path(&path);
+                    match try!(d.entry(&path)) {
+                        bson::Entry::Found(e) => {
+                            // something might already be there from the include loop above,
+                            // so this is not an error in this case.
+                            //return Err(Error::Misc(format!("projection error, include, should not be here yet")));
                         },
                         bson::Entry::Absent(e) => {
                             e.insert(v);
@@ -553,8 +576,6 @@ impl Projection {
                 }
             },
         }
-
-        // TODO projIncludeOps?
 
         for &(ref path, ref op) in self.ops.iter() {
             //println!("op: {:?}", op);
@@ -579,8 +600,8 @@ impl Projection {
                                         }
                                     }
                                 },
-                                _ => {
-                                    return Err(Error::Misc(format!("projection $slice.1 got a non-array")));
+                                v => {
+                                    return Err(Error::Misc(format!("projection $slice.1 got a non-array: {:?}", v)));
                                 },
                             }
                         },

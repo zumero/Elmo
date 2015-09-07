@@ -218,6 +218,7 @@ fn get_table_name_for_index(db: &str, coll: &str, name: &str) -> String {
 
 fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::IndexType)>, weights: &Option<std::collections::HashMap<String,i32>>, options: &bson::Document, entries: &mut Vec<Vec<(bson::Value,bool)>>) -> Result<()> {
     fn find_index_entry_vals(normspec: &Vec<(String, elmo::IndexType)>, new_doc: &bson::Document, sparse: bool) -> Vec<(bson::Value,bool)> {
+        //println!("find_index_entry_vals: sparse = {:?}", sparse);
         let mut r = Vec::new();
         for t in normspec {
             let k = &t.0;
@@ -905,6 +906,7 @@ impl MyWriter {
     }
 
     fn create_index(&self, info: elmo::IndexInfo) -> Result<bool> {
+        //println!("create_index: {:?}", info);
         let _created = try!(self.base_create_collection(&info.db, &info.coll, bson::Document::new()));
         match try!(self.myconn.get_index_info(&info.db, &info.coll, &info.name)) {
             Some(already) => {
