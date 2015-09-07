@@ -83,10 +83,13 @@ impl From<std::str::Utf8Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub enum FoundPath<'a> {
-    NotFound,
-    Value(&'a Value),
-    Dive(Vec<FoundPath<'a>>),
+pub enum WalkPath<'v, 'p> {
+    NotFound(&'v Document, &'p str),
+    BadIndex(&'v Array, i32),
+    NotContainer(&'v Value, &'p str),
+    ArrayValue(&'v Array, usize, &'v Value),
+    DocumentValue(&'v Document, &'p str, &'v Value),
+    Dive(&'v Array, &'p str, Vec<WalkPath<'v, 'p>>),
 }
 
 // TODO this function doesn't seem to go here
@@ -499,7 +502,7 @@ impl Document {
         }
     }
 
-    pub fn find_path2<'a>(&'a self, path: &str) -> Result<FoundPath<'a>> {
+    pub fn walk_path<'v, 'p>(&'v self, path: &'p str) -> WalkPath<'v, 'p> {
         let dot = path.find('.');
         let name = match dot { 
             None => path,
@@ -509,11 +512,13 @@ impl Document {
             Some(ndx) => {
                 let v = &self.pairs[ndx].1;
                 match dot {
-                    None => Ok(FoundPath::Value(v)),
-                    Some(dot) => v.find_path2(&path[dot+1..])
+                    None => WalkPath::DocumentValue(self, name, v),
+                    Some(dot) => v.walk_path(&path[dot + 1..])
                 }
             },
-            None => Ok(FoundPath::NotFound),
+            None => {
+                WalkPath::NotFound(self, path)
+            },
         }
     }
 
@@ -529,7 +534,7 @@ impl Document {
                 match dot {
                     // TODO ouch.  horrifying clone.
                     None => v.clone(),
-                    Some(dot) => v.find_path(&path[dot+1..])
+                    Some(dot) => v.find_path(&path[dot + 1..])
                 }
             },
             None => Value::BUndefined
@@ -608,15 +613,12 @@ impl Array {
         Ok(())
     }
 
-    pub fn find_path2<'a>(&'a self, path: &str) -> Result<FoundPath<'a>> {
+    pub fn walk_path<'v, 'p>(&'v self, path: &'p str) -> WalkPath<'v, 'p> {
         let dot = path.find('.');
         let name = match dot { 
             None => path,
             Some(ndx) => &path[0 .. ndx]
         };
-        // TODO why not parse as usize?  
-        // what should happen if an element of the path is a
-        // negative number?
         match name.parse::<i32>() {
             Err(_) => {
                 // when we have an array and the next step of the path is not
@@ -627,38 +629,18 @@ impl Array {
                 // path : b.c
                 // needs to get: [ 1, 2 ]
 
-                // TODO are there any functions in the matcher which could be
-                // simplified by using this function? 
-                let a = self.items.iter().filter_map(|subv| 
-                        match subv {
-                        &Value::BDocument(_) => {
-                            Some(subv.find_path2(path))
-                        },
-                        _ => {
-                            // child of the array is not a document.
-                            // TODO should this be an error?
-                            None
-                        },
-                        }
-                                               ).collect::<Result<Vec<_>>>();
-                let a = try!(a);
-                // if nothing matched, return None instead of an empty array.
-                // TODO is this right?
-                if a.len()==0 { Ok(FoundPath::NotFound) } else { Ok(FoundPath::Dive(a)) }
+                let a = self.items.iter().map(|subv| subv.walk_path(path)).collect::<Vec<_>>();
+                WalkPath::Dive(self, path, a)
             }, 
             Ok(ndx) => {
-                if ndx<0 {
-                    // TODO or we could return something like FoundPath::NegativeArrayIndex
-                    return Err(Error::Misc(format!("invalid path, negative array index: {}", path)));
-                } else if (ndx as usize)>=self.items.len() {
-                    // FoundPath::ArrayIndexTooLarge
-                    // TODO useless panic.  need to return Result.
-                    panic!( "array index too large");
+                if ndx < 0 || (ndx as usize) >= self.items.len() {
+                    WalkPath::BadIndex(self, ndx)
                 } else {
-                    let v = &self.items[ndx as usize];
+                    let ndx = ndx as usize;
+                    let v = &self.items[ndx];
                     match dot {
-                        None => Ok(FoundPath::Value(v)),
-                        Some(dot) => v.find_path2(&path[dot+1..])
+                        None => WalkPath::ArrayValue(self, ndx, v),
+                        Some(dot) => v.walk_path(&path[dot + 1 ..])
                     }
                 }
             }
@@ -1457,12 +1439,11 @@ impl Value {
         }
     }
 
-    pub fn find_path2<'a>(&'a self, path: &str) -> Result<FoundPath<'a>> {
+    pub fn walk_path<'v, 'p>(&'v self, path: &'p str) -> WalkPath<'v, 'p> {
         match self {
-            &Value::BDocument(ref bd) => bd.find_path2(path),
-            &Value::BArray(ref ba) => ba.find_path2(path),
-            // TODO or maybe FoundPath::NotContainer
-            _ => Ok(FoundPath::NotFound)
+            &Value::BDocument(ref bd) => bd.walk_path(path),
+            &Value::BArray(ref ba) => ba.walk_path(path),
+            _ => WalkPath::NotContainer(self, path)
         }
     }
 
@@ -1514,7 +1495,7 @@ impl Value {
                             let v = &ba.items[ndx as usize];
                             match dot {
                                 None => v.clone(),
-                                Some(dot) => v.find_path(&path[dot+1..])
+                                Some(dot) => v.find_path(&path[dot + 1..])
                             }
                         }
                     }
