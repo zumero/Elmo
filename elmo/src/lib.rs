@@ -1319,11 +1319,13 @@ impl Connection {
                                             a.push(v.clone());
                                         }
                                     },
-                                    _ => return Err(Error::Misc(format!("$pull not an array: {}", path))),
+                                    _ => return Err(Error::Misc(format!("$addToSet not an array: {}", path))),
                                 }
                             },
                             bson::Entry::Absent(e) => {
-                                return Err(Error::Misc(format!("$pull path not found: {}", path)));
+                                let mut ba = bson::Array::new();
+                                ba.push(v.clone());
+                                e.insert(ba.into_value());
                             },
                         }
                     }
