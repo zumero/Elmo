@@ -466,10 +466,10 @@ impl<'b> Server<'b> {
 
     fn reply_distinct(&self, mut req: MsgQuery, db: &str) -> Result<Reply> {
         let coll = try!(req.query.must_remove_string("distinct"));
-        // TODO invalid type in the following line wants to be 18510
-        let key = try!(req.query.must_remove_string("key"));
-        // TODO invalid type in the following line wants to be 18511
-        let query = try!(req.query.must_remove_document("query"));
+        let key = try!(req.query.must_remove("key"));
+        let key = try!(key.into_string().map_err(|e| elmo::Error::MongoCode(18510, format!("must be string"))));
+        let query = try!(req.query.must_remove("query"));
+        let query = try!(query.into_document().map_err(|e| elmo::Error::MongoCode(18511, format!("must be document"))));
 
         let values = try!(self.conn.distinct(db, &coll, &key, query));
         let mut doc = bson::Document::new();
