@@ -85,15 +85,136 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub enum WalkPath<'v, 'p> {
-    NotFound(&'v Document, &'p str),
-    BadIndex(&'v Array, i32),
     NotContainer(&'v Value, &'p str),
+
+    ArraySubDocument(&'v Array, usize, Box<WalkPath<'v, 'p>>),
+    ArraySubArray(&'v Array, usize, Box<WalkPath<'v, 'p>>),
+    ArraySubNotContainer(&'v Array, usize, &'v Value),
+
+    DocumentSubDocument(&'v Document, &'p str, Box<WalkPath<'v, 'p>>),
+    DocumentSubArray(&'v Document, &'p str, Box<WalkPath<'v, 'p>>),
+    DocumentSubNotContainer(&'v Document, &'p str, &'v Value),
+
     ArrayValue(&'v Array, usize, &'v Value),
     DocumentValue(&'v Document, &'p str, &'v Value),
+
+    NotFound(&'v Document, &'p str),
+    BadIndex(&'v Array, i32),
+
     Dive(&'v Array, &'p str, Vec<WalkPath<'v, 'p>>),
 }
 
-// TODO this function doesn't seem to go here
+impl<'v, 'p> WalkPath<'v, 'p> {
+    pub fn has_any_dives(&self) -> bool {
+        match self {
+            &WalkPath::Dive(_,_,_) => true,
+
+            &WalkPath::ArraySubDocument(_,_,ref p) => p.has_any_dives(),
+            &WalkPath::ArraySubArray(_,_,ref p) => p.has_any_dives(),
+            &WalkPath::DocumentSubDocument(_,_,ref p) => p.has_any_dives(),
+            &WalkPath::DocumentSubArray(_,_,ref p) => p.has_any_dives(),
+
+            &WalkPath::ArraySubNotContainer(_,_,_) => false,
+            &WalkPath::DocumentSubNotContainer(_,_,_) => false,
+            &WalkPath::NotContainer(_,_) => false,
+            &WalkPath::NotFound(_,_) => false,
+            &WalkPath::BadIndex(_,_) => false,
+
+            &WalkPath::ArrayValue(_,_,_) => false,
+            &WalkPath::DocumentValue(_,_,_) => false,
+        }
+    }
+
+    pub fn has_any_fails(&self) -> bool {
+        match self {
+            &WalkPath::Dive(_,_,ref a) => {
+                a.iter().any(|p| p.has_any_fails())
+            },
+            &WalkPath::ArraySubDocument(_,_,ref p) => p.has_any_fails(),
+            &WalkPath::ArraySubArray(_,_,ref p) => p.has_any_fails(),
+            &WalkPath::DocumentSubDocument(_,_,ref p) => p.has_any_fails(),
+            &WalkPath::DocumentSubArray(_,_,ref p) => p.has_any_fails(),
+
+            &WalkPath::ArraySubNotContainer(_,_,_) => true,
+            &WalkPath::DocumentSubNotContainer(_,_,_) => true,
+            &WalkPath::NotContainer(_,_) => true,
+            &WalkPath::NotFound(_,_) => true,
+            &WalkPath::BadIndex(_,_) => true,
+
+            &WalkPath::ArrayValue(_,_,_) => false,
+            &WalkPath::DocumentValue(_,_,_) => false,
+        }
+    }
+
+    pub fn has_any_values(&self) -> bool {
+        match self {
+            &WalkPath::Dive(_,_,ref a) => {
+                a.iter().any(|p| p.has_any_values())
+            },
+            &WalkPath::ArraySubDocument(_,_,ref p) => p.has_any_values(),
+            &WalkPath::ArraySubArray(_,_,ref p) => p.has_any_values(),
+            &WalkPath::DocumentSubDocument(_,_,ref p) => p.has_any_values(),
+            &WalkPath::DocumentSubArray(_,_,ref p) => p.has_any_values(),
+
+            &WalkPath::ArraySubNotContainer(_,_,_) => false,
+            &WalkPath::DocumentSubNotContainer(_,_,_) => false,
+            &WalkPath::NotContainer(_,_) => false,
+            &WalkPath::NotFound(_,_) => false,
+            &WalkPath::BadIndex(_,_) => false,
+
+            &WalkPath::ArrayValue(_,_,_) => true,
+            &WalkPath::DocumentValue(_,_,_) => true,
+        }
+    }
+
+    pub fn project(&self, d: &mut Value) -> Result<()> {
+        match self {
+            &WalkPath::Dive(_,_,ref a) => {
+                Err(Error::Misc(format!("TODO")))
+            },
+            &WalkPath::ArraySubDocument(_,_,ref p) => {
+                Err(Error::Misc(format!("TODO")))
+            },
+            &WalkPath::ArraySubArray(_,_,ref p) => {
+                Err(Error::Misc(format!("TODO")))
+            },
+            &WalkPath::ArraySubNotContainer(_,_,ref p) => {
+                Err(Error::Misc(format!("TODO")))
+            },
+            &WalkPath::DocumentSubDocument(_,name,ref p) => {
+                let sub = Document::new().into_value();
+                let d = try!(d.as_mut_document());
+                let sub = d.set(name, sub);
+                p.project(sub)
+            },
+            &WalkPath::DocumentSubArray(_,_,ref p) => {
+                Err(Error::Misc(format!("TODO")))
+            },
+            &WalkPath::DocumentSubNotContainer(_,_,ref p) => {
+                Err(Error::Misc(format!("TODO")))
+            },
+            &WalkPath::NotContainer(_,_) => {
+                Err(Error::Misc(format!("TODO")))
+            },
+            &WalkPath::NotFound(_,_) => {
+                Err(Error::Misc(format!("TODO")))
+            },
+            &WalkPath::BadIndex(_,_) => {
+                Err(Error::Misc(format!("TODO")))
+            },
+            &WalkPath::ArrayValue(_,_,_) => {
+                Err(Error::Misc(format!("TODO")))
+            },
+            &WalkPath::DocumentValue(_,name,v) => {
+                let d = try!(d.as_mut_document());
+                let _ = d.set(name, v.clone());
+                Ok(())
+            },
+        }
+    }
+}
+
+// TODO this function doesn't seem to belong here
 pub fn split_name(s: &str) -> Result<(&str, &str)> {
     match s.find('.') {
         None => Err(Error::Misc(format!("bad collection name: {}", s))),
@@ -514,10 +635,24 @@ impl Document {
                 let v = &self.pairs[ndx].1;
                 match dot {
                     None => WalkPath::DocumentValue(self, name, v),
-                    Some(dot) => v.walk_path(&path[dot + 1..])
+                    Some(dot) => {
+                        match v {
+                            &Value::BDocument(ref bd) => {
+                                WalkPath::DocumentSubDocument(self, name, box v.walk_path(&path[dot + 1..]))
+                            },
+                            &Value::BArray(ref ba) => {
+                                WalkPath::DocumentSubArray(self, name, box v.walk_path(&path[dot + 1..]))
+                            },
+                            _ => {
+                                WalkPath::DocumentSubNotContainer(self, name, v)
+                            },
+                        }
+                    },
                 }
             },
             None => {
+                // TODO do we need to distinguish between dot/not?
+                // ie, whether this was supposed to be a container or not?
                 WalkPath::NotFound(self, path)
             },
         }
@@ -631,17 +766,32 @@ impl Array {
                 // needs to get: [ 1, 2 ]
 
                 let a = self.items.iter().map(|subv| subv.walk_path(path)).collect::<Vec<_>>();
+                // TODO by definition, everything under a Dive is going to be a document
+                // or a NotContainer.
                 WalkPath::Dive(self, path, a)
             }, 
             Ok(ndx) => {
                 if ndx < 0 || (ndx as usize) >= self.items.len() {
+                    // TODO do we need to distinguish between dot or not?
                     WalkPath::BadIndex(self, ndx)
                 } else {
                     let ndx = ndx as usize;
                     let v = &self.items[ndx];
                     match dot {
                         None => WalkPath::ArrayValue(self, ndx, v),
-                        Some(dot) => v.walk_path(&path[dot + 1 ..])
+                        Some(dot) => {
+                            match v {
+                                &Value::BDocument(ref bd) => {
+                                    WalkPath::ArraySubDocument(self, ndx, box v.walk_path(&path[dot + 1 ..]))
+                                },
+                                &Value::BArray(ref ba) => {
+                                    WalkPath::ArraySubArray(self, ndx, box v.walk_path(&path[dot + 1 ..]))
+                                },
+                                _ => {
+                                    WalkPath::ArraySubNotContainer(self, ndx, v)
+                                },
+                            }
+                        },
                     }
                 }
             }
@@ -1241,6 +1391,13 @@ impl Value {
     pub fn as_document(&self) -> Result<&Document> {
         match self {
             &Value::BDocument(ref s) => Ok(s),
+            _ => Err(Error::Misc(format!("document required, but found {:?}", self))),
+        }
+    }
+
+    pub fn as_mut_document(&mut self) -> Result<&mut Document> {
+        match self {
+            &mut Value::BDocument(ref mut s) => Ok(s),
             _ => Err(Error::Misc(format!("document required, but found {:?}", self))),
         }
     }
