@@ -508,7 +508,7 @@ impl Document {
             None => path,
             Some(ndx) => &path[0 .. ndx]
         };
-        match slice_find(&self.pairs, name) {
+        match self.pairs.iter().position(|&(ref k, _)| k == name) {
             Some(ndx) => {
                 let v = &self.pairs[ndx].1;
                 match dot {
