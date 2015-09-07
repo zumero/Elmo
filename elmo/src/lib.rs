@@ -536,6 +536,12 @@ impl Projection {
                     // not
                     // {comments.id: [0,1,2,3]}
                     // We could use the new find_path code and simply project it properly.
+
+                    //println!("walk_path: path = {}", &path);
+                    //println!("walk_path: doc = {:?}", doc);
+                    //println!("walk_path: walk = {:?}", doc.walk_path(&path));
+                    //println!("");
+
                     let v = doc.find_path(&path);
                     match try!(d.entry(&path)) {
                         bson::Entry::Found(e) => {

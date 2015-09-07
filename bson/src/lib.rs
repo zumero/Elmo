@@ -83,6 +83,7 @@ impl From<std::str::Utf8Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Debug)]
 pub enum WalkPath<'v, 'p> {
     NotFound(&'v Document, &'p str),
     BadIndex(&'v Array, i32),
