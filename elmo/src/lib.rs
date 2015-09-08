@@ -542,15 +542,8 @@ impl Projection {
                     //println!("walk_path: walk = {:?}", doc.walk_path(&path));
                     //println!("");
 
-                    let v = doc.find_path(&path);
-                    match try!(d.entry(&path)) {
-                        bson::Entry::Found(e) => {
-                            return Err(Error::Misc(format!("projection error, include, should not be here yet")));
-                        },
-                        bson::Entry::Absent(e) => {
-                            e.insert(v);
-                        },
-                    }
+                    let walk = doc.walk_path(&path);
+                    try!(walk.project(&mut d));
                 }
                 // we need to include things that are in ops so we can modify them.
                 for &(ref path, _) in self.ops.iter() {
@@ -571,14 +564,7 @@ impl Projection {
             ProjectionMode::Exclude => {
                 d = doc;
                 for path in self.paths.iter() {
-                    match try!(d.entry(&path)) {
-                        bson::Entry::Found(e) => {
-                            e.remove();
-                        },
-                        bson::Entry::Absent(e) => {
-                            return Err(Error::Misc(format!("projection error, exclude, should be here")));
-                        },
-                    }
+                    d.exclude_path(&path);
                 }
             },
         }
