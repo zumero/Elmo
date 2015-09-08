@@ -144,27 +144,34 @@ impl<'v, 'p> WalkPath<'v, 'p> {
             &WalkPath::Dive(_,ref a) => {
                 for p in a.iter() {
                     match p {
-                        &WalkPath::Value(name, ref v) => {
+                        &WalkPath::Value(_, _) => {
                             let mut sub = Document::new();
                             p.project(&mut sub);
                             d.items.push(sub.into_value());
                         },
-                        &WalkPath::SubDocument(name, ref p) => {
+                        &WalkPath::SubDocument(_, _) => {
                             let mut sub = Document::new();
                             p.project(&mut sub);
                             d.items.push(sub.into_value());
                         },
-                        &WalkPath::SubArray(name, ref p) => {
-                            let mut sub = Array::new();
-                            p.project_into_array(&mut sub);
+                        &WalkPath::SubArray(_, _) => {
+                            let mut sub = Document::new();
+                            p.project(&mut sub);
                             d.items.push(sub.into_value());
                         },
-                        &WalkPath::NotContainer(name, ref p) => {
+                        &WalkPath::NotFound(_) => {
+                            // mongo tests seem to indicate that an empty document gets
+                            // produced in this case.
+                            let mut sub = Document::new();
+                            p.project(&mut sub);
+                            d.items.push(sub.into_value());
                         },
-                        &WalkPath::NotFound(name) => {
+                        &WalkPath::NotContainer(_, _) => {
+                            // mongo tests seem to indicate that doing nothing here is correct
                         },
                         &WalkPath::Dive(_,_) => {
                             // TODO what does this mean?
+                            // TODO this should be unreachable?
                         },
                     }
                 }
@@ -196,7 +203,8 @@ impl<'v, 'p> WalkPath<'v, 'p> {
             },
             &WalkPath::SubDocument(name, ref p) => {
                 // TODO the following code is dorky.  it wants to use something like entry(),
-                // but that's not quite right.  we need to make sure that d.name is a
+                // but that's not quite right.  its Absent::insert() doesn't return mut ref.
+                // we need to make sure that d.name is a
                 // subdocument, and insert one if it's not there, after which we will
                 // immediately need a mut ref to it so we can project into it.
                 {
