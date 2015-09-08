@@ -171,19 +171,19 @@ impl<'v, 'p> WalkPath<'v, 'p> {
                 Ok(())
             },
             &WalkPath::SubDocument(_,_) => {
-                Err(Error::Misc(format!("TODO: {:?}", self)))
+                Err(Error::Misc(format!("TODO project_into_array: {:?}", self)))
             },
             &WalkPath::SubArray(_,_) => {
-                Err(Error::Misc(format!("TODO: {:?}", self)))
+                Err(Error::Misc(format!("TODO project_into_array: {:?}", self)))
             },
             &WalkPath::NotContainer(_,_) => {
-                Err(Error::Misc(format!("TODO: {:?}", self)))
+                Err(Error::Misc(format!("TODO project_into_array: {:?}", self)))
             },
             &WalkPath::NotFound(_) => {
-                Err(Error::Misc(format!("TODO: {:?}", self)))
+                Err(Error::Misc(format!("TODO project_into_array: {:?}", self)))
             },
             &WalkPath::Value(_,_) => {
-                Err(Error::Misc(format!("TODO: {:?}", self)))
+                Err(Error::Misc(format!("TODO project_into_array: {:?}", self)))
             },
         }
     }
@@ -228,7 +228,7 @@ impl<'v, 'p> WalkPath<'v, 'p> {
             },
             &WalkPath::NotContainer(_,_) => {
                 // TODO this is an error, right?
-                Err(Error::Misc(format!("TODO: {:?}", self)))
+                Err(Error::Misc(format!("TODO project_into_document: {:?} walk = {:?}", d, self)))
             },
             &WalkPath::NotFound(_) => {
                 //Err(Error::Misc(format!("TODO: {:?}", self)))

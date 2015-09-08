@@ -613,8 +613,8 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
             b == match_pair_exists(pred, path, start)
         },
         &Pred::Not(ref a) => {
-            let any_matches = a.iter().any(|p| match_pair(p, path, start, cb_array_pos));
-            !any_matches
+            let any_matches = a.iter().any(|p| !match_pair(p, path, start, cb_array_pos));
+            any_matches
         },
         &Pred::NE(ref a) => {
             // TODO since this is implemented in matchPredicate, it seems like we should
@@ -918,7 +918,7 @@ fn parse_pred(k: &str, v: bson::Value) -> Result<Pred> {
                 Err(super::Error::Misc(format!("$mod arg must be array of len 2: {:?}", a)))
             } else {
                 let div = try!(a.items[0].numeric_to_i64());
-                let rem = try!(a.items[0].numeric_to_i64());
+                let rem = try!(a.items[1].numeric_to_i64());
                 if div == 0 {
                     Err(super::Error::MongoCode(16810, format!("$mod div by 0: {:?}", a)))
                 } else {
