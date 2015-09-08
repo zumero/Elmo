@@ -560,7 +560,7 @@ impl Document {
     pub fn unset_path(&mut self, path: &str) -> Result<Option<Value>> {
         match try!(self.entry(path)) {
             Entry::Found(e) => {
-                Ok(Some(e.remove()))
+                Ok(Some(e.unset()))
             },
             Entry::Absent(e) => {
                 Ok(None)
@@ -923,7 +923,7 @@ impl Array {
     pub fn unset_path(&mut self, path: &str) -> Result<Option<Value>> {
         match try!(self.entry(path)) {
             Entry::Found(e) => {
-                Ok(Some(e.remove()))
+                Ok(Some(e.unset()))
             },
             Entry::Absent(e) => {
                 Ok(None)
@@ -1263,6 +1263,17 @@ impl<'v> EntryFound<'v> {
             },
             EntryFound::ArrayParent(ba, i) => {
                 ba.items.remove(i)
+            },
+        }
+    }
+
+    pub fn unset(self) -> Value {
+        match self {
+            EntryFound::DocumentParent(bd, i) => {
+                bd.pairs.remove(i).1
+            },
+            EntryFound::ArrayParent(_, _) => {
+                self.replace(Value::BNull)
             },
         }
     }
