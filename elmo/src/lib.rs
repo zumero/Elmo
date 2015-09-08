@@ -3630,9 +3630,8 @@ impl Connection {
                     Ok(s) => {
                         Ok(bson::Value::BString(s))
                     },
-                    Err(_) => {
-                        // TODO get the actual error into this
-                        Err(Error::Misc(format!("strftime failed: {}", format)))
+                    Err(e) => {
+                        Err(Error::Misc(format!("strftime failed {}: {:?}", format, e)))
                     },
                 }
             },
