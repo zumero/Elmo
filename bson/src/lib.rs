@@ -195,12 +195,26 @@ impl<'v, 'p> WalkPath<'v, 'p> {
                 Err(Error::Misc(format!("project_into_document TODO: {:?}", self)))
             },
             &WalkPath::SubDocument(name, ref p) => {
-                // TODO what if name is already present?  error?
-                let sub = Document::new().into_value();
-                let sub = d.set(name, sub);
-                // need to get the document ref back
-                // TODO following line could just panic on fail
-                let mut sub = try!(sub.as_mut_document());
+                // TODO the following code is dorky.  it wants to use something like entry(),
+                // but that's not quite right.  we need to make sure that d.name is a
+                // subdocument, and insert one if it's not there, after which we will
+                // immediately need a mut ref to it so we can project into it.
+                {
+                    match d.get_mut(name) {
+                        Some(&mut Value::BDocument(ref mut bd)) => {
+                            return p.project(bd);
+                        },
+                        Some(_) => {
+                            return Err(Error::Misc(format!("project_into_document not a document: {:?}", self)));
+                        },
+                        None => {
+                            // fall thru to below to let the lexical mut borrow end
+                        },
+                    }
+                }
+                let mut sub = d.set(name, Document::new().into_value());
+                // TODO following line could just panic on fail, since we know it's a document
+                let sub = try!(sub.as_mut_document());
                 p.project(sub)
             },
             &WalkPath::SubArray(name,ref p) => {
