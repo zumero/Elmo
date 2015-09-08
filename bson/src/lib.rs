@@ -306,6 +306,9 @@ impl Document {
     }
 
     pub fn validate_depth(&self, depth: usize, max: usize) -> Result<()> {
+        if depth > max {
+            return Err(Error::Misc(format!("too much nesting")));
+        }
         for &(ref k, ref v) in &self.pairs {
             match v {
                 &Value::BDocument(ref bd) => try!(bd.validate_depth(1 + depth, max)),

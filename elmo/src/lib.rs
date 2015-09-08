@@ -3400,6 +3400,7 @@ impl Connection {
                     } else {
                         let s1 = try!(cur.into_string());
                         let s2 = try!(v.into_string());
+                        // TODO these into_string calls above must be errcode 16702
                         let s = s1 + &s2;
                         cur = bson::Value::BString(s);
                     }
@@ -3421,8 +3422,12 @@ impl Connection {
                 let v0 = try!(Self::eval(ctx, &t.0));
                 let v1 = try!(Self::eval(ctx, &t.1));
                 if !v0.is_numeric() || !v1.is_numeric() {
-                    return Err(Error::MongoCode(16611, format!("16611 numeric types only: {:?}", t)));
+                    return Err(Error::MongoCode(16611, format!("numeric types only: {:?}", t)));
                 }
+                if 0 == try!(v1.numeric_to_i32()) {
+                    return Err(Error::MongoCode(16610, format!("mod by 0: {:?}", t)));
+                }
+
                 match (v0,v1) {
                     (bson::Value::BInt32(n0),bson::Value::BInt32(n1)) => Ok(bson::Value::BInt32(n0 % n1)),
                     (bson::Value::BInt64(n0),bson::Value::BInt64(n1)) => Ok(bson::Value::BInt64(n0 % n1)),
@@ -3589,7 +3594,23 @@ impl Connection {
             },
             &Expr::Week(ref v) => {
                 // mongo wants 0 thru 53
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
+                let tm = try!(eval_tm(v));
+                match time::strftime("%U", &tm) {
+                    Ok(s) => {
+                        match s.parse::<u8>() {
+                            Ok(n) => {
+                                Ok(bson::Value::BInt32(n as i32))
+                            },
+                            Err(_) => {
+                                Err(Error::Misc(format!("strftime %U produced: {}", s)))
+                            },
+                        }
+                    },
+                    Err(_) => {
+                        // TODO get the actual error into this
+                        Err(Error::Misc(format!("strftime failed on %U")))
+                    },
+                }
             },
             &Expr::Month(ref v) => {
                 let tm = try!(eval_tm(v));
@@ -3615,8 +3636,9 @@ impl Connection {
                     },
                 }
             },
-            &Expr::Not(_) => {
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
+            &Expr::Not(ref v) => {
+                let b = try!(Self::eval(ctx, v)).as_expr_bool();
+                Ok(bson::Value::BBoolean(!b))
             },
             &Expr::SetDifference(_) => {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
