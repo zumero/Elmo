@@ -124,6 +124,49 @@ impl<'a, E: Error + 'a> From<E> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+pub fn mongo_strftime(fmt: &str, tm: &time::Tm) -> Result<String> {
+    //println!("mongo_strftime on: {:?}", tm);
+    let mut s = String::from(fmt).chars().collect::<Vec<char>>();
+    let mut cur = 0;
+    while (cur < s.len()) {
+        let mut n = cur;
+        while n < s.len() && s[n] != '%' {
+            n = n + 1;
+        }
+        if n == s.len() {
+            break;
+        } else if n+1 == s.len() {
+            return Err(Error::MongoCode(18535, format!("strftime format ends with single %")));
+        } else {
+            let repl = match s[n+1] {
+                'Y' => format!("{}", tm.tm_year + 1900),
+                'm' => format!("{:02}", tm.tm_mon + 1),
+                'd' => format!("{:02}", tm.tm_mday),
+                'H' => format!("{:02}", tm.tm_hour),
+                'M' => format!("{:02}", tm.tm_min),
+                'S' => format!("{:02}", tm.tm_sec),
+                'L' => format!("{:03}", tm.tm_nsec / 1000000),
+                'j' => format!("{:03}", tm.tm_yday + 1),
+                'w' => format!("{}", tm.tm_wday + 1),
+                'U' => format!("{:02}", (tm.tm_yday - tm.tm_wday + 7) / 7),
+                '%' => String::from("%"),
+                _ => return Err(Error::MongoCode(18536, format!("strftime format contains invalid specifier: {}", fmt))),
+            };
+            let repl = repl.chars().collect::<Vec<char>>();
+            s.remove(n + 1);
+            s.remove(n);
+            // TODO I wish there were a nicer way to insert the contents of one vec into another
+            for i in 0 .. repl.len() {
+                let c = repl[repl.len() - i - 1];
+                s.insert(n, c);
+            }
+            cur = n + repl.len();
+        }
+    }
+    let s = s.iter().cloned().collect::<String>();
+    Ok(s)
+}
+
 mod matcher;
 
 pub struct CollectionInfo {
@@ -3180,12 +3223,31 @@ impl Connection {
                                 Ok(Expr::SetUnion(try!(parse_vec(v))))
                             },
                             "$dateToString" => {
-                                let mut v = try!(v.into_document());
-                                if v.len() != 2 {
-                                    return Err(Error::Misc(format!("invalid $dateToString: {:?}", v)))
+                                if !v.is_document() {
+                                    return Err(Error::MongoCode(18629, format!("$dateToString requires a document")));
                                 }
-                                let date = try!(v.must_remove("date"));
-                                let format = try!(v.must_remove_string("format"));
+                                // TODO following could unwrap
+                                let mut v = try!(v.into_document());
+                                let date = match v.remove("date") {
+                                    Some(v) => v,
+                                    None => {
+                                        return Err(Error::MongoCode(18628, format!("$dateToString requires date")));
+                                    },
+                                };
+                                let format = match v.remove("format") {
+                                    Some(bson::Value::BString(s)) => {
+                                        s
+                                    },
+                                    Some(_) => {
+                                        return Err(Error::MongoCode(18533, format!("$dateToString format must be a string")));
+                                    },
+                                    None => {
+                                        return Err(Error::MongoCode(18627, format!("$dateToString requires format")));
+                                    },
+                                };
+                                if v.len() > 0 {
+                                    return Err(Error::MongoCode(18534, format!("$dateToString extra stuff")));
+                                }
                                 let date = try!(Self::parse_expr(date));
                                 Ok(Expr::DateToString(format, box date))
                             },
@@ -3217,9 +3279,9 @@ impl Connection {
     fn eval(ctx: &bson::Document, e: &Expr) -> Result<bson::Value> {
         let eval_tm = |v: &Expr| -> Result<time::Tm> {
             let d = try!(Self::eval(ctx, v));
-            let sec = try!(d.datetime_to_i64()) / 1000;
-            let ts = time::Timespec::new(sec, 0);
-            let tm = time::at(ts);
+            let n = try!(d.datetime_to_i64());
+            let ts = time::Timespec::new(n / 1000, ((n % 1000) * 1000000) as i32);
+            let tm = time::at_utc(ts);
             Ok(tm)
         };
 
@@ -3595,22 +3657,8 @@ impl Connection {
             &Expr::Week(ref v) => {
                 // mongo wants 0 thru 53
                 let tm = try!(eval_tm(v));
-                match time::strftime("%U", &tm) {
-                    Ok(s) => {
-                        match s.parse::<u8>() {
-                            Ok(n) => {
-                                Ok(bson::Value::BInt32(n as i32))
-                            },
-                            Err(_) => {
-                                Err(Error::Misc(format!("strftime %U produced: {}", s)))
-                            },
-                        }
-                    },
-                    Err(_) => {
-                        // TODO get the actual error into this
-                        Err(Error::Misc(format!("strftime failed on %U")))
-                    },
-                }
+                let n = (tm.tm_yday - tm.tm_wday + 7) / 7;
+                Ok(bson::Value::BInt32(n as i32))
             },
             &Expr::Month(ref v) => {
                 let tm = try!(eval_tm(v));
@@ -3625,14 +3673,24 @@ impl Connection {
                 Ok(bson::Value::BInt32(tm.tm_year + 1900))
             },
             &Expr::DateToString(ref format, ref v) => {
-                let tm = try!(eval_tm(v));
-                match time::strftime(&format, &tm) {
-                    Ok(s) => {
-                        Ok(bson::Value::BString(s))
-                    },
-                    Err(e) => {
-                        Err(Error::Misc(format!("strftime failed {}: {:?}", format, e)))
-                    },
+                let d = try!(Self::eval(ctx, v));
+                if d.is_null() {
+                    Ok(bson::Value::BNull)
+                } else {
+                    let n = 
+                        match d {
+                            bson::Value::BDateTime(n) => n,
+                            bson::Value::BTimeStamp(n) => {
+                                let ms = (n >> 32) * 1000;
+                                ms
+                            },
+                            _ => return Err(Error::MongoCode(16006, format!("datetime or timestamp required, but found {:?}", d))),
+                        };
+                    let ts = time::Timespec::new(n / 1000, ((n % 1000) * 1000000) as i32);
+                    let tm = time::at_utc(ts);
+                    let tm = try!(eval_tm(v));
+                    let s = try!(mongo_strftime(&format, &tm));
+                    Ok(bson::Value::BString(s))
                 }
             },
             &Expr::Not(ref v) => {

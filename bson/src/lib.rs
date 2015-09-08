@@ -83,6 +83,22 @@ impl From<std::str::Utf8Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+fn simple_mongo_strftime(fmt: &str, tm: &time::Tm) -> String {
+    let mut s = String::from(fmt);
+    s = s.replace("%Y", &format!("{}", tm.tm_year + 1900));
+    s = s.replace("%m", &format!("{:02}", tm.tm_mon + 1));
+    s = s.replace("%d", &format!("{:02}", tm.tm_mday));
+    s = s.replace("%H", &format!("{:02}", tm.tm_hour));
+    s = s.replace("%M", &format!("{:02}", tm.tm_min));
+    s = s.replace("%S", &format!("{:02}", tm.tm_sec));
+    s = s.replace("%L", &format!("{:03}", tm.tm_nsec / 1000000));
+    s = s.replace("%j", &format!("{:03}", tm.tm_yday + 1));
+    s = s.replace("%w", &format!("{}", tm.tm_wday + 1));
+    s = s.replace("%U", &format!("{:02}", (tm.tm_yday - tm.tm_wday + 7) / 7));
+    s = s.replace("%%", "%");
+    s
+}
+
 // TODO
 pub enum PathKey<'a> {
     Array(usize),
@@ -1482,19 +1498,11 @@ impl Value {
 
         match self {
             Value::BDateTime(n) => {
-                let sec = n / 1000;
-                let ts = time::Timespec::new(sec, 0);
-                let tm = time::at(ts);
+                let ts = time::Timespec::new(n / 1000, ((n % 1000) * 1000000) as i32);
+                let tm = time::at_utc(ts);
                 // yyyy-MM-ddTHH:mm:ss
-                match time::strftime("%Y-%m-%dT%H:%M:%S", &tm) {
-                    Ok(s) => {
-                        Ok(s)
-                    },
-                    Err(_) => {
-                        // TODO get the actual error into this
-                        Err(Error::Misc(format!("strftime failed")))
-                    },
-                }
+                let s = simple_mongo_strftime("%Y-%m-%dT%H:%M:%S", &tm);
+                Ok(s)
             },
             Value::BInt32(n) => Ok(format!("{}", n)),
             Value::BInt64(n) => Ok(format!("{}", n)),
