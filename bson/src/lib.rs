@@ -136,6 +136,10 @@ impl<'v, 'p> WalkPath<'v, 'p> {
     fn project_into_array(&self, d: &mut Array) -> Result<()> {
         // TODO mongo docs say that projecting a portion of an array
         // doesn't work without projection ops.
+
+        // TODO are the cases below supposed to always push?  Or
+        // should they take the given index into account?
+
         match self {
             &WalkPath::Dive(_,ref a) => {
                 for p in a.iter() {
@@ -191,19 +195,19 @@ impl<'v, 'p> WalkPath<'v, 'p> {
                 Err(Error::Misc(format!("project_into_document TODO: {:?}", self)))
             },
             &WalkPath::SubDocument(name, ref p) => {
-                // TODO what if name is already present?
+                // TODO what if name is already present?  error?
                 let sub = Document::new().into_value();
                 let sub = d.set(name, sub);
-                // TODO need to get the document ref back
+                // need to get the document ref back
                 // TODO following line could just panic on fail
                 let mut sub = try!(sub.as_mut_document());
                 p.project(sub)
             },
             &WalkPath::SubArray(name,ref p) => {
-                // TODO what if name is already present?
+                // TODO what if name is already present?  error?
                 let sub = Array::new().into_value();
                 let sub = d.set(name, sub);
-                // TODO need to get the array ref back
+                // need to get the array ref back
                 // TODO following line could just panic on fail
                 let mut sub = try!(sub.as_mut_array());
                 p.project_into_array(sub)

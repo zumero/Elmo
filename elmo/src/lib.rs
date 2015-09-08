@@ -4215,7 +4215,7 @@ impl Connection {
             move |rr| {
                 match rr {
                     Ok(mut row) => {
-                        let mut d = bson::Value::BDocument(bson::Document::new());
+                        let mut d = bson::Document::new();
                         let mut ctx = Self::init_eval_ctx(row.doc);
                         for &(ref path, ref op) in expressions.iter() {
                             match op {
@@ -4235,22 +4235,15 @@ impl Connection {
                                     }
                                 },
                                 &AggProj::Include => {
-                                    let v = try!(ctx.must_get_document("CURRENT")).find_path(path);
-                                    // TODO DRY
-                                    match try!(d.entry(path)) {
-                                        bson::Entry::Found(e) => {
-                                            return Err(Error::Misc(format!("16400 already: {}", path)))
-                                        },
-                                        bson::Entry::Absent(e) => {
-                                            if !v.is_undefined() {
-                                                e.insert(v);
-                                            }
-                                        },
-                                    }
+                                    // TODO this code probably expects that if it tries to project
+                                    // something that is already present it will error.  not sure
+                                    // walk.project() does that exactly how this code wants it.
+                                    let walk = try!(ctx.must_get_document("CURRENT")).walk_path(path);
+                                    try!(walk.project(&mut d));
                                 },
                             }
                         }
-                        row.doc = d;
+                        row.doc = d.into_value();
                         Ok(row)
                     },
                     Err(e) => Err(e),
