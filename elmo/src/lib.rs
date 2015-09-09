@@ -387,27 +387,23 @@ impl Projection {
 
         let paths = paths.into_iter().map(|(k,_)| k).collect::<Vec<_>>();
         let posop = {
-            fn fetch_paths(a: Vec<bool>, paths: &Vec<String>) -> Vec<&str> {
+            fn fetch_paths(a: Vec<bool>, paths: &Vec<String>) -> Vec<String> {
                 a
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(i,b)| 
-                                if b {
-                                    Some(paths[i].as_str())
-                                } else {
-                                    None
-                                }
-                                )
-                    .collect::<Vec<_>>()
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i,b)| 
+                            if b {
+                                Some(paths[i].clone())
+                            } else {
+                                None
+                            }
+                            )
+                .collect::<Vec<_>>()
             }
 
             let paths_with_posop = try!(paths
                                         .iter()
                                         .map(|p| Self::has_position_operator(p))
-                                        .collect::<Result<Vec<_>>>());
-            let ops_with_posop = try!(ops
-                                        .iter()
-                                        .map(|&(ref p,_)| Self::has_position_operator(p))
                                         .collect::<Result<Vec<_>>>());
             let mut paths_with_posop = fetch_paths(paths_with_posop, &paths);
             if paths_with_posop.len() > 0 {
@@ -420,19 +416,24 @@ impl Projection {
                     },
                 }
             }
-            let mut ops_with_posop = fetch_paths(ops_with_posop, &paths);
+            let ops_with_posop = try!(ops
+                                        .iter()
+                                        .map(|&(ref p,_)| Self::has_position_operator(p))
+                                        .collect::<Result<Vec<_>>>());
+            let ops_paths = ops.iter().map(|&(ref p,_)| p.clone()).collect::<Vec<_>>();
+            let mut ops_with_posop = fetch_paths(ops_with_posop, &ops_paths);
             paths_with_posop.append(&mut ops_with_posop);
             let r =
-            if paths_with_posop.len() > 1 {
-                return Err(Error::Misc(format!("only one posop allowed")));
-            } else {
-                match paths_with_posop.pop() {
-                    None => None,
-                    Some(s) => {
-                        Some(String::from(s))
-                    },
-                }
-            };
+                if paths_with_posop.len() > 1 {
+                    return Err(Error::Misc(format!("only one posop allowed")));
+                } else {
+                    match paths_with_posop.pop() {
+                        None => None,
+                        Some(s) => {
+                            Some(String::from(s))
+                        },
+                    }
+                };
             r
         };
         // TODO now check posop against matcher query paths
@@ -3280,7 +3281,10 @@ impl Connection {
         let eval_tm = |v: &Expr| -> Result<time::Tm> {
             let d = try!(Self::eval(ctx, v));
             let n = try!(d.datetime_to_i64());
-            let ts = time::Timespec::new(n / 1000, ((n % 1000) * 1000000) as i32);
+            // TODO problem here if n<0
+            let sec = n / 1000;
+            let ms = n % 1000;
+            let ts = time::Timespec::new(sec, (ms * 1000000) as i32);
             let tm = time::at_utc(ts);
             Ok(tm)
         };

@@ -379,7 +379,6 @@ let tests = [
     "jstests/core/update_arrayMatch6.js";
     "jstests/core/update_arrayMatch7.js";
     "jstests/core/update_arrayMatch8.js"; // dbref
-    "jstests/core/update_blank1.js";
     "jstests/core/update_invalid1.js";
     "jstests/core/update_mul_examples.js";
     "jstests/core/update_multi3.js";
