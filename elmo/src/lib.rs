@@ -3028,7 +3028,7 @@ impl Connection {
             match v {
                 bson::Value::BArray(mut a) => {
                     if a.len() != 1 {
-                        Err(Error::Misc(String::from("16020 wrong number of args")))
+                        Err(Error::MongoCode(16020, String::from("wrong number of args")))
                     } else {
                         Self::parse_expr(a.items.remove(0))
                     }
@@ -3041,7 +3041,7 @@ impl Connection {
             match v {
                 bson::Value::BArray(mut a) => {
                     if a.len() != 2 {
-                        Err(Error::MongoCode(16020, String::from("16020 wrong number of args")))
+                        Err(Error::MongoCode(16020, String::from("wrong number of args")))
                     } else {
                         let v1 = a.items.remove(1);
                         let v0 = a.items.remove(0);
@@ -3050,7 +3050,7 @@ impl Connection {
                         Ok((e0, e1))
                     }
                 },
-                _ => Err(Error::Misc(String::from("16020 wrong number of args")))
+                _ => Err(Error::MongoCode(16020, String::from("wrong number of args")))
             }
         };
 
@@ -3058,7 +3058,7 @@ impl Connection {
             match v {
                 bson::Value::BArray(mut a) => {
                     if a.len() != 3 {
-                        Err(Error::MongoCode(16020, String::from("16020 wrong number of args")))
+                        Err(Error::MongoCode(16020, String::from("wrong number of args")))
                     } else {
                         let v2 = a.items.remove(2);
                         let v1 = a.items.remove(1);
@@ -3069,7 +3069,7 @@ impl Connection {
                         Ok((e0, e1, e2))
                     }
                 },
-                _ => Err(Error::Misc(String::from("16020 wrong number of args")))
+                _ => Err(Error::MongoCode(16020, String::from("wrong number of args")))
             }
         };
 
@@ -3195,7 +3195,7 @@ impl Connection {
                                 } else if v.is_document() {
                                     Err(Error::Misc(format!("TODO $cond document: {:?}", v)))
                                 } else {
-                                    Err(Error::Misc(String::from("16020 wrong number of args")))
+                                    Err(Error::MongoCode(16020, String::from("wrong number of args")))
                                 }
                             },
 
@@ -3280,7 +3280,15 @@ impl Connection {
     fn eval(ctx: &bson::Document, e: &Expr) -> Result<bson::Value> {
         let eval_tm = |v: &Expr| -> Result<time::Tm> {
             let d = try!(Self::eval(ctx, v));
-            let n = try!(d.datetime_to_i64());
+            let n = 
+                match d {
+                    bson::Value::BDateTime(n) => n,
+                    bson::Value::BTimeStamp(n) => {
+                        let ms = (n >> 32) * 1000;
+                        ms
+                    },
+                    _ => return Err(Error::MongoCode(16006, format!("datetime or timestamp required, but found {:?}", d))),
+                };
             // TODO problem here if n<0
             let sec = n / 1000;
             let ms = n % 1000;
@@ -3427,7 +3435,9 @@ impl Connection {
             },
             &Expr::Size(ref v) => {
                 let s = try!(Self::eval(ctx, v));
-                // TODO 17124 on non-array
+                if !s.is_array() {
+                    return Err(Error::MongoCode(17124, format!("must be an array: {:?}", s)));
+                }
                 let s = try!(s.into_array());
                 Ok(bson::Value::BInt32(s.len() as i32))
             },
@@ -3690,7 +3700,10 @@ impl Connection {
                             },
                             _ => return Err(Error::MongoCode(16006, format!("datetime or timestamp required, but found {:?}", d))),
                         };
-                    let ts = time::Timespec::new(n / 1000, ((n % 1000) * 1000000) as i32);
+                    // TODO problem with negative number here
+                    let sec = n / 1000;
+                    let ms =  n % 1000;
+                    let ts = time::Timespec::new(sec, (ms * 1000000) as i32);
                     let tm = time::at_utc(ts);
                     let tm = try!(eval_tm(v));
                     let s = try!(mongo_strftime(&format, &tm));
@@ -3807,8 +3820,12 @@ impl Connection {
                         "$match" => {
                             let v = try!(v.into_document());
                             let m = try!(matcher::parse_query(v));
-                            // TODO disallow $where
-                            // TODO disallow $near
+                            if matcher::uses_where(&m) {
+                                return Err(Error::MongoCode(16395, String::from("$where not allowed in agg match")))
+                            }
+                            if matcher::uses_near(&m) {
+                                return Err(Error::MongoCode(16424, String::from("$near not allowed in agg match")))
+                            }
                             Ok(AggOp::Match(m))
                         },
                         "$project" => {
@@ -3880,9 +3897,12 @@ impl Connection {
                                         let a = try!(Self::parse_accum(op));
                                         Ok((k, a))
                                     }).collect::<Result<Vec<_>>>());
-                                    // TODO make sure 16414 no dot
-                                    let id = try!(Self::parse_expr(id));
-                                    Ok(AggOp::Group(id, accums))
+                                    if accums.iter().any(|&(ref s,_)| s.find('.').is_some()) {
+                                        Err(Error::MongoCode(16414, format!("$group does not allow dot in name")))
+                                    } else {
+                                        let id = try!(Self::parse_expr(id));
+                                        Ok(AggOp::Group(id, accums))
+                                    }
                                 }
                             }
                         },

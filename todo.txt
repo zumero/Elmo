@@ -1,4 +1,8 @@
 
+sometimes date1.js gets a network connect failure.  it's right after a
+big test.  and sometimes nestedobj1.js does the same thing.  and it's
+also right after a big test.  why?
+
 we're using usize all over the place for cases size and index into a page.
 this is sad, because a page will never exceed 32 bits, and probably will
 not exceed 16 bits.

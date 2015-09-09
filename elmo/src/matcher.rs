@@ -438,10 +438,6 @@ fn match_predicate<F: Fn(usize)>(pred: &Pred, d: &bson::Value, cb_array_pos: &F)
                 _ => false,
             }
         },
-        &Pred::Near(_) => panic!("TODO geo"),
-        &Pred::NearSphere(_) => panic!("TODO geo"),
-        &Pred::GeoWithin(_) => panic!("TODO geo"),
-        &Pred::GeoIntersects(_) => panic!("TODO geo"),
         &Pred::Type(n) => (d.getTypeNumber_u8() as i32) == n,
         &Pred::In(ref lits) => lits.iter().any(|v| cmp_in(d, v)),
         &Pred::Nin(ref lits) => !lits.iter().any(|v| cmp_in(d, v)),
@@ -459,6 +455,12 @@ fn match_predicate<F: Fn(usize)>(pred: &Pred, d: &bson::Value, cb_array_pos: &F)
                 _ => false,
             }
         },
+
+        // TODO don't panic here.  need to return Result<>
+        &Pred::Near(_) => panic!("TODO geo"),
+        &Pred::NearSphere(_) => panic!("TODO geo"),
+        &Pred::GeoWithin(_) => panic!("TODO geo"),
+        &Pred::GeoIntersects(_) => panic!("TODO geo"),
     }
 }
 
@@ -690,6 +692,31 @@ pub fn match_query(m: &QueryDoc, d: &bson::Value) -> (bool,Option<usize>) {
     };
     let b = match_query_doc(m, d, &cb);
     (b, pos.get())
+}
+
+pub fn uses_where(m: &QueryDoc) -> bool {
+    let &QueryDoc::QueryDoc(ref items) = m;
+    items.iter().any(
+        |q| match q {
+            &QueryItem::Where(_) => true,
+            _ => false,
+        })
+}
+
+pub fn uses_near(m: &QueryDoc) -> bool {
+    let &QueryDoc::QueryDoc(ref items) = m;
+    items.iter().any(
+        |q| match q {
+            &QueryItem::Compare(_, ref preds) => {
+                preds.iter().any(
+                    |p| match p {
+                        &Pred::Near(_) => true,
+                        _ => false,
+                    }
+                    )
+            },
+            _ => false,
+        })
 }
 
 fn contains_no_dollar_keys(v: &bson::Value) -> bool {
@@ -938,10 +965,12 @@ fn parse_pred(k: &str, v: bson::Value) -> Result<Pred> {
                 Ok(Pred::ElemMatchPreds(preds))
             }
         },
-        "$near" => panic!("TODO parse_pred $near"),
-        "$nearSphere" => panic!("TODO parse_pred $nearSphere"),
-        "$geoWithin" => panic!("TODO parse_pred $geoWithin"),
-        "$geoIntersects" => panic!("TODO parse_pred $geoIntersects"),
+
+        // TODO the following items need more parsing
+        "$near" => Ok(Pred::Near(v)),
+        "$nearSphere" => Ok(Pred::NearSphere(v)),
+        "$geoWithin" => Ok(Pred::GeoWithin(v)),
+        "$geoIntersects" => Ok(Pred::GeoIntersects(v)),
         _ => Err(super::Error::Misc(format!("unknown pred: {}", k))),
     }
 }
@@ -1047,6 +1076,7 @@ fn parse_query_doc(bd: &bson::Document) -> Result<Vec<QueryItem>> {
             "$where" => {
                 // TODO clone
                 result.push(QueryItem::Where(v.clone()));
+                //return Err(Error::Misc(format!("$where is not supported")));
             },
             "$and" => {
                 let ba = try!(v.as_array());
@@ -1063,7 +1093,10 @@ fn parse_query_doc(bd: &bson::Document) -> Result<Vec<QueryItem>> {
                             Some(&(_, bson::Value::BString(ref s))) => {
                                 result.push(QueryItem::Text(s.clone()));
                             },
-                            _ => panic!("invalid $text"),
+                            _ => {
+                                // TODO no panic here
+                                panic!("invalid $text");
+                            },
                         }
                     },
                     _ => panic!("invalid $text"),
