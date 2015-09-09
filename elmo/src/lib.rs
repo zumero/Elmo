@@ -3351,16 +3351,10 @@ impl Connection {
                         if subpath.chars().any(|c| c == (0 as char)) {
                             return Err(Error::MongoCode(16419, format!("field path cannot contain NUL char: {:?}", subpath)));
                         }
-                        // TODO ensure no null char in this string
-                        match v.find_path(subpath) {
-                            bson::Value::BUndefined => {
-                                // TODO is this right?  or should it error?
-                                Ok(bson::Value::BUndefined)
-                            },
-                            v => {
-                                // TODO remove undefined
-                                Ok(v)
-                            },
+                        let v = try!(v.as_document());
+                        match v.walk_path(subpath).cloned_value() {
+                            Some(v) => Ok(v),
+                            None => Ok(bson::Value::BUndefined),
                         }
                     },
                 }
@@ -4153,6 +4147,8 @@ impl Connection {
                 },
             };
             for &(ref k, ref op) in ops.iter() {
+                //println!("group: k = {}", k);
+                //println!("group: op = {:?}", op);
                 match op {
                     &GroupAccum::First(ref e) => {
                         let v = try!(Self::eval(&ctx, &e));
@@ -4167,6 +4163,7 @@ impl Connection {
                     },
                     &GroupAccum::Last(ref e) => {
                         let v = try!(Self::eval(&ctx, &e));
+                        // TODO shouldn't this be entry?  can k be a path with dots?
                         acc.set(k, v);
                     },
                     &GroupAccum::Max(ref e) => {

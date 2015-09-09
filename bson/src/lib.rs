@@ -211,6 +211,31 @@ impl<'v, 'p> WalkPath<'v, 'p> {
         }
     }
 
+    pub fn cloned_value(&self) -> Option<Value> {
+        match self {
+            &WalkPath::Dive(_,ref a) => {
+                let a2 = a.iter().filter_map(|p| p.cloned_value()).collect::<Vec<_>>();
+                let a2 = Array { items: a2 };
+                Some(Value::BArray(a2))
+            },
+            &WalkPath::SubDocument(_, ref p) => {
+                p.cloned_value()
+            },
+            &WalkPath::SubArray(_,ref p) => {
+                p.cloned_value()
+            },
+            &WalkPath::NotContainer(_,_) => {
+                None
+            },
+            &WalkPath::NotFound(_) => {
+                None
+            },
+            &WalkPath::Value(_,v) => {
+                Some(v.clone())
+            },
+        }
+    }
+
     pub fn project(&self, d: &mut Document) -> Result<()> {
         match self {
             &WalkPath::Dive(_,_) => {
@@ -2080,6 +2105,7 @@ impl Value {
     }
 
     pub fn replace_undefined(&mut self) {
+        // TODO er, why doesn't this function recurse?  the fs version did.
         match self {
             &mut Value::BUndefined => {
                 *self = Value::BNull;
