@@ -3193,7 +3193,34 @@ impl Connection {
                                 if v.is_array() {
                                     Ok(Expr::Cond(box try!(get_three_args(v))))
                                 } else if v.is_document() {
-                                    Err(Error::Misc(format!("TODO $cond document: {:?}", v)))
+                                    let mut v = try!(v.into_document());
+                                    if v.pairs.iter().any(|&(ref k,_)| k != "if" && k != "then" && k != "else") {
+                                        Err(Error::MongoCode(17083, String::from("unrecognized $cond arg")))
+                                    } else {
+                                        let arg_if = match v.remove("if") {
+                                            Some(v) => v,
+                                            None => {
+                                                return Err(Error::MongoCode(17080, String::from("$cond missing if")));
+                                            },
+                                        };
+                                        let arg_then = match v.remove("then") {
+                                            Some(v) => v,
+                                            None => {
+                                                return Err(Error::MongoCode(17081, String::from("$cond missing then")));
+                                            },
+                                        };
+                                        let arg_else = match v.remove("else") {
+                                            Some(v) => v,
+                                            None => {
+                                                return Err(Error::MongoCode(17082, String::from("$cond missing else")));
+                                            },
+                                        };
+                                        let e_if = try!(Self::parse_expr(arg_if));
+                                        let e_then = try!(Self::parse_expr(arg_then));
+                                        let e_else = try!(Self::parse_expr(arg_else));
+                                        let t = (e_if, e_then, e_else);
+                                        Ok(Expr::Cond(box t))
+                                    }
                                 } else {
                                     Err(Error::MongoCode(16020, String::from("wrong number of args")))
                                 }
@@ -3717,6 +3744,14 @@ impl Connection {
                 let b = try!(Self::eval(ctx, v)).as_expr_bool();
                 Ok(bson::Value::BBoolean(!b))
             },
+            &Expr::Cond(ref t) => {
+                let b = try!(Self::eval(ctx, &t.0)).as_expr_bool();
+                if b {
+                    Self::eval(ctx, &t.1)
+                } else {
+                    Self::eval(ctx, &t.2)
+                }
+            },
             &Expr::SetDifference(_) => {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
@@ -3730,9 +3765,6 @@ impl Connection {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
             &Expr::SetUnion(_) => {
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
-            },
-            &Expr::Cond(_) => {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
             &Expr::Map(_,_,_) => {
@@ -3910,7 +3942,8 @@ impl Connection {
                             }
                         },
                         "$redact" => {
-                            Err(Error::Misc(format!("agg pipeline TODO: {}", k)))
+                            let e = try!(Self::parse_expr(v));
+                            Ok(AggOp::Redact(e))
                         },
                         "$geoNear" => {
                             Err(Error::Misc(format!("agg pipeline TODO: {}", k)))
@@ -3921,6 +3954,112 @@ impl Connection {
             }).collect::<Result<Vec<AggOp>>>()
     }
 
+    fn redact_array(a: bson::Array, e: &Expr) -> Result<bson::Value> {
+        let mut a2 = bson::Array::new();
+        for v in a.items {
+            match v {
+                bson::Value::BDocument(bd) => {
+                    match try!(Self::redact_document(bd, e)) {
+                        Some(v) => {
+                            a2.push(v);
+                        },
+                        None => {
+                        },
+                    }
+                },
+                bson::Value::BArray(ba) => {
+                    let a3 = try!(Self::redact_array(ba, e));
+                    a2.push(a3);
+                },
+                v => {
+                    a2.push(v);
+                },
+            }
+        }
+        Ok(a2.into_value())
+    }
+
+    fn redact_document(doc: bson::Document, e: &Expr) -> Result<Option<bson::Value>> {
+        // TODO the clone() in the following line is sad.  but cases below
+        // need the document.  should we get it back from CURRENT?  or make
+        // a copy just for the purpose of eval() ?
+        let mut ctx = Self::init_eval_ctx(doc.clone().into_value());
+        let v = try!(Self::eval(&ctx, &e));
+        match v {
+            bson::Value::BString(ref s) => {
+                match s.as_str() {
+                    "__descend__" => {
+                        let mut d2 = bson::Document::new();
+                        for (k, v) in doc.pairs.into_iter() {
+                            match v {
+                                bson::Value::BDocument(bd) => {
+                                    match try!(Self::redact_document(bd, &e)) {
+                                        Some(q) => {
+                                            d2.set(&k, q);
+                                        },
+                                        None => {
+                                        },
+                                    }
+                                },
+                                bson::Value::BArray(ba) => {
+                                    d2.set(&k, try!(Self::redact_array(ba, e)));
+                                },
+                                _ => {
+                                    d2.set(&k, v);
+                                },
+                            }
+                        }
+                        Ok(Some(d2.into_value()))
+                    },
+                    "__prune__" => {
+                        Ok(None)
+                    },
+                    "__keep__" => {
+                        Ok(Some(doc.into_value()))
+                    },
+                    v => {
+                        Err(Error::MongoCode(17053, format!("invalid result from $redact expression: {}", v)))
+                    },
+                }
+            },
+            v => {
+                Err(Error::MongoCode(17053, format!("invalid result from $redact expression: {:?}", v)))
+            },
+        }
+    }
+
+    fn agg_redact(seq: Box<Iterator<Item=Result<Row>>>, e: Expr) -> Box<Iterator<Item=Result<Row>>> {
+        box seq.filter_map(
+            move |rr| {
+                match rr {
+                    Ok(row) => {
+                        // TODO I still wish Row.doc was a document
+                        let doc = row.doc.into_document().unwrap();
+                        match Self::redact_document(doc, &e) {
+                            Ok(Some(v)) => {
+                                let r2 = Row {
+                                    doc: v,
+                                    pos: row.pos,
+                                    score: row.score,
+                                };
+                                Some(Ok(r2))
+                            },
+                            Ok(None) => {
+                                None
+                            },
+                            Err(e) => {
+                                Some(Err(e))
+                            },
+                        }
+                    },
+                    Err(e) => {
+                        Some(Err(e))
+                    },
+                }
+            }
+            )
+    }
+
     fn agg_unwind(seq: Box<Iterator<Item=Result<Row>>>, mut path: String) -> Box<Iterator<Item=Result<Row>>> {
         // TODO verify/strip $ in front of path
         path.remove(0);
@@ -3928,12 +4067,12 @@ impl Connection {
             move |rr| -> Box<Iterator<Item=Result<Row>>> {
                 match rr {
                     Ok(row) => {
-                        println!("unwind: {:?}", row);
+                        //println!("unwind: {:?}", row);
                         match row.doc.find_path(&path) {
                             bson::Value::BUndefined => box std::iter::empty(),
                             bson::Value::BNull => box std::iter::empty(),
                             bson::Value::BArray(a) => {
-                                println!("unwind: {:?}", a);
+                                //println!("unwind: {:?}", a);
                                 if a.len() == 0 {
                                     box std::iter::empty()
                                 } else {
@@ -3972,9 +4111,10 @@ impl Connection {
         let mut ctx = bson::Document::new();
         ctx.set("CURRENT", d);
         // TODO ROOT
-        // TODO DESCEND
-        // TODO PRUNE
-        // TODO KEEP
+        // TODO use string constants for the stuff below
+        ctx.set("DESCEND", bson::Value::BString(String::from("__descend__")));
+        ctx.set("PRUNE", bson::Value::BString(String::from("__prune__")));
+        ctx.set("KEEP", bson::Value::BString(String::from("__keep__")));
         ctx
     }
 
@@ -4394,6 +4534,9 @@ impl Connection {
                 },
                 AggOp::Unwind(path) => {
                     seq = Self::agg_unwind(seq, path);
+                },
+                AggOp::Redact(e) => {
+                    seq = Self::agg_redact(seq, e);
                 },
                 _ => {
                     return Err(Error::Misc(format!("agg pipeline TODO: {:?}", op)))

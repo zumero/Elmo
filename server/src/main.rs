@@ -1156,7 +1156,7 @@ impl<'b> Server<'b> {
         let (out, seq) = try!(self.conn.aggregate(db, &coll, pipeline));
         match out {
             Some(new_coll_name) => {
-                return Err(Error::Misc(format!("agg $out")))
+                return Err(Error::Misc(format!("TODO agg $out")))
             },
             None => {
                 let default_batch_size = 100;
