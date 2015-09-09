@@ -3098,6 +3098,9 @@ impl Connection {
                     let (k, v) = bd.pairs.remove(0);
                     if k.starts_with("$") {
                         match k.as_str() {
+                            "$literal" => {
+                                Ok(Expr::Literal(v))
+                            },
                             "$allElementsTrue" => {
                                 Ok(Expr::AllElementsTrue(box try!(get_one_arg(v))))
                             },
@@ -3332,7 +3335,7 @@ impl Connection {
         match e {
             &Expr::Literal(ref v) => Ok(v.clone()),
             &Expr::Var(ref s) => {
-                println!("Var: {}", s);
+                //println!("Var: {}", s);
                 // if the var contains an object followed by a dotted path,
                 // we need to dive into that path.
                 let dot = s.find('.');
@@ -3345,6 +3348,9 @@ impl Connection {
                     None => Ok(v.clone()),
                     Some(i) => {
                         let subpath = &s[i + 1 ..];
+                        if subpath.chars().any(|c| c == (0 as char)) {
+                            return Err(Error::MongoCode(16419, format!("field path cannot contain NUL char: {:?}", subpath)));
+                        }
                         // TODO ensure no null char in this string
                         match v.find_path(subpath) {
                             bson::Value::BUndefined => {
@@ -4135,10 +4141,12 @@ impl Connection {
             // TODO if the idval is numeric, we are apparently supposed to collapse them.
             // for example the same value in i32 and i64 are a match.  double too, if it's
             // an integral value.  server5209
-            // TODO see if mapa already has idval
-            let acc = match mapa.entry(idval) {
+            // TODO avoid clone() in following line
+            let acc = match mapa.entry(idval.clone()) {
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(bson::Document::new())
+                    let mut d = bson::Document::new();
+                    d.set("_id", idval);
+                    e.insert(d)
                 },
                 std::collections::hash_map::Entry::Occupied(e) => {
                     e.into_mut()
@@ -4278,6 +4286,7 @@ impl Connection {
                 },
             }
         }
+        println!("grouped: {:?}", mapa);
         Ok(mapa)
     }
 
