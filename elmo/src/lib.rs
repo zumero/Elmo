@@ -2208,10 +2208,52 @@ impl Connection {
         Ok(results)
     }
 
-    pub fn list_collections(&self) -> Result<Vec<CollectionInfo>> {
+    pub fn list_all_collections(&self) -> Result<Vec<CollectionInfo>> {
         let reader = try!(self.conn.begin_read());
         let v = try!(reader.list_collections());
         Ok(v)
+    }
+
+    pub fn list_collections(&self, db: &str, filter: Option<bson::Document>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>> {
+        let results = try!(self.list_all_collections());
+        let mut seq: Box<Iterator<Item=Result<Row>>>;
+        seq = box {
+            // we need db to get captured by this closure which outlives
+            // this function, so we create String from it and use a move
+            // closure.
+
+            let db = String::from(db);
+            let results = results.into_iter().filter_map(
+                move |c| {
+                    if db.as_str() == c.db {
+                        let mut doc = bson::Document::new();
+                        doc.set_string("name", c.coll);
+                        doc.set_document("options", c.options);
+                        let r = Row {
+                            doc: bson::Value::BDocument(doc),
+                            pos: None,
+                            score: None,
+                        };
+                        Some(Ok(r))
+                    } else {
+                        None
+                    }
+                }
+                );
+            results
+        };
+
+        match filter {
+            Some(q) => {
+                let m = try!(matcher::parse_query(q));
+                seq = Self::seq_match(seq, m);
+                Ok(box seq)
+            },
+            None => {
+                Ok(box seq)
+            },
+        }
+
     }
 
     pub fn list_indexes(&self) -> Result<Vec<IndexInfo>> {

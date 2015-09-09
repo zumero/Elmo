@@ -983,37 +983,12 @@ impl<'b> Server<'b> {
     }
 
     fn reply_list_collections(&mut self, mut req: MsgQuery, db: &str) -> Result<Reply> {
-        let results = try!(self.conn.list_collections());
-        let seq = {
-            // we need db to get captured by this closure which outlives
-            // this function, so we create String from it and use a move
-            // closure.
-
-            let db = String::from(db);
-            let results = results.into_iter().filter_map(
-                move |c| {
-                    if db.as_str() == c.db {
-                        let mut doc = bson::Document::new();
-                        doc.set_string("name", c.coll);
-                        doc.set_document("options", c.options);
-                        let r = elmo::Row {
-                            doc: bson::Value::BDocument(doc),
-                            pos: None,
-                            score: None,
-                        };
-                        Some(Ok(r))
-                    } else {
-                        None
-                    }
-                }
-                );
-            results
-        };
-
-        match req.query.get("filter") {
-            Some(_) => println!("TODO list_collections filter"),
-            None => (),
-        }
+        let filter = 
+            match req.query.remove("filter") {
+                Some(v) => Some(try!(v.into_document())),
+                None => None,
+            };
+        let seq = try!(self.conn.list_collections(db, filter));
 
         let default_batch_size = 100;
         let cursor_options = 
@@ -1417,7 +1392,9 @@ impl<'b> Server<'b> {
                 }
             },
             None => {
-                reply_err(req.req_id, Error::Misc(String::from("cursor not found")))
+                let mut r = create_reply(req.req_id, vec![], 0);
+                r.flags = 1;
+                r
             },
         }
     }
@@ -1464,6 +1441,7 @@ impl<'b> Server<'b> {
                     },
                     Request::GetMore(req) => {
                         let resp = self.reply_2005(req);
+                        println!("2005 reply: {:?}", resp);
                         send_reply(stream, resp)
                     },
                 }
