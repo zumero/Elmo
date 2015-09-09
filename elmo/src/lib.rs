@@ -4421,14 +4421,7 @@ impl Connection {
                             let vb = b.doc.find_path(&path);
                             // TODO replace undefined
 
-                            let mut c = matcher::cmp(&va, &vb);
-                            if dir < 0 {
-                                c = match c {
-                                    Ordering::Equal => Ordering::Equal,
-                                    Ordering::Less => Ordering::Greater,
-                                    Ordering::Greater => Ordering::Less,
-                                }
-                            }
+                            let mut c = matcher::cmpdir(&va, &vb, dir<0);
                             if c != Ordering::Equal {
                                 return c;
                             }

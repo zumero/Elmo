@@ -192,7 +192,7 @@ fn array_max(a: &Vec<bson::Value>) -> Option<&bson::Value> {
     array_min_max(a, Ordering::Greater)
 }
 
-fn cmpdir(d: &bson::Value, lit: &bson::Value, reverse: bool) -> Ordering {
+pub fn cmpdir(d: &bson::Value, lit: &bson::Value, reverse: bool) -> Ordering {
     // when comparing an array against something else during sort:
     // if two arrays, compare element by element.
     // if array vs. not-array, find the min or max (depending on the
