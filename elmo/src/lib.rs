@@ -3571,6 +3571,9 @@ impl Connection {
             },
             &Expr::Add(ref a) => {
                 let vals = try!(a.iter().map(|e| Self::eval(ctx, e)).collect::<Result<Vec<_>>>());
+                if vals.iter().any(|v| (!v.is_date()) && (!v.is_numeric())) {
+                    return Err(Error::MongoCode(16554, format!("$add supports numeric or date: {:?}", a)));
+                }
                 let count_dates = vals.iter().filter(|v| v.is_date()).count();
                 if count_dates > 1 {
                     Err(Error::MongoCode(16612, format!("only one date allowed: {:?}", a)))

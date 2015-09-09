@@ -252,7 +252,8 @@ impl<'v, 'p> WalkPath<'v, 'p> {
             },
             &WalkPath::NotContainer(_,_) => {
                 // TODO this is an error, right?
-                Err(Error::Misc(format!("TODO project_into_document: {:?} walk = {:?}", d, self)))
+                //Err(Error::Misc(format!("TODO project_into_document: {:?} walk = {:?}", d, self)))
+                Ok(())
             },
             &WalkPath::NotFound(_) => {
                 //Err(Error::Misc(format!("TODO: {:?}", self)))
