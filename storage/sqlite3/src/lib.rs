@@ -1019,6 +1019,8 @@ impl MyWriter {
             Some(_) => {
                 let old_tbl = get_table_name_for_collection(old_db, old_coll);
                 let new_tbl = get_table_name_for_collection(new_db, new_coll);
+                let indexes = try!(self.myconn.base_list_indexes());
+                let indexes = indexes.into_iter().filter(|info| info.db == old_db && info.coll == old_coll ).collect::<Vec<_>>();
 
                 let mut stmt = try!(self.myconn.conn.prepare("UPDATE \"collections\" SET dbName=?, collName=? WHERE dbName=? AND collName=?").map_err(elmo::wrap_err));
                 try!(stmt.bind_text(1, new_db).map_err(elmo::wrap_err));
@@ -1030,13 +1032,10 @@ impl MyWriter {
 
                 try!(self.myconn.conn.exec(&format!("ALTER TABLE \"{}\" RENAME TO \"{}\"", old_tbl, new_tbl)).map_err(elmo::wrap_err));
 
-                let indexes = try!(self.myconn.base_list_indexes());
                 for info in indexes {
-                    if info.db == old_db && info.coll == old_coll {
-                        let old_ndx_tbl = get_table_name_for_index(old_db, old_coll, &info.name);
-                        let new_ndx_tbl = get_table_name_for_index(new_db, new_coll, &info.name);
-                        try!(self.myconn.conn.exec(&format!("ALTER TABLE \"{}\" RENAME TO \"{}\"", old_ndx_tbl, new_ndx_tbl)).map_err(elmo::wrap_err));
-                    }
+                    let old_ndx_tbl = get_table_name_for_index(old_db, old_coll, &info.name);
+                    let new_ndx_tbl = get_table_name_for_index(new_db, new_coll, &info.name);
+                    try!(self.myconn.conn.exec(&format!("ALTER TABLE \"{}\" RENAME TO \"{}\"", old_ndx_tbl, new_ndx_tbl)).map_err(elmo::wrap_err));
                 }
                 Ok(false)
             },
