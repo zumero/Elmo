@@ -4321,6 +4321,7 @@ impl Connection {
                                 return c;
                             }
                         } else {
+                            println!("TODO sort on textScore: {:?}", dir);
                             // TODO sort on textScore?
                         }
                     }
@@ -4378,8 +4379,33 @@ impl Connection {
                             if c != Ordering::Equal {
                                 return c;
                             }
+                        } else if dir.is_document() {
+                            let dir = dir.as_document().unwrap();
+                            if dir.len() != 1 {
+                                println!("TODO error dir is invalid: {:?}", dir);
+                            } else if dir.pairs[0].0 != "$meta" {
+                                println!("TODO error dir is invalid: {:?}", dir);
+                            } else if !dir.pairs[0].1.is_string() {
+                                println!("TODO error dir is invalid: {:?}", dir);
+                            } else if dir.pairs[0].1.as_str().unwrap() != "textScore" {
+                                println!("TODO error dir is invalid: {:?}", dir);
+                            } else if a.score.is_none() {
+                                println!("TODO score is missing");
+                            } else if b.score.is_none() {
+                                println!("TODO score is missing");
+                            } else {
+                                let sa = a.score.unwrap();
+                                let sb = b.score.unwrap();
+                                if sb < sa {
+                                    return Ordering::Less;
+                                } else if sb > sa {
+                                    return Ordering::Greater;
+                                } else {
+                                    // Ordering::Equal
+                                }
+                            }
                         } else {
-                            // TODO sort on textScore?
+                            println!("TODO error dir is invalid: {:?}", dir);
                         }
                     }
                     Ordering::Equal
