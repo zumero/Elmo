@@ -899,7 +899,7 @@ fn decode_index_type(v: &bson::Value) -> Result<IndexType> {
 // TODO this is basically iter().position()
 fn slice_find(pairs: &[(String, bson::Value)], s: &str) -> Option<usize> {
     for i in 0 .. pairs.len() {
-        match pairs[0].1 {
+        match pairs[i].1 {
             bson::Value::BString(ref t) => {
                 if t == s {
                     return Some(i);
@@ -926,8 +926,9 @@ fn slice_find(pairs: &[(String, bson::Value)], s: &str) -> Option<usize> {
 // index, which we're ignoring.
 //
 pub fn get_normalized_spec(info: &IndexInfo) -> Result<(Vec<(String,IndexType)>,Option<HashMap<String,i32>>)> {
-    //printfn "info: %A" info
+    //println!("info: {:?}", info);
     let first_text = slice_find(&info.spec.pairs, "text");
+    //println!("first_text: {:?}", first_text);
     let w1 = info.options.get("weights");
     match (first_text, w1) {
         (None, None) => {
@@ -956,6 +957,8 @@ pub fn get_normalized_spec(info: &IndexInfo) -> Result<(Vec<(String,IndexType)>,
                     },
                     None => (&info.spec.pairs[0 ..], Vec::new())
                 };
+            //println!("scalar_keys: {:?}", scalar_keys);
+            //println!("text_keys: {:?}", text_keys);
             let mut weights = HashMap::new();
             match w1 {
                 Some(&bson::Value::BDocument(ref bd)) => {
@@ -970,7 +973,9 @@ pub fn get_normalized_spec(info: &IndexInfo) -> Result<(Vec<(String,IndexType)>,
                         weights.insert(t.0.clone(), n);
                     }
                 },
-                Some(_) => panic!( "weights must be a document"),
+                Some(_) => {
+                    return Err(Error::Misc(format!("weights must be a document")));
+                },
                 None => (),
             };
             for k in text_keys {
