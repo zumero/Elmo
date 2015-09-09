@@ -89,9 +89,17 @@ open System
 open System.IO
 open System.Diagnostics
 
+let pattern =
+    if fsi.CommandLineArgs.Length > 1 then
+        fsi.CommandLineArgs.[1] |> Some
+    else
+        None
+
+printfn "Pattern: %A" pattern
+
 let path_mongo_shell = "/Users/eric/Downloads/mongodb-osx-x86_64-3.0.1/bin/mongo"
 let path_mongo_src = "/Users/eric/m/mongo"
-let tests = [
+let all_tests = [
     "jstests/core/basic1.js";
     "jstests/core/basic2.js";
     "jstests/core/basic3.js";
@@ -535,6 +543,13 @@ let tests = [
     "jstests/core/regexb.js";
     "jstests/core/regexc.js";
     ]
+
+let tests = 
+    match pattern with
+    | Some pattern ->
+        List.filter (fun (s:string) -> s.Contains(pattern)) all_tests
+    | None ->
+        all_tests
 
 type res =
     {
