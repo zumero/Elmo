@@ -1155,7 +1155,18 @@ impl<'b> Server<'b> {
         } = req;
         let coll = try!(query.must_remove_string("count"));
         let hint = query.remove("hint");
-        let q = try!(query.must_remove_document("query"));
+        let q = 
+            match query.remove("query") {
+                Some(bson::Value::BDocument(bd)) => {
+                    bd
+                },
+                Some(q) => {
+                    return Err(Error::Misc(format!("invalid query: {:?}", q)));
+                },
+                None => {
+                    bson::Document::new()
+                },
+            };
         let seq = try!(self.conn.find(
                 db, 
                 &coll, 
