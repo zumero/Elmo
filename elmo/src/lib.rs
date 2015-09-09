@@ -3500,10 +3500,13 @@ impl Connection {
                         cur = bson::Value::BNull;
                     } else if v.is_undefined() {
                         cur = bson::Value::BNull;
+                    } else if !v.is_string() {
+                        return Err(Error::MongoCode(16702, format!("must be a string: {:?}", v)));
+                    } else if !cur.is_string() {
+                        return Err(Error::MongoCode(16702, format!("must be a string: {:?}", cur)));
                     } else {
                         let s1 = try!(cur.into_string());
                         let s2 = try!(v.into_string());
-                        // TODO these into_string calls above must be errcode 16702
                         let s = s1 + &s2;
                         cur = bson::Value::BString(s);
                     }
