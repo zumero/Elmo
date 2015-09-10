@@ -2095,7 +2095,9 @@ impl Connection {
                     let old_doc = try!(row.doc.into_document());
                     let mut new_doc = old_doc.clone();
                     try!(Self::apply_update_ops(&mut new_doc, &ops, false, row.pos));
-                    // TODO make sure _id did not change
+                    if try!(Self::id_changed(&old_doc, &new_doc)) {
+                        return Err(Error::Misc(String::from("cannot change _id")));
+                    }
                     if old_doc != new_doc {
                         let id = try!(Self::validate_for_storage(&mut new_doc));
                         // TODO error in the following line?
@@ -2111,6 +2113,15 @@ impl Connection {
                 } else {
                     let old_doc = try!(row.doc.into_document());
                     let old_id = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated")))).clone();
+                    match u.get("_id") {
+                        Some(new_id) => {
+                            if old_id != *new_id {
+                                return Err(Error::Misc(String::from("cannot change _id")));
+                            }
+                        },
+                        None => {
+                        },
+                    }
                     // TODO if u has _id, make sure it's the same
                     let mut new_doc = u;
                     new_doc.set("_id", old_id);
