@@ -1131,6 +1131,15 @@ impl<'b> Server<'b> {
         let (out, seq) = try!(self.conn.aggregate(db, &coll, pipeline));
         match out {
             Some(new_coll_name) => {
+                if new_coll_name.starts_with("system.") {
+                    return Err(Error::MongoCode(17385, format!("no $out into system coll: {}", new_coll_name)))
+                }
+                // TODO no $out into a capped collection
+                let full_coll = format!("{}.{}", db, new_coll_name);
+                self.remove_cursors_for_collection(&full_coll);
+                try!(self.conn.clear_collection(db, &new_coll_name));
+                // TODO this will fail because we need a separate connection
+                let results = try!(self.conn.insert_seq(db, &coll, seq));
                 return Err(Error::Misc(format!("TODO agg $out")))
             },
             None => {

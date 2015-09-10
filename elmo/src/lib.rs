@@ -2215,6 +2215,39 @@ impl Connection {
         }
     }
 
+    pub fn insert_seq(&self, db: &str, coll: &str, docs: Box<Iterator<Item=Result<Row>>>) -> Result<Vec<Result<()>>> {
+        let mut results = Vec::new();
+        {
+            let writer = try!(self.conn.begin_write());
+            {
+                let mut collwriter = try!(writer.get_collection_writer(db, coll));
+                for mut rr in docs {
+                    match rr {
+                        Ok(row) => {
+                            let doc = row.doc;
+                            match doc.into_document() {
+                                Ok(mut doc) => {
+                                    doc.ensure_id();
+                                    let id = try!(Self::validate_for_storage(&mut doc));
+                                    let r = collwriter.insert(&doc);
+                                    results.push(r);
+                                },
+                                Err(e) => {
+                                    results.push(Err(wrap_err(e)));
+                                },
+                            }
+                        },
+                        Err(e) => {
+                            results.push(Err(e));
+                        },
+                    }
+                }
+            }
+            try!(writer.commit());
+        }
+        Ok(results)
+    }
+
     pub fn insert(&self, db: &str, coll: &str, docs: &mut Vec<bson::Document>) -> Result<Vec<Result<()>>> {
         // make sure every doc has an _id
         for d in docs.iter_mut() {
@@ -2353,6 +2386,16 @@ impl Connection {
             deleted
         };
         Ok(deleted)
+    }
+
+    pub fn clear_collection(&self, db: &str, coll: &str) -> Result<bool> {
+        let b = {
+            let writer = try!(self.conn.begin_write());
+            let b = try!(writer.clear_collection(db, coll));
+            try!(writer.commit());
+            b
+        };
+        Ok(b)
     }
 
     pub fn rename_collection(&self, old_name: &str, new_name: &str, drop_target: bool) -> Result<bool> {
