@@ -19,6 +19,18 @@
 
 use std::collections::HashMap;
 
+pub fn fix_ms(n: i64) -> (i64, i64) {
+    if n < 0 {
+        let sec = -((-n) / 1000);
+        let ms = n % 1000 + 1000;
+        (sec, ms)
+    } else {
+        let sec = n / 1000;
+        let ms = n % 1000;
+        (sec, ms)
+    }
+}
+
 pub fn tid() -> String {
     // TODO use the rand crate
     fn bytes() -> std::io::Result<[u8; 16]> {

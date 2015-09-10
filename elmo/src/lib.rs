@@ -3366,9 +3366,7 @@ impl Connection {
                     },
                     _ => return Err(Error::MongoCode(16006, format!("datetime or timestamp required, but found {:?}", d))),
                 };
-            // TODO problem here if n<0
-            let sec = n / 1000;
-            let ms = n % 1000;
+            let (sec, ms) = misc::fix_ms(n);
             let ts = time::Timespec::new(sec, (ms * 1000000) as i32);
             let tm = time::at_utc(ts);
             Ok(tm)
@@ -3785,9 +3783,7 @@ impl Connection {
                             },
                             _ => return Err(Error::MongoCode(16006, format!("datetime or timestamp required, but found {:?}", d))),
                         };
-                    // TODO problem with negative number here
-                    let sec = n / 1000;
-                    let ms =  n % 1000;
+                    let (sec, ms) = misc::fix_ms(n);
                     let ts = time::Timespec::new(sec, (ms * 1000000) as i32);
                     let tm = time::at_utc(ts);
                     let tm = try!(eval_tm(v));

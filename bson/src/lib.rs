@@ -1524,7 +1524,8 @@ impl Value {
 
         match self {
             Value::BDateTime(n) => {
-                let ts = time::Timespec::new(n / 1000, ((n % 1000) * 1000000) as i32);
+                let (sec,ms) = misc::fix_ms(n);
+                let ts = time::Timespec::new(sec, (ms * 1000000) as i32);
                 let tm = time::at_utc(ts);
                 // yyyy-MM-ddTHH:mm:ss
                 let s = simple_mongo_strftime("%Y-%m-%dT%H:%M:%S", &tm);
