@@ -1142,13 +1142,17 @@ impl<'b> Server<'b> {
         let (out, seq) = try!(self.conn.aggregate(db, &coll, pipeline));
         match out {
             Some(new_coll_name) => {
+                let full_coll = format!("{}.{}", db, new_coll_name);
                 if new_coll_name.starts_with("system.") {
                     return Err(Error::MongoCode(17385, format!("no $out into system coll: {}", new_coll_name)))
                 }
-                // TODO no $out into a capped collection
-                let full_coll = format!("{}.{}", db, new_coll_name);
-                self.remove_cursors_for_collection(&full_coll);
                 let conn2 = try!(self.factory.open());
+                let colls = try!(conn2.list_all_collections());
+                let colls = colls.into_iter().filter(|ndx| ndx.db == db && ndx.coll == new_coll_name && ndx.options.get("capped").is_some()).collect::<Vec<_>>();
+                if colls.len() > 0 {
+                    return Err(Error::MongoCode(17152, format!("no $out into capped coll: {}", new_coll_name)))
+                }
+                self.remove_cursors_for_collection(&full_coll);
                 try!(conn2.clear_collection(db, &new_coll_name));
                 let results = try!(conn2.insert_seq(db, &new_coll_name, seq));
                 println!("OUT results: {:?}", results);
