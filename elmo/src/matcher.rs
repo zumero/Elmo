@@ -831,7 +831,14 @@ fn parse_pred(k: &str, v: bson::Value) -> Result<Pred> {
         "$exists" => Ok(Pred::Exists(try!(v.to_bool()))),
         "$type" => Ok(Pred::Type(try!(v.numeric_to_i32()))),
         "$regex" => {
-            let v = try!(v.into_string());
+            let v = 
+                match v {
+                    bson::Value::BString(s) => s,
+                    bson::Value::BRegex(s,options) => s,
+                    _ => {
+                        return Err(super::Error::Misc(String::from("invalid type for regex")));
+                    },
+                };
             let re = try!(regex::Regex::new(&v).map_err(super::wrap_err));
             Ok(Pred::REGEX(re))
         },
@@ -984,13 +991,27 @@ pub fn parse_pred_list(pairs: Vec<(String,bson::Value)>) -> Result<Vec<Pred>> {
     let options = options.pop();
     match (expr, options) {
         (Some((_,expr)), None) => {
-            let expr = try!(expr.into_string());
+            let expr = 
+                match expr {
+                    bson::Value::BString(s) => s,
+                    bson::Value::BRegex(s,options) => s,
+                    _ => {
+                        return Err(super::Error::Misc(String::from("invalid type for regex")));
+                    },
+                };
             let re = try!(regex::Regex::new(&expr).map_err(super::wrap_err));
             preds.push(Pred::REGEX(re));
         },
         (Some((_,expr)), Some((_,options))) => {
             // TODO options
-            let expr = try!(expr.into_string());
+            let expr = 
+                match expr {
+                    bson::Value::BString(s) => s,
+                    bson::Value::BRegex(s,options) => s,
+                    _ => {
+                        return Err(super::Error::Misc(String::from("invalid type for regex")));
+                    },
+                };
             let re = try!(regex::Regex::new(&expr).map_err(super::wrap_err));
             preds.push(Pred::REGEX(re));
         },
