@@ -987,7 +987,7 @@ impl MyWriter {
             },
             Some(_) => {
                 let tbl = get_table_name_for_collection(db, coll);
-                try!(self.myconn.conn.exec(&format!("DROP TABLE \"{}\"", tbl)).map_err(elmo::wrap_err));
+                try!(self.myconn.conn.exec(&format!("DELETE FROM \"{}\"", tbl)).map_err(elmo::wrap_err));
                 Ok(false)
             },
         }
@@ -1376,8 +1376,7 @@ impl MyFactory {
 impl elmo::ConnectionFactory for MyFactory {
     fn open(&self) -> elmo::Result<elmo::Connection> {
         let conn = try!(connect(&self.filename));
-        let rconn = try!(connect(&self.filename));
-        let conn = elmo::Connection::new(conn,rconn);
+        let conn = elmo::Connection::new(conn);
         Ok(conn)
     }
 

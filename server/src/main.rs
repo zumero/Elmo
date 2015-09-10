@@ -425,7 +425,7 @@ impl<'b> Server<'b> {
         let mut updates = try!(vec_values_to_docs(updates.items));
         // TODO ordered
         // TODO do we need to keep ownership of updates?
-        let results = try!(self.conn.update(db, &coll, &mut updates));
+        let results = try!(self.conn.update(db, &coll, &mut updates, &*self.factory));
         let mut matches = 0;
         let mut mods = 0;
         let mut upserts = bson::Array::new();
@@ -1148,10 +1148,22 @@ impl<'b> Server<'b> {
                 // TODO no $out into a capped collection
                 let full_coll = format!("{}.{}", db, new_coll_name);
                 self.remove_cursors_for_collection(&full_coll);
-                try!(self.conn.clear_collection(db, &new_coll_name));
-                // TODO this will fail because we need a separate connection
-                let results = try!(self.conn.insert_seq(db, &coll, seq));
-                return Err(Error::Misc(format!("TODO agg $out")))
+                let conn2 = try!(self.factory.open());
+                try!(conn2.clear_collection(db, &new_coll_name));
+                let results = try!(conn2.insert_seq(db, &new_coll_name, seq));
+                println!("OUT results: {:?}", results);
+                let mut errors = Vec::new();
+                for i in 0 .. results.len() {
+                    if results[i].is_err() {
+                        let msg = format!("{:?}", results[i]);
+                        let err = bson::Value::BDocument(bson::Document {pairs: vec![(String::from("index"), bson::Value::BInt32(i as i32)), (String::from("errmsg"), bson::Value::BString(msg))]});
+                        errors.push(err);
+                    }
+                }
+                let default_batch_size = 100;
+                let doc = try!(self.reply_with_cursor(&full_coll, std::iter::empty(), cursor_options, default_batch_size));
+                // note that this uses the newer way of returning a cursor ID, so we pass 0 below
+                Ok(create_reply(req.req_id, vec![doc], 0))
             },
             None => {
                 let default_batch_size = 100;

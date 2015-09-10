@@ -1003,7 +1003,6 @@ pub trait StorageConnection {
 
 pub struct Connection {
     conn: Box<StorageConnection>,
-    rconn: Box<StorageConnection>,
 }
 
 pub trait ConnectionFactory {
@@ -1113,10 +1112,9 @@ enum Expr {
 }
 
 impl Connection {
-    pub fn new(conn: Box<StorageConnection>, rconn: Box<StorageConnection>) -> Connection {
+    pub fn new(conn: Box<StorageConnection>) -> Connection {
         Connection {
             conn: conn,
-            rconn: rconn,
         }
     }
 
@@ -1915,7 +1913,7 @@ impl Connection {
         Ok(b)
     }
 
-    pub fn update(&self, db: &str, coll: &str, updates: &mut Vec<bson::Document>) -> Result<Vec<Result<(i32, i32, Option<bson::Value>)>>> {
+    pub fn update(&self, db: &str, coll: &str, updates: &mut Vec<bson::Document>, factory: &ConnectionFactory) -> Result<Vec<Result<(i32, i32, Option<bson::Value>)>>> {
         let mut results = Vec::new();
         {
             let writer = try!(self.conn.begin_write());
@@ -1941,7 +1939,8 @@ impl Connection {
                         //println!("ops: {:?}", ops);
                         let (count_matches, count_modified) =
                             if multi {
-                                let reader = try!(self.rconn.begin_read());
+                                let rconn = try!(factory.open());
+                                let reader = try!(rconn.conn.begin_read());
                                 // TODO DRY
                                 let indexes = try!(reader.list_indexes()).into_iter().filter(
                                     |ndx| ndx.db == db && ndx.coll == coll
@@ -4662,6 +4661,7 @@ impl Connection {
         let plan = None;
         let reader = try!(self.conn.begin_read());
         let mut seq: Box<Iterator<Item=Result<Row>>> = try!(reader.into_collection_reader(db, coll, plan));
+        let mut out = None;
         for op in ops {
             match op {
                 AggOp::Skip(n) => {
@@ -4690,15 +4690,15 @@ impl Connection {
                 AggOp::Redact(e) => {
                     seq = Self::agg_redact(seq, e);
                 },
-                AggOp::Out(_) => {
-                    //return Err(Error::Misc(format!("agg pipeline TODO: {:?}", op)))
+                AggOp::Out(s) => {
+                    out = Some(s);
                 },
                 AggOp::GeoNear(_) => {
                     return Err(Error::Misc(format!("agg pipeline TODO: {:?}", op)))
                 },
             }
         }
-        Ok((None, seq))
+        Ok((out, seq))
     }
 
     pub fn distinct(&self, db: &str, coll: &str, key: &str, query: bson::Document) -> Result<bson::Array> {
