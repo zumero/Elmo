@@ -1443,6 +1443,7 @@ impl<'b> Server<'b> {
                     },
                     Request::Query(req) => {
                         // TODO so if we clear all the cursors here, count2.js passes.
+                        //self.cursors.clear();
                         let req_id = req.req_id;
                         let resp = 
                             match self.reply_2004(req) {
