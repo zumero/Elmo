@@ -765,7 +765,7 @@ impl<'b> Server<'b> {
         } else {
             // soft limit.  keep cursor open.
             let docs = try!(Self::grab(seq, number_to_return as usize));
-            if docs.len() > 0 {
+            if docs.len() == (number_to_return as usize) {
                 Ok((docs, true))
             } else {
                 Ok((docs, false))
@@ -1442,6 +1442,7 @@ impl<'b> Server<'b> {
                         Ok(true)
                     },
                     Request::Query(req) => {
+                        // TODO so if we clear all the cursors here, count2.js passes.
                         let req_id = req.req_id;
                         let resp = 
                             match self.reply_2004(req) {
