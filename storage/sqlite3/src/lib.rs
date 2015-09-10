@@ -1360,6 +1360,32 @@ pub fn connect(name: &str) -> Result<Box<elmo::StorageConnection>> {
     Ok(box c)
 }
 
+#[derive(Clone)]
+pub struct MyFactory {
+    filename: String,
+}
+
+impl MyFactory {
+    pub fn new(filename: String) -> MyFactory {
+        MyFactory {
+            filename: filename,
+        }
+    }
+}
+
+impl elmo::ConnectionFactory for MyFactory {
+    fn open(&self) -> elmo::Result<elmo::Connection> {
+        let conn = try!(connect(&self.filename));
+        let rconn = try!(connect(&self.filename));
+        let conn = elmo::Connection::new(conn,rconn);
+        Ok(conn)
+    }
+
+    fn clone_for_new_thread(&self) -> Box<elmo::ConnectionFactory + Send> {
+        box self.clone()
+    }
+}
+
 /*
 
 look at the non-allocating alternatives to column_text() and column_blob()

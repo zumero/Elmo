@@ -1006,6 +1006,11 @@ pub struct Connection {
     rconn: Box<StorageConnection>,
 }
 
+pub trait ConnectionFactory {
+    fn open(&self) -> Result<Connection>;
+    fn clone_for_new_thread(&self) -> Box<ConnectionFactory + Send>;
+}
+
 // TODO this type was created so that all the projection operations
 // could be done in the order they appeared, which we are not really
 // doing.  So now the parser is constructing these values and then

@@ -259,14 +259,25 @@ fn reply_errmsg(req_id: i32, err: Error) -> Reply {
 // TODO mongo has a way of automatically killing a cursor after 10 minutes idle
 
 struct Server<'a> {
-    conn: elmo::Connection,
+    factory: Box<elmo::ConnectionFactory>,
     cursor_num: i64,
+    conn: elmo::Connection,
     // TODO this is problematic when/if the Iterator has a reference to or the same lifetime
     // as self.conn.
     cursors: std::collections::HashMap<i64, (String, Box<Iterator<Item=Result<elmo::Row>> + 'a>)>,
 }
 
 impl<'b> Server<'b> {
+
+    pub fn new(factory: Box<elmo::ConnectionFactory>) -> Server<'b> {
+        let conn = factory.open().expect("TODO");
+        Server {
+            factory: factory,
+            conn: conn,
+            cursor_num: 0,
+            cursors: std::collections::HashMap::new(),
+        }
+    }
 
     fn reply_whatsmyuri(&self, req: &MsgQuery) -> Result<Reply> {
         println!("----------------------------------------------------------------");
@@ -1489,25 +1500,18 @@ impl<'b> Server<'b> {
 
 }
 
-// TODO args:  filename, ipaddr, port
-pub fn serve() {
+// TODO args:  ipaddr, port
+pub fn serve(factory: Box<elmo::ConnectionFactory>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:27017").unwrap();
 
     // accept connections and process them, spawning a new thread for each one
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                std::thread::spawn(move|| {
+                let factory = factory.clone_for_new_thread();
+                std::thread::spawn(move || {
                     // connection succeeded
-                    // TODO how to use filename arg.  lifetime problem.
-                    let conn = elmo_sqlite3::connect("elmodata.db").expect("TODO");
-                    let rconn = elmo_sqlite3::connect("elmodata.db").expect("TODO");
-                    let conn = elmo::Connection::new(conn,rconn);
-                    let mut s = Server {
-                        conn: conn,
-                        cursors: std::collections::HashMap::new(),
-                        cursor_num: 0,
-                    };
+                    let mut s = Server::new(factory);
                     s.handle_client(stream).expect("TODO");
                 });
             }
@@ -1520,6 +1524,7 @@ pub fn serve() {
 }
 
 pub fn main() {
-    serve();
+    let factory = elmo_sqlite3::MyFactory::new(String::from("elmodata.db"));
+    serve(box factory);
 }
 
