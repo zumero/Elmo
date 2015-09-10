@@ -1837,9 +1837,29 @@ impl Connection {
         for (path, v) in a {
             try!(doc.set_path(&path, v.clone()));
         }
-        // TODO save the id so we can make sure it didn't change
+        // save the id so we can make sure it didn't change
+        let id1 =
+            match doc.get("_id") {
+                Some(v) => Some(v.clone()),
+                None => None,
+            };
         try!(Self::apply_update_ops(&mut doc, ops, true, None));
-        // TODO make sure the id didn't change
+        // make sure the id didn't change
+        match id1 {
+            Some(id1) => {
+                match doc.get("_id") {
+                    Some(v) => {
+                        if id1 != *v {
+                            return Err(Error::Misc(String::from("cannot change _id")));
+                        }
+                    },
+                    None => {
+                    },
+                }
+            },
+            None => {
+            },
+        }
         doc.ensure_id();
         Ok(doc)
     }
