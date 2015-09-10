@@ -572,8 +572,7 @@ impl Projection {
                 d = bson::Document::new();
                 for path in self.paths.iter() {
                     let path = fix_positional(path, pos);
-                    // TODO for a path which dives through an array, this will
-                    // be wrong.  
+
                     // {comments: [{id:0, text:'a'},{id:1, text:'b'},{id:2, text:'c'},{id:3, text:'d'}]}
                     // comments.id should be
                     // {comments: [{id:0},{id:1},{id:2},{id:3}]}
@@ -841,7 +840,6 @@ pub trait StorageBase {
 pub trait StorageCollectionWriter {
     fn insert(&mut self, v: &bson::Document) -> Result<()>;
     fn update(&mut self, v: &bson::Document) -> Result<()>;
-    // TODO arg to delete should be what?
     fn delete(&mut self, v: &bson::Value) -> Result<bool>;
 }
 
@@ -2122,7 +2120,6 @@ impl Connection {
                         None => {
                         },
                     }
-                    // TODO if u has _id, make sure it's the same
                     let mut new_doc = u;
                     new_doc.set("_id", old_id);
                     if old_doc != new_doc {
@@ -4625,7 +4622,10 @@ impl Connection {
                 AggOp::Redact(e) => {
                     seq = Self::agg_redact(seq, e);
                 },
-                _ => {
+                AggOp::Out(_) => {
+                    //return Err(Error::Misc(format!("agg pipeline TODO: {:?}", op)))
+                },
+                AggOp::GeoNear(_) => {
                     return Err(Error::Misc(format!("agg pipeline TODO: {:?}", op)))
                 },
             }
