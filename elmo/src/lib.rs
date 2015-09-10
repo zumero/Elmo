@@ -3648,6 +3648,7 @@ impl Connection {
             },
             &Expr::Add(ref a) => {
                 let vals = try!(a.iter().map(|e| Self::eval(ctx, e)).collect::<Result<Vec<_>>>());
+                // TODO don't loop twice here.
                 if vals.iter().any(|v| (!v.is_date()) && (!v.is_numeric())) {
                     return Err(Error::MongoCode(16554, format!("$add supports numeric or date: {:?}", a)));
                 }
@@ -3674,6 +3675,10 @@ impl Connection {
             },
             &Expr::Multiply(ref a) => {
                 let vals = try!(a.iter().map(|e| Self::eval(ctx, e)).collect::<Result<Vec<_>>>());
+                // TODO don't loop twice here.
+                if vals.iter().any(|v| !v.is_numeric()) {
+                    return Err(Error::MongoCode(16555, format!("$multiply supports numeric only: {:?}", a)));
+                }
                 let vals = try!(vals.iter().map(|v| {
                     let f = try!(v.numeric_to_f64());
                     Ok(f)
