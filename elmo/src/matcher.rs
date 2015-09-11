@@ -1057,7 +1057,13 @@ fn parse_compare(k: &str, v: &bson::Value) -> Result<QueryItem> {
 
 // TODO this func kinda wants to consume its argument
 fn parse_query_doc(bd: &bson::Document) -> Result<Vec<QueryItem>> {
-    fn do_and_or(result: &mut Vec<QueryItem>, a: &Vec<bson::Value>, op: &str) -> Result<()> {
+    #[derive(Copy,Clone)]
+    enum AndOr {
+        And,
+        Or,
+    }
+
+    fn do_and_or(result: &mut Vec<QueryItem>, a: &Vec<bson::Value>, op: AndOr) -> Result<()> {
         if a.len() == 0 {
             return Err(super::Error::Misc(String::from("array arg for $and+$or cannot be empty")));
         } else if a.len() == 1 {
@@ -1075,13 +1081,9 @@ fn parse_query_doc(bd: &bson::Document) -> Result<Vec<QueryItem>> {
                 let d = QueryDoc::QueryDoc(d);
                 m.push(d);
             }
-            // TODO grrr.  this str compare hack is ugly.
-            if op == "$and" {
-                result.push(QueryItem::AND(m));
-            } else if op == "$or" {
-                result.push(QueryItem::OR(m));
-            } else {
-                unreachable!();
+            match op {
+                AndOr::And => result.push(QueryItem::AND(m)),
+                AndOr::Or => result.push(QueryItem::OR(m)),
             }
         }
         Ok(())
@@ -1101,11 +1103,11 @@ fn parse_query_doc(bd: &bson::Document) -> Result<Vec<QueryItem>> {
             },
             "$and" => {
                 let ba = try!(v.as_array());
-                try!(do_and_or(&mut result, &ba.items, k));
+                try!(do_and_or(&mut result, &ba.items, AndOr::And));
             },
             "$or" => {
                 let ba = try!(v.as_array());
-                try!(do_and_or(&mut result, &ba.items, k));
+                try!(do_and_or(&mut result, &ba.items, AndOr::Or));
             },
             "$text" => {
                 match v {
@@ -1115,12 +1117,13 @@ fn parse_query_doc(bd: &bson::Document) -> Result<Vec<QueryItem>> {
                                 result.push(QueryItem::Text(s.clone()));
                             },
                             _ => {
-                                // TODO no panic here
-                                panic!("invalid $text");
+                                return Err(super::Error::Misc(format!("invalid $text: {:?}", bd)));
                             },
                         }
                     },
-                    _ => panic!("invalid $text"),
+                    v => {
+                        return Err(super::Error::Misc(format!("invalid $text: {:?}", v)));
+                    },
                 }
             },
             "$nor" => {
