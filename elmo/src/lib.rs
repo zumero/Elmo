@@ -1105,7 +1105,7 @@ enum Expr {
     SetUnion(Vec<Expr>),
 
     Let(Vec<(String, Expr)>, Box<Expr>),
-    Map(Box<Expr>, String, Box<Expr>),
+    Map(Box<(Expr, String, Expr)>),
     DateToString(String, Box<Expr>),
 
     // TODO meta
@@ -3351,6 +3351,37 @@ impl Connection {
                                 }
                             },
 
+                            "$map" => {
+                                let mut v = try!(v.into_document());
+                                if v.pairs.iter().any(|&(ref k,_)| k != "input" && k != "as" && k != "in") {
+                                    Err(Error::MongoCode(16879, String::from("unrecognized $map arg")))
+                                } else {
+                                    let arg_input = match v.remove("input") {
+                                        Some(v) => v,
+                                        None => {
+                                            return Err(Error::MongoCode(16880, String::from("$map missing input")));
+                                        },
+                                    };
+                                    let arg_as = match v.remove("as") {
+                                        Some(v) => v,
+                                        None => {
+                                            return Err(Error::MongoCode(16881, String::from("$map missing as")));
+                                        },
+                                    };
+                                    let arg_in = match v.remove("in") {
+                                        Some(v) => v,
+                                        None => {
+                                            return Err(Error::MongoCode(16882, String::from("$map missing in")));
+                                        },
+                                    };
+                                    let e_input = try!(Self::parse_expr(arg_input));
+                                    let v_as = try!(arg_as.into_string());
+                                    let e_in = try!(Self::parse_expr(arg_in));
+                                    let t = (e_input, v_as, e_in);
+                                    Ok(Expr::Map(box t))
+                                }
+                            },
+
                             "$and" => {
                                 Ok(Expr::And(try!(parse_vec(v))))
                             },
@@ -3406,7 +3437,6 @@ impl Connection {
                             },
 
                             // TODO let
-                            // TODO map
 
                             _ => {
                                 Err(Error::MongoCode(15999, format!("invalid expression operator: {}", k)))
@@ -3426,6 +3456,21 @@ impl Connection {
                 // been handled before this point.
                 Ok(Expr::Literal(v))
             },
+        }
+    }
+
+    fn is_legal_var_name(s: &str) -> bool {
+        if s == "CURRENT" {
+            true
+        } else {
+            match s.chars().next() {
+                Some(c) => {
+                    c >= 'a' && c <= 'z'
+                },
+                None => {
+                    false
+                },
+            }
         }
     }
 
@@ -3878,6 +3923,33 @@ impl Connection {
                     Self::eval(ctx, &t.2)
                 }
             },
+            &Expr::Map(ref t) => {
+                let name = &t.1;
+                if !Self::is_legal_var_name(name) {
+                    return Err(Error::MongoCode(16867, format!("illegal variable name{:?}", name)));
+                }
+                let mut ctx = ctx.clone();
+                match try!(Self::eval(&ctx, &t.0)) {
+                    bson::Value::BArray(ba) => {
+                        let mut a2 = vec![];
+                        for v in ba.items {
+                            ctx.set(name, v);
+                            let v2 = try!(Self::eval(&ctx, &t.2));
+                            a2.push(v2);
+                        }
+                        let a2 = bson::Array {
+                            items: a2,
+                        };
+                        Ok(bson::Value::BArray(a2))
+                    },
+                    bson::Value::BNull => {
+                        Ok(bson::Value::BNull)
+                    },
+                    v => {
+                        Err(Error::MongoCode(16883, format!("$map invalid type {:?}", v)))
+                    },
+                }
+            },
             &Expr::SetDifference(_) => {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
@@ -3891,9 +3963,6 @@ impl Connection {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
             &Expr::SetUnion(_) => {
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
-            },
-            &Expr::Map(_,_,_) => {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
             &Expr::Let(_,_) => {
