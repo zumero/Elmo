@@ -4117,16 +4117,16 @@ impl Connection {
                                     }
                                     ).collect::<Result<Vec<_>>>();
                             let mut expressions = try!(expressions);
+                            match id_item {
+                                Some(id) => {
+                                    expressions.insert(0, id);
+                                },
+                                None => {
+                                },
+                            }
                             if expressions.len() == 0 {
                                 Err(Error::MongoCode(16403, String::from("agg $project must output something")))
                             } else {
-                                match id_item {
-                                    Some(id) => {
-                                        expressions.insert(0, id);
-                                    },
-                                    None => {
-                                    },
-                                }
                                 Ok(AggOp::Project(expressions))
                             }
                         },
@@ -4490,10 +4490,24 @@ impl Connection {
         Ok(mapa)
     }
 
+    fn compare_values_at_path(a: &bson::Value, b: &bson::Value, path: &str, backward: bool) -> Ordering {
+        // TODO switch the following calls to use walk_path()
+
+        let va = a.find_path(&path);
+        // TODO replace undefined
+
+        let vb = b.find_path(&path);
+        // TODO replace undefined
+
+        let c = matcher::cmpdir(&va, &vb, backward);
+        c
+    }
+
     fn do_sort_docs(a: &mut Vec<bson::Value>, orderby: &bson::Value) -> Result<()> {
         let keys =
             match orderby {
                 &bson::Value::BDocument(ref bd) => {
+                    // TODO it would be nice to do this with map()
                     let mut a = vec![];
                     for &(ref path, ref dir) in &bd.pairs {
                         let n = try!(dir.numeric_to_i32());
@@ -4510,15 +4524,7 @@ impl Connection {
             };
         a.sort_by(|a,b| -> Ordering {
             for &(ref path, dir) in keys.iter() {
-                // TODO switch the following calls to use walk_path()
-
-                let va = a.find_path(&path);
-                // TODO replace undefined
-
-                let vb = b.find_path(&path);
-                // TODO replace undefined
-
-                let mut c = matcher::cmpdir(&va, &vb, dir);
+                let c = Self::compare_values_at_path(a, b, path, dir);
                 if c != Ordering::Equal {
                     return c;
                 }
@@ -4529,78 +4535,75 @@ impl Connection {
     }
 
     fn do_sort(a: &mut Vec<Row>, orderby: &bson::Value) -> Result<()> {
+        #[derive(Copy,Clone)]
+        enum foo {
+            Compare(bool),
+            TextScore,
+        };
 
-        // TODO validate orderby up here so we don't have to check it for errors
-        // inside the sort loop..
-        a.sort_by(|a,b| -> Ordering {
+        let keys =
             match orderby {
                 &bson::Value::BDocument(ref bd) => {
+                    // TODO it would be nice to do this with map()
+                    let mut a = vec![];
                     for &(ref path, ref dir) in &bd.pairs {
                         if dir.is_numeric() {
-                            let dir = 
-                                match dir.numeric_to_i32() {
-                                    Ok(n) => {
-                                        if n < 0 {
-                                            -1
-                                        } else if n > 0 {
-                                            1
-                                        } else {
-                                            println!("TODO error dir is 0");
-                                            0
-                                        }
-                                    },
-                                    Err(_) => {
-                                        println!("TODO error dir not a number");
-                                        0
-                                    },
-                                };
-
-                            let va = a.doc.find_path(&path);
-                            // TODO replace undefined
-
-                            let vb = b.doc.find_path(&path);
-                            // TODO replace undefined
-
-                            let mut c = matcher::cmpdir(&va, &vb, dir<0);
-                            if c != Ordering::Equal {
-                                return c;
+                            let n = try!(dir.numeric_to_i32());
+                            if n == 0 {
+                                return Err(Error::Misc(String::from("sort dir cannot be 0")));
                             }
+                            a.push((path, foo::Compare(n < 0)));
                         } else if dir.is_document() {
                             let dir = dir.as_document().unwrap();
                             if dir.len() != 1 {
-                                println!("TODO error dir is invalid: {:?}", dir);
+                                return Err(Error::Misc(format!("sort dir invalid: {:?}", dir)));
                             } else if dir.pairs[0].0 != "$meta" {
-                                println!("TODO error dir is invalid: {:?}", dir);
+                                return Err(Error::Misc(format!("sort dir invalid: {:?}", dir)));
                             } else if !dir.pairs[0].1.is_string() {
-                                println!("TODO error dir is invalid: {:?}", dir);
+                                return Err(Error::Misc(format!("sort dir invalid: {:?}", dir)));
                             } else if dir.pairs[0].1.as_str().unwrap() != "textScore" {
-                                println!("TODO error dir is invalid: {:?}", dir);
-                            } else if a.score.is_none() {
-                                println!("TODO score is missing");
-                            } else if b.score.is_none() {
-                                println!("TODO score is missing");
+                                return Err(Error::Misc(format!("sort dir invalid: {:?}", dir)));
                             } else {
-                                let sa = a.score.unwrap();
-                                let sb = b.score.unwrap();
-                                if sb < sa {
-                                    return Ordering::Less;
-                                } else if sb > sa {
-                                    return Ordering::Greater;
-                                } else {
-                                    // Ordering::Equal
-                                }
+                                a.push((path, foo::TextScore));
                             }
                         } else {
-                            println!("TODO error dir is invalid: {:?}", dir);
+                            return Err(Error::Misc(format!("sort dir invalid: {:?}", dir)));
                         }
                     }
-                    Ordering::Equal
+                    a
                 },
                 _ => {
-                    println!("TODO orderby not a document");
-                    Ordering::Equal
+                    return Err(Error::Misc(String::from("orderby must be a document")));
                 },
+            };
+
+        a.sort_by(|a,b| -> Ordering {
+            for &(ref path, dir) in keys.iter() {
+                match dir {
+                    foo::Compare(backward) => {
+                        let c = Self::compare_values_at_path(&a.doc, &b.doc, path, backward);
+                        if c != Ordering::Equal {
+                            return c;
+                        }
+                    },
+                    foo::TextScore => {
+                        if a.score.is_none() || b.score.is_none() {
+                            println!("TODO score is missing");
+                        } else {
+                            let sa = a.score.unwrap();
+                            let sb = b.score.unwrap();
+                            if sb < sa {
+                                return Ordering::Less;
+                            } else if sb > sa {
+                                return Ordering::Greater;
+                            } else {
+                                // Ordering::Equal
+                            }
+                        }
+                    },
+                }
             }
+            Ordering::Equal
         });
         Ok(())
     }
