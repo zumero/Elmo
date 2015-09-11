@@ -1019,8 +1019,10 @@ impl<'b> Server<'b> {
         if coll.as_str() == "" {
             return Err(Error::Misc(String::from("empty string for argument of listIndexes")));
         }
-        // TODO this need to error when giving a coll that does not exist
         let conn = try!(self.factory.open());
+        if try!(conn.list_all_collections()).into_iter().filter(|c| c.db == db && c.coll == coll).next().is_none() {
+            return Err(Error::Misc(String::from("collection does not exist")));
+        }
         let results = try!(conn.list_indexes());
         let seq = {
             // we need db to get captured by this closure which outlives
