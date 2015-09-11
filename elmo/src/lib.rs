@@ -4474,67 +4474,46 @@ impl Connection {
         Ok(mapa)
     }
 
-    // TODO dry. this func duplicates do_sort()
     fn do_sort_docs(a: &mut Vec<bson::Value>, orderby: &bson::Value) -> Result<()> {
-        // TODO validate orderby up here so we don't have to check it for errors
-        // inside the sort loop..
-        a.sort_by(|a,b| -> Ordering {
+        let keys =
             match orderby {
                 &bson::Value::BDocument(ref bd) => {
+                    let mut a = vec![];
                     for &(ref path, ref dir) in &bd.pairs {
-                        if dir.is_numeric() {
-                            let dir = 
-                                match dir.numeric_to_i32() {
-                                    Ok(n) => {
-                                        if n < 0 {
-                                            -1
-                                        } else if n > 0 {
-                                            1
-                                        } else {
-                                            println!("TODO error dir is 0");
-                                            0
-                                        }
-                                    },
-                                    Err(_) => {
-                                        println!("TODO error dir not a number");
-                                        0
-                                    },
-                                };
-
-                            let va = a.find_path(&path);
-                            // TODO replace undefined
-
-                            let vb = b.find_path(&path);
-                            // TODO replace undefined
-
-                            let mut c = matcher::cmp(&va, &vb);
-                            if dir < 0 {
-                                c = match c {
-                                    Ordering::Equal => Ordering::Equal,
-                                    Ordering::Less => Ordering::Greater,
-                                    Ordering::Greater => Ordering::Less,
-                                }
-                            }
-                            if c != Ordering::Equal {
-                                return c;
-                            }
-                        } else {
-                            println!("TODO sort on textScore: {:?}", dir);
-                            // TODO sort on textScore?
+                        let n = try!(dir.numeric_to_i32());
+                        if n == 0 {
+                            return Err(Error::Misc(String::from("sort dir cannot be 0")));
                         }
+                        a.push((path, n<0));
                     }
-                    Ordering::Equal
+                    a
                 },
                 _ => {
-                    println!("TODO orderby not a document");
-                    Ordering::Equal
+                    return Err(Error::Misc(String::from("orderby must be a document")));
                 },
+            };
+        a.sort_by(|a,b| -> Ordering {
+            for &(ref path, dir) in keys.iter() {
+                // TODO switch the following calls to use walk_path()
+
+                let va = a.find_path(&path);
+                // TODO replace undefined
+
+                let vb = b.find_path(&path);
+                // TODO replace undefined
+
+                let mut c = matcher::cmpdir(&va, &vb, dir);
+                if c != Ordering::Equal {
+                    return c;
+                }
             }
+            Ordering::Equal
         });
         Ok(())
     }
 
     fn do_sort(a: &mut Vec<Row>, orderby: &bson::Value) -> Result<()> {
+
         // TODO validate orderby up here so we don't have to check it for errors
         // inside the sort loop..
         a.sort_by(|a,b| -> Ordering {
