@@ -1343,6 +1343,7 @@ fn base_connect(name: &str) -> sqlite3::SqliteResult<sqlite3::DatabaseConnection
     let conn = try!(sqlite3::DatabaseConnection::new(access));
     try!(conn.exec("PRAGMA journal_mode=WAL"));
     try!(conn.exec("PRAGMA foreign_keys=ON"));
+    // TODO might need BEGIN IMMEDIATE here.  and maybe wait/retry on busy.
     try!(conn.exec("CREATE TABLE IF NOT EXISTS \"collections\" (dbName TEXT NOT NULL, collName TEXT NOT NULL, options BLOB NOT NULL, PRIMARY KEY (dbName,collName))"));
     try!(conn.exec("CREATE TABLE IF NOT EXISTS \"indexes\" (dbName TEXT NOT NULL, collName TEXT NOT NULL, ndxName TEXT NOT NULL, spec BLOB NOT NULL, options BLOB NOT NULL, PRIMARY KEY (dbName, collName, ndxName), FOREIGN KEY (dbName,collName) REFERENCES \"collections\" ON DELETE CASCADE ON UPDATE CASCADE, UNIQUE (spec,dbName,collName))"));
 

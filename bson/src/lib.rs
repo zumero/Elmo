@@ -1820,11 +1820,9 @@ impl Value {
                     }, 
                     Ok(ndx) => {
                         if ndx<0 {
-                            // TODO useless panic.  need to return Result.
-                            panic!( "array index < 0");
+                            Value::BUndefined
                         } else if (ndx as usize)>=ba.items.len() {
-                            // TODO useless panic.  need to return Result.
-                            panic!( "array index too large");
+                            Value::BUndefined
                         } else {
                             let v = &ba.items[ndx as usize];
                             match dot {
