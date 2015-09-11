@@ -14,17 +14,11 @@
     limitations under the License.
 */
 
-#![feature(core)]
-#![feature(collections)]
 #![feature(box_syntax)]
 #![feature(convert)]
-#![feature(collections_drain)]
 #![feature(associated_consts)]
 #![feature(vec_push_all)]
 #![feature(clone_from_slice)]
-#![feature(drain)]
-#![feature(iter_arith)]
-#![feature(slice_position_elem)]
 
 extern crate misc;
 
@@ -162,24 +156,24 @@ impl<'v, 'p> WalkPath<'v, 'p> {
                     match p {
                         &WalkPath::Value(_, _) => {
                             let mut sub = Document::new();
-                            p.project(&mut sub);
+                            try!(p.project(&mut sub));
                             d.items.push(sub.into_value());
                         },
                         &WalkPath::SubDocument(_, _) => {
                             let mut sub = Document::new();
-                            p.project(&mut sub);
+                            try!(p.project(&mut sub));
                             d.items.push(sub.into_value());
                         },
                         &WalkPath::SubArray(_, _) => {
                             let mut sub = Document::new();
-                            p.project(&mut sub);
+                            try!(p.project(&mut sub));
                             d.items.push(sub.into_value());
                         },
                         &WalkPath::NotFound(_) => {
                             // mongo tests seem to indicate that an empty document gets
                             // produced in this case.
                             let mut sub = Document::new();
-                            p.project(&mut sub);
+                            try!(p.project(&mut sub));
                             d.items.push(sub.into_value());
                         },
                         &WalkPath::NotContainer(_, _) => {
@@ -359,7 +353,7 @@ impl Document {
         if depth > max {
             return Err(Error::Misc(format!("too much nesting")));
         }
-        for &(ref k, ref v) in &self.pairs {
+        for &(_, ref v) in &self.pairs {
             match v {
                 &Value::BDocument(ref bd) => try!(bd.validate_depth(1 + depth, max)),
                 &Value::BArray(ref ba) => try!(ba.validate_depth(1 + depth, max)),
@@ -1037,7 +1031,7 @@ impl Array {
                             let e = Entry::Absent(e);
                             Ok(e)
                         },
-                        Some(dot) => {
+                        Some(_) => {
                             // gotta dive more, but the array isn't big enough
                             let e = EntryAbsent::ArrayAncestor(self, path);
                             let e = Entry::Absent(e);
@@ -1285,9 +1279,9 @@ pub fn slurp_document(ba: &[u8], i: &mut usize) -> Result<Document> {
 
 fn slurp_array(ba: &[u8], i: &mut usize) -> Result<Array> {
     let pairs = try!(slurp_document_pairs(ba, i));
-    // TODO verify that the keys are correct, integers, ascending, etc?
     let a = pairs.into_iter().map(|t| {
         let (k,v) = t;
+        // TODO verify that the keys are correct, integers, ascending, etc?
         v
     }).collect();
     Ok(Array { items: a})
@@ -1988,7 +1982,7 @@ impl Value {
 
         let need = e - a.len();
         if need > 0 {
-            for i in 0 .. need {
+            for _ in 0 .. need {
                 v = v * 100;
             }
         }

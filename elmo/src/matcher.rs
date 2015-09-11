@@ -354,7 +354,7 @@ fn match_predicate<F: Fn(usize)>(pred: &Pred, d: &bson::Value, cb_array_pos: &F)
     //println!("match_predicate: pred = {:?}", pred);
     //println!("match_predicate: d = {:?}", d);
     match pred {
-        &Pred::Exists(b) => {
+        &Pred::Exists(_) => {
             unreachable!();
         },
         &Pred::Not(ref preds) => {
@@ -576,7 +576,7 @@ fn match_pair_other<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, 
                         },
                         _ => {
                             match pred {
-                                &Pred::Type(n) => false,
+                                &Pred::Type(_) => false,
                                 _ => match_predicate(pred, &bson::Value::BNull, cb_array_pos),
                             }
                         },

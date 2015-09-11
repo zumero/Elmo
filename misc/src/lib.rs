@@ -47,7 +47,7 @@ pub fn tid() -> String {
         let strs: Vec<String> = ba.iter()
             .map(|b| format!("{:02X}", b))
             .collect();
-        strs.connect("")
+        strs.join("")
     }
 
     let ba = bytes().unwrap();
@@ -639,11 +639,9 @@ impl Sqlite4Num {
         } else if d==0.0 {
             Sqlite4Num::ZERO
         } else {
-            let LARGEST_UINT64 = u64::max_value();
-            let TENTH_MAX = LARGEST_UINT64 / 10;
-            let large = LARGEST_UINT64 as f64;
-            let large10 = TENTH_MAX as f64;
-            let neg = d<0.0;
+            let large = u64::max_value() as f64;
+            let large10 = (u64::max_value() / 10) as f64;
+            let neg = d < 0.0;
             let mut d = if neg { -d } else { d };
             let mut e = 0;
             while d>large || (d>1.0 && d==((d as i64) as f64)) {
@@ -715,25 +713,25 @@ impl Sqlite4Num {
             let num = self.normalize();
             let mut m = num.m;
             let mut e = num.e;
-            let mut iDigit;
-            let mut aDigit = [0; 12];
+            let mut i_digit;
+            let mut a_digit = [0; 12];
 
             if (num.e%2) != 0 {
-                aDigit[0] = (10 * (m % 10)) as u8;
+                a_digit[0] = (10 * (m % 10)) as u8;
                 m = m / 10;
                 e = e - 1;
-                iDigit = 1;
+                i_digit = 1;
             } else {
-                iDigit = 0;
+                i_digit = 0;
             }
 
             while m != 0 {
-                aDigit[iDigit] = (m % 100) as u8;
-                iDigit = iDigit + 1;
+                a_digit[i_digit] = (m % 100) as u8;
+                i_digit = i_digit + 1;
                 m = m / 100;
             }
 
-            e = (iDigit as i16) + (e/2);
+            e = (i_digit as i16) + (e/2);
 
             fn push_u16_be(w: &mut Vec<u8>, e: u16) {
                 w.push(((e>>8) & 0xff_u16) as u8);
@@ -764,10 +762,10 @@ impl Sqlite4Num {
                 }
             }
 
-            while iDigit>0 {
-                iDigit = iDigit - 1;
-                let mut d = aDigit[iDigit] * 2u8;
-                if iDigit != 0 { d = d | 0x01u8; }
+            while i_digit>0 {
+                i_digit = i_digit - 1;
+                let mut d = a_digit[i_digit] * 2u8;
+                if i_digit != 0 { d = d | 0x01u8; }
                 if num.neg { d = !d; }
                 w.push(d)
             }

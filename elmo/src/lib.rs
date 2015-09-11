@@ -27,10 +27,6 @@ extern crate time;
 
 extern crate misc;
 
-use misc::endian;
-use misc::bufndx;
-use misc::varint;
-
 extern crate bson;
 
 #[derive(Debug)]
@@ -128,7 +124,7 @@ pub fn mongo_strftime(fmt: &str, tm: &time::Tm) -> Result<String> {
     //println!("mongo_strftime on: {:?}", tm);
     let mut s = String::from(fmt).chars().collect::<Vec<char>>();
     let mut cur = 0;
-    while (cur < s.len()) {
+    while cur < s.len() {
         let mut n = cur;
         while n < s.len() && s[n] != '%' {
             n = n + 1;
@@ -333,7 +329,7 @@ impl Projection {
     fn has_position_operator(s: &str) -> Result<bool> {
         let parts = s.split('.').collect::<Vec<_>>();
         let len_parts = parts.len();
-        let mut posops = parts.into_iter().enumerate().filter(|&(i,s)| s == "$").collect::<Vec<_>>();
+        let mut posops = parts.into_iter().enumerate().filter(|&(_,s)| s == "$").collect::<Vec<_>>();
         if posops.len() == 0 {
             Ok(false)
         } else if posops.len() > 1 {
@@ -372,8 +368,8 @@ impl Projection {
             (paths, pairs, maybe_mode)
         };
 
-        let (id, pairs): (Vec<_>, Vec<_>) = pairs.into_iter().partition(|&(ref k, ref v)| k == "_id");
-        let (ops, pairs): (Vec<_>, Vec<_>) = pairs.into_iter().partition(|&(ref k, ref v)| 
+        let (id, pairs): (Vec<_>, Vec<_>) = pairs.into_iter().partition(|&(ref k, _)| k == "_id");
+        let (ops, pairs): (Vec<_>, Vec<_>) = pairs.into_iter().partition(|&(_, ref v)| 
                                          match v {
                                              &bson::Value::BDocument(ref bd) => {
                                                  bd.len() == 1 && bd.pairs[0].0.starts_with("$")
@@ -2122,8 +2118,7 @@ impl Connection {
                     }
                     if old_doc != new_doc {
                         let id = try!(Self::validate_for_storage(&mut new_doc));
-                        // TODO error in the following line?
-                        collwriter.update(&new_doc);
+                        try!(collwriter.update(&new_doc));
                         changed = true;
                     }
                     result = 
@@ -2148,8 +2143,7 @@ impl Connection {
                     new_doc.set("_id", old_id);
                     if old_doc != new_doc {
                         let id = try!(Self::validate_for_storage(&mut new_doc));
-                        // TODO handle error in following line
-                        collwriter.update(&new_doc);
+                        try!(collwriter.update(&new_doc));
                         changed = true;
                     }
                     result = 
@@ -2162,7 +2156,7 @@ impl Connection {
             },
             (Some(u), None, None) => {
                 // update, not found, maybe upsert
-                let mut u = try!(u.into_document());
+                let u = try!(u.into_document());
                 if upsert {
                     let has_update_operators = u.pairs.iter().any(|&(ref k, _)| k.starts_with("$"));
                     if has_update_operators {
@@ -2225,7 +2219,7 @@ impl Connection {
             let writer = try!(self.conn.begin_write());
             {
                 let mut collwriter = try!(writer.get_collection_writer(db, coll));
-                for mut rr in docs {
+                for rr in docs {
                     match rr {
                         Ok(row) => {
                             let doc = row.doc;
@@ -3072,7 +3066,7 @@ impl Connection {
         Ok((fits, text_query))
     }
 
-    fn choose_from_possibles(mut possibles: Vec<QueryPlan>) -> Option<QueryPlan> {
+    fn choose_from_possibles(possibles: Vec<QueryPlan>) -> Option<QueryPlan> {
         if possibles.len() == 0 {
             None
         } else {
@@ -3146,7 +3140,7 @@ impl Connection {
     }
 
     fn parse_expr(v: bson::Value) -> Result<Expr> {
-        let get_one_arg = |mut v: bson::Value| -> Result<Expr> {
+        let get_one_arg = |v: bson::Value| -> Result<Expr> {
             match v {
                 bson::Value::BArray(mut a) => {
                     if a.len() != 1 {
@@ -3159,7 +3153,7 @@ impl Connection {
             }
         };
 
-        let get_two_args = |mut v: bson::Value| -> Result<(Expr,Expr)> {
+        let get_two_args = |v: bson::Value| -> Result<(Expr,Expr)> {
             match v {
                 bson::Value::BArray(mut a) => {
                     if a.len() != 2 {
@@ -3176,7 +3170,7 @@ impl Connection {
             }
         };
 
-        let get_three_args = |mut v: bson::Value| -> Result<(Expr,Expr,Expr)> {
+        let get_three_args = |v: bson::Value| -> Result<(Expr,Expr,Expr)> {
             match v {
                 bson::Value::BArray(mut a) => {
                     if a.len() != 3 {
@@ -4069,6 +4063,9 @@ impl Connection {
                             if args.iter().any(|&(ref k, _)| k.starts_with("$")) {
                                 return Err(Error::MongoCode(16404, String::from("16404 $project key begins with $")))
                             }
+                            if args.len() == 0 {
+                                return Err(Error::MongoCode(16403, String::from("agg $project must output something")));
+                            }
                             let (mut id, not_id): (Vec<_>, Vec<_>) = args.into_iter().partition(|&(ref k, _)| k=="_id");
                             if id.len() > 1 {
                                 return Err(Error::Misc(String::from("only one id allowed here")))
@@ -4536,7 +4533,7 @@ impl Connection {
 
     fn do_sort(a: &mut Vec<Row>, orderby: &bson::Value) -> Result<()> {
         #[derive(Copy,Clone)]
-        enum foo {
+        enum SortType {
             Compare(bool),
             TextScore,
         };
@@ -4552,7 +4549,7 @@ impl Connection {
                             if n == 0 {
                                 return Err(Error::Misc(String::from("sort dir cannot be 0")));
                             }
-                            a.push((path, foo::Compare(n < 0)));
+                            a.push((path, SortType::Compare(n < 0)));
                         } else if dir.is_document() {
                             let dir = dir.as_document().unwrap();
                             if dir.len() != 1 {
@@ -4564,7 +4561,7 @@ impl Connection {
                             } else if dir.pairs[0].1.as_str().unwrap() != "textScore" {
                                 return Err(Error::Misc(format!("sort dir invalid: {:?}", dir)));
                             } else {
-                                a.push((path, foo::TextScore));
+                                a.push((path, SortType::TextScore));
                             }
                         } else {
                             return Err(Error::Misc(format!("sort dir invalid: {:?}", dir)));
@@ -4580,13 +4577,13 @@ impl Connection {
         a.sort_by(|a,b| -> Ordering {
             for &(ref path, dir) in keys.iter() {
                 match dir {
-                    foo::Compare(backward) => {
+                    SortType::Compare(backward) => {
                         let c = Self::compare_values_at_path(&a.doc, &b.doc, path, backward);
                         if c != Ordering::Equal {
                             return c;
                         }
                     },
-                    foo::TextScore => {
+                    SortType::TextScore => {
                         if a.score.is_none() || b.score.is_none() {
                             println!("TODO score is missing");
                         } else {
@@ -4611,7 +4608,7 @@ impl Connection {
     fn agg_group(seq: Box<Iterator<Item=Result<Row>>>, id: Expr, ops: Vec<(String,GroupAccum)>) -> Box<Iterator<Item=Result<Row>>> {
         match Self::do_group(seq, id, ops) {
             Ok(mapa) => {
-                box mapa.into_iter().map(|(k,v)| {
+                box mapa.into_iter().map(|(_,v)| {
                     let row = Row {
                         doc: bson::Value::BDocument(v),
                         pos: None,
@@ -4655,7 +4652,7 @@ impl Connection {
         box seq.map(
             move |rr| {
                 match rr {
-                    Ok(mut row) => {
+                    Ok(row) => {
                         proj.project(row)
                     },
                     Err(e) => Err(e),
@@ -4680,7 +4677,7 @@ impl Connection {
                 match rr {
                     Ok(mut row) => {
                         let mut d = bson::Document::new();
-                        let mut ctx = Self::init_eval_ctx(row.doc);
+                        let ctx = Self::init_eval_ctx(row.doc);
                         for &(ref path, ref op) in expressions.iter() {
                             match op {
                                 &AggProj::Expr(ref e) => {
