@@ -4101,18 +4101,26 @@ impl Connection {
                                         | bson::Value::BInt64(1) 
                                         | bson::Value::BDouble(1.0)
                                         | bson::Value::BBoolean(true) => Ok((k, AggProj::Include)),
+                                        bson::Value::BInt32(0) 
+                                        | bson::Value::BInt64(0) 
+                                        | bson::Value::BDouble(0.0)
+                                        | bson::Value::BBoolean(false) => Err(Error::MongoCode(16406, String::from("agg $project does not support exclude"))),
                                         _ => Ok((k, AggProj::Expr(try!(Self::parse_expr(v))))),
                                     }
                                     ).collect::<Result<Vec<_>>>();
                             let mut expressions = try!(expressions);
-                            match id_item {
-                                Some(id) => {
-                                    expressions.insert(0, id);
-                                },
-                                None => {
-                                },
+                            if expressions.len() == 0 {
+                                Err(Error::MongoCode(16403, String::from("agg $project must output something")))
+                            } else {
+                                match id_item {
+                                    Some(id) => {
+                                        expressions.insert(0, id);
+                                    },
+                                    None => {
+                                    },
+                                }
+                                Ok(AggOp::Project(expressions))
                             }
-                            Ok(AggOp::Project(expressions))
                         },
                         "$group" => {
                             let mut d = try!(v.into_document());

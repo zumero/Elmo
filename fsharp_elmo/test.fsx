@@ -1,19 +1,3 @@
-(*
-    Copyright 2015 Zumero, LLC
-
-    This program is free software: you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*)
 
 // force hint even when it doesn't fit?  what bounds?  minkey and maxkey?
 //
@@ -70,20 +54,13 @@
 // consider hacking the tests so I don't have to throw out a long test just
 // because mongolite can't pass one little part of it
 //
-// convert BinReader/BinWriter to closures?
-//
 // bson writer BsonValue.BJSCodeWithScope
-//
-// lots of failwiths should be mongocode
 //
 // should find and aggregate share their implementation of projection?
 // 
 // no test case for $orderby int?  see sortFunc.
 //
 // should count (and maybe distinct) map onto the agg pipeline?
-//
-// often it seems like this code uses arrays (instead of lists) way too much
-//
 
 open System
 open System.IO
@@ -100,25 +77,10 @@ printfn "Pattern: %A" pattern
 let path_mongo_shell = "/Users/eric/Downloads/mongodb-osx-x86_64-3.0.1/bin/mongo"
 let path_mongo_src = "/Users/eric/m/mongo"
 let all_tests = [
-    "jstests/core/basic1.js";
-    "jstests/core/basic2.js";
-    "jstests/core/basic3.js";
-    "jstests/core/basic4.js";
-    "jstests/core/basic5.js";
-    "jstests/core/basic6.js";
-    "jstests/core/basic7.js";
-    "jstests/core/basic8.js";
-    "jstests/core/basic9.js";
-    "jstests/core/basica.js";
-    "jstests/core/basicb.js";
     "jstests/core/orh.js"; // disallow use of a sparse index on y for query {y:null}
     "jstests/core/null.js"; // disallow use of a sparse index on y for query {y:null}
     "jstests/core/exists9.js"; // bad index on {a.0}
     "jstests/core/fts1.js"; // missing info from listIndexes for a text index
-    "jstests/core/fts2.js";
-    "jstests/core/fts3.js";
-    "jstests/core/fts4.js";
-    "jstests/core/fts5.js";
     "jstests/core/fts6.js"; // $or
     "jstests/core/fts_blog.js"; // stemming, write vs writing
     "jstests/core/fts_blogwild.js";
@@ -126,11 +88,9 @@ let all_tests = [
     "jstests/core/fts_enabled.js"; // setParameter
     "jstests/core/fts_explain.js";
     "jstests/core/fts_index.js"; // spanglish not recognized
-    "jstests/core/fts_index2.js"; // wildcard
     "jstests/core/fts_index3.js"; // stemming
     "jstests/core/fts_index_version1.js";
     "jstests/core/fts_mix.js";
-    "jstests/core/fts_partition1.js";
     "jstests/core/fts_partition_no_multikey.js"; // should fail insert empty array?
     "jstests/core/fts_phrase.js"; // score wrong?
     "jstests/core/fts_proj.js";
@@ -141,7 +101,6 @@ let all_tests = [
     "jstests/aggregation/bugs/server11675.js"; // $text fts?
     "jstests/aggregation/bugs/server5209.js"; // group by 24 vs 24L vs 24.0
     "jstests/aggregation/bugs/server6125.js"; // sort.  test case seems wrong.  array containing 1 should sort before 2L.
-    "jstests/aggregation/bugs/server6165.js"; // long_dublong case.  mongo results seems wrong.
     "jstests/aggregation/bugs/server6177.js"; // $project:{ 'x':{ $add:[ 1 ] }, 'x.b':1 } } should fail even when doc is {}, broke on fix of 6185
     "jstests/aggregation/bugs/server6192_server6193.js"; // explain
     "jstests/aggregation/bugs/server6238.js"; // error codes on invalid $ in paths, project and group
@@ -151,17 +110,12 @@ let all_tests = [
     "jstests/aggregation/bugs/server6531.js"; // support $within
     "jstests/aggregation/bugs/server7781.js"; // $geoNear
     "jstests/aggregation/bugs/server9840.js"; // $const.  also, japanese variable name seen as invalid.
-    "jstests/aggregation/bugs/strcasecmp.js"; // "fails" because unicode support is more complete
     "jstests/aggregation/bugs/substr.js"; // "fails" because unicode support is more complete
-    "jstests/aggregation/bugs/upperlower.js"; // "fails" because unicode support is more complete
     "jstests/core/drop.js"; // seems to require listIndexes on a non-existent collection to return empty instead of error
-    "jstests/core/updatej.js"; // update validation failure terminates the update without modifying subsequent
     // "jstests/core/elemMatchProjection.js"; // jira server-1013, partial
     // "jstests/core/remove_undefined.js"; // test is broken.  doesn't drop its coll first.
     // "jstests/aggregation/bugs/server5932.js"; // unwind, exceeds message size
-    "jstests/core/minmax.js"; // min/max query modifier, 2 Compares
     "jstests/core/count_hint.js";
-    "jstests/core/hint1.js";
     // "jstests/core/server9547.js"; // comment in test says that mongo SHOULD be giving the result we are giving
     // "jstests/aggregation/bugs/server9444.js"; // huge
     // "jstests/aggregation/bugs/server14969.js"; // outofmemory ?
@@ -170,6 +124,10 @@ let all_tests = [
     // "jstests/aggregation/bugs/server6179.js"; // shard
 
     "jstests/aggregation/bugs/server6189.js"; // date operators with dates before 1970.  date formatting ?
+    "jstests/aggregation/bugs/server6184.js"; // project b:{a:1} should be an inclusion of b.a, not {a:1} as a doc literal for b
+    "jstests/core/or5.js"; // cursor,batchSize
+    "jstests/core/regex2.js"; // dot all syntax, Singleline mode
+
     "jstests/aggregation/bugs/server11118.js"; // date formatting
     "jstests/aggregation/bugs/match.js"; // invalid matcher syntax mod:[0,0]
     "jstests/aggregation/bugs/server8581.js"; // $redact, matcher problem with $lte undefined vs number
@@ -194,7 +152,6 @@ let all_tests = [
     "jstests/aggregation/bugs/server6198.js"; // disallow dots in group output field names, 16414
     "jstests/aggregation/bugs/server6275.js"; // $avg
     "jstests/aggregation/bugs/server6468.js"; // nested/dotted projections should be same
-    "jstests/aggregation/bugs/server6184.js"; // project b:{a:1} should be an inclusion of b.a, not {a:1} as a doc literal for b
     "jstests/aggregation/bugs/server6181.js"; // expression _id
     "jstests/aggregation/bugs/server6127.js"; // projection issue
     "jstests/aggregation/bugs/server6185.js"; // projecting nonexistent subfield
@@ -222,11 +179,33 @@ let all_tests = [
     "jstests/aggregation/bugs/server9841.js";
     "jstests/aggregation/bugs/server6186.js";
     "jstests/aggregation/bugs/server6232.js";
+    "jstests/aggregation/bugs/server6165.js"; // long_dublong case.  mongo results seems wrong.
 
+    "jstests/core/minmax.js"; // min/max query modifier, 2 Compares
+    "jstests/core/fts2.js";
+    "jstests/core/fts3.js";
+    "jstests/core/fts4.js";
+    "jstests/core/fts5.js";
+    "jstests/core/fts_index2.js"; // wildcard
+    "jstests/core/fts_partition1.js";
+    "jstests/aggregation/bugs/strcasecmp.js"; // "fails" because unicode support is more complete
+    "jstests/aggregation/bugs/upperlower.js"; // "fails" because unicode support is more complete
+    "jstests/core/updatej.js"; // update validation failure terminates the update without modifying subsequent
+    "jstests/core/hint1.js";
+    "jstests/core/basic1.js";
+    "jstests/core/basic2.js";
+    "jstests/core/basic3.js";
+    "jstests/core/basic4.js";
+    "jstests/core/basic5.js";
+    "jstests/core/basic6.js";
+    "jstests/core/basic7.js";
+    "jstests/core/basic8.js";
+    "jstests/core/basic9.js";
+    "jstests/core/basica.js";
+    "jstests/core/basicb.js";
     "jstests/core/sortd.js"; // batchSize
     "jstests/core/drop3.js"; // batchSize, cursor
     "jstests/core/nan.js"; // cursor
-    "jstests/core/or5.js"; // cursor,batchSize
     "jstests/core/or6.js"; // cursor
     "jstests/core/oro.js"; // batchSize, cursor, explain
     // "jstests/core/find9.js"; // huge
@@ -531,7 +510,6 @@ let all_tests = [
     // "jstests/core/find6.js"; // js
     
     "jstests/core/regex.js";
-    "jstests/core/regex2.js"; // dot all syntax, Singleline mode
     // "jstests/core/regex3.js"; // stats
     // "jstests/core/regex4.js"; // stats
     // "jstests/core/regex5.js"; // SERVER-505
