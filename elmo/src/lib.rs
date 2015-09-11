@@ -4871,7 +4871,21 @@ impl Connection {
                                 unreachable!();
                             },
                             (Some(min), Some(max)) => {
-                                return Err(Error::Misc(String::from("TODO query bounds min and max")));
+                                let min = try!(Self::parse_index_min_max(min));
+                                let max = try!(Self::parse_index_min_max(max));
+                                assert_eq!(min.len(), max.len());
+                                let (minkeys, minvals): (Vec<_>, Vec<_>) = min.into_iter().unzip();
+                                let (maxkeys, maxvals): (Vec<_>, Vec<_>) = max.into_iter().unzip();
+                                // TODO minkeys must == maxkeys
+                                match try!(Self::find_index_for_min_max(&indexes, &minkeys)) {
+                                    Some(ndx) => {
+                                        let bounds = QueryBounds::GTE_LT(minvals, maxvals);
+                                        (ndx, bounds)
+                                    },
+                                    None => {
+                                        return Err(Error::Misc(String::from("index not found. TODO should be None?")));
+                                    },
+                                }
                             },
                             (Some(min), None) => {
                                 let min = try!(Self::parse_index_min_max(min));
@@ -4887,7 +4901,17 @@ impl Connection {
                                 }
                             },
                             (None, Some(max)) => {
-                                return Err(Error::Misc(String::from("TODO query bounds max")));
+                                let max = try!(Self::parse_index_min_max(max));
+                                let (keys, maxvals): (Vec<_>, Vec<_>) = max.into_iter().unzip();
+                                match try!(Self::find_index_for_min_max(&indexes, &keys)) {
+                                    Some(ndx) => {
+                                        let bounds = QueryBounds::LT(maxvals);
+                                        (ndx, bounds)
+                                    },
+                                    None => {
+                                        return Err(Error::Misc(String::from("index not found. TODO should be None?")));
+                                    },
+                                }
                             },
                         };
 
