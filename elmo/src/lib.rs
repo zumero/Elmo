@@ -3972,6 +3972,9 @@ impl Connection {
     }
 
     fn parse_accum(v: bson::Value) -> Result<GroupAccum> {
+        if !v.is_document() {
+            return Err(Error::MongoCode(15950, format!("$group accum invalid: {:?}", v)));
+        }
         let mut v = try!(v.into_document());
         if v.pairs.len() != 1 {
             return Err(Error::Misc(format!("$group accum invalid: {:?}", v)));
@@ -4096,16 +4099,21 @@ impl Connection {
                             println!("id_item: {:?}", id_item);
                             let expressions =
                                 not_id.into_iter().map(
-                                    |(k,v)| match v {
-                                        bson::Value::BInt32(1) 
-                                        | bson::Value::BInt64(1) 
-                                        | bson::Value::BDouble(1.0)
-                                        | bson::Value::BBoolean(true) => Ok((k, AggProj::Include)),
-                                        bson::Value::BInt32(0) 
-                                        | bson::Value::BInt64(0) 
-                                        | bson::Value::BDouble(0.0)
-                                        | bson::Value::BBoolean(false) => Err(Error::MongoCode(16406, String::from("agg $project does not support exclude"))),
-                                        _ => Ok((k, AggProj::Expr(try!(Self::parse_expr(v))))),
+                                    |(k,v)| 
+                                    if Self::any_part_starts_with_dollar_sign(&k) {
+                                        Err(Error::MongoCode(16410, format!("key starts with dollar sign: {}", k)))
+                                    } else {
+                                        match v {
+                                            bson::Value::BInt32(1) 
+                                            | bson::Value::BInt64(1) 
+                                            | bson::Value::BDouble(1.0)
+                                            | bson::Value::BBoolean(true) => Ok((k, AggProj::Include)),
+                                            bson::Value::BInt32(0) 
+                                            | bson::Value::BInt64(0) 
+                                            | bson::Value::BDouble(0.0)
+                                            | bson::Value::BBoolean(false) => Err(Error::MongoCode(16406, String::from("agg $project does not support exclude"))),
+                                            _ => Ok((k, AggProj::Expr(try!(Self::parse_expr(v))))),
+                                        }
                                     }
                                     ).collect::<Result<Vec<_>>>();
                             let mut expressions = try!(expressions);

@@ -103,8 +103,6 @@ let all_tests = [
     "jstests/aggregation/bugs/server6125.js"; // sort.  test case seems wrong.  array containing 1 should sort before 2L.
     "jstests/aggregation/bugs/server6177.js"; // $project:{ 'x':{ $add:[ 1 ] }, 'x.b':1 } } should fail even when doc is {}, broke on fix of 6185
     "jstests/aggregation/bugs/server6192_server6193.js"; // explain
-    "jstests/aggregation/bugs/server6238.js"; // error codes on invalid $ in paths, project and group
-    "jstests/aggregation/bugs/server6361.js"; // exclusions not allowed
     "jstests/aggregation/bugs/server6529.js"; // {$project:{foo:{$add:[{b:1}]}}} is supposed to complain about field inclusion?!?  16420.
     "jstests/aggregation/bugs/server6530.js"; // no $near in match, but syntax looks wrong anyway?
     "jstests/aggregation/bugs/server6531.js"; // support $within
@@ -128,6 +126,8 @@ let all_tests = [
     "jstests/core/or5.js"; // cursor,batchSize
     "jstests/core/regex2.js"; // dot all syntax, Singleline mode
 
+    "jstests/aggregation/bugs/server6238.js"; // error codes on invalid $ in paths, project and group
+    "jstests/aggregation/bugs/server6361.js"; // exclusions not allowed
     "jstests/aggregation/bugs/server11118.js"; // date formatting
     "jstests/aggregation/bugs/match.js"; // invalid matcher syntax mod:[0,0]
     "jstests/aggregation/bugs/server8581.js"; // $redact, matcher problem with $lte undefined vs number
