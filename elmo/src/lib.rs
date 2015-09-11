@@ -4873,7 +4873,9 @@ impl Connection {
                             (Some(min), Some(max)) => {
                                 let min = try!(Self::parse_index_min_max(min));
                                 let max = try!(Self::parse_index_min_max(max));
-                                assert_eq!(min.len(), max.len());
+                                if min.len() != max.len() {
+                                    return Err(Error::Misc(String::from("min/max hints must be same length")));
+                                }
                                 let (minkeys, minvals): (Vec<_>, Vec<_>) = min.into_iter().unzip();
                                 let (maxkeys, maxvals): (Vec<_>, Vec<_>) = max.into_iter().unzip();
                                 // TODO minkeys must == maxkeys

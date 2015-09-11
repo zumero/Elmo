@@ -264,7 +264,7 @@ struct Server<'a> {
     conn: elmo::Connection,
     // TODO this is problematic when/if the Iterator has a reference to or the same lifetime
     // as self.conn.
-    cursors: std::collections::HashMap<i64, (String, Box<Iterator<Item=Result<elmo::Row>> + 'a>)>,
+    cursors: std::collections::HashMap<i64, (String, elmo::Connection, Box<Iterator<Item=Result<elmo::Row>> + 'a>)>,
 }
 
 impl<'b> Server<'b> {
@@ -723,14 +723,14 @@ impl<'b> Server<'b> {
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
 
-    fn store_cursor<T: Iterator<Item=Result<elmo::Row>> + 'b>(&mut self, ns: &str, seq: T) -> i64 {
+    fn store_cursor<T: Iterator<Item=Result<elmo::Row>> + 'b>(&mut self, ns: &str, conn: elmo::Connection, seq: T) -> i64 {
         self.cursor_num = self.cursor_num + 1;
-        self.cursors.insert(self.cursor_num, (String::from(ns), box seq));
+        self.cursors.insert(self.cursor_num, (String::from(ns), conn, box seq));
         self.cursor_num
     }
 
     fn remove_cursors_for_collection(&mut self, ns: &str) {
-        let remove = self.cursors.iter().filter_map(|(&num, &(ref s, _))| if s.as_str() == ns { Some(num) } else { None }).collect::<Vec<_>>();
+        let remove = self.cursors.iter().filter_map(|(&num, &(ref s, _, _))| if s.as_str() == ns { Some(num) } else { None }).collect::<Vec<_>>();
         for cursor_num in remove {
             self.cursors.remove(&cursor_num);
         }
@@ -785,7 +785,7 @@ impl<'b> Server<'b> {
     }
 
     // this is a newer way of returning a cursor.  used by the agg framework.
-    fn reply_with_cursor<T: Iterator<Item=Result<elmo::Row>> + 'static>(&mut self, ns: &str, mut seq: T, cursor_options: Option<&bson::Value>, default_batch_size: usize) -> Result<bson::Document> {
+    fn reply_with_cursor<T: Iterator<Item=Result<elmo::Row>> + 'static>(&mut self, ns: &str, conn: elmo::Connection, mut seq: T, cursor_options: Option<&bson::Value>, default_batch_size: usize) -> Result<bson::Document> {
         let number_to_return =
             match cursor_options {
                 Some(&bson::Value::BDocument(ref bd)) => {
@@ -845,7 +845,7 @@ impl<'b> Server<'b> {
                     // get lost.  so we grab a batch but then put it back.
 
                     // TODO peek, or something
-                    let cursor_id = self.store_cursor(ns, seq);
+                    let cursor_id = self.store_cursor(ns, conn, seq);
                     (Vec::new(), cursor_id)
                 },
                 Some(n) => {
@@ -853,7 +853,7 @@ impl<'b> Server<'b> {
                     if docs.len() == n {
                         // if we grabbed the same number we asked for, we assume the
                         // sequence has more, so we store the cursor and return it.
-                        let cursor_id = self.store_cursor(ns, seq);
+                        let cursor_id = self.store_cursor(ns, conn, seq);
                         (docs, cursor_id)
                     } else {
                         // but if we got less than we asked for, we assume we have
@@ -999,7 +999,8 @@ impl<'b> Server<'b> {
                 Some(v) => Some(try!(v.into_document())),
                 None => None,
             };
-        let seq = try!(self.conn.list_collections(db, filter));
+        let conn = try!(self.factory.open());
+        let seq = try!(conn.list_collections(db, filter));
 
         let default_batch_size = 100;
         let cursor_options = 
@@ -1008,7 +1009,7 @@ impl<'b> Server<'b> {
                 None => Some(bson::Document::new().into_value()),
             };
         let ns = format!("{}.$cmd.listCollections", db);
-        let doc = try!(self.reply_with_cursor(&ns, seq, cursor_options.as_ref(), default_batch_size));
+        let doc = try!(self.reply_with_cursor(&ns, conn, seq, cursor_options.as_ref(), default_batch_size));
         // note that this uses the newer way of returning a cursor ID, so we pass 0 below
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
@@ -1019,7 +1020,8 @@ impl<'b> Server<'b> {
             return Err(Error::Misc(String::from("empty string for argument of listIndexes")));
         }
         // TODO this need to error when giving a coll that does not exist
-        let results = try!(self.conn.list_indexes());
+        let conn = try!(self.factory.open());
+        let results = try!(conn.list_indexes());
         let seq = {
             // we need db to get captured by this closure which outlives
             // this function, so we create String from it and use a move
@@ -1064,7 +1066,7 @@ impl<'b> Server<'b> {
                 None => Some(bson::Document::new().into_value()),
             };
         let ns = format!("{}.$cmd.listIndexes", db);
-        let doc = try!(self.reply_with_cursor(&ns, seq, cursor_options.as_ref(), default_batch_size));
+        let doc = try!(self.reply_with_cursor(&ns, conn, seq, cursor_options.as_ref(), default_batch_size));
         // note that this uses the newer way of returning a cursor ID, so we pass 0 below
         Ok(create_reply(req.req_id, vec![doc], 0))
     }
@@ -1139,7 +1141,8 @@ impl<'b> Server<'b> {
             Some(_) => return Err(Error::Misc(format!("aggregate.cursor must be a document: {:?}", cursor_options))),
             None => (),
         }
-        let (out, seq) = try!(self.conn.aggregate(db, &coll, pipeline));
+        let conn = try!(self.factory.open());
+        let (out, seq) = try!(conn.aggregate(db, &coll, pipeline));
         match out {
             Some(new_coll_name) => {
                 let full_coll = format!("{}.{}", db, new_coll_name);
@@ -1165,14 +1168,15 @@ impl<'b> Server<'b> {
                     }
                 }
                 let default_batch_size = 100;
-                let doc = try!(self.reply_with_cursor(&full_coll, std::iter::empty(), cursor_options, default_batch_size));
+                // TODO conn wasted here.  not even needed by the stored fake cursor.
+                let doc = try!(self.reply_with_cursor(&full_coll, conn, std::iter::empty(), cursor_options, default_batch_size));
                 // note that this uses the newer way of returning a cursor ID, so we pass 0 below
                 Ok(create_reply(req.req_id, vec![doc], 0))
             },
             None => {
                 let default_batch_size = 100;
                 let ns = format!("{}.{}", db, coll);
-                let doc = try!(self.reply_with_cursor(&ns, seq, cursor_options, default_batch_size));
+                let doc = try!(self.reply_with_cursor(&ns, conn, seq, cursor_options, default_batch_size));
                 // note that this uses the newer way of returning a cursor ID, so we pass 0 below
                 Ok(create_reply(req.req_id, vec![doc], 0))
             },
@@ -1266,6 +1270,7 @@ impl<'b> Server<'b> {
         // This other stuff is called query modifiers.  
         // Sigh.
 
+        let conn = try!(self.factory.open());
         let seq = 
             match Self::try_remove_optional_prefix(&mut query, "$query") {
                 Some(q) => {
@@ -1277,7 +1282,7 @@ impl<'b> Server<'b> {
                     let hint = Self::try_remove_optional_prefix(&mut query, "$hint");
                     let explain = Self::try_remove_optional_prefix(&mut query, "$explain");
                     let q = try!(q.into_document());
-                    let seq = try!(self.conn.find(
+                    let seq = try!(conn.find(
                             db, 
                             coll, 
                             q,
@@ -1291,7 +1296,7 @@ impl<'b> Server<'b> {
                     seq
                 },
                 None => {
-                    let seq = try!(self.conn.find(
+                    let seq = try!(conn.find(
                             db, 
                             coll, 
                             query,
@@ -1321,9 +1326,10 @@ impl<'b> Server<'b> {
 
         let (docs, more) = try!(Self::do_limit(&full_collection_name, &mut seq, number_to_return));
         let cursor_id = if more {
-            self.store_cursor(&full_collection_name, seq)
+            self.store_cursor(&full_collection_name, conn, seq)
             //0
         } else {
+            // TODO conn wasted here
             0
         };
         let docs = vec_rows_to_values(docs);
@@ -1413,7 +1419,7 @@ impl<'b> Server<'b> {
     fn reply_2005(&mut self, req: MsgGetMore) -> Reply {
         // TODO this function should be using reply_code
         match self.cursors.remove(&req.cursor_id) {
-            Some((ns, mut seq)) => {
+            Some((ns, conn, mut seq)) => {
                 match Self::do_limit(&ns, &mut seq, req.number_to_return) {
                     Ok((docs, more)) => {
                         //println!("GetMore: docs = {:?}", docs);
@@ -1421,7 +1427,9 @@ impl<'b> Server<'b> {
                         //println!("GetMore: more = {:?}", more);
                         if more {
                             // put the cursor back for next time
-                            self.cursors.insert(req.cursor_id, (ns, box seq));
+                            self.cursors.insert(req.cursor_id, (ns, conn, box seq));
+                        } else {
+                            // TODO conn wasted here
                         }
                         let docs = vec_rows_to_values(docs);
                         match vec_values_to_docs(docs) {
