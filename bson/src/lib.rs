@@ -93,104 +93,63 @@ fn simple_mongo_strftime(fmt: &str, tm: &time::Tm) -> String {
     s
 }
 
-// TODO
-pub enum PathKey<'a> {
-    Array(usize),
-    Document(&'a str),
-}
-
 #[derive(Debug)]
 pub enum WalkPath<'v, 'p> {
+    // TODO open question here about whether the strs should be
+    // the name (the current step in the path), or the whole remaining 
+    // path.
+
     SubDocument(&'p str, Box<WalkPath<'v, 'p>>),
-    SubArray(&'p str, Box<WalkPath<'v, 'p>>),
+    SubArray(&'p str, (Box<WalkPath<'v, 'p>>, Vec<WalkPath<'v, 'p>>)),
     NotContainer(&'p str, &'v Value),
 
     Value(&'p str, &'v Value),
     NotFound(&'p str),
+}
 
-    // TODO not sure dive needs the str.
-    // TODO every item within it has a copy of that same str.
-    Dive(&'p str, Vec<WalkPath<'v, 'p>>),
+fn project_dive<'v, 'p>(d: &mut Array, dive: &Vec<WalkPath<'v, 'p>>) -> Result<()> {
+    for p in dive.iter() {
+        match p {
+            &WalkPath::Value(_, _) => {
+                let mut sub = Document::new();
+                try!(p.project(&mut sub));
+                d.items.push(sub.into_value());
+            },
+            &WalkPath::SubDocument(_, _) => {
+                let mut sub = Document::new();
+                try!(p.project(&mut sub));
+                d.items.push(sub.into_value());
+            },
+            &WalkPath::SubArray(_, _) => {
+                let mut sub = Document::new();
+                try!(p.project(&mut sub));
+                d.items.push(sub.into_value());
+            },
+            &WalkPath::NotFound(_) => {
+                // mongo tests seem to indicate that an empty document gets
+                // produced in this case.
+                let mut sub = Document::new();
+                try!(p.project(&mut sub));
+                d.items.push(sub.into_value());
+            },
+            &WalkPath::NotContainer(_, _) => {
+                // mongo tests seem to indicate that doing nothing here is correct
+            },
+        }
+    }
+    Ok(())
 }
 
 impl<'v, 'p> WalkPath<'v, 'p> {
-    pub fn has_any_dives(&self) -> bool {
-        match self {
-            &WalkPath::Dive(_,_) => true,
-
-            &WalkPath::SubDocument(_,ref p) => p.has_any_dives(),
-            &WalkPath::SubArray(_,ref p) => p.has_any_dives(),
-
-            &WalkPath::NotContainer(_,_) => false,
-            &WalkPath::NotFound(_) => false,
-
-            &WalkPath::Value(_,_) => false,
-        }
-    }
-
-    pub fn has_any_values(&self) -> bool {
-        match self {
-            &WalkPath::Dive(_,ref a) => {
-                a.iter().any(|p| p.has_any_values())
-            },
-            &WalkPath::SubDocument(_,ref p) => p.has_any_values(),
-            &WalkPath::SubArray(_,ref p) => p.has_any_values(),
-
-            &WalkPath::NotContainer(_,_) => false,
-            &WalkPath::NotFound(_) => false,
-
-            &WalkPath::Value(_,_) => true,
-        }
-    }
-
     fn project_into_array(&self, d: &mut Array) -> Result<()> {
         // TODO mongo docs say that projecting a portion of an array
         // doesn't work without projection ops.
 
-        // TODO are the cases below supposed to always push?  Or
-        // should they take the given index into account?
-
         match self {
-            &WalkPath::Dive(_,ref a) => {
-                for p in a.iter() {
-                    match p {
-                        &WalkPath::Value(_, _) => {
-                            let mut sub = Document::new();
-                            try!(p.project(&mut sub));
-                            d.items.push(sub.into_value());
-                        },
-                        &WalkPath::SubDocument(_, _) => {
-                            let mut sub = Document::new();
-                            try!(p.project(&mut sub));
-                            d.items.push(sub.into_value());
-                        },
-                        &WalkPath::SubArray(_, _) => {
-                            let mut sub = Document::new();
-                            try!(p.project(&mut sub));
-                            d.items.push(sub.into_value());
-                        },
-                        &WalkPath::NotFound(_) => {
-                            // mongo tests seem to indicate that an empty document gets
-                            // produced in this case.
-                            let mut sub = Document::new();
-                            try!(p.project(&mut sub));
-                            d.items.push(sub.into_value());
-                        },
-                        &WalkPath::NotContainer(_, _) => {
-                            // mongo tests seem to indicate that doing nothing here is correct
-                        },
-                        &WalkPath::Dive(_,_) => {
-                            // TODO what does this mean?
-                            // TODO this should be unreachable?
-                        },
-                    }
-                }
-                Ok(())
-            },
             &WalkPath::SubDocument(_,_) => {
                 Err(Error::Misc(format!("TODO project_into_array: {:?}", self)))
             },
-            &WalkPath::SubArray(_,_) => {
+            &WalkPath::SubArray(_,(_,ref dive)) => {
                 Err(Error::Misc(format!("TODO project_into_array: {:?}", self)))
             },
             &WalkPath::NotContainer(_,_) => {
@@ -207,16 +166,14 @@ impl<'v, 'p> WalkPath<'v, 'p> {
 
     pub fn cloned_value(&self) -> Option<Value> {
         match self {
-            &WalkPath::Dive(_,ref a) => {
-                let a2 = a.iter().filter_map(|p| p.cloned_value()).collect::<Vec<_>>();
-                let a2 = Array { items: a2 };
-                Some(Value::BArray(a2))
-            },
             &WalkPath::SubDocument(_, ref p) => {
                 p.cloned_value()
             },
-            &WalkPath::SubArray(_,ref p) => {
-                p.cloned_value()
+            &WalkPath::SubArray(_,(ref direct, ref dive)) => {
+                // TODO direct.  ambiguous.
+                let a2 = dive.iter().filter_map(|p| p.cloned_value()).collect::<Vec<_>>();
+                let a2 = Array { items: a2 };
+                Some(Value::BArray(a2))
             },
             &WalkPath::NotContainer(_,_) => {
                 None
@@ -230,15 +187,31 @@ impl<'v, 'p> WalkPath<'v, 'p> {
         }
     }
 
+    pub fn exists(&self) -> bool {
+        match self {
+            &WalkPath::SubDocument(_, ref p) => {
+                p.exists()
+            },
+            &WalkPath::SubArray(_,(ref direct,ref dive)) => {
+                direct.exists() || dive.iter().any(|p| p.exists())
+            },
+            &WalkPath::NotContainer(_,_) => {
+                false
+            },
+            &WalkPath::NotFound(_) => {
+                false
+            },
+            &WalkPath::Value(_,v) => {
+                true
+            },
+        }
+    }
+
     pub fn project(&self, d: &mut Document) -> Result<()> {
         match self {
-            &WalkPath::Dive(_,_) => {
-                // TODO should never happen.  this is not an array.
-                Err(Error::Misc(format!("project_into_document TODO: {:?}", self)))
-            },
             &WalkPath::SubDocument(name, ref p) => {
                 // TODO the following code is dorky.  it wants to use something like entry(),
-                // but that's not quite right.  its Absent::insert() doesn't return mut ref.
+                // but that's not quite right.  Absent::insert() doesn't return mut ref.
                 // we need to make sure that d.name is a
                 // subdocument, and insert one if it's not there, after which we will
                 // immediately need a mut ref to it so we can project into it.
@@ -260,14 +233,16 @@ impl<'v, 'p> WalkPath<'v, 'p> {
                 let sub = try!(sub.as_mut_document());
                 p.project(sub)
             },
-            &WalkPath::SubArray(name,ref p) => {
+            &WalkPath::SubArray(name,(ref direct, ref dive)) => {
                 // TODO what if name is already present?  error?
                 let sub = Array::new().into_value();
                 let sub = d.set(name, sub);
                 // need to get the array ref back
                 // TODO following line could just panic on fail
                 let mut sub = try!(sub.as_mut_array());
-                p.project_into_array(sub)
+                try!(project_dive(sub, dive));
+                // TODO? try!(direct.project_into_array(sub));
+                Ok(())
             },
             &WalkPath::NotContainer(_,_) => {
                 // TODO this is an error, right?
@@ -751,7 +726,8 @@ impl Document {
                                 WalkPath::SubDocument(name, box bd.walk_path(&path[dot + 1..]))
                             },
                             &Value::BArray(ref ba) => {
-                                WalkPath::SubArray(name, box ba.walk_path(&path[dot + 1..]))
+                                let (direct, dive) = ba.walk_path(&path[dot + 1 ..]);
+                                WalkPath::SubArray(name, (box direct, dive))
                             },
                             _ => {
                                 WalkPath::NotContainer(name, v)
@@ -865,6 +841,7 @@ impl Array {
             None => path,
             Some(ndx) => &path[0 .. ndx]
         };
+        // TODO may need to handle "1" as a subdoc dive
         match name.parse::<i32>() {
             Err(_) => {
                 // when we have an array and the next step of the path is not
@@ -915,60 +892,88 @@ impl Array {
         }
     }
 
-    pub fn walk_path<'v, 'p>(&'v self, path: &'p str) -> WalkPath<'v, 'p> {
+    // When we walk a path into an array, there are two ways we can go, and we have to
+    // do both of them.
+    //
+    // Consider the following document, containing an array with two documents
+    // inside it:
+
+    /*
+    {
+        a : [
+                {
+                    "1" : {
+                        "foo" : 4
+                    }
+                },
+                {
+                    "foo" : 6
+                },
+            ]
+    }
+    */
+
+    // and suppose the path to be walked is a.1.foo
+    // There are two ways to interpret this path for this document.
+    // Either it results in 4 or 6.
+    // If 1 is the index into the array, it results in 6.
+    // If 1 is used as the key for diving into subdocuments of the array, it is 4.
+
+    pub fn walk_path<'v, 'p>(&'v self, path: &'p str) -> (WalkPath<'v, 'p>, Vec<WalkPath<'v, 'p>>) {
         let dot = path.find('.');
         let name = match dot { 
             None => path,
             Some(ndx) => &path[0 .. ndx]
         };
-        match name.parse::<i32>() {
-            Err(_) => {
-                // when we have an array and the next step of the path is not
-                // an integer index, we search any subdocs in that array for
-                // that path and construct an array of the matches.
-
-                // document : { a:1, b:[ { c:1 }, { c:2 } ] }
-                // path : b.c
-                // needs to get: [ 1, 2 ]
-
-                let a = self.items.iter().map(|subv| 
-                                              match subv {
-                                                  &Value::BDocument(ref bd) => {
-                                                      bd.walk_path(path)
-                                                  },
-                                                  _ => {
-                                                      WalkPath::NotContainer(path, subv)
-                                                  },
-                                              }
-                                              ).collect::<Vec<_>>();
-                WalkPath::Dive(path, a)
-            }, 
-            Ok(ndx) => {
-                if ndx < 0 || (ndx as usize) >= self.items.len() {
-                    // TODO do we need to distinguish between dot or not?
+        let direct = 
+            match name.parse::<i32>() {
+                Err(_) => {
                     WalkPath::NotFound(name)
-                } else {
-                    let ndx = ndx as usize;
-                    let v = &self.items[ndx];
-                    match dot {
-                        None => WalkPath::Value(name, v),
-                        Some(dot) => {
-                            match v {
-                                &Value::BDocument(ref bd) => {
-                                    WalkPath::SubDocument(name, box bd.walk_path(&path[dot + 1 ..]))
-                                },
-                                &Value::BArray(ref ba) => {
-                                    WalkPath::SubArray(name, box ba.walk_path(&path[dot + 1 ..]))
-                                },
-                                _ => {
-                                    WalkPath::NotContainer(name, v)
-                                },
-                            }
-                        },
+                }, 
+                Ok(ndx) => {
+                    if ndx < 0 || (ndx as usize) >= self.items.len() {
+                        WalkPath::NotFound(name)
+                    } else {
+                        let ndx = ndx as usize;
+                        let v = &self.items[ndx];
+                        match dot {
+                            None => WalkPath::Value(name, v),
+                            Some(dot) => {
+                                match v {
+                                    &Value::BDocument(ref bd) => {
+                                        WalkPath::SubDocument(name, box bd.walk_path(&path[dot + 1 ..]))
+                                    },
+                                    &Value::BArray(ref ba) => {
+                                        let (direct, dive) = ba.walk_path(&path[dot + 1 ..]);
+                                        WalkPath::SubArray(name, (box direct, dive))
+                                    },
+                                    _ => {
+                                        WalkPath::NotContainer(name, v)
+                                    },
+                                }
+                            },
+                        }
                     }
                 }
-            }
-        }
+            };
+        let dive = self.items
+            .iter()
+            .map(
+                |subv| 
+                    match subv {
+                        &Value::BDocument(ref bd) => {
+                            bd.walk_path(path)
+                        },
+                        _ => {
+                            // TODO should this be a little different?
+                            // like CannotDive?
+                            // like "child of array is not a document"?
+                            WalkPath::NotContainer(path, subv)
+                        },
+                    }
+                    )
+            .collect::<Vec<_>>();
+        (direct, dive)
     }
 
     pub fn set_path(&mut self, path: &str, v: Value) -> Result<()> {

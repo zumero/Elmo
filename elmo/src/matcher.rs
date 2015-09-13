@@ -464,42 +464,21 @@ fn match_predicate<F: Fn(usize)>(pred: &Pred, d: &bson::Value, cb_array_pos: &F)
     }
 }
 
-fn match_pair_exists(pred: &Pred, path: &str, start: &bson::Value) -> bool {
-    // TODO pred is not used
-    let dot = path.find('.');
-    let name = match dot { 
-        None => path,
-        Some(ndx) => &path[0 .. ndx]
-    };
-    match start.tryGetValueEither(name) {
-        Some(v) => {
-            match dot {
-                None => true,
-                Some(dot) => {
-                    let subpath = &path[dot+1 ..];
-                    match v {
-                        &bson::Value::BDocument(_) => {
-                            match_pair_exists(pred, subpath, v)
-                        },
-                        &bson::Value::BArray(ref ba) => {
-                            let b = match_pair_exists(pred, subpath, v);
-                            if b {
-                                true
-                            } else {
-                                ba.items.iter().any(|vsub| {
-                                    match vsub {
-                                        &bson::Value::BDocument(_) => match_pair_exists(pred, subpath, vsub),
-                                        _ => false,
-                                    }
-                                })
-                            }
-                        },
-                        _ => false,
-                    }
-                },
-            }
+fn match_pair_exists(pred: &Pred, path: &str, doc: &bson::Value) -> bool {
+    match doc {
+        &bson::Value::BDocument(ref bd) => {
+            let walk = bd.walk_path(path);
+            let b = walk.exists();
+            b
         },
-        None => false,
+        &bson::Value::BArray(ref ba) => {
+            let (direct, dive) = ba.walk_path(path);
+            let b = direct.exists() || dive.iter().any(|p| p.exists());
+            b
+        },
+        _ => {
+            false
+        },
     }
 }
 
