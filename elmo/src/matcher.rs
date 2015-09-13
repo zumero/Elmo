@@ -464,7 +464,7 @@ fn match_predicate<F: Fn(usize)>(pred: &Pred, d: &bson::Value, cb_array_pos: &F)
     }
 }
 
-fn match_pair_exists(pred: &Pred, path: &str, doc: &bson::Value) -> bool {
+fn match_pair_exists(path: &str, doc: &bson::Value) -> bool {
     match doc {
         &bson::Value::BDocument(ref bd) => {
             let walk = bd.walk_path(path);
@@ -591,7 +591,7 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
             }
         },
         &Pred::Exists(b) => {
-            b == match_pair_exists(pred, path, start)
+            b == match_pair_exists(path, start)
         },
         &Pred::Not(ref a) => {
             let any_matches = a.iter().any(|p| !match_pair(p, path, start, cb_array_pos));
