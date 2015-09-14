@@ -628,40 +628,40 @@ fn match_walk<F: Fn(usize)>(pred: &Pred, walk: &bson::WalkPath, cb_array_pos: &F
             let any_matches = preds.iter().any(|p| match_walk(p, walk, cb_array_pos));
             !any_matches
         },
-        &Pred::EQ(ref lit) => walk.values().iter().any(|d| cmp_eq(d, lit)),
-        &Pred::NE(ref lit) => walk.values().iter().any(|d| !cmp_eq(d, lit)),
-        &Pred::LT(ref lit) => walk.values().iter().any(|d| cmp_lt(d, lit)),
-        &Pred::GT(ref lit) => walk.values().iter().any(|d| cmp_gt(d, lit)),
-        &Pred::LTE(ref lit) => walk.values().iter().any(|d| cmp_lte(d, lit)),
-        &Pred::GTE(ref lit) => walk.values().iter().any(|d| cmp_gte(d, lit)),
-        &Pred::Type(n) => walk.values().iter().any(|d| (d.getTypeNumber_u8() as i32) == n),
-        &Pred::Size(n) => walk.values().iter().any(|d| 
+        &Pred::EQ(ref lit) => walk.values().any(|d| cmp_eq(d, lit)),
+        &Pred::NE(ref lit) => walk.values().any(|d| !cmp_eq(d, lit)),
+        &Pred::LT(ref lit) => walk.values().any(|d| cmp_lt(d, lit)),
+        &Pred::GT(ref lit) => walk.values().any(|d| cmp_gt(d, lit)),
+        &Pred::LTE(ref lit) => walk.values().any(|d| cmp_lte(d, lit)),
+        &Pred::GTE(ref lit) => walk.values().any(|d| cmp_gte(d, lit)),
+        &Pred::Type(n) => walk.values().any(|d| (d.getTypeNumber_u8() as i32) == n),
+        &Pred::Size(n) => walk.values().any(|d| 
             match d {
-                &&bson::Value::BArray(ref ba) => ba.items.len() == (n as usize),
+                &bson::Value::BArray(ref ba) => ba.items.len() == (n as usize),
                 _ => false,
             }
             ),
-        &Pred::Mod(div, rem) => walk.values().iter().any(|d| 
+        &Pred::Mod(div, rem) => walk.values().any(|d| 
             match d {
-                &&bson::Value::BInt32(n) => ((n as i64) % div) == rem,
-                &&bson::Value::BInt64(n) => (n % div) == rem,
-                &&bson::Value::BDouble(n) => ((n as i64) % div) == rem,
+                &bson::Value::BInt32(n) => ((n as i64) % div) == rem,
+                &bson::Value::BInt64(n) => (n % div) == rem,
+                &bson::Value::BDouble(n) => ((n as i64) % div) == rem,
                 _ => false,
             }
             ),
-        &Pred::REGEX(ref re) => walk.values().iter().any(|d| 
+        &Pred::REGEX(ref re) => walk.values().any(|d| 
             match d {
-                &&bson::Value::BString(ref s) => {
+                &bson::Value::BString(ref s) => {
                     re.is_match(s)
                 },
                 _ => false,
             }
             ),
-        &Pred::In(ref lits) => lits.iter().any(|v| walk.values().iter().any(|d| cmp_in(d, v))),
-        &Pred::Nin(ref lits) => !lits.iter().any(|v| walk.values().iter().any(|d| cmp_in(d, v))),
-        &Pred::ElemMatchObjects(ref doc) => walk.values().iter().any(|d|
+        &Pred::In(ref lits) => lits.iter().any(|v| walk.values().any(|d| cmp_in(d, v))),
+        &Pred::Nin(ref lits) => !lits.iter().any(|v| walk.values().any(|d| cmp_in(d, v))),
+        &Pred::ElemMatchObjects(ref doc) => walk.values().any(|d|
             match d {
-                &&bson::Value::BArray(ref ba) => {
+                &bson::Value::BArray(ref ba) => {
                     let found = 
                         ba.items.iter().position(|vsub| {
                             match vsub {
@@ -680,9 +680,9 @@ fn match_walk<F: Fn(usize)>(pred: &Pred, walk: &bson::WalkPath, cb_array_pos: &F
                 _ => false,
             }
             ),
-        &Pred::ElemMatchPreds(ref preds) => walk.values().iter().any(|d|
+        &Pred::ElemMatchPreds(ref preds) => walk.values().any(|d|
             match d {
-                &&bson::Value::BArray(ref ba) => {
+                &bson::Value::BArray(ref ba) => {
                     let found = 
                         ba.items.iter().position(|vsub| preds.iter().all(|p| match_predicate(p, vsub, cb_array_pos)));
                     match found {
@@ -696,7 +696,7 @@ fn match_walk<F: Fn(usize)>(pred: &Pred, walk: &bson::WalkPath, cb_array_pos: &F
                 _ => false,
             }
             ),
-        &Pred::AllElemMatchObjects(ref docs) => walk.values().iter().any(|d| 
+        &Pred::AllElemMatchObjects(ref docs) => walk.values().any(|d| 
             // for each elemMatch doc in the $all array, run it against
             // the candidate array.  if any elemMatch doc fails, false.
             docs.iter().all(|doc| do_elem_match_objects(doc, d, cb_array_pos))
@@ -706,14 +706,14 @@ fn match_walk<F: Fn(usize)>(pred: &Pred, walk: &bson::WalkPath, cb_array_pos: &F
             if lits.len() == 0 {
                 false
             } else {
-                !lits.iter().any(|lit| walk.values().iter().any(|d|
+                !lits.iter().any(|lit| walk.values().any(|d|
                                                                 {
                     let b =
                         if cmp_eq(d, lit) {
                             true
                         } else {
                             match d {
-                                &&bson::Value::BArray(ref ba) => {
+                                &bson::Value::BArray(ref ba) => {
                                     ba.items.iter().any(|v| cmp_eq(v, lit))
                                 },
                                 _ => false,

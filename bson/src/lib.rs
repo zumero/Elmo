@@ -219,11 +219,10 @@ impl<'v, 'p> WalkPath<'v, 'p> {
         }
     }
 
-    // TODO it would be nicer if this returned an iterator
-    pub fn values(&self) -> Vec<&Value> {
+    pub fn values<'q>(&'q self) -> Box<Iterator<Item=&'q Value> + 'q> {
         let mut a = vec![];
         self.get_values(&mut a);
-        a
+        box a.into_iter()
     }
 
     pub fn exists(&self) -> bool {
