@@ -617,9 +617,130 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
     }
 }
 
+fn match_walk<F: Fn(usize)>(pred: &Pred, walk: &bson::WalkPath, cb_array_pos: &F) -> bool {
+    println!("match_walk: pred = {:?}", pred);
+    println!("match_walk: walk = {:?}", walk);
+    match pred {
+        &Pred::Exists(b) => {
+            b == walk.exists()
+        },
+        &Pred::Not(ref preds) => {
+            let any_matches = preds.iter().any(|p| match_walk(p, walk, cb_array_pos));
+            !any_matches
+        },
+        &Pred::EQ(ref lit) => walk.values().iter().any(|d| cmp_eq(d, lit)),
+        &Pred::NE(ref lit) => walk.values().iter().any(|d| !cmp_eq(d, lit)),
+        &Pred::LT(ref lit) => walk.values().iter().any(|d| cmp_lt(d, lit)),
+        &Pred::GT(ref lit) => walk.values().iter().any(|d| cmp_gt(d, lit)),
+        &Pred::LTE(ref lit) => walk.values().iter().any(|d| cmp_lte(d, lit)),
+        &Pred::GTE(ref lit) => walk.values().iter().any(|d| cmp_gte(d, lit)),
+        &Pred::Type(n) => walk.values().iter().any(|d| (d.getTypeNumber_u8() as i32) == n),
+        &Pred::Size(n) => walk.values().iter().any(|d| 
+            match d {
+                &&bson::Value::BArray(ref ba) => ba.items.len() == (n as usize),
+                _ => false,
+            }
+            ),
+        &Pred::Mod(div, rem) => walk.values().iter().any(|d| 
+            match d {
+                &&bson::Value::BInt32(n) => ((n as i64) % div) == rem,
+                &&bson::Value::BInt64(n) => (n % div) == rem,
+                &&bson::Value::BDouble(n) => ((n as i64) % div) == rem,
+                _ => false,
+            }
+            ),
+        &Pred::REGEX(ref re) => walk.values().iter().any(|d| 
+            match d {
+                &&bson::Value::BString(ref s) => {
+                    re.is_match(s)
+                },
+                _ => false,
+            }
+            ),
+        &Pred::In(ref lits) => lits.iter().any(|v| walk.values().iter().any(|d| cmp_in(d, v))),
+        &Pred::Nin(ref lits) => !lits.iter().any(|v| walk.values().iter().any(|d| cmp_in(d, v))),
+        &Pred::ElemMatchObjects(ref doc) => walk.values().iter().any(|d|
+            match d {
+                &&bson::Value::BArray(ref ba) => {
+                    let found = 
+                        ba.items.iter().position(|vsub| {
+                            match vsub {
+                                &bson::Value::BDocument(_) | &bson::Value::BArray(_) => match_query_doc(doc, vsub, cb_array_pos),
+                                _ => false,
+                            }
+                        });
+                    match found {
+                        Some(n) => {
+                            cb_array_pos(n);
+                            true
+                        },
+                        None => false
+                    }
+                },
+                _ => false,
+            }
+            ),
+        &Pred::ElemMatchPreds(ref preds) => walk.values().iter().any(|d|
+            match d {
+                &&bson::Value::BArray(ref ba) => {
+                    let found = 
+                        ba.items.iter().position(|vsub| preds.iter().all(|p| match_predicate(p, vsub, cb_array_pos)));
+                    match found {
+                        Some(n) => {
+                            cb_array_pos(n);
+                            true
+                        },
+                        None => false
+                    }
+                },
+                _ => false,
+            }
+            ),
+        &Pred::AllElemMatchObjects(ref docs) => walk.values().iter().any(|d| 
+            // for each elemMatch doc in the $all array, run it against
+            // the candidate array.  if any elemMatch doc fails, false.
+            docs.iter().all(|doc| do_elem_match_objects(doc, d, cb_array_pos))
+            ),
+        &Pred::All(ref lits) => 
+            // TODO does this ever happen, now that it is handled earlier?
+            if lits.len() == 0 {
+                false
+            } else {
+                !lits.iter().any(|lit| walk.values().iter().any(|d|
+                                                                {
+                    let b =
+                        if cmp_eq(d, lit) {
+                            true
+                        } else {
+                            match d {
+                                &&bson::Value::BArray(ref ba) => {
+                                    ba.items.iter().any(|v| cmp_eq(v, lit))
+                                },
+                                _ => false,
+                            }
+                        };
+                    !b
+                                                                }
+                    )
+                )
+            },
+
+        // TODO don't panic here.  need to return Result<>
+        &Pred::Near(_) => panic!("TODO geo"),
+        &Pred::NearSphere(_) => panic!("TODO geo"),
+        &Pred::GeoWithin(_) => panic!("TODO geo"),
+        &Pred::GeoIntersects(_) => panic!("TODO geo"),
+    }
+}
+
 fn match_query_item<F: Fn(usize)>(qit: &QueryItem, d: &bson::Value, cb_array_pos: &F) -> bool {
     match qit {
         &QueryItem::Compare(ref path, ref preds) => {
+/*
+            let d = d.as_document().unwrap();
+            let walk = d.walk_path(path);
+            preds.iter().all(|p| match_walk(p, &walk, cb_array_pos))
+*/
             preds.iter().all(|v| match_pair(v, path, d, cb_array_pos))
         },
         &QueryItem::AND(ref qd) => {

@@ -187,6 +187,45 @@ impl<'v, 'p> WalkPath<'v, 'p> {
         }
     }
 
+    fn get_values<'q>(&'q self, a: &mut Vec<&'q Value>) {
+        match self {
+            &WalkPath::SubDocument(_, ref p) => {
+                p.get_values(a);
+            },
+            &WalkPath::SubArray(_,(ref direct,ref dive)) => {
+                direct.get_values(a);
+                for p in dive.iter() {
+                    p.get_values(a);
+                }
+            },
+            &WalkPath::NotContainer(_,_) => {
+            },
+            &WalkPath::NotFound(_) => {
+            },
+            &WalkPath::Value(_,v) => {
+                a.push(v);
+                /*
+                match v {
+                    &Value::BArray(ref ba) => {
+                        for v in ba.items.iter() {
+                            a.push(v);
+                        }
+                    },
+                    _ => {
+                    },
+                }
+                */
+            },
+        }
+    }
+
+    // TODO it would be nicer if this returned an iterator
+    pub fn values(&self) -> Vec<&Value> {
+        let mut a = vec![];
+        self.get_values(&mut a);
+        a
+    }
+
     pub fn exists(&self) -> bool {
         match self {
             &WalkPath::SubDocument(_, ref p) => {
@@ -919,6 +958,8 @@ impl Array {
     // If 1 is the index into the array, it results in 6.
     // If 1 is used as the key for diving into subdocuments of the array, it is 4.
 
+    // TODO this function wants to be private.  all walks from outside this module
+    // should start with a Document at the top.
     pub fn walk_path<'v, 'p>(&'v self, path: &'p str) -> (WalkPath<'v, 'p>, Vec<WalkPath<'v, 'p>>) {
         let dot = path.find('.');
         let name = match dot { 
