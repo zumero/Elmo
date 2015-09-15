@@ -194,6 +194,7 @@ impl<'v, 'p> WalkPath<'v, 'p> {
             },
             &WalkPath::SubArray(_,(ref direct,ref dive)) => {
                 direct.get_values(a);
+                // TODO do we care here how much deeper this goes?
                 for p in dive.iter() {
                     p.get_values(a);
                 }
@@ -996,6 +997,27 @@ impl Array {
                     }
                 }
             };
+        // TODO seems like maybe dot should matter here for the dive.
+        // If dot is None, and this is the last piece of the path,
+        // then this dive terminates the array, so from the perspective
+        // of someone wanting to know what kind of "value" this array
+        // results in, it results in an array, albeit one that was
+        // constructed by a dive.  In this case, the dive will contain
+        // Values (for cases where the array element was a subdoc which
+        // contained the name), NotFound (for cases where the array
+        // element was a subdoc that did not contain the name), or
+        // NotContainer (for cases where the array element was not a
+        // subdoc).
+        // OTOH, suppose there is more to the path.  Now this dive is
+        // very different.  It doesn't "end" with an array.  Rather,
+        // it explodes into a N different end points.  I guess it could
+        // still be viewed as a synthesized array, but it's still different.
+        // The dive will contain SubDocument (for cases where the array
+        // element was a subdoc that contained the name and THAT value
+        // was also a subdoc), for example.
+
+        // What would happen if we simply disallowed dives that go deeper?
+        // or tagged them differently?
         let dive = self.items
             .iter()
             .map(
