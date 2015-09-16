@@ -568,6 +568,48 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
     // TODO consider a reusable function which generates all possible paths
     
     match pred {
+        &Pred::EQ(ref lit) => {
+
+            let walk = start.walk_path(path);
+            let new = 
+                walk.for_each_leaf(
+                    &|ov| {
+                        match ov {
+                            Some(v) => {
+                                cmp_eq(v, lit)
+                                || {
+                                    match v {
+                                        &bson::Value::BArray(ref ba) => {
+                                            ba.items.iter().any(|v| cmp_eq(v, lit))
+                                        },
+                                        _ => false,
+                                    }
+                                }
+                            },
+                            None => {
+                                // TODO if lit is null or undefined, true
+                                false
+                            },
+                        }
+                    }
+                ) 
+                || match lit {
+                    &bson::Value::BNull | &bson::Value::BUndefined => !walk.exists(),
+                    _ => false,
+                };
+            let old = match_pair_other(pred, path, start, false, cb_array_pos);
+            if new != old {
+                println!("BEGIN EQ fail");
+                println!("    new = {:?}", new);
+                println!("    old = {:?}", old);
+                println!("    lit = {:?}", lit);
+                println!("    start = {:?}", start);
+                println!("    path = {:?}", path);
+                println!("    walk = {:?}", walk);
+                println!("    END EQ fail");
+            }
+            old
+        },
         &Pred::All(ref a) => {
             if a.len() == 0 {
                 false
@@ -723,11 +765,8 @@ fn match_walk<F: Fn(usize)>(pred: &Pred, walk: &bson::WalkPath, cb_array_pos: &F
 fn match_query_item<F: Fn(usize)>(qit: &QueryItem, d: &bson::Value, cb_array_pos: &F) -> bool {
     match qit {
         &QueryItem::Compare(ref path, ref preds) => {
- /*
-            let d = d.as_document().unwrap();
-            let walk = d.walk_path(path);
-            preds.iter().all(|p| match_walk(p, &walk, cb_array_pos))
- */
+            //let walk = d.walk_path(path);
+            //preds.iter().all(|p| match_walk(p, &walk, cb_array_pos))
             preds.iter().all(|v| match_pair(v, path, d, cb_array_pos))
         },
         &QueryItem::AND(ref qd) => {

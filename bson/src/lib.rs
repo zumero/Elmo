@@ -143,9 +143,11 @@ impl<'v, 'p> WalkRoot<'v, 'p> {
         }
     }
 
-    // TODO maybe the callback should get the path too?
+    // TODO maybe the callback should get the path too?  might need this to
+    // get the array match pos.
+
     // callback should return true to make it stop
-    fn for_each_leaf<F : Fn(Option<&Value>) -> bool>(&self, func: &F) -> bool {
+    pub fn for_each_leaf<F : Fn(Option<&Value>) -> bool>(&self, func: &F) -> bool {
         match self {
             &WalkRoot::Document(ref p) => p.for_each_leaf(func),
             &WalkRoot::Not(_) => func(None),
@@ -210,6 +212,10 @@ impl<'v, 'p> WalkIntermediate<'v, 'p> {
                 p.for_each_leaf(func)
             },
             &WalkIntermediate::Array(_,(ref direct,ref dive)) => {
+                // TODO I think what we want here is either:
+                //     all the actual values from either direct or dive
+                // or if there are no such values:
+                //     just one NotFound
                 direct.for_each_leaf(func) || dive.iter().any(|p| p.for_each_leaf(func))
             },
             &WalkIntermediate::NotContainer(_,_) => {
