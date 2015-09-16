@@ -3505,6 +3505,10 @@ impl Connection {
                         if subpath.chars().any(|c| c == (0 as char)) {
                             return Err(Error::MongoCode(16419, format!("field path cannot contain NUL char: {:?}", subpath)));
                         }
+                        // TODO if the path matches multiple values here, we have a problem.
+                        // what we probably should do is ask the path for all its values or leaves.
+                        // and if we get more than one, we might need to error here?  or do we
+                        // construct an array?
                         let v = try!(v.as_document());
                         match v.walk_path(subpath).cloned_value() {
                             Some(v) => Ok(v),

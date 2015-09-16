@@ -465,21 +465,7 @@ fn match_predicate<F: Fn(usize)>(pred: &Pred, d: &bson::Value, cb_array_pos: &F)
 }
 
 fn match_pair_exists(path: &str, doc: &bson::Value) -> bool {
-    match doc {
-        &bson::Value::BDocument(ref bd) => {
-            let walk = bd.walk_path(path);
-            let b = walk.exists();
-            b
-        },
-        &bson::Value::BArray(ref ba) => {
-            let (direct, dive) = ba.walk_path(path);
-            let b = direct.exists() || dive.iter().any(|p| p.exists());
-            b
-        },
-        _ => {
-            false
-        },
-    }
+    doc.walk_path(path).exists()
 }
 
 fn match_pair_other<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, arr: bool, cb_array_pos: &F) -> bool {
@@ -617,6 +603,7 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
     }
 }
 
+/*
 fn match_walk<F: Fn(usize)>(pred: &Pred, walk: &bson::WalkPath, cb_array_pos: &F) -> bool {
     println!("match_walk: pred = {:?}", pred);
     println!("match_walk: walk = {:?}", walk);
@@ -731,16 +718,17 @@ fn match_walk<F: Fn(usize)>(pred: &Pred, walk: &bson::WalkPath, cb_array_pos: &F
         &Pred::GeoIntersects(_) => panic!("TODO geo"),
     }
 }
+*/
 
 fn match_query_item<F: Fn(usize)>(qit: &QueryItem, d: &bson::Value, cb_array_pos: &F) -> bool {
     match qit {
         &QueryItem::Compare(ref path, ref preds) => {
-// /*
+ /*
             let d = d.as_document().unwrap();
             let walk = d.walk_path(path);
             preds.iter().all(|p| match_walk(p, &walk, cb_array_pos))
-// */
-            //preds.iter().all(|v| match_pair(v, path, d, cb_array_pos))
+ */
+            preds.iter().all(|v| match_pair(v, path, d, cb_array_pos))
         },
         &QueryItem::AND(ref qd) => {
             qd.iter().all(|v| match_query_doc(v, d, cb_array_pos))
