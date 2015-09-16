@@ -171,6 +171,8 @@ impl<'v, 'p> WalkPath<'v, 'p> {
             },
             &WalkPath::SubArray(_,(ref direct, ref dive)) => {
                 // TODO direct.  ambiguous.
+                let v = direct.cloned_value();
+
                 let a2 = dive.iter().filter_map(|p| p.cloned_value()).collect::<Vec<_>>();
                 let a2 = Array { items: a2 };
                 Some(Value::BArray(a2))
@@ -183,6 +185,35 @@ impl<'v, 'p> WalkPath<'v, 'p> {
             },
             &WalkPath::Value(_,v) => {
                 Some(v.clone())
+            },
+        }
+    }
+
+    // TODO Suppose we want a function that calls back on every node
+    // which is at the end of the path, whether that lands on a
+    // value or not.  Are those nodes always going to be Value or
+    // NotFound?  Should we make sure of that?
+
+    fn pred<F : Fn(&Value) -> bool>(&self, func: &F) -> bool {
+        match self {
+            &WalkPath::SubDocument(_, ref p) => {
+                p.pred(func)
+            },
+            &WalkPath::SubArray(_,(ref direct, ref dive)) => {
+                if direct.pred(func) {
+                    true
+                } else {
+                    dive.iter().any(|p| p.pred(func))
+                }
+            },
+            &WalkPath::NotContainer(_,_) => {
+                false
+            },
+            &WalkPath::NotFound(_) => {
+                false
+            },
+            &WalkPath::Value(_,v) => {
+                func(v)
             },
         }
     }
@@ -778,7 +809,10 @@ impl Document {
             None => {
                 // TODO do we need to distinguish between dot/not?
                 // ie, whether this was supposed to be a container or not?
-                WalkPath::NotFound(path)
+                match dot {
+                    None => WalkPath::NotFound(path),
+                    Some(dot) => WalkPath::NotFound(path),
+                }
             },
         }
     }
@@ -1037,6 +1071,43 @@ impl Array {
             .collect::<Vec<_>>();
         (direct, dive)
     }
+
+    /*
+       This document:
+
+    {
+        a : [
+                {
+                    "x" : {
+                        "foo" : 4,
+                        "bar" : 3
+                    }
+                },
+                {
+                    "x" : {
+                        "foo" : 5,
+                        "bar" : 4
+                    }
+                },
+            ]
+    }
+
+    Mongo does not seem to think a.x evaluates to an array in the matcher.
+    For example, I can't do this:
+
+    db.foo.find({"a.x":{"$size":2}})
+
+    Same for a.x.foo
+
+    but btw, this matches:
+
+    db.foo.find({"a.y":null})
+
+    It would seem that for walk_path, there needs to be a difference between
+    something that evaluates to an array, and something that evaluates to
+    multiple values because it walks through an array.
+
+    */
 
     pub fn set_path(&mut self, path: &str, v: Value) -> Result<()> {
         match try!(self.entry(path)) {

@@ -657,8 +657,8 @@ fn match_walk<F: Fn(usize)>(pred: &Pred, walk: &bson::WalkPath, cb_array_pos: &F
                 _ => false,
             }
             ),
-        &Pred::In(ref lits) => lits.iter().any(|v| walk.values().any(|d| cmp_in(d, v))),
-        &Pred::Nin(ref lits) => !lits.iter().any(|v| walk.values().any(|d| cmp_in(d, v))),
+        &Pred::In(ref lits) => walk.values().any(|d| lits.iter().any(|v| cmp_in(d, v))),
+        &Pred::Nin(ref lits) => walk.values().any(|d| !lits.iter().any(|v| cmp_in(d, v))),
         &Pred::ElemMatchObjects(ref doc) => walk.values().any(|d|
             match d {
                 &bson::Value::BArray(ref ba) => {
@@ -701,12 +701,11 @@ fn match_walk<F: Fn(usize)>(pred: &Pred, walk: &bson::WalkPath, cb_array_pos: &F
             // the candidate array.  if any elemMatch doc fails, false.
             docs.iter().all(|doc| do_elem_match_objects(doc, d, cb_array_pos))
             ),
-        &Pred::All(ref lits) => 
-            // TODO does this ever happen, now that it is handled earlier?
+        &Pred::All(ref lits) => walk.values().any(|d|
             if lits.len() == 0 {
                 false
             } else {
-                !lits.iter().any(|lit| walk.values().any(|d|
+                !lits.iter().any(|lit| 
                                                                 {
                     let b =
                         if cmp_eq(d, lit) {
@@ -722,8 +721,8 @@ fn match_walk<F: Fn(usize)>(pred: &Pred, walk: &bson::WalkPath, cb_array_pos: &F
                     !b
                                                                 }
                     )
-                )
-            },
+            }
+                ),
 
         // TODO don't panic here.  need to return Result<>
         &Pred::Near(_) => panic!("TODO geo"),
@@ -736,12 +735,12 @@ fn match_walk<F: Fn(usize)>(pred: &Pred, walk: &bson::WalkPath, cb_array_pos: &F
 fn match_query_item<F: Fn(usize)>(qit: &QueryItem, d: &bson::Value, cb_array_pos: &F) -> bool {
     match qit {
         &QueryItem::Compare(ref path, ref preds) => {
-/*
+// /*
             let d = d.as_document().unwrap();
             let walk = d.walk_path(path);
             preds.iter().all(|p| match_walk(p, &walk, cb_array_pos))
-*/
-            preds.iter().all(|v| match_pair(v, path, d, cb_array_pos))
+// */
+            //preds.iter().all(|v| match_pair(v, path, d, cb_array_pos))
         },
         &QueryItem::AND(ref qd) => {
             qd.iter().all(|v| match_query_doc(v, d, cb_array_pos))
