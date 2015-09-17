@@ -3508,12 +3508,16 @@ impl Connection {
                         let mut vals = v.walk_path(subpath).leaves().filter_map(|v| v).collect::<Vec<_>>();
                         if vals.is_empty() {
                             Ok(bson::Value::BUndefined)
-                        } else {
-                            // TODO if the path matches multiple values here, we have a problem.
-                            // what we probably should do is ask the path for all its values or leaves.
-                            // and if we get more than one, we might need to error here?  or do we
-                            // construct an array?
+                        } else if vals.len() == 1 {
                             Ok(vals.remove(0).clone())
+                        } else {
+                            // so in this case, yes, when this path resolves to multiple values, 
+                            // we need to construct an array for them.  test case arrayfind9
+                            let vals = vals.into_iter().map(|v| v.clone()).collect::<Vec<_>>();
+                            let a = bson::Array {
+                                items: vals,
+                            };
+                            Ok(bson::Value::BArray(a))
                         }
                     },
                 }

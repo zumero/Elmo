@@ -93,20 +93,17 @@ fn simple_mongo_strftime(fmt: &str, tm: &time::Tm) -> String {
     s
 }
 
-// TODO arrayfind9 has a case which seems like it needs to walk a top-level array.
-// probably just direct?
+#[derive(Debug)]
+pub enum WalkRoot<'v, 'p> {
+    Document(WalkPath<'v, 'p>),
+    Array(WalkArray<'v, 'p>),
+    Not(&'v Value),
+}
 
 #[derive(Debug)]
 pub struct WalkArray<'v, 'p> {
     direct: WalkPath<'v, 'p>,
     dive: Vec<WalkRoot<'v, 'p>>,
-}
-
-#[derive(Debug)]
-pub enum WalkRoot<'v, 'p> {
-    Document(WalkPath<'v, 'p>),
-    // TODO Array(WalkPath<'v, 'p>),
-    Not(&'v Value),
 }
 
 #[derive(Debug)]
@@ -135,18 +132,16 @@ pub enum WalkLeaf<'v, 'p> {
 
 impl<'v, 'p> WalkArray<'v, 'p> {
     fn get_leaves(&self, a: &mut Vec<Option<&'v Value>>) {
+        // Mongo's rules for this case are a bit funky.
+
         // if a is []
         // a.b is not == null
         // but if a is [{}]
         // then a.b IS null
 
-        // so if direct is a leaf and NotFound, do nothing
-        // if it is anything else descend
-
-        // in dive, anything which is a Not, do nothing
-        // documents, descend
-
-        // matcher compares notfound as null only if the notfound comes directly under a document
+        // for the direct case, if we have a Leaf(NotFound),
+        // we do not consider that a leaf when it is a direct
+        // child of an array.  Anything else, we descend.
 
         match self.direct {
             WalkPath::Intermediate(ref p) => p.get_leaves(a),
@@ -158,9 +153,13 @@ impl<'v, 'p> WalkArray<'v, 'p> {
             },
         }
 
+        // for the dive case, descend when the array element is
+        // a subdoc, but nothing else results in a leaf.
+
         for p in self.dive.iter() {
             match p {
                 &WalkRoot::Document(ref p) => p.get_leaves(a),
+                &WalkRoot::Array(ref p) => (),
                 &WalkRoot::Not(_) => (),
             }
         }
@@ -175,6 +174,7 @@ impl<'v, 'p> WalkRoot<'v, 'p> {
     fn get_leaves(&self, a: &mut Vec<Option<&'v Value>>) {
         match self {
             &WalkRoot::Document(ref p) => p.get_leaves(a),
+            &WalkRoot::Array(ref p) => p.get_leaves(a),
             &WalkRoot::Not(_) => a.push(None),
         }
     }
@@ -265,6 +265,10 @@ impl<'v, 'p> WalkIntermediate<'v, 'p> {
                             let mut sub = Document::new();
                             try!(p.project(&mut sub));
                             a.items.push(sub.into_value());
+                        },
+                        &WalkRoot::Array(ref p) => {
+                            // TODO not sure what to do with this, but I believe
+                            // that doing nothing is correct.
                         },
                         &WalkRoot::Not(_) => {
                             // mongo tests seem to indicate that doing nothing here is correct
@@ -1498,6 +1502,7 @@ impl Value {
     pub fn walk_path<'v, 'p>(&'v self, path: &'p str) -> WalkRoot<'v, 'p> {
         match self {
             &Value::BDocument(ref bd) => WalkRoot::Document(bd.walk_path(path)),
+            &Value::BArray(ref ba) => WalkRoot::Array(ba.walk_path(path)),
             _ => WalkRoot::Not(self),
         }
     }

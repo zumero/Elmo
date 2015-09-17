@@ -464,10 +464,6 @@ fn match_predicate<F: Fn(usize)>(pred: &Pred, d: &bson::Value, cb_array_pos: &F)
     }
 }
 
-fn match_pair_exists(path: &str, doc: &bson::Value) -> bool {
-    doc.walk_path(path).exists()
-}
-
 fn match_pair_other<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, arr: bool, cb_array_pos: &F) -> bool {
     //println!("match_pair_other: pred = {:?}", pred);
     //println!("match_pair_other: path = {:?}", path);
@@ -565,17 +561,22 @@ fn match_pair_other<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, 
 
 fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_array_pos: &F) -> bool {
     // not all predicates do their path searching in the same way
-    // TODO consider a reusable function which generates all possible paths
     
+    let walk = start.walk_path(path);
+
     match pred {
         &Pred::EQ(ref lit) => {
 
-            let walk = start.walk_path(path);
             let new = 
                 walk.leaves().any(
-                    &|ov| {
+                    |ov| {
                         match ov {
                             Some(v) => {
+                                // TODO the following code is an idiom that should
+                                // be wrapped in a function so it can be reused.
+                                // we compare the value agains the literal.  if it
+                                // doesn't match, and if the value is an array, we
+                                // compare all its elements against the literal.
                                 cmp_eq(v, lit)
                                 || {
                                     match v {
@@ -587,7 +588,11 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
                                 }
                             },
                             None => {
+                                // If we have a path leaf (as we have defined it) that
+                                // results in missing value, and if we are being asked to
+                                // compare to null, then we consider that a match.
                                 match lit {
+                                    // TODO not sure if BUndefined needs to be included here
                                     &bson::Value::BNull | &bson::Value::BUndefined => true,
                                     _ => false,
                                 }
@@ -618,7 +623,7 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
             }
         },
         &Pred::Exists(b) => {
-            b == match_pair_exists(path, start)
+            b == walk.exists()
         },
         &Pred::Not(ref a) => {
             let any_matches = a.iter().any(|p| !match_pair(p, path, start, cb_array_pos));
