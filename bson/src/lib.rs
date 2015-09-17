@@ -148,13 +148,21 @@ impl<'v, 'p> WalkArray<'v, 'p> {
 
         // matcher compares notfound as null only if the notfound comes directly under a document
 
-        self.direct.get_leaves_a(a);
-        // TODO I think what we want here is either:
-        //     all the actual values from either direct or dive
-        // or if there are no such values:
-        //     just one NotFound
+        match self.direct {
+            WalkPath::Intermediate(ref p) => p.get_leaves(a),
+            WalkPath::Leaf(ref p) => {
+                match p {
+                    &WalkLeaf::Value(_, v) => a.push(Some(v)),
+                    &WalkLeaf::NotFound(_) => (),
+                }
+            },
+        }
+
         for p in self.dive.iter() {
-            p.get_leaves_a(a);
+            match p {
+                &WalkRoot::Document(ref p) => p.get_leaves(a),
+                &WalkRoot::Not(_) => (),
+            }
         }
     }
 }
@@ -168,14 +176,6 @@ impl<'v, 'p> WalkRoot<'v, 'p> {
         match self {
             &WalkRoot::Document(ref p) => p.get_leaves(a),
             &WalkRoot::Not(_) => a.push(None),
-        }
-    }
-
-    // TODO if the immediate parent is an array, we don't really want a.push(None)
-    fn get_leaves_a(&self, a: &mut Vec<Option<&'v Value>>) {
-        match self {
-            &WalkRoot::Document(ref p) => p.get_leaves(a),
-            &WalkRoot::Not(_) => (),
         }
     }
 
@@ -203,14 +203,6 @@ impl<'v, 'p> WalkPath<'v, 'p> {
         match self {
             &WalkPath::Intermediate(ref p) => p.get_leaves(a),
             &WalkPath::Leaf(ref p) => p.get_leaves(a),
-        }
-    }
-
-    // TODO if the immediate parent is an array, we don't really want a.push(None)
-    fn get_leaves_a(&self, a: &mut Vec<Option<&'v Value>>) {
-        match self {
-            &WalkPath::Intermediate(ref p) => p.get_leaves(a),
-            &WalkPath::Leaf(ref p) => p.get_leaves_a(a),
         }
     }
 
@@ -298,14 +290,6 @@ impl<'v, 'p> WalkLeaf<'v, 'p> {
         match self {
             &WalkLeaf::Value(_, v) => a.push(Some(v)),
             &WalkLeaf::NotFound(_) => a.push(None),
-        }
-    }
-
-    // TODO if the immediate parent is an array, we don't really want a.push(None)
-    fn get_leaves_a(&self, a: &mut Vec<Option<&'v Value>>) {
-        match self {
-            &WalkLeaf::Value(_, v) => a.push(Some(v)),
-            &WalkLeaf::NotFound(_) => (),
         }
     }
 
