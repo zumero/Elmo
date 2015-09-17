@@ -3505,14 +3505,15 @@ impl Connection {
                         if subpath.chars().any(|c| c == (0 as char)) {
                             return Err(Error::MongoCode(16419, format!("field path cannot contain NUL char: {:?}", subpath)));
                         }
-                        // TODO if the path matches multiple values here, we have a problem.
-                        // what we probably should do is ask the path for all its values or leaves.
-                        // and if we get more than one, we might need to error here?  or do we
-                        // construct an array?
-                        let v = try!(v.as_document());
-                        match v.walk_path(subpath).cloned_value() {
-                            Some(v) => Ok(v),
-                            None => Ok(bson::Value::BUndefined),
+                        let mut vals = v.walk_path(subpath).leaves().filter_map(|v| v).collect::<Vec<_>>();
+                        if vals.is_empty() {
+                            Ok(bson::Value::BUndefined)
+                        } else {
+                            // TODO if the path matches multiple values here, we have a problem.
+                            // what we probably should do is ask the path for all its values or leaves.
+                            // and if we get more than one, we might need to error here?  or do we
+                            // construct an array?
+                            Ok(vals.remove(0).clone())
                         }
                     },
                 }

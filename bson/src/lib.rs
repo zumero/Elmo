@@ -164,25 +164,6 @@ impl<'v, 'p> WalkRoot<'v, 'p> {
         self.leaves().filter_map(|v| v).next().is_some()
     }
 
-    // TODO this function is a hack and should probably be removed.
-    pub fn cloned_value(&self) -> Option<Value> {
-        match self {
-            &WalkRoot::Document(ref p) => p.cloned_value(),
-            /*
-            &WalkRoot::Array(ref direct, ref dive) => {
-                // TODO direct.  ambiguous.
-                let v = direct.cloned_value();
-
-                // TODO this feels wrong.  we are constructing an array.
-                let a2 = dive.iter().filter_map(|p| p.cloned_value()).collect::<Vec<_>>();
-                let a2 = Array { items: a2 };
-                Some(Value::BArray(a2))
-            },
-            */
-            &WalkRoot::Not(_) => None,
-        }
-    }
-
     fn get_leaves(&self, a: &mut Vec<Option<&'v Value>>) {
         match self {
             &WalkRoot::Document(ref p) => p.get_leaves(a),
@@ -228,14 +209,6 @@ impl<'v, 'p> WalkPath<'v, 'p> {
         }
     }
 
-    // TODO this function is a hack and should probably be removed.
-    pub fn cloned_value(&self) -> Option<Value> {
-        match self {
-            &WalkPath::Intermediate(ref p) => p.cloned_value(),
-            &WalkPath::Leaf(ref p) => p.cloned_value(),
-        }
-    }
-
     pub fn project(&self, d: &mut Document) -> Result<()> {
         match self {
             &WalkPath::Intermediate(ref p) => p.project(d),
@@ -261,30 +234,6 @@ impl<'v, 'p> WalkPath<'v, 'p> {
 }
 
 impl<'v, 'p> WalkIntermediate<'v, 'p> {
-    // TODO this function is a hack and should probably be removed.
-    pub fn cloned_value(&self) -> Option<Value> {
-        match self {
-            &WalkIntermediate::Document(_, ref p) => {
-                p.cloned_value()
-            },
-            &WalkIntermediate::Array(_,ref wa) => {
-                // TODO direct.  ambiguous.
-                let v = wa.direct.cloned_value();
-
-                // TODO this feels wrong.  we are constructing an array.
-                let a2 = wa.dive.iter().filter_map(|p| p.cloned_value()).collect::<Vec<_>>();
-                let a2 = Array { items: a2 };
-                Some(Value::BArray(a2))
-            },
-            &WalkIntermediate::NotContainer(_,_) => {
-                None
-            },
-            &WalkIntermediate::NotFound(_) => {
-                None
-            },
-        }
-    }
-
     fn get_leaves(&self, a: &mut Vec<Option<&'v Value>>) {
         match self {
             &WalkIntermediate::Document(_, ref p) => {
@@ -404,14 +353,6 @@ impl<'v, 'p> WalkLeaf<'v, 'p> {
         match self {
             &WalkLeaf::Value(_, v) => func(Some(v)),
             &WalkLeaf::NotFound(_) => func(None),
-        }
-    }
-
-    // TODO this function is a hack and should probably be removed.
-    pub fn cloned_value(&self) -> Option<Value> {
-        match self {
-            &WalkLeaf::Value(_, v) => Some(v.clone()),
-            &WalkLeaf::NotFound(_) => None,
         }
     }
 
