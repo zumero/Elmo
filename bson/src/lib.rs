@@ -117,39 +117,42 @@ impl<'v> PathLeaf<'v> {
 pub enum WalkRoot<'v, 'p> {
     Document(WalkDocument<'v, 'p>),
     Array(WalkArray<'v, 'p>),
-    Not(&'v Value),
+    NotContainer(&'v Value),
+}
+
+#[derive(Debug)]
+pub enum WalkArrayItemDirect<'v, 'p> {
+    Document(usize, Box<WalkDocument<'v, 'p>>),
+    Array(usize, Box<WalkArray<'v, 'p>>),
+    Value(usize, &'v Value),
+    NotContainer(usize, &'v Value),
+    Invalid(&'p str),
+    OutOfBounds(usize),
 }
 
 #[derive(Debug)]
 pub struct WalkArray<'v, 'p> {
-    direct: Option<(usize, WalkItem<'v, 'p>)>,
+    direct: WalkArrayItemDirect<'v, 'p>,
+
+    // TODO is WalkRoot the right type for the elements of this vector?
+    // we probably only care about the cases where the array element is
+    // a subdocument.
     dive: Vec<WalkRoot<'v, 'p>>,
 }
 
 #[derive(Debug)]
 pub struct WalkDocument<'v, 'p> {
     name: &'p str,
-    dive: Vec<WalkRoot<'v, 'p>>,
+    item: WalkDocumentItem<'v, 'p>,
 }
 
 #[derive(Debug)]
-pub enum WalkItem<'v, 'p> {
-    Intermediate(WalkIntermediate<'v, 'p>),
-    Leaf(WalkLeaf<'v, 'p>),
-}
-
-#[derive(Debug)]
-pub enum WalkIntermediate<'v, 'p> {
+pub enum WalkDocumentItem<'v, 'p> {
     Document(Box<WalkDocument<'v, 'p>>),
     Array(Box<WalkArray<'v, 'p>>),
     NotContainer(&'v Value),
     NotFound,
-}
-
-#[derive(Debug)]
-pub enum WalkLeaf<'v> {
     Value(&'v Value),
-    NotFound,
 }
 
 impl<'v, 'p> WalkArray<'v, 'p> {
@@ -165,18 +168,7 @@ impl<'v, 'p> WalkArray<'v, 'p> {
         // we do not consider that a leaf when it is a direct
         // child of an array.  Anything else, we descend.
 
-        match self.direct {
-            WalkItem::Intermediate(ref p) => p.get_leaves(a),
-            WalkItem::Leaf(ref p) => {
-                match p {
-                    &WalkLeaf::Value(_, v) => {
-                        a.push(PathLeaf::new(v));
-                    },
-                    &WalkLeaf::NotFound(_) => {
-                    },
-                }
-            },
-        }
+        self.direct.get_leaves(a);
 
         // for the dive case, descend when the array element is
         // a subdoc, but nothing else results in a leaf.
@@ -185,9 +177,19 @@ impl<'v, 'p> WalkArray<'v, 'p> {
             match p {
                 &WalkRoot::Document(ref p) => p.get_leaves(a),
                 &WalkRoot::Array(ref p) => (),
-                &WalkRoot::Not(_) => (),
+                &WalkRoot::NotContainer(_) => (),
             }
         }
+    }
+}
+
+impl<'v, 'p> WalkDocument<'v, 'p> {
+    fn get_leaves(&self, a: &mut Vec<PathLeaf<'v>>) {
+        self.item.get_leaves(a);
+    }
+
+    pub fn project(&self, d: &mut Document) -> Result<()> {
+        self.item.project(self.name, d)
     }
 }
 
@@ -200,7 +202,7 @@ impl<'v, 'p> WalkRoot<'v, 'p> {
         match self {
             &WalkRoot::Document(ref p) => p.get_leaves(a),
             &WalkRoot::Array(ref p) => p.get_leaves(a),
-            &WalkRoot::Not(_) => a.push(PathLeaf::empty()),
+            &WalkRoot::NotContainer(_) => a.push(PathLeaf::empty()),
         }
     }
 
@@ -213,47 +215,56 @@ impl<'v, 'p> WalkRoot<'v, 'p> {
         box a.into_iter()
     }
 
+    // TODO we probably do NOT want a project() method here, right?
 }
 
-impl<'v, 'p> WalkPath<'v, 'p> {
-
-    pub fn project(&self, d: &mut Document) -> Result<()> {
-        match self {
-            &WalkItem::Intermediate(ref p) => p.project(d),
-            &WalkItem::Leaf(ref p) => p.project(d),
-        }
-    }
-
+impl<'v, 'p> WalkArrayItemDirect<'v, 'p> {
     fn get_leaves(&self, a: &mut Vec<PathLeaf<'v>>) {
         match self {
-            &WalkItem::Intermediate(ref p) => p.get_leaves(a),
-            &WalkItem::Leaf(ref p) => p.get_leaves(a),
-        }
-    }
-
-}
-
-impl<'v, 'p> WalkIntermediate<'v, 'p> {
-    fn get_leaves(&self, a: &mut Vec<PathLeaf<'v>>) {
-        match self {
-            &WalkIntermediate::Document(_, ref p) => {
+            &WalkArrayItemDirect::Document(i, ref p) => {
                 p.get_leaves(a)
             },
-            &WalkIntermediate::Array(_,ref wa) => {
+            &WalkArrayItemDirect::Array(i, ref wa) => {
                 wa.get_leaves(a)
             },
-            &WalkIntermediate::NotContainer(_,_) => {
-                a.push(PathLeaf::empty())
+            &WalkArrayItemDirect::Value(i, v) => {
+                a.push(PathLeaf::new(v));
             },
-            &WalkIntermediate::NotFound(_) => {
-                a.push(PathLeaf::empty())
+            &WalkArrayItemDirect::NotContainer(i, v) => {
+            },
+            &WalkArrayItemDirect::Invalid(s) => {
+            },
+            &WalkArrayItemDirect::OutOfBounds(i) => {
             },
         }
     }
 
-    pub fn project(&self, d: &mut Document) -> Result<()> {
+}
+
+impl<'v, 'p> WalkDocumentItem<'v, 'p> {
+    fn get_leaves(&self, a: &mut Vec<PathLeaf<'v>>) {
         match self {
-            &WalkIntermediate::Document(ref name, ref p) => {
+            &WalkDocumentItem::Document(ref p) => {
+                p.get_leaves(a)
+            },
+            &WalkDocumentItem::Array(ref wa) => {
+                wa.get_leaves(a)
+            },
+            &WalkDocumentItem::NotContainer(_) => {
+                a.push(PathLeaf::empty())
+            },
+            &WalkDocumentItem::NotFound => {
+                a.push(PathLeaf::empty())
+            },
+            &WalkDocumentItem::Value(v) => {
+                a.push(PathLeaf::new(v));
+            },
+        }
+    }
+
+    fn project(&self, name: &str, d: &mut Document) -> Result<()> {
+        match self {
+            &WalkDocumentItem::Document(ref p) => {
                 // TODO the following code is dorky.  it wants to use something like entry(),
                 // but that's not quite right.  Absent::insert() doesn't return mut ref.
                 // we need to make sure that d.name is a
@@ -277,7 +288,7 @@ impl<'v, 'p> WalkIntermediate<'v, 'p> {
                 let sub = try!(sub.as_mut_document());
                 p.project(sub)
             },
-            &WalkIntermediate::Array(ref name,ref wa) => {
+            &WalkDocumentItem::Array(ref wa) => {
                 let a = Array::new().into_value();
                 // TODO what if name is already present?  error?  need code like above.
                 let a = d.set(name, a);
@@ -295,7 +306,7 @@ impl<'v, 'p> WalkIntermediate<'v, 'p> {
                             // TODO not sure what to do with this, but I believe
                             // that doing nothing is correct.
                         },
-                        &WalkRoot::Not(_) => {
+                        &WalkRoot::NotContainer(_) => {
                             // mongo tests seem to indicate that doing nothing here is correct
                         },
                     }
@@ -304,36 +315,13 @@ impl<'v, 'p> WalkIntermediate<'v, 'p> {
                 // TODO? try!(wa.direct.project_into_array(sub));
                 Ok(())
             },
-            &WalkIntermediate::NotContainer(_,_) => {
+            &WalkDocumentItem::NotContainer(_) => {
                 Ok(())
             },
-            &WalkIntermediate::NotFound(_) => {
+            &WalkDocumentItem::NotFound => {
                 Ok(())
             },
-        }
-    }
-}
-
-impl<'v, 'p> WalkLeaf<'v, 'p> {
-    fn get_leaves(&self, a: &mut Vec<PathLeaf<'v>>) {
-        match self {
-            &WalkLeaf::Value(_, v) => {
-                a.push(PathLeaf::new(v));
-            },
-            &WalkLeaf::NotFound(_) => {
-                a.push(PathLeaf::empty());
-            },
-        }
-    }
-
-    pub fn project(&self, d: &mut Document) -> Result<()> {
-        match self {
-            &WalkLeaf::NotFound(_) => {
-                //Err(Error::Misc(format!("TODO: {:?}", self)))
-                // TODO do nothing?
-                Ok(())
-            },
-            &WalkLeaf::Value(name,v) => {
+            &WalkDocumentItem::Value(v) => {
                 let _ = d.set(name, v.clone());
                 Ok(())
             },
@@ -788,40 +776,40 @@ impl Document {
         }
     }
 
-    pub fn walk_path<'v, 'p>(&'v self, path: &'p str) -> WalkPath<'v, 'p> {
+    pub fn walk_path<'v, 'p>(&'v self, path: &'p str) -> WalkDocument<'v, 'p> {
         let dot = path.find('.');
         let name = match dot { 
             None => path,
             Some(ndx) => &path[0 .. ndx]
         };
-        match self.pairs.iter().position(|&(ref k, _)| k == name) {
-            Some(ndx) => {
-                let v = &self.pairs[ndx].1;
-                match dot {
-                    None => WalkItem::Leaf(WalkLeaf::Value(name, v)),
-                    Some(dot) => {
-                        let middle =
+        let item =
+            match self.pairs.iter().position(|&(ref k, _)| k == name) {
+                Some(ndx) => {
+                    let v = &self.pairs[ndx].1;
+                    match dot {
+                        None => WalkDocumentItem::Value(v),
+                        Some(dot) => {
                             match v {
                                 &Value::BDocument(ref bd) => {
-                                    WalkIntermediate::Document(name, box bd.walk_path(&path[dot + 1..]))
+                                    WalkDocumentItem::Document(box bd.walk_path(&path[dot + 1..]))
                                 },
                                 &Value::BArray(ref ba) => {
-                                    WalkIntermediate::Array(name, box ba.walk_path(&path[dot + 1 ..]))
+                                    WalkDocumentItem::Array(box ba.walk_path(&path[dot + 1 ..]))
                                 },
                                 _ => {
-                                    WalkIntermediate::NotContainer(name, v)
+                                    WalkDocumentItem::NotContainer(v)
                                 },
-                            };
-                        WalkItem::Intermediate(middle)
-                    },
-                }
-            },
-            None => {
-                match dot {
-                    None => WalkItem::Leaf(WalkLeaf::NotFound(path)),
-                    Some(dot) => WalkItem::Intermediate(WalkIntermediate::NotFound(path)),
-                }
-            },
+                            }
+                        },
+                    }
+                },
+                None => {
+                    WalkDocumentItem::NotFound
+                },
+            };
+        WalkDocument {
+            name: name,
+            item: item,
         }
     }
 
@@ -1007,38 +995,30 @@ impl Array {
             Some(ndx) => &path[0 .. ndx]
         };
         let direct = 
-            match name.parse::<i32>() {
+            match name.parse::<usize>() {
                 Err(_) => {
-                    match dot {
-                        None => WalkItem::Leaf(WalkLeaf::NotFound(name)),
-                        Some(dot) => WalkItem::Intermediate(WalkIntermediate::NotFound(path)),
-                    }
+                    WalkArrayItemDirect::Invalid(name)
                 }, 
                 Ok(ndx) => {
-                    if ndx < 0 || (ndx as usize) >= self.items.len() {
-                        match dot {
-                            None => WalkItem::Leaf(WalkLeaf::NotFound(name)),
-                            Some(dot) => WalkItem::Intermediate(WalkIntermediate::NotFound(path)),
-                        }
+                    let ndx = ndx as usize;
+                    if ndx >= self.items.len() {
+                        WalkArrayItemDirect::OutOfBounds(ndx)
                     } else {
-                        let ndx = ndx as usize;
                         let v = &self.items[ndx];
                         match dot {
-                            None => WalkItem::Leaf(WalkLeaf::Value(name, v)),
+                            None => WalkArrayItemDirect::Value(ndx, v),
                             Some(dot) => {
-                                let middle = 
-                                    match v {
-                                        &Value::BDocument(ref bd) => {
-                                            WalkIntermediate::Document(name, box bd.walk_path(&path[dot + 1 ..]))
-                                        },
-                                        &Value::BArray(ref ba) => {
-                                            WalkIntermediate::Array(name, box ba.walk_path(&path[dot + 1 ..]))
-                                        },
-                                        _ => {
-                                            WalkIntermediate::NotContainer(name, v)
-                                        },
-                                    };
-                                WalkItem::Intermediate(middle)
+                                match v {
+                                    &Value::BDocument(ref bd) => {
+                                        WalkArrayItemDirect::Document(ndx, box bd.walk_path(&path[dot + 1 ..]))
+                                    },
+                                    &Value::BArray(ref ba) => {
+                                        WalkArrayItemDirect::Array(ndx, box ba.walk_path(&path[dot + 1 ..]))
+                                    },
+                                    _ => {
+                                        WalkArrayItemDirect::NotContainer(ndx, v)
+                                    },
+                                }
                             },
                         }
                     }
@@ -1532,7 +1512,7 @@ impl Value {
         match self {
             &Value::BDocument(ref bd) => WalkRoot::Document(bd.walk_path(path)),
             &Value::BArray(ref ba) => WalkRoot::Array(ba.walk_path(path)),
-            _ => WalkRoot::Not(self),
+            _ => WalkRoot::NotContainer(self),
         }
     }
 
