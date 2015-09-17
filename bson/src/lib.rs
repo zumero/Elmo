@@ -93,9 +93,19 @@ fn simple_mongo_strftime(fmt: &str, tm: &time::Tm) -> String {
     s
 }
 
+// TODO arrayfind9 has a case which seems like it needs to walk a top-level array.
+// probably just direct?
+
+#[derive(Debug)]
+pub struct WalkArray<'v, 'p> {
+    direct: WalkPath<'v, 'p>,
+    dive: Vec<WalkRoot<'v, 'p>>,
+}
+
 #[derive(Debug)]
 pub enum WalkRoot<'v, 'p> {
     Document(WalkPath<'v, 'p>),
+    // TODO Array(WalkPath<'v, 'p>),
     Not(&'v Value),
 }
 
@@ -112,7 +122,7 @@ pub enum WalkIntermediate<'v, 'p> {
     // path.
 
     Document(&'p str, Box<WalkPath<'v, 'p>>),
-    Array(&'p str, (Box<WalkPath<'v, 'p>>, Vec<WalkRoot<'v, 'p>>)),
+    Array(&'p str, Box<WalkArray<'v, 'p>>),
     NotContainer(&'p str, &'v Value),
     NotFound(&'p str),
 }
@@ -123,24 +133,78 @@ pub enum WalkLeaf<'v, 'p> {
     NotFound(&'p str),
 }
 
+impl<'v, 'p> WalkArray<'v, 'p> {
+    fn get_leaves(&self, a: &mut Vec<Option<&'v Value>>) {
+        // if a is []
+        // a.b is not == null
+        // but if a is [{}]
+        // then a.b IS null
+
+        // so if direct is a leaf and NotFound, do nothing
+        // if it is anything else descend
+
+        // in dive, anything which is a Not, do nothing
+        // documents, descend
+
+        // matcher compares notfound as null only if the notfound comes directly under a document
+
+        self.direct.get_leaves_a(a);
+        // TODO I think what we want here is either:
+        //     all the actual values from either direct or dive
+        // or if there are no such values:
+        //     just one NotFound
+        for p in self.dive.iter() {
+            p.get_leaves_a(a);
+        }
+    }
+}
+
 impl<'v, 'p> WalkRoot<'v, 'p> {
     pub fn exists(&self) -> bool {
-        fn func(v: Option<&Value>) -> bool {
-            match v {
-                Some(_) => true,
-                None => false,
-            }
-        }
-
-        self.for_each_leaf(&func)
+        self.leaves().filter_map(|v| v).next().is_some()
     }
 
     // TODO this function is a hack and should probably be removed.
     pub fn cloned_value(&self) -> Option<Value> {
         match self {
             &WalkRoot::Document(ref p) => p.cloned_value(),
+            /*
+            &WalkRoot::Array(ref direct, ref dive) => {
+                // TODO direct.  ambiguous.
+                let v = direct.cloned_value();
+
+                // TODO this feels wrong.  we are constructing an array.
+                let a2 = dive.iter().filter_map(|p| p.cloned_value()).collect::<Vec<_>>();
+                let a2 = Array { items: a2 };
+                Some(Value::BArray(a2))
+            },
+            */
             &WalkRoot::Not(_) => None,
         }
+    }
+
+    fn get_leaves(&self, a: &mut Vec<Option<&'v Value>>) {
+        match self {
+            &WalkRoot::Document(ref p) => p.get_leaves(a),
+            &WalkRoot::Not(_) => a.push(None),
+        }
+    }
+
+    // TODO if the immediate parent is an array, we don't really want a.push(None)
+    fn get_leaves_a(&self, a: &mut Vec<Option<&'v Value>>) {
+        match self {
+            &WalkRoot::Document(ref p) => p.get_leaves(a),
+            &WalkRoot::Not(_) => (),
+        }
+    }
+
+    pub fn leaves(&self) -> Box<Iterator<Item=Option<&'v Value>> + 'v> {
+        // TODO this is a lousy way to do this.  much better would be
+        // to keep track of the state and move forward on each call to
+        // next().  but very complicated.
+        let mut a = vec![];
+        self.get_leaves(&mut a);
+        box a.into_iter()
     }
 
     // TODO maybe the callback should get the path too?  might need this to
@@ -178,6 +242,22 @@ impl<'v, 'p> WalkPath<'v, 'p> {
             &WalkPath::Leaf(ref p) => p.project(d),
         }
     }
+
+    fn get_leaves(&self, a: &mut Vec<Option<&'v Value>>) {
+        match self {
+            &WalkPath::Intermediate(ref p) => p.get_leaves(a),
+            &WalkPath::Leaf(ref p) => p.get_leaves(a),
+        }
+    }
+
+    // TODO if the immediate parent is an array, we don't really want a.push(None)
+    fn get_leaves_a(&self, a: &mut Vec<Option<&'v Value>>) {
+        match self {
+            &WalkPath::Intermediate(ref p) => p.get_leaves(a),
+            &WalkPath::Leaf(ref p) => p.get_leaves_a(a),
+        }
+    }
+
 }
 
 impl<'v, 'p> WalkIntermediate<'v, 'p> {
@@ -187,12 +267,12 @@ impl<'v, 'p> WalkIntermediate<'v, 'p> {
             &WalkIntermediate::Document(_, ref p) => {
                 p.cloned_value()
             },
-            &WalkIntermediate::Array(_,(ref direct,ref dive)) => {
+            &WalkIntermediate::Array(_,ref wa) => {
                 // TODO direct.  ambiguous.
-                let v = direct.cloned_value();
+                let v = wa.direct.cloned_value();
 
                 // TODO this feels wrong.  we are constructing an array.
-                let a2 = dive.iter().filter_map(|p| p.cloned_value()).collect::<Vec<_>>();
+                let a2 = wa.dive.iter().filter_map(|p| p.cloned_value()).collect::<Vec<_>>();
                 let a2 = Array { items: a2 };
                 Some(Value::BArray(a2))
             },
@@ -205,18 +285,35 @@ impl<'v, 'p> WalkIntermediate<'v, 'p> {
         }
     }
 
+    fn get_leaves(&self, a: &mut Vec<Option<&'v Value>>) {
+        match self {
+            &WalkIntermediate::Document(_, ref p) => {
+                p.get_leaves(a)
+            },
+            &WalkIntermediate::Array(_,ref wa) => {
+                wa.get_leaves(a)
+            },
+            &WalkIntermediate::NotContainer(_,_) => {
+                a.push(None)
+            },
+            &WalkIntermediate::NotFound(_) => {
+                a.push(None)
+            },
+        }
+    }
+
     // callback should return true to make it stop
     fn for_each_leaf<F : Fn(Option<&Value>) -> bool>(&self, func: &F) -> bool {
         match self {
             &WalkIntermediate::Document(_, ref p) => {
                 p.for_each_leaf(func)
             },
-            &WalkIntermediate::Array(_,(ref direct,ref dive)) => {
+            &WalkIntermediate::Array(_,ref wa) => {
                 // TODO I think what we want here is either:
                 //     all the actual values from either direct or dive
                 // or if there are no such values:
                 //     just one NotFound
-                direct.for_each_leaf(func) || dive.iter().any(|p| p.for_each_leaf(func))
+                wa.direct.for_each_leaf(func) || wa.dive.iter().any(|p| p.for_each_leaf(func))
             },
             &WalkIntermediate::NotContainer(_,_) => {
                 func(None)
@@ -253,14 +350,14 @@ impl<'v, 'p> WalkIntermediate<'v, 'p> {
                 let sub = try!(sub.as_mut_document());
                 p.project(sub)
             },
-            &WalkIntermediate::Array(ref name,(ref direct,ref dive)) => {
+            &WalkIntermediate::Array(ref name,ref wa) => {
                 let a = Array::new().into_value();
                 // TODO what if name is already present?  error?  need code like above.
                 let a = d.set(name, a);
                 // need to get the array ref back
                 // TODO following line could just panic on fail
                 let mut a = try!(a.as_mut_array());
-                for p in dive.iter() {
+                for p in wa.dive.iter() {
                     match p {
                         &WalkRoot::Document(ref p) => {
                             let mut sub = Document::new();
@@ -273,7 +370,7 @@ impl<'v, 'p> WalkIntermediate<'v, 'p> {
                     }
                 }
 
-                // TODO? try!(direct.project_into_array(sub));
+                // TODO? try!(wa.direct.project_into_array(sub));
                 Ok(())
             },
             &WalkIntermediate::NotContainer(_,_) => {
@@ -287,6 +384,21 @@ impl<'v, 'p> WalkIntermediate<'v, 'p> {
 }
 
 impl<'v, 'p> WalkLeaf<'v, 'p> {
+    fn get_leaves(&self, a: &mut Vec<Option<&'v Value>>) {
+        match self {
+            &WalkLeaf::Value(_, v) => a.push(Some(v)),
+            &WalkLeaf::NotFound(_) => a.push(None),
+        }
+    }
+
+    // TODO if the immediate parent is an array, we don't really want a.push(None)
+    fn get_leaves_a(&self, a: &mut Vec<Option<&'v Value>>) {
+        match self {
+            &WalkLeaf::Value(_, v) => a.push(Some(v)),
+            &WalkLeaf::NotFound(_) => (),
+        }
+    }
+
     // callback should return true to make it stop
     fn for_each_leaf<F : Fn(Option<&Value>) -> bool>(&self, func: &F) -> bool {
         match self {
@@ -783,8 +895,7 @@ impl Document {
                                     WalkIntermediate::Document(name, box bd.walk_path(&path[dot + 1..]))
                                 },
                                 &Value::BArray(ref ba) => {
-                                    let (direct, dive) = ba.walk_path(&path[dot + 1 ..]);
-                                    WalkIntermediate::Array(name, (box direct, dive))
+                                    WalkIntermediate::Array(name, box ba.walk_path(&path[dot + 1 ..]))
                                 },
                                 _ => {
                                     WalkIntermediate::NotContainer(name, v)
@@ -978,7 +1089,7 @@ impl Array {
     // If 1 is the index into the array, it results in 6.
     // If 1 is used as the key for diving into subdocuments of the array, it is 4.
 
-    fn walk_path<'v, 'p>(&'v self, path: &'p str) -> (WalkPath<'v, 'p>, Vec<WalkRoot<'v, 'p>>) {
+    fn walk_path<'v, 'p>(&'v self, path: &'p str) -> WalkArray<'v, 'p> {
         let dot = path.find('.');
         let name = match dot { 
             None => path,
@@ -1010,8 +1121,7 @@ impl Array {
                                             WalkIntermediate::Document(name, box bd.walk_path(&path[dot + 1 ..]))
                                         },
                                         &Value::BArray(ref ba) => {
-                                            let (direct, dive) = ba.walk_path(&path[dot + 1 ..]);
-                                            WalkIntermediate::Array(name, (box direct, dive))
+                                            WalkIntermediate::Array(name, box ba.walk_path(&path[dot + 1 ..]))
                                         },
                                         _ => {
                                             WalkIntermediate::NotContainer(name, v)
@@ -1027,7 +1137,10 @@ impl Array {
             .iter()
             .map(|subv| subv.walk_path(path))
             .collect::<Vec<_>>();
-        (direct, dive)
+        WalkArray {
+            direct: direct,
+            dive: dive,
+        }
     }
 
     /*

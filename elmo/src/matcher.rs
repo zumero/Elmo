@@ -572,7 +572,7 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
 
             let walk = start.walk_path(path);
             let new = 
-                walk.for_each_leaf(
+                walk.leaves().any(
                     &|ov| {
                         match ov {
                             Some(v) => {
@@ -587,16 +587,14 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
                                 }
                             },
                             None => {
-                                // TODO if lit is null or undefined, true
-                                false
+                                match lit {
+                                    &bson::Value::BNull | &bson::Value::BUndefined => true,
+                                    _ => false,
+                                }
                             },
                         }
                     }
-                ) 
-                || match lit {
-                    &bson::Value::BNull | &bson::Value::BUndefined => !walk.exists(),
-                    _ => false,
-                };
+                );
             let old = match_pair_other(pred, path, start, false, cb_array_pos);
             if new != old {
                 println!("BEGIN EQ fail");
@@ -606,6 +604,7 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
                 println!("    start = {:?}", start);
                 println!("    path = {:?}", path);
                 println!("    walk = {:?}", walk);
+                println!("    leaves = {:?}", walk.leaves().collect::<Vec<_>>());
                 println!("    END EQ fail");
             }
             old
