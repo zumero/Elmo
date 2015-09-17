@@ -589,8 +589,8 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
 
             let new = 
                 walk.leaves().any(
-                    |ov| {
-                        match ov {
+                    |leaf| {
+                        match leaf.v {
                             Some(v) => {
                                 cmp_with_array(cmp_eq, cb_array_pos, v, lit)
                             },
@@ -607,7 +607,6 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
                         }
                     }
                 );
-            /*
             let old = match_pair_other(pred, path, start, false, cb_array_pos);
             if new != old {
                 println!("BEGIN EQ fail");
@@ -620,7 +619,6 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
                 println!("    leaves = {:?}", walk.leaves().collect::<Vec<_>>());
                 println!("    END EQ fail");
             }
-            */
             new
         },
         &Pred::All(ref a) => {

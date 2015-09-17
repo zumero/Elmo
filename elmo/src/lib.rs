@@ -3505,7 +3505,7 @@ impl Connection {
                         if subpath.chars().any(|c| c == (0 as char)) {
                             return Err(Error::MongoCode(16419, format!("field path cannot contain NUL char: {:?}", subpath)));
                         }
-                        let mut vals = v.walk_path(subpath).leaves().filter_map(|v| v).collect::<Vec<_>>();
+                        let mut vals = v.walk_path(subpath).leaves().filter_map(|leaf| leaf.v).collect::<Vec<_>>();
                         if vals.is_empty() {
                             Ok(bson::Value::BUndefined)
                         } else if vals.len() == 1 {

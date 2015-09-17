@@ -94,6 +94,25 @@ fn simple_mongo_strftime(fmt: &str, tm: &time::Tm) -> String {
 }
 
 #[derive(Debug)]
+pub struct PathLeaf<'v> {
+    pub v: Option<&'v Value>,
+}
+
+impl<'v> PathLeaf<'v> {
+    fn new(v: &'v Value) -> PathLeaf<'v> {
+        PathLeaf {
+            v: Some(v),
+        }
+    }
+
+    fn empty() -> PathLeaf<'v> {
+        PathLeaf {
+            v: None,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum WalkRoot<'v, 'p> {
     Document(WalkPath<'v, 'p>),
     Array(WalkArray<'v, 'p>),
@@ -131,7 +150,7 @@ pub enum WalkLeaf<'v, 'p> {
 }
 
 impl<'v, 'p> WalkArray<'v, 'p> {
-    fn get_leaves(&self, a: &mut Vec<Option<&'v Value>>) {
+    fn get_leaves(&self, a: &mut Vec<PathLeaf<'v>>) {
         // Mongo's rules for this case are a bit funky.
 
         // if a is []
@@ -147,8 +166,11 @@ impl<'v, 'p> WalkArray<'v, 'p> {
             WalkPath::Intermediate(ref p) => p.get_leaves(a),
             WalkPath::Leaf(ref p) => {
                 match p {
-                    &WalkLeaf::Value(_, v) => a.push(Some(v)),
-                    &WalkLeaf::NotFound(_) => (),
+                    &WalkLeaf::Value(_, v) => {
+                        a.push(PathLeaf::new(v));
+                    },
+                    &WalkLeaf::NotFound(_) => {
+                    },
                 }
             },
         }
@@ -168,18 +190,18 @@ impl<'v, 'p> WalkArray<'v, 'p> {
 
 impl<'v, 'p> WalkRoot<'v, 'p> {
     pub fn exists(&self) -> bool {
-        self.leaves().filter_map(|v| v).next().is_some()
+        self.leaves().filter_map(|leaf| leaf.v).next().is_some()
     }
 
-    fn get_leaves(&self, a: &mut Vec<Option<&'v Value>>) {
+    fn get_leaves(&self, a: &mut Vec<PathLeaf<'v>>) {
         match self {
             &WalkRoot::Document(ref p) => p.get_leaves(a),
             &WalkRoot::Array(ref p) => p.get_leaves(a),
-            &WalkRoot::Not(_) => a.push(None),
+            &WalkRoot::Not(_) => a.push(PathLeaf::empty()),
         }
     }
 
-    pub fn leaves(&self) -> Box<Iterator<Item=Option<&'v Value>> + 'v> {
+    pub fn leaves(&self) -> Box<Iterator<Item=PathLeaf<'v>> + 'v> {
         // TODO this is a lousy way to do this.  much better would be
         // to keep track of the state and move forward on each call to
         // next().  but very complicated.
@@ -199,7 +221,7 @@ impl<'v, 'p> WalkPath<'v, 'p> {
         }
     }
 
-    fn get_leaves(&self, a: &mut Vec<Option<&'v Value>>) {
+    fn get_leaves(&self, a: &mut Vec<PathLeaf<'v>>) {
         match self {
             &WalkPath::Intermediate(ref p) => p.get_leaves(a),
             &WalkPath::Leaf(ref p) => p.get_leaves(a),
@@ -209,7 +231,7 @@ impl<'v, 'p> WalkPath<'v, 'p> {
 }
 
 impl<'v, 'p> WalkIntermediate<'v, 'p> {
-    fn get_leaves(&self, a: &mut Vec<Option<&'v Value>>) {
+    fn get_leaves(&self, a: &mut Vec<PathLeaf<'v>>) {
         match self {
             &WalkIntermediate::Document(_, ref p) => {
                 p.get_leaves(a)
@@ -218,10 +240,10 @@ impl<'v, 'p> WalkIntermediate<'v, 'p> {
                 wa.get_leaves(a)
             },
             &WalkIntermediate::NotContainer(_,_) => {
-                a.push(None)
+                a.push(PathLeaf::empty())
             },
             &WalkIntermediate::NotFound(_) => {
-                a.push(None)
+                a.push(PathLeaf::empty())
             },
         }
     }
@@ -290,10 +312,14 @@ impl<'v, 'p> WalkIntermediate<'v, 'p> {
 }
 
 impl<'v, 'p> WalkLeaf<'v, 'p> {
-    fn get_leaves(&self, a: &mut Vec<Option<&'v Value>>) {
+    fn get_leaves(&self, a: &mut Vec<PathLeaf<'v>>) {
         match self {
-            &WalkLeaf::Value(_, v) => a.push(Some(v)),
-            &WalkLeaf::NotFound(_) => a.push(None),
+            &WalkLeaf::Value(_, v) => {
+                a.push(PathLeaf::new(v));
+            },
+            &WalkLeaf::NotFound(_) => {
+                a.push(PathLeaf::empty());
+            },
         }
     }
 
