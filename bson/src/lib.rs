@@ -115,39 +115,41 @@ impl<'v> PathLeaf<'v> {
 
 #[derive(Debug)]
 pub enum WalkRoot<'v, 'p> {
-    Document(WalkPath<'v, 'p>),
+    Document(WalkDocument<'v, 'p>),
     Array(WalkArray<'v, 'p>),
     Not(&'v Value),
 }
 
 #[derive(Debug)]
 pub struct WalkArray<'v, 'p> {
-    direct: WalkPath<'v, 'p>,
+    direct: Option<(usize, WalkItem<'v, 'p>)>,
     dive: Vec<WalkRoot<'v, 'p>>,
 }
 
 #[derive(Debug)]
-pub enum WalkPath<'v, 'p> {
+pub struct WalkDocument<'v, 'p> {
+    name: &'p str,
+    dive: Vec<WalkRoot<'v, 'p>>,
+}
+
+#[derive(Debug)]
+pub enum WalkItem<'v, 'p> {
     Intermediate(WalkIntermediate<'v, 'p>),
     Leaf(WalkLeaf<'v, 'p>),
 }
 
 #[derive(Debug)]
 pub enum WalkIntermediate<'v, 'p> {
-    // TODO open question here about whether the strs should be
-    // the name (the current step in the path), or the whole remaining 
-    // path.
-
-    Document(&'p str, Box<WalkPath<'v, 'p>>),
-    Array(&'p str, Box<WalkArray<'v, 'p>>),
-    NotContainer(&'p str, &'v Value),
-    NotFound(&'p str),
+    Document(Box<WalkDocument<'v, 'p>>),
+    Array(Box<WalkArray<'v, 'p>>),
+    NotContainer(&'v Value),
+    NotFound,
 }
 
 #[derive(Debug)]
-pub enum WalkLeaf<'v, 'p> {
-    Value(&'p str, &'v Value),
-    NotFound(&'p str),
+pub enum WalkLeaf<'v> {
+    Value(&'v Value),
+    NotFound,
 }
 
 impl<'v, 'p> WalkArray<'v, 'p> {
@@ -164,8 +166,8 @@ impl<'v, 'p> WalkArray<'v, 'p> {
         // child of an array.  Anything else, we descend.
 
         match self.direct {
-            WalkPath::Intermediate(ref p) => p.get_leaves(a),
-            WalkPath::Leaf(ref p) => {
+            WalkItem::Intermediate(ref p) => p.get_leaves(a),
+            WalkItem::Leaf(ref p) => {
                 match p {
                     &WalkLeaf::Value(_, v) => {
                         a.push(PathLeaf::new(v));
@@ -217,15 +219,15 @@ impl<'v, 'p> WalkPath<'v, 'p> {
 
     pub fn project(&self, d: &mut Document) -> Result<()> {
         match self {
-            &WalkPath::Intermediate(ref p) => p.project(d),
-            &WalkPath::Leaf(ref p) => p.project(d),
+            &WalkItem::Intermediate(ref p) => p.project(d),
+            &WalkItem::Leaf(ref p) => p.project(d),
         }
     }
 
     fn get_leaves(&self, a: &mut Vec<PathLeaf<'v>>) {
         match self {
-            &WalkPath::Intermediate(ref p) => p.get_leaves(a),
-            &WalkPath::Leaf(ref p) => p.get_leaves(a),
+            &WalkItem::Intermediate(ref p) => p.get_leaves(a),
+            &WalkItem::Leaf(ref p) => p.get_leaves(a),
         }
     }
 
@@ -796,7 +798,7 @@ impl Document {
             Some(ndx) => {
                 let v = &self.pairs[ndx].1;
                 match dot {
-                    None => WalkPath::Leaf(WalkLeaf::Value(name, v)),
+                    None => WalkItem::Leaf(WalkLeaf::Value(name, v)),
                     Some(dot) => {
                         let middle =
                             match v {
@@ -810,14 +812,14 @@ impl Document {
                                     WalkIntermediate::NotContainer(name, v)
                                 },
                             };
-                        WalkPath::Intermediate(middle)
+                        WalkItem::Intermediate(middle)
                     },
                 }
             },
             None => {
                 match dot {
-                    None => WalkPath::Leaf(WalkLeaf::NotFound(path)),
-                    Some(dot) => WalkPath::Intermediate(WalkIntermediate::NotFound(path)),
+                    None => WalkItem::Leaf(WalkLeaf::NotFound(path)),
+                    Some(dot) => WalkItem::Intermediate(WalkIntermediate::NotFound(path)),
                 }
             },
         }
@@ -1008,21 +1010,21 @@ impl Array {
             match name.parse::<i32>() {
                 Err(_) => {
                     match dot {
-                        None => WalkPath::Leaf(WalkLeaf::NotFound(name)),
-                        Some(dot) => WalkPath::Intermediate(WalkIntermediate::NotFound(path)),
+                        None => WalkItem::Leaf(WalkLeaf::NotFound(name)),
+                        Some(dot) => WalkItem::Intermediate(WalkIntermediate::NotFound(path)),
                     }
                 }, 
                 Ok(ndx) => {
                     if ndx < 0 || (ndx as usize) >= self.items.len() {
                         match dot {
-                            None => WalkPath::Leaf(WalkLeaf::NotFound(name)),
-                            Some(dot) => WalkPath::Intermediate(WalkIntermediate::NotFound(path)),
+                            None => WalkItem::Leaf(WalkLeaf::NotFound(name)),
+                            Some(dot) => WalkItem::Intermediate(WalkIntermediate::NotFound(path)),
                         }
                     } else {
                         let ndx = ndx as usize;
                         let v = &self.items[ndx];
                         match dot {
-                            None => WalkPath::Leaf(WalkLeaf::Value(name, v)),
+                            None => WalkItem::Leaf(WalkLeaf::Value(name, v)),
                             Some(dot) => {
                                 let middle = 
                                     match v {
@@ -1036,7 +1038,7 @@ impl Array {
                                             WalkIntermediate::NotContainer(name, v)
                                         },
                                     };
-                                WalkPath::Intermediate(middle)
+                                WalkItem::Intermediate(middle)
                             },
                         }
                     }
