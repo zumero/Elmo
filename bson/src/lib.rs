@@ -188,26 +188,9 @@ impl<'v, 'p> WalkRoot<'v, 'p> {
         box a.into_iter()
     }
 
-    // TODO maybe the callback should get the path too?  might need this to
-    // get the array match pos.
-
-    // callback should return true to make it stop
-    pub fn for_each_leaf<F : Fn(Option<&Value>) -> bool>(&self, func: &F) -> bool {
-        match self {
-            &WalkRoot::Document(ref p) => p.for_each_leaf(func),
-            &WalkRoot::Not(_) => func(None),
-        }
-    }
 }
 
 impl<'v, 'p> WalkPath<'v, 'p> {
-    // callback should return true to make it stop
-    fn for_each_leaf<F : Fn(Option<&Value>) -> bool>(&self, func: &F) -> bool {
-        match self {
-            &WalkPath::Intermediate(ref p) => p.for_each_leaf(func),
-            &WalkPath::Leaf(ref p) => p.for_each_leaf(func),
-        }
-    }
 
     pub fn project(&self, d: &mut Document) -> Result<()> {
         match self {
@@ -247,28 +230,6 @@ impl<'v, 'p> WalkIntermediate<'v, 'p> {
             },
             &WalkIntermediate::NotFound(_) => {
                 a.push(None)
-            },
-        }
-    }
-
-    // callback should return true to make it stop
-    fn for_each_leaf<F : Fn(Option<&Value>) -> bool>(&self, func: &F) -> bool {
-        match self {
-            &WalkIntermediate::Document(_, ref p) => {
-                p.for_each_leaf(func)
-            },
-            &WalkIntermediate::Array(_,ref wa) => {
-                // TODO I think what we want here is either:
-                //     all the actual values from either direct or dive
-                // or if there are no such values:
-                //     just one NotFound
-                wa.direct.for_each_leaf(func) || wa.dive.iter().any(|p| p.for_each_leaf(func))
-            },
-            &WalkIntermediate::NotContainer(_,_) => {
-                func(None)
-            },
-            &WalkIntermediate::NotFound(_) => {
-                func(None)
             },
         }
     }
@@ -345,14 +306,6 @@ impl<'v, 'p> WalkLeaf<'v, 'p> {
         match self {
             &WalkLeaf::Value(_, v) => a.push(Some(v)),
             &WalkLeaf::NotFound(_) => (),
-        }
-    }
-
-    // callback should return true to make it stop
-    fn for_each_leaf<F : Fn(Option<&Value>) -> bool>(&self, func: &F) -> bool {
-        match self {
-            &WalkLeaf::Value(_, v) => func(Some(v)),
-            &WalkLeaf::NotFound(_) => func(None),
         }
     }
 
