@@ -559,6 +559,18 @@ fn match_pair_other<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, 
     }
 }
 
+fn cmp_with_array<F: Fn(&bson::Value, &bson::Value) -> bool>(func: F, v: &bson::Value, lit: &bson::Value) -> bool {
+    func(v, lit)
+    || {
+        match v {
+            &bson::Value::BArray(ref ba) => {
+                ba.items.iter().any(|v| func(v, lit))
+            },
+            _ => false,
+        }
+    }
+}
+
 fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_array_pos: &F) -> bool {
     // not all predicates do their path searching in the same way
     
@@ -572,20 +584,7 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
                     |ov| {
                         match ov {
                             Some(v) => {
-                                // TODO the following code is an idiom that should
-                                // be wrapped in a function so it can be reused.
-                                // we compare the value agains the literal.  if it
-                                // doesn't match, and if the value is an array, we
-                                // compare all its elements against the literal.
-                                cmp_eq(v, lit)
-                                || {
-                                    match v {
-                                        &bson::Value::BArray(ref ba) => {
-                                            ba.items.iter().any(|v| cmp_eq(v, lit))
-                                        },
-                                        _ => false,
-                                    }
-                                }
+                                cmp_with_array(cmp_eq, v, lit)
                             },
                             None => {
                                 // If we have a path leaf (as we have defined it) that
