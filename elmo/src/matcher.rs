@@ -559,9 +559,17 @@ fn match_pair_other<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, 
     }
 }
 
-fn cmp_with_array<F: Fn(&bson::Value, &bson::Value) -> bool, G: Fn(usize)>(func: F, cb_array_pos: &G, v: &bson::Value, lit: &bson::Value) -> bool {
-    func(v, lit)
-    || {
+fn cmp_with_array<F: Fn(&bson::Value, &bson::Value) -> bool, G: Fn(usize)>(func: F, cb_array_pos: &G, pos: Option<usize>, v: &bson::Value, lit: &bson::Value) -> bool {
+    if func(v, lit) {
+        match pos {
+            Some(i) => {
+                cb_array_pos(i);
+            },
+            None => {
+            },
+        }
+        true
+    } else {
         match v {
             &bson::Value::BArray(ref ba) => {
                 match ba.items.iter().position(|v| func(v, lit)) {
@@ -583,47 +591,48 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
     // not all predicates do their path searching in the same way
     
     let walk = start.walk_path(path);
+    let null = bson::Value::BNull;
 
     match pred {
         &Pred::EQ(ref lit) => {
-
-            // TODO cmp_with_array(cmp_eq, cb_array_pos, ov.unwrap_or(&null), lit)
-
-            let new = 
-                walk.leaves().any(
-                    |leaf| {
-                        match leaf.v {
-                            Some(v) => {
-                                let pos = leaf.path.last_array_index();
-                                println!("TODO cb_array_pos: {:?}", pos);
-                                cmp_with_array(cmp_eq, cb_array_pos, v, lit)
-                            },
-                            None => {
-                                // If we have a path leaf (as we have defined it) that
-                                // results in missing value, and if we are being asked to
-                                // compare to null, then we consider that a match.
-                                match lit {
-                                    // TODO not sure if BUndefined needs to be included here
-                                    &bson::Value::BNull | &bson::Value::BUndefined => true,
-                                    _ => false,
-                                }
-                            },
-                        }
-                    }
-                );
-            let old = match_pair_other(pred, path, start, false, cb_array_pos);
-            if new != old {
-                println!("BEGIN EQ fail");
-                println!("    new = {:?}", new);
-                println!("    old = {:?}", old);
-                println!("    lit = {:?}", lit);
-                println!("    start = {:?}", start);
-                println!("    path = {:?}", path);
-                println!("    walk = {:?}", walk);
-                println!("    leaves = {:?}", walk.leaves().collect::<Vec<_>>());
-                println!("    END EQ fail");
-            }
-            new
+            walk.leaves().any(
+                |leaf| {
+                    let pos = leaf.path.last_array_index();
+                    cmp_with_array(cmp_eq, cb_array_pos, pos, leaf.v.unwrap_or(&null), lit)
+                }
+            )
+        },
+        &Pred::LT(ref lit) => {
+            walk.leaves().any(
+                |leaf| {
+                    let pos = leaf.path.last_array_index();
+                    cmp_with_array(cmp_lt, cb_array_pos, pos, leaf.v.unwrap_or(&null), lit)
+                }
+            )
+        },
+        &Pred::GT(ref lit) => {
+            walk.leaves().any(
+                |leaf| {
+                    let pos = leaf.path.last_array_index();
+                    cmp_with_array(cmp_gt, cb_array_pos, pos, leaf.v.unwrap_or(&null), lit)
+                }
+            )
+        },
+        &Pred::LTE(ref lit) => {
+            walk.leaves().any(
+                |leaf| {
+                    let pos = leaf.path.last_array_index();
+                    cmp_with_array(cmp_lte, cb_array_pos, pos, leaf.v.unwrap_or(&null), lit)
+                }
+            )
+        },
+        &Pred::GTE(ref lit) => {
+            walk.leaves().any(
+                |leaf| {
+                    let pos = leaf.path.last_array_index();
+                    cmp_with_array(cmp_gte, cb_array_pos, pos, leaf.v.unwrap_or(&null), lit)
+                }
+            )
         },
         &Pred::All(ref a) => {
             if a.len() == 0 {
