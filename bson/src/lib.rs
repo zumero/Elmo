@@ -96,6 +96,7 @@ fn simple_mongo_strftime(fmt: &str, tm: &time::Tm) -> String {
 #[derive(Debug)]
 pub struct PathLeaf<'v> {
     pub v: Option<&'v Value>,
+    // TODO pub i: Option<usize>,
 }
 
 impl<'v> PathLeaf<'v> {
