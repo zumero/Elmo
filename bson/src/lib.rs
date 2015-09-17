@@ -101,50 +101,63 @@ pub enum PathKey {
 }
 
 #[derive(Debug,Clone)]
-pub struct Path {
+pub struct ActualPath {
     a: Vec<PathKey>,
 }
 
-impl Path {
-    fn new() -> Path {
-        Path {
+impl ActualPath {
+    fn new() -> ActualPath {
+        ActualPath {
             a: vec![],
         }
     }
 
-    fn append_name(&self, s: &str) -> Path {
+    fn append_name(&self, s: &str) -> ActualPath {
         let mut a = self.a.clone();
         a.push(PathKey::Name(String::from(s)));
-        Path {
+        ActualPath {
             a: a
         }
     }
 
-    fn append_index(&self, i: usize) -> Path {
+    fn append_index(&self, i: usize) -> ActualPath {
         let mut a = self.a.clone();
         a.push(PathKey::Index(i));
-        Path {
+        ActualPath {
             a: a
         }
     }
 
+    pub fn last_array_index(&self) -> Option<usize> {
+        self.a
+            .iter()
+            .rev()
+            .filter_map(
+                |k|
+                match k {
+                    &PathKey::Name(_) => None,
+                    &PathKey::Index(i) => Some(i),
+                }
+                )
+            .next()
+    }
 }
 
 #[derive(Debug)]
 pub struct PathLeaf<'v> {
     pub v: Option<&'v Value>,
-    pub path: Path,
+    pub path: ActualPath,
 }
 
 impl<'v> PathLeaf<'v> {
-    fn new(v: &'v Value, path: Path) -> PathLeaf<'v> {
+    fn new(v: &'v Value, path: ActualPath) -> PathLeaf<'v> {
         PathLeaf {
             v: Some(v),
             path: path,
         }
     }
 
-    fn empty(path: Path) -> PathLeaf<'v> {
+    fn empty(path: ActualPath) -> PathLeaf<'v> {
         PathLeaf {
             v: None,
             path: path,
@@ -195,7 +208,7 @@ pub enum WalkDocumentItem<'v, 'p> {
 }
 
 impl<'v, 'p> WalkArray<'v, 'p> {
-    fn get_leaves(&self, path: &Path, a: &mut Vec<PathLeaf<'v>>) {
+    fn get_leaves(&self, path: &ActualPath, a: &mut Vec<PathLeaf<'v>>) {
         // Mongo's rules for this case are a bit funky.
 
         // if a is []
@@ -225,7 +238,7 @@ impl<'v, 'p> WalkArray<'v, 'p> {
 }
 
 impl<'v, 'p> WalkDocument<'v, 'p> {
-    fn get_leaves(&self, path: &Path, a: &mut Vec<PathLeaf<'v>>) {
+    fn get_leaves(&self, path: &ActualPath, a: &mut Vec<PathLeaf<'v>>) {
         self.item.get_leaves(path.append_name(self.name), a);
     }
 
@@ -244,7 +257,7 @@ impl<'v, 'p> WalkRoot<'v, 'p> {
         // to keep track of the state and move forward on each call to
         // next().  but very complicated.
         let mut a = vec![];
-        let path = Path::new();
+        let path = ActualPath::new();
         match self {
             &WalkRoot::Document(ref p) => p.get_leaves(&path, &mut a),
             &WalkRoot::Array(ref p) => p.get_leaves(&path, &mut a),
@@ -260,7 +273,7 @@ impl<'v, 'p> WalkRoot<'v, 'p> {
 }
 
 impl<'v, 'p> WalkArrayItemDirect<'v, 'p> {
-    fn get_leaves(&self, path: &Path, a: &mut Vec<PathLeaf<'v>>) {
+    fn get_leaves(&self, path: &ActualPath, a: &mut Vec<PathLeaf<'v>>) {
         match self {
             &WalkArrayItemDirect::Document(i, ref p) => {
                 p.get_leaves(&path.append_index(i), a)
@@ -283,7 +296,7 @@ impl<'v, 'p> WalkArrayItemDirect<'v, 'p> {
 }
 
 impl<'v, 'p> WalkDocumentItem<'v, 'p> {
-    fn get_leaves(&self, path: Path, a: &mut Vec<PathLeaf<'v>>) {
+    fn get_leaves(&self, path: ActualPath, a: &mut Vec<PathLeaf<'v>>) {
         match self {
             &WalkDocumentItem::Document(ref p) => {
                 p.get_leaves(&path, a)

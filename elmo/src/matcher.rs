@@ -587,11 +587,15 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
     match pred {
         &Pred::EQ(ref lit) => {
 
+            // TODO cmp_with_array(cmp_eq, cb_array_pos, ov.unwrap_or(&null), lit)
+
             let new = 
                 walk.leaves().any(
                     |leaf| {
                         match leaf.v {
                             Some(v) => {
+                                let pos = leaf.path.last_array_index();
+                                println!("TODO cb_array_pos: {:?}", pos);
                                 cmp_with_array(cmp_eq, cb_array_pos, v, lit)
                             },
                             None => {
