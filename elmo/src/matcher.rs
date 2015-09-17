@@ -559,12 +559,20 @@ fn match_pair_other<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, 
     }
 }
 
-fn cmp_with_array<F: Fn(&bson::Value, &bson::Value) -> bool>(func: F, v: &bson::Value, lit: &bson::Value) -> bool {
+fn cmp_with_array<F: Fn(&bson::Value, &bson::Value) -> bool, G: Fn(usize)>(func: F, cb_array_pos: &G, v: &bson::Value, lit: &bson::Value) -> bool {
     func(v, lit)
     || {
         match v {
             &bson::Value::BArray(ref ba) => {
-                ba.items.iter().any(|v| func(v, lit))
+                match ba.items.iter().position(|v| func(v, lit)) {
+                    Some(i) => {
+                        cb_array_pos(i);
+                        true
+                    },
+                    None => {
+                        false
+                    },
+                }
             },
             _ => false,
         }
@@ -577,35 +585,6 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
     let walk = start.walk_path(path);
 
     match pred {
-        &Pred::LT(ref lit) => {
-
-            let new = 
-                walk.leaves().any(
-                    |ov| {
-                        match ov {
-                            Some(v) => {
-                                cmp_with_array(cmp_lt, v, lit)
-                            },
-                            None => {
-                                false
-                            },
-                        }
-                    }
-                );
-            let old = match_pair_other(pred, path, start, false, cb_array_pos);
-            if new != old {
-                println!("BEGIN LT fail");
-                println!("    new = {:?}", new);
-                println!("    old = {:?}", old);
-                println!("    lit = {:?}", lit);
-                println!("    start = {:?}", start);
-                println!("    path = {:?}", path);
-                println!("    walk = {:?}", walk);
-                println!("    leaves = {:?}", walk.leaves().collect::<Vec<_>>());
-                println!("    END LT fail");
-            }
-            old
-        },
         &Pred::EQ(ref lit) => {
 
             let new = 
@@ -613,7 +592,7 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
                     |ov| {
                         match ov {
                             Some(v) => {
-                                cmp_with_array(cmp_eq, v, lit)
+                                cmp_with_array(cmp_eq, cb_array_pos, v, lit)
                             },
                             None => {
                                 // If we have a path leaf (as we have defined it) that
@@ -628,6 +607,7 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
                         }
                     }
                 );
+            /*
             let old = match_pair_other(pred, path, start, false, cb_array_pos);
             if new != old {
                 println!("BEGIN EQ fail");
@@ -640,43 +620,8 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
                 println!("    leaves = {:?}", walk.leaves().collect::<Vec<_>>());
                 println!("    END EQ fail");
             }
-            old
-        },
-        &Pred::LTE(ref lit) => {
-
-            let new = 
-                walk.leaves().any(
-                    |ov| {
-                        match ov {
-                            Some(v) => {
-                                cmp_with_array(cmp_lte, v, lit)
-                            },
-                            None => {
-                                // If we have a path leaf (as we have defined it) that
-                                // results in missing value, and if we are being asked to
-                                // compare to null, then we consider that a match.
-                                match lit {
-                                    // TODO not sure if BUndefined needs to be included here
-                                    &bson::Value::BNull | &bson::Value::BUndefined => true,
-                                    _ => false,
-                                }
-                            },
-                        }
-                    }
-                );
-            let old = match_pair_other(pred, path, start, false, cb_array_pos);
-            if new != old {
-                println!("BEGIN LTE fail");
-                println!("    new = {:?}", new);
-                println!("    old = {:?}", old);
-                println!("    lit = {:?}", lit);
-                println!("    start = {:?}", start);
-                println!("    path = {:?}", path);
-                println!("    walk = {:?}", walk);
-                println!("    leaves = {:?}", walk.leaves().collect::<Vec<_>>());
-                println!("    END LTE fail");
-            }
-            old
+            */
+            new
         },
         &Pred::All(ref a) => {
             if a.len() == 0 {
