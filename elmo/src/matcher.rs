@@ -359,230 +359,7 @@ fn do_elem_match_objects<F: Fn(usize)>(doc: &QueryDoc, v: &bson::Value, cb_array
     }
 }
 
-/*
-fn match_predicate<F: Fn(usize)>(pred: &Pred, d: &bson::Value, cb_array_pos: &F) -> bool {
-    //println!("match_predicate: pred = {:?}", pred);
-    //println!("match_predicate: d = {:?}", d);
-    match pred {
-        &Pred::Exists(_) => {
-            unreachable!();
-        },
-        &Pred::Not(ref preds) => {
-            let any_matches = preds.iter().any(|p| match_predicate(p, d, cb_array_pos));
-            !any_matches
-        },
-        &Pred::ElemMatchObjects(ref doc) => {
-            do_elem_match_objects(doc, d, cb_array_pos)
-        },
-        &Pred::ElemMatchPreds(ref preds) => {
-            match d {
-                &bson::Value::BArray(ref ba) => {
-                    let found = 
-                        ba.items.iter().position(|vsub| preds.iter().all(|p| match_predicate(p, vsub, cb_array_pos)));
-                    match found {
-                        Some(n) => {
-                            cb_array_pos(n);
-                            true
-                        },
-                        None => false
-                    }
-                },
-                _ => false,
-            }
-        },
-        &Pred::AllElemMatchObjects(ref docs) => {
-            // for each elemMatch doc in the $all array, run it against
-            // the candidate array.  if any elemMatch doc fails, false.
-            docs.iter().all(|doc| do_elem_match_objects(doc, d, cb_array_pos))
-        },
-        &Pred::All(ref lits) => {
-            // TODO does this ever happen, now that it is handled earlier?
-            if lits.len() == 0 {
-                false
-            } else {
-                !lits.iter().any(|lit| {
-                    let b =
-                        if cmp_eq(d, lit) {
-                            true
-                        } else {
-                            match d {
-                                &bson::Value::BArray(ref ba) => {
-                                    ba.items.iter().any(|v| cmp_eq(v, lit))
-                                },
-                                _ => false,
-                            }
-                        };
-                    !b
-                })
-            }
-        },
-        &Pred::EQ(ref lit) => cmp_eq(d, lit),
-        &Pred::NE(ref lit) => !cmp_eq(d, lit),
-        &Pred::LT(ref lit) => cmp_lt(d, lit),
-        &Pred::GT(ref lit) => cmp_gt(d, lit),
-        &Pred::LTE(ref lit) => cmp_lte(d, lit),
-        &Pred::GTE(ref lit) => cmp_gte(d, lit),
-        &Pred::REGEX(ref re) => {
-            match d {
-                &bson::Value::BString(ref s) => {
-                    re.is_match(s)
-                },
-                _ => false,
-            }
-        },
-        &Pred::Type(n) => (d.getTypeNumber_u8() as i32) == n,
-        &Pred::In(ref lits) => lits.iter().any(|v| cmp_in(d, v)),
-        &Pred::Nin(ref lits) => !lits.iter().any(|v| cmp_in(d, v)),
-        &Pred::Size(n) => {
-            match d {
-                &bson::Value::BArray(ref ba) => ba.items.len() == (n as usize),
-                _ => false,
-            }
-        },
-        &Pred::Mod(div, rem) => {
-            match d {
-                &bson::Value::BInt32(n) => ((n as i64) % div) == rem,
-                &bson::Value::BInt64(n) => (n % div) == rem,
-                &bson::Value::BDouble(n) => ((n as i64) % div) == rem,
-                _ => false,
-            }
-        },
-
-        // TODO don't panic here.  need to return Result<>
-        &Pred::Near(_) => panic!("TODO geo"),
-        &Pred::NearSphere(_) => panic!("TODO geo"),
-        &Pred::GeoWithin(_) => panic!("TODO geo"),
-        &Pred::GeoIntersects(_) => panic!("TODO geo"),
-    }
-}
-
-fn match_pair_other<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, arr: bool, cb_array_pos: &F) -> bool {
-    //println!("match_pair_other: pred = {:?}", pred);
-    //println!("match_pair_other: path = {:?}", path);
-    //println!("match_pair_other: start = {:?}", start);
-    let dot = path.find('.');
-    let name = match dot { 
-        None => path,
-        Some(ndx) => &path[0 .. ndx]
-    };
-    //println!("match_pair_other: name = {:?}", name);
-    match start.tryGetValueEither(name) {
-        Some(v) => {
-            //println!("name found: {:?}", v);
-            match dot {
-                None => {
-                    if match_predicate(pred, v, cb_array_pos) {
-                        true
-                    } else if !arr {
-                        match pred {
-                            &Pred::Size(_) => false,
-                            &Pred::All(_) => false,
-                            &Pred::ElemMatchPreds(_) => false,
-                            _ => {
-                                match v {
-                                    &bson::Value::BArray(ref ba) => {
-                                        //println!("match_pair_other: diving");
-                                        match ba.items.iter().position(|vsub| match_predicate(pred, vsub, cb_array_pos)) {
-                                            Some(ndx) => {
-                                                cb_array_pos(ndx);
-                                                true
-                                            },
-                                            None => false,
-                                        }
-                                    },
-                                    _ => false,
-                                }
-                            },
-                        }
-                    } else {
-                        false
-                    }
-                },
-                Some(dot) => {
-                    //println!("subpath");
-                    let subpath = &path[dot+1 ..];
-                    match v {
-                        &bson::Value::BDocument(_) => {
-                            match_pair_other(pred, subpath, v, false, cb_array_pos)
-                        },
-                        &bson::Value::BArray(ref ba) => {
-                            //println!("it's an array");
-                            let b = match_pair_other(pred, subpath, v, true, cb_array_pos);
-                            if b {
-                                true
-                            } else {
-                                //println!("diving into the array");
-                                let f = |vsub| {
-                                    match vsub {
-                                        &bson::Value::BDocument(_) => match_pair_other(pred, subpath, vsub, false, cb_array_pos),
-                                        _ => false,
-                                    }
-                                };
-                                match ba.items.iter().position(f) {
-                                    Some(ndx) => {
-                                        cb_array_pos(ndx);
-                                        true
-                                    },
-                                    None => false,
-                                }
-                            }
-                        },
-                        _ => {
-                            match pred {
-                                &Pred::Type(_) => false,
-                                _ => match_predicate(pred, &bson::Value::BNull, cb_array_pos),
-                            }
-                        },
-                    }
-                },
-            }
-        },
-        None => {
-            //println!("name not found");
-            if arr {
-                false
-            } else {
-                match pred {
-                    &Pred::Type(n) => false,
-                    _ => match_predicate(pred, &bson::Value::BNull, cb_array_pos),
-                }
-            }
-        },
-    }
-}
-*/
-
-// TODO consider not passing func and lit separately.  instead, have lit captured by the func
-// closure.
-fn cmp_with_array<F: Fn(&bson::Value, &bson::Value) -> bool, G: Fn(usize)>(func: F, cb_array_pos: &G, pos: Option<usize>, v: &bson::Value, lit: &bson::Value) -> bool {
-    if func(v, lit) {
-        match pos {
-            Some(i) => {
-                cb_array_pos(i);
-            },
-            None => {
-            },
-        }
-        true
-    } else {
-        match v {
-            &bson::Value::BArray(ref ba) => {
-                match ba.items.iter().position(|v| func(v, lit)) {
-                    Some(i) => {
-                        cb_array_pos(i);
-                        true
-                    },
-                    None => {
-                        false
-                    },
-                }
-            },
-            _ => false,
-        }
-    }
-}
-
-fn cmp2_with_array<F: Fn(&bson::Value) -> bool, G: Fn(usize)>(func: F, cb_array_pos: &G, pos: Option<usize>, v: &bson::Value) -> bool {
+fn cmp_with_array<F: Fn(&bson::Value) -> bool, G: Fn(usize)>(func: F, cb_array_pos: &G, pos: Option<usize>, v: &bson::Value) -> bool {
     if func(v) {
         match pos {
             Some(i) => {
@@ -621,7 +398,7 @@ fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, 
         walk.leaves().any(
             |leaf| {
                 let pos = leaf.path.last_array_index();
-                cmp_with_array(cmp_eq, cb_array_pos, pos, leaf.v.unwrap_or(&null), lit)
+                cmp_with_array(|v| cmp_eq(v, lit), cb_array_pos, pos, leaf.v.unwrap_or(&null))
             }
         );
 
@@ -651,7 +428,7 @@ fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, 
             walk.leaves().any(
                 |leaf| {
                     let pos = leaf.path.last_array_index();
-                    cmp_with_array(cmp_lt, cb_array_pos, pos, leaf.v.unwrap_or(&null), lit)
+                    cmp_with_array(|v| cmp_lt(v,lit), cb_array_pos, pos, leaf.v.unwrap_or(&null))
                 }
             )
         },
@@ -659,7 +436,7 @@ fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, 
             walk.leaves().any(
                 |leaf| {
                     let pos = leaf.path.last_array_index();
-                    cmp_with_array(cmp_gt, cb_array_pos, pos, leaf.v.unwrap_or(&null), lit)
+                    cmp_with_array(|v| cmp_gt(v,lit), cb_array_pos, pos, leaf.v.unwrap_or(&null))
                 }
             )
         },
@@ -667,7 +444,7 @@ fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, 
             walk.leaves().any(
                 |leaf| {
                     let pos = leaf.path.last_array_index();
-                    cmp_with_array(cmp_lte, cb_array_pos, pos, leaf.v.unwrap_or(&null), lit)
+                    cmp_with_array(|v| cmp_lte(v,lit), cb_array_pos, pos, leaf.v.unwrap_or(&null))
                 }
             )
         },
@@ -675,7 +452,7 @@ fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, 
             walk.leaves().any(
                 |leaf| {
                     let pos = leaf.path.last_array_index();
-                    cmp_with_array(cmp_gte, cb_array_pos, pos, leaf.v.unwrap_or(&null), lit)
+                    cmp_with_array(|v| cmp_gte(v,lit), cb_array_pos, pos, leaf.v.unwrap_or(&null))
                 }
             )
         },
@@ -706,7 +483,7 @@ fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, 
                     walk.leaves().any( 
                         |leaf|
                         // apparently cb_array_pos doesn't matter here
-                        cmp_with_array(cmp_eq, cb_array_pos, None, leaf.v.unwrap_or(&null), lit)
+                        cmp_with_array(|v| cmp_eq(v,lit), cb_array_pos, None, leaf.v.unwrap_or(&null))
                     )
                 )
             }
@@ -726,7 +503,7 @@ fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, 
             walk.leaves().any(
                 |leaf| {
                     let pos = leaf.path.last_array_index();
-                    cmp2_with_array(|v| cmp_regex(v, re), cb_array_pos, pos, leaf.v.unwrap_or(&null))
+                    cmp_with_array(|v| cmp_regex(v, re), cb_array_pos, pos, leaf.v.unwrap_or(&null))
                 }
             )
         },
@@ -736,7 +513,7 @@ fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, 
                     match leaf.v {
                         Some(v) => {
                             let pos = leaf.path.last_array_index();
-                            cmp2_with_array(|v| (v.getTypeNumber_u8() as i32) == n, cb_array_pos, pos, leaf.v.unwrap_or(&null))
+                            cmp_with_array(|v| (v.getTypeNumber_u8() as i32) == n, cb_array_pos, pos, leaf.v.unwrap_or(&null))
                         },
                         None => {
                             false
@@ -751,7 +528,7 @@ fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, 
                 walk.leaves().any( 
                     |leaf|
                     // apparently cb_array_pos doesn't matter here
-                    cmp_with_array(cmp_in, cb_array_pos, None, leaf.v.unwrap_or(&null), lit)
+                    cmp_with_array(|v| cmp_in(v,lit), cb_array_pos, None, leaf.v.unwrap_or(&null))
                 )
             )
         },
