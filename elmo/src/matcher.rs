@@ -240,6 +240,15 @@ pub fn cmpdir(d: &bson::Value, lit: &bson::Value, reverse: bool) -> Ordering {
     }
 }
 
+fn cmp_regex(d: &bson::Value, re: &regex::Regex) -> bool {
+    match d {
+        &bson::Value::BString(ref s) => {
+            re.is_match(s)
+        },
+        _ => false,
+    }
+}
+
 fn cmp_eq(d: &bson::Value, lit: &bson::Value) -> bool {
     let torder_d = d.get_type_order();
     let torder_lit = lit.get_type_order();
@@ -559,6 +568,8 @@ fn match_pair_other<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, 
     }
 }
 
+// TODO consider not passing func and lit separately.  instead, have lit captured by the func
+// closure.
 fn cmp_with_array<F: Fn(&bson::Value, &bson::Value) -> bool, G: Fn(usize)>(func: F, cb_array_pos: &G, pos: Option<usize>, v: &bson::Value, lit: &bson::Value) -> bool {
     if func(v, lit) {
         match pos {
@@ -573,6 +584,34 @@ fn cmp_with_array<F: Fn(&bson::Value, &bson::Value) -> bool, G: Fn(usize)>(func:
         match v {
             &bson::Value::BArray(ref ba) => {
                 match ba.items.iter().position(|v| func(v, lit)) {
+                    Some(i) => {
+                        cb_array_pos(i);
+                        true
+                    },
+                    None => {
+                        false
+                    },
+                }
+            },
+            _ => false,
+        }
+    }
+}
+
+fn cmp2_with_array<F: Fn(&bson::Value) -> bool, G: Fn(usize)>(func: F, cb_array_pos: &G, pos: Option<usize>, v: &bson::Value) -> bool {
+    if func(v) {
+        match pos {
+            Some(i) => {
+                cb_array_pos(i);
+            },
+            None => {
+            },
+        }
+        true
+    } else {
+        match v {
+            &bson::Value::BArray(ref ba) => {
+                match ba.items.iter().position(|v| func(v)) {
                     Some(i) => {
                         cb_array_pos(i);
                         true
@@ -692,9 +731,91 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
             // TODO don't call match_pair recursively
             !match_pair(&Pred::In(a.clone()), path, start, cb_array_pos)
         },
-        _ => {
+        &Pred::REGEX(ref re) => {
+            walk.leaves().any(
+                |leaf| {
+                    let pos = leaf.path.last_array_index();
+                    cmp2_with_array(|v| cmp_regex(v, re), cb_array_pos, pos, leaf.v.unwrap_or(&null))
+                }
+            )
+        },
+        &Pred::Type(n) => {
+            walk.leaves().any(
+                |leaf| {
+                    match leaf.v {
+                        Some(v) => {
+                            let pos = leaf.path.last_array_index();
+                            cmp2_with_array(|v| (v.getTypeNumber_u8() as i32) == n, cb_array_pos, pos, leaf.v.unwrap_or(&null))
+                        },
+                        None => {
+                            false
+                        },
+                    }
+                }
+            )
+        },
+        &Pred::In(ref lits) => {
+            lits.iter().any( 
+                |lit| 
+                walk.leaves().any( 
+                    |leaf|
+                    // apparently cb_array_pos doesn't matter here
+                    cmp_with_array(cmp_in, cb_array_pos, None, leaf.v.unwrap_or(&null), lit)
+                )
+            )
+        },
+        &Pred::Size(n) => {
+            walk.leaves().any(
+                |leaf| {
+                    match leaf.v {
+                        Some(v) => {
+                            match v {
+                                &bson::Value::BArray(ref ba) => ba.items.len() == (n as usize),
+                                _ => false,
+                            }
+                        },
+                        None => {
+                            false
+                        },
+                    }
+                }
+            )
+        },
+        &Pred::Mod(div, rem) => {
+            walk.leaves().any(
+                |leaf| {
+                    match leaf.v {
+                        Some(v) => {
+                            match v {
+                                &bson::Value::BInt32(n) => ((n as i64) % div) == rem,
+                                &bson::Value::BInt64(n) => (n % div) == rem,
+                                &bson::Value::BDouble(n) => ((n as i64) % div) == rem,
+                                _ => false,
+                            }
+                        },
+                        None => {
+                            false
+                        },
+                    }
+                }
+                )
+        },
+
+        &Pred::ElemMatchObjects(_) => {
             match_pair_other(pred, path, start, false, cb_array_pos)
         },
+        &Pred::ElemMatchPreds(_) => {
+            match_pair_other(pred, path, start, false, cb_array_pos)
+        },
+        &Pred::AllElemMatchObjects(_) => {
+            match_pair_other(pred, path, start, false, cb_array_pos)
+        },
+
+        // TODO don't panic here.  need to return Result<>
+        &Pred::Near(_) => panic!("TODO geo"),
+        &Pred::NearSphere(_) => panic!("TODO geo"),
+        &Pred::GeoWithin(_) => panic!("TODO geo"),
+        &Pred::GeoIntersects(_) => panic!("TODO geo"),
     }
 }
 
