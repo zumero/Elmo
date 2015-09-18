@@ -586,14 +586,13 @@ impl Projection {
                 // we need to include things that are in ops so we can modify them.
                 for &(ref path, _) in self.ops.iter() {
                     let path = fix_positional(path, pos);
-                    let v = doc.walk_path(&path).hack_like_find_path();
                     match try!(d.entry(&path)) {
                         bson::Entry::Found(e) => {
                             // something might already be there from the include loop above,
-                            // so this is not an error in this case.
-                            //return Err(Error::Misc(format!("projection error, include, should not be here yet")));
+                            // so this is not an error in this case, and we do not overwrite.
                         },
                         bson::Entry::Absent(e) => {
+                            let v = doc.walk_path(&path).hack_like_find_path();
                             e.insert(v);
                         },
                     }

@@ -98,12 +98,16 @@ fn simple_mongo_strftime(fmt: &str, tm: &time::Tm) -> String {
 //
 // A Walk object doesn't clone any values from the document it walked.  
 // Rather, it contains references into same.
+//
 // Also, Walk.leaves() represents a missing value as a None, not as
 // BUndefined.
 //
+// Also, Walk.leaves() returns multiple values separately, rather
+// than synthesizing an array to contain them.
+//
 // This func takes the output of walk.leaves() and converts missing
-// values to BUndefined and clones all the values, like find_path()
-// did.
+// values to BUndefined and clones all the values, returning multiples
+// in a new array if needed, like find_path() did.
 fn leaves_to_cloned<'v, T: Iterator<Item=PathLeaf<'v>>>(leaves: T) -> Value {
     let mut vals = 
         leaves
@@ -285,6 +289,10 @@ impl<'v, 'p> WalkArray<'v, 'p> {
 }
 
 impl<'v, 'p> WalkDocument<'v, 'p> {
+    pub fn exists(&self) -> bool {
+        self.leaves().filter_map(|leaf| leaf.v).next().is_some()
+    }
+
     fn get_leaves(&self, path: &ActualPath, a: &mut Vec<PathLeaf<'v>>) {
         self.item.get_leaves(path.append_name(self.name), a);
     }
