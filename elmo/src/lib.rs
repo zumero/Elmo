@@ -4800,11 +4800,14 @@ impl Connection {
         let mut results = HashSet::new();
         for rr in seq {
             let row = try!(rr);
-            match row.doc.walk_path(key).hack_like_find_path() {
-                bson::Value::BUndefined => (),
-                v => {
-                    results.insert(v);
-                },
+            for leaf in row.doc.walk_path(key).leaves() {
+                match leaf.v {
+                    Some(v) => {
+                        results.insert(v.clone());
+                    },
+                    None => {
+                    },
+                }
             }
         }
         let mut a = bson::Array::new();
