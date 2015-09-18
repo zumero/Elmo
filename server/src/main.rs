@@ -1535,6 +1535,8 @@ pub fn serve(factory: Box<elmo::ConnectionFactory>) {
         match stream {
             Ok(stream) => {
                 let factory = factory.clone_for_new_thread();
+                // TODO thread::spawn panics when the OS cannot create
+                // a thread.  use thread::Builder::spawn() instead.
                 std::thread::spawn(move || {
                     // connection succeeded
                     let mut s = Server::new(factory);
