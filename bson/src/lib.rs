@@ -256,6 +256,24 @@ impl<'v, 'p> WalkDocument<'v, 'p> {
     pub fn project(&self, d: &mut Document) -> Result<()> {
         self.item.project(self.name, d)
     }
+
+    pub fn leaves(&self) -> Box<Iterator<Item=PathLeaf<'v>> + 'v> {
+        // TODO this is a lousy way to do this.  much better would be
+        // to keep track of the state and move forward on each call to
+        // next().  but very complicated.
+        let mut a = vec![];
+        let path = ActualPath::new();
+        self.get_leaves(&path, &mut a);
+
+        // TODO should we catch the case here where a is empty and
+        // add an empty leaf?
+
+        //println!("");
+        //println!("LEAVES: {:?}", a);
+        //println!("");
+        box a.into_iter()
+    }
+
 }
 
 impl<'v, 'p> WalkRoot<'v, 'p> {

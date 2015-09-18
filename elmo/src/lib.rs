@@ -574,7 +574,6 @@ impl Projection {
                     // {comments: [{id:0},{id:1},{id:2},{id:3}]}
                     // not
                     // {comments.id: [0,1,2,3]}
-                    // We could use the new find_path code and simply project it properly.
 
                     //println!("walk_path: path = {}", &path);
                     //println!("walk_path: doc = {:?}", doc);
@@ -587,6 +586,7 @@ impl Projection {
                 // we need to include things that are in ops so we can modify them.
                 for &(ref path, _) in self.ops.iter() {
                     let path = fix_positional(path, pos);
+                    // TODO convert to walk_path
                     let v = doc.find_path(&path);
                     match try!(d.entry(&path)) {
                         bson::Entry::Found(e) => {
@@ -4285,6 +4285,7 @@ impl Connection {
                 match rr {
                     Ok(row) => {
                         //println!("unwind: {:?}", row);
+                        // TODO convert to walk_path
                         match row.doc.find_path(&path) {
                             bson::Value::BUndefined => box std::iter::empty(),
                             bson::Value::BNull => box std::iter::empty(),
@@ -4799,6 +4800,7 @@ impl Connection {
         let mut results = HashSet::new();
         for rr in seq {
             let row = try!(rr);
+            // TODO convert to walk_path
             match row.doc.find_path(key) {
                 bson::Value::BUndefined => (),
                 v => {
