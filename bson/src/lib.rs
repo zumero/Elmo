@@ -1572,8 +1572,13 @@ pub enum Entry<'v,'p> {
 }
 
 impl Value {
+    pub fn fake_walk<'v, 'p>(&'v self) -> WalkRoot<'v, 'p> {
+        WalkRoot::Value(self)
+    }
+
     pub fn walk_path<'v, 'p>(&'v self, path: &'p str) -> WalkRoot<'v, 'p> {
         if path.is_empty() {
+            // TODO maybe this should be an error?
             WalkRoot::Value(self)
         } else {
             match self {

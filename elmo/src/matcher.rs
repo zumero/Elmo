@@ -552,10 +552,6 @@ fn match_pair_other<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, 
 }
 */
 
-fn match_predicate<F: Fn(usize)>(pred: &Pred, d: &bson::Value, cb_array_pos: &F) -> bool {
-    match_pair(pred, "", d, cb_array_pos)
-}
-
 // TODO consider not passing func and lit separately.  instead, have lit captured by the func
 // closure.
 fn cmp_with_array<F: Fn(&bson::Value, &bson::Value) -> bool, G: Fn(usize)>(func: F, cb_array_pos: &G, pos: Option<usize>, v: &bson::Value, lit: &bson::Value) -> bool {
@@ -617,11 +613,7 @@ fn cmp2_with_array<F: Fn(&bson::Value) -> bool, G: Fn(usize)>(func: F, cb_array_
 // TODO rather than call cb_array_pos, it would be better if this function simply returned
 // the actual path that matched.
 
-// TODO change this to accept the Walk
-fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_array_pos: &F) -> bool {
-    // not all predicates do their path searching in the same way
-    
-    let walk = start.walk_path(path);
+fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, cb_array_pos: &F) -> bool {
     let null = bson::Value::BNull;
 
     let eq = 
@@ -723,17 +715,12 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
             b == walk.exists()
         },
         &Pred::Not(ref preds) => {
-            // TODO don't call match_pair recursively
-            let any_matches = preds.iter().any(|p| !match_pair(p, path, start, cb_array_pos));
+            let any_matches = preds.iter().any(|p| !match_walk(p, walk, cb_array_pos));
             any_matches
         },
         &Pred::Nin(ref a) => {
-            // TODO since this is implemented in matchPredicate, it seems like we should
-            // be able to remove this implementation.  but if we do, some tests fail.
-            // figure out exactly why.
             // TODO clone below is awful
-            // TODO don't call match_pair recursively
-            !match_pair(&Pred::In(a.clone()), path, start, cb_array_pos)
+            !match_walk(&Pred::In(a.clone()), walk, cb_array_pos)
         },
         &Pred::REGEX(ref re) => {
             walk.leaves().any(
@@ -818,8 +805,6 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
                 )
         },
         &Pred::ElemMatchPreds(ref preds) => {
-            // TODO
-            //match_pair_other(pred, path, start, false, cb_array_pos)
             walk.leaves().any(
                 |leaf| {
                     match leaf.v {
@@ -827,7 +812,7 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
                             match v {
                                 &bson::Value::BArray(ref ba) => {
                                     let found = 
-                                        ba.items.iter().position(|vsub| preds.iter().all(|p| match_predicate(p, vsub, cb_array_pos)));
+                                        ba.items.iter().position(|vsub| preds.iter().all(|p| match_walk(p, &vsub.fake_walk(), cb_array_pos)));
                                     match found {
                                         Some(n) => {
                                             cb_array_pos(n);
@@ -858,9 +843,8 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
 fn match_query_item<F: Fn(usize)>(qit: &QueryItem, d: &bson::Value, cb_array_pos: &F) -> bool {
     match qit {
         &QueryItem::Compare(ref path, ref preds) => {
-            //let walk = d.walk_path(path);
-            //preds.iter().all(|p| match_walk(p, &walk, cb_array_pos))
-            preds.iter().all(|v| match_pair(v, path, d, cb_array_pos))
+            let walk = d.walk_path(path);
+            preds.iter().all(|p| match_walk(p, &walk, cb_array_pos))
         },
         &QueryItem::AND(ref qd) => {
             qd.iter().all(|v| match_query_doc(v, d, cb_array_pos))
@@ -899,7 +883,7 @@ pub fn match_pred_list(preds: &Vec<Pred>, d: &bson::Value) -> (bool,Option<usize
         // TODO error if it is already set?
         pos.set(Some(n));
     };
-    let b = preds.iter().all(|p| match_predicate(p, d, &cb));
+    let b = preds.iter().all(|p| match_walk(p, &d.fake_walk(), &cb));
     (b, pos.get())
 }
 
