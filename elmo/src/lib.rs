@@ -345,7 +345,7 @@ impl Projection {
     }
 
     pub fn parse(proj: bson::Document) -> Result<Projection> {
-        println!("parsing projection: {:?}", proj);
+        //println!("parsing projection: {:?}", proj);
         let pairs = proj.pairs;
 
         let (paths, pairs, maybe_mode) = {
@@ -4102,7 +4102,7 @@ impl Connection {
                                         }
                                     },
                                 };
-                            println!("id_item: {:?}", id_item);
+                            //println!("id_item: {:?}", id_item);
                             let expressions =
                                 not_id.into_iter().map(
                                     |(k,v)| 
@@ -4492,20 +4492,28 @@ impl Connection {
                 },
             }
         }
-        println!("grouped: {:?}", mapa);
+        //println!("grouped: {:?}", mapa);
         Ok(mapa)
     }
 
     fn compare_values_at_path(a: &bson::Value, b: &bson::Value, path: &str, backward: bool) -> Ordering {
-        // TODO switch the following calls to use walk_path()
+        let null = bson::Value::BNull;
 
-        let va = a.find_path(&path);
-        // TODO replace undefined
+        // TODO what is this supposed to do if the path yields multiple values?  error?
+        // zip?  what if the two iterators are different lengths?
+        // for now, we just call next() on the iterator and use the first value.
 
-        let vb = b.find_path(&path);
-        // TODO replace undefined
+        // TODO it is possible for leaves() to result in nothing.  unfortunately.  so
+        // for now, we add an extra unwrap_or(&null) after .next()
 
-        let c = matcher::cmpdir(&va, &vb, backward);
+        // TODO it would be nice to wrap the following long line in a function, but
+        // the lifetime of the return value is unknown.  sometimes it returns a reference
+        // to our special local 'null'
+
+        let va = a.walk_path(path).leaves().map(|leaf| leaf.v.unwrap_or(&null)).next().unwrap_or(&null);
+        let vb = b.walk_path(path).leaves().map(|leaf| leaf.v.unwrap_or(&null)).next().unwrap_or(&null);
+
+        let c = matcher::cmpdir(va, vb, backward);
         c
     }
 
@@ -4690,9 +4698,9 @@ impl Connection {
                         for &(ref path, ref op) in expressions.iter() {
                             match op {
                                 &AggProj::Expr(ref e) => {
-                                    println!("e: {:?}", e);
+                                    //println!("e: {:?}", e);
                                     let v = try!(Self::eval(&ctx, e));
-                                    println!("v: {:?}", v);
+                                    //println!("v: {:?}", v);
                                     match try!(d.entry(path)) {
                                         bson::Entry::Found(e) => {
                                             return Err(Error::Misc(format!("16400 already: {}", path)))

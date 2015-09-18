@@ -218,6 +218,11 @@ impl<'v, 'p> WalkArray<'v, 'p> {
 
         // if a is []
         // a.b is not == null
+
+        // TODO
+        // an unfortunate consequence of these apparent rules:
+        // in the case above, the path produces no leaves at all.
+
         // but if a is [{}]
         // then a.b IS null
 
@@ -270,6 +275,10 @@ impl<'v, 'p> WalkRoot<'v, 'p> {
             &WalkRoot::NotContainer(_) => a.push(PathLeaf::empty(path)),
             &WalkRoot::Value(v) => a.push(PathLeaf::new(v, path)),
         }
+
+        // TODO should we catch the case here where a is empty and
+        // add an empty leaf?
+
         //println!("");
         //println!("LEAVES: {:?}", a);
         //println!("");
