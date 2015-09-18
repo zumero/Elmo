@@ -2522,7 +2522,7 @@ impl<'a> SegmentCursor<'a> {
         let len = try!(misc::io::seek_len(&mut f));
 
         let mut res = SegmentCursor {
-            path: String::from_str(path),
+            path: String::from(path),
             fs: f,
             blocks: blocks,
             inner: inner,
@@ -4266,6 +4266,7 @@ type Database(_io:IDatabaseFile, _settings:DbSettings) =
 mod tests {
     use std;
     use super::Result;
+    use super::misc;
 
     #[test]
     fn it_works() {
@@ -4275,30 +4276,8 @@ mod tests {
     #[ignore]
     fn quick() {
         fn tempfile(base: &str) -> String {
-            fn tid() -> String {
-                // TODO use the rand crate
-                fn bytes() -> std::io::Result<[u8;16]> {
-                    let mut f = try!(std::fs::OpenOptions::new()
-                            .read(true)
-                            .open("/dev/urandom"));
-                    let mut ba = [0;16];
-                    try!(super::misc::io::read_fully(&mut f, &mut ba));
-                    Ok(ba)
-                }
-
-                fn to_hex_string(ba: &[u8]) -> String {
-                    let strs: Vec<String> = ba.iter()
-                        .map(|b| format!("{:02X}", b))
-                        .collect();
-                    strs.connect("")
-                }
-
-                let ba = bytes().unwrap();
-                to_hex_string(&ba)
-            }
-
             std::fs::create_dir("tmp");
-            let file = "tmp/".to_string() + base + "_" + &tid();
+            let file = "tmp/".to_string() + base + "_" + &misc::tid();
             file
         }
 

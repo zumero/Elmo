@@ -17,6 +17,8 @@
 #![feature(associated_consts)]
 #![feature(clone_from_slice)]
 
+extern crate rand;
+
 use std::collections::HashMap;
 
 pub fn fix_ms(n: i64) -> (i64, i64) {
@@ -32,17 +34,6 @@ pub fn fix_ms(n: i64) -> (i64, i64) {
 }
 
 pub fn tid() -> String {
-    // TODO use the rand crate
-    fn bytes() -> std::io::Result<[u8; 16]> {
-        use std::fs::OpenOptions;
-        let mut f = try!(OpenOptions::new()
-                .read(true)
-                .open("/dev/urandom"));
-        let mut ba = [0;16];
-        try!(io::read_fully(&mut f, &mut ba));
-        Ok(ba)
-    }
-
     fn to_hex_string(ba: &[u8]) -> String {
         let strs: Vec<String> = ba.iter()
             .map(|b| format!("{:02X}", b))
@@ -50,23 +41,12 @@ pub fn tid() -> String {
         strs.join("")
     }
 
-    let ba = bytes().unwrap();
+    let ba = rand::random::<[u8; 16]>();
     to_hex_string(&ba)
 }
 
 pub fn new_bson_objectid_rand() -> [u8; 12] {
-    // TODO use the rand crate
-    fn bytes() -> std::io::Result<[u8; 12]> {
-        use std::fs::OpenOptions;
-        let mut f = try!(OpenOptions::new()
-                .read(true)
-                .open("/dev/urandom"));
-        let mut ba = [0;12];
-        try!(io::read_fully(&mut f, &mut ba));
-        Ok(ba)
-    }
-
-    let ba = bytes().unwrap();
+    let ba = rand::random::<[u8; 12]>();
     ba
 }
 
