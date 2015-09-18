@@ -93,6 +93,41 @@ fn simple_mongo_strftime(fmt: &str, tm: &time::Tm) -> String {
     s
 }
 
+// this function allows Walk.leaves() to emulate the behavior of the
+// old find_path() function.  
+//
+// A Walk object doesn't clone any values from the document it walked.  
+// Rather, it contains references into same.
+// Also, Walk.leaves() represents a missing value as a None, not as
+// BUndefined.
+//
+// This func takes the output of walk.leaves() and converts missing
+// values to BUndefined and clones all the values, like find_path()
+// did.
+fn leaves_to_cloned<'v, T: Iterator<Item=PathLeaf<'v>>>(leaves: T) -> Value {
+    let mut vals = 
+        leaves
+        .map(
+            |leaf| 
+            match leaf.v {
+                Some(v) => v.clone(),
+                None => Value::BUndefined,
+            }
+            ).collect::<Vec<_>>();
+    if vals.is_empty() {
+        Value::BUndefined
+    } else if vals.len() == 1 {
+        vals.remove(0)
+    } else {
+        // so in this case, yes, when this path resolves to multiple values, 
+        // we need to construct an array for them.  test case arrayfind9
+        let a = Array {
+            items: vals,
+        };
+        Value::BArray(a)
+    }
+}
+
 #[derive(Debug,Clone)]
 pub enum PathKey {
     // TODO we want to not own/clone this String
@@ -171,10 +206,11 @@ pub enum WalkRoot<'v, 'p> {
     Array(WalkArray<'v, 'p>),
     NotContainer(&'v Value),
 
-    // this happens when given an empty path.
-    // it's a hack to allow a Walk to represent
-    // a single object.
-    Value(&'v Value),
+    // this is a hack to allow a Walk to represent
+    // a single object.  the matcher has a function
+    // which needs a WalkRoot but needs to be called
+    // with a single Value.
+    Fake(&'v Value),
 }
 
 #[derive(Debug)]
@@ -242,7 +278,7 @@ impl<'v, 'p> WalkArray<'v, 'p> {
                 },
                 &WalkRoot::Array(ref p) => (),
                 &WalkRoot::NotContainer(_) => (),
-                &WalkRoot::Value(_) => (),
+                &WalkRoot::Fake(_) => (),
             }
         }
     }
@@ -257,6 +293,7 @@ impl<'v, 'p> WalkDocument<'v, 'p> {
         self.item.project(self.name, d)
     }
 
+    // TODO this function exists at WalkDocument and WalkRoot
     pub fn leaves(&self) -> Box<Iterator<Item=PathLeaf<'v>> + 'v> {
         // TODO this is a lousy way to do this.  much better would be
         // to keep track of the state and move forward on each call to
@@ -274,6 +311,10 @@ impl<'v, 'p> WalkDocument<'v, 'p> {
         box a.into_iter()
     }
 
+    pub fn hack_like_find_path(&self) -> Value {
+        leaves_to_cloned(self.leaves())
+    }
+
 }
 
 impl<'v, 'p> WalkRoot<'v, 'p> {
@@ -281,6 +322,7 @@ impl<'v, 'p> WalkRoot<'v, 'p> {
         self.leaves().filter_map(|leaf| leaf.v).next().is_some()
     }
 
+    // TODO this function exists at WalkDocument and WalkRoot
     pub fn leaves(&self) -> Box<Iterator<Item=PathLeaf<'v>> + 'v> {
         // TODO this is a lousy way to do this.  much better would be
         // to keep track of the state and move forward on each call to
@@ -291,7 +333,7 @@ impl<'v, 'p> WalkRoot<'v, 'p> {
             &WalkRoot::Document(ref p) => p.get_leaves(&path, &mut a),
             &WalkRoot::Array(ref p) => p.get_leaves(&path, &mut a),
             &WalkRoot::NotContainer(_) => a.push(PathLeaf::empty(path)),
-            &WalkRoot::Value(v) => a.push(PathLeaf::new(v, path)),
+            &WalkRoot::Fake(v) => a.push(PathLeaf::new(v, path)),
         }
 
         // TODO should we catch the case here where a is empty and
@@ -301,6 +343,10 @@ impl<'v, 'p> WalkRoot<'v, 'p> {
         //println!("LEAVES: {:?}", a);
         //println!("");
         box a.into_iter()
+    }
+
+    pub fn hack_like_find_path(&self) -> Value {
+        leaves_to_cloned(self.leaves())
     }
 
     // TODO we probably do NOT want a project() method here, right?
@@ -397,7 +443,7 @@ impl<'v, 'p> WalkDocumentItem<'v, 'p> {
                         &WalkRoot::NotContainer(_) => {
                             // mongo tests seem to indicate that doing nothing here is correct
                         },
-                        &WalkRoot::Value(_) => {
+                        &WalkRoot::Fake(_) => {
                             // this can't happen anyway
                         },
                     }
@@ -901,25 +947,6 @@ impl Document {
         WalkDocument {
             name: name,
             item: item,
-        }
-    }
-
-    pub fn find_path(&self, path: &str) -> Value {
-        let dot = path.find('.');
-        let name = match dot { 
-            None => path,
-            Some(ndx) => &path[0 .. ndx]
-        };
-        match slice_find(&self.pairs, name) {
-            Some(ndx) => {
-                let v = &self.pairs[ndx].1;
-                match dot {
-                    // TODO ouch.  horrifying clone.
-                    None => v.clone(),
-                    Some(dot) => v.find_path(&path[dot + 1..])
-                }
-            },
-            None => Value::BUndefined
         }
     }
 
@@ -1600,19 +1627,14 @@ pub enum Entry<'v,'p> {
 
 impl Value {
     pub fn fake_walk<'v, 'p>(&'v self) -> WalkRoot<'v, 'p> {
-        WalkRoot::Value(self)
+        WalkRoot::Fake(self)
     }
 
     pub fn walk_path<'v, 'p>(&'v self, path: &'p str) -> WalkRoot<'v, 'p> {
-        if path.is_empty() {
-            // TODO maybe this should be an error?
-            WalkRoot::Value(self)
-        } else {
-            match self {
-                &Value::BDocument(ref bd) => WalkRoot::Document(bd.walk_path(path)),
-                &Value::BArray(ref ba) => WalkRoot::Array(ba.walk_path(path)),
-                _ => WalkRoot::NotContainer(self),
-            }
+        match self {
+            &Value::BDocument(ref bd) => WalkRoot::Document(bd.walk_path(path)),
+            &Value::BArray(ref ba) => WalkRoot::Array(ba.walk_path(path)),
+            _ => WalkRoot::NotContainer(self),
         }
     }
 
@@ -1986,62 +2008,6 @@ impl Value {
         &Value::BInt64(a) => Ok(a as f64),
         &Value::BDouble(a) => Ok(a),
         _ => Err(Error::Misc(String::from("must be convertible to f64"))),
-        }
-    }
-
-    // TODO it's awful that this returns a clone, simply because
-    // it sometimes has to construct an array.
-    pub fn find_path(&self, path: &str) -> Value {
-        let dot = path.find('.');
-        let name = match dot { 
-            None => path,
-            Some(ndx) => &path[0 .. ndx]
-        };
-        match self {
-            &Value::BDocument(ref bd) => bd.find_path(path),
-            &Value::BArray(ref ba) => {
-                // TODO move into array and call from here?
-                // TODO why not parse as usize?  
-                // what should happen if an element of the path is a
-                // negative number?
-                match name.parse::<i32>() {
-                    Err(_) => {
-                        // when we have an array and the next step of the path is not
-                        // an integer index, we search any subdocs in that array for
-                        // that path and construct an array of the matches.
-
-                        // document : { a:1, b:[ { c:1 }, { c:2 } ] }
-                        // path : b.c
-                        // needs to get: [ 1, 2 ]
-
-                        // TODO are there any functions in the matcher which could be
-                        // simplified by using this function? 
-                        let a:Vec<Value> = ba.items.iter().filter_map(|subv| 
-                                match subv {
-                                &Value::BDocument(_) => Some(subv.find_path(path)),
-                                _ => None
-                                }
-                                                       ).collect();
-                        // if nothing matched, return None instead of an empty array.
-                        // TODO is this right?
-                        if a.len()==0 { Value::BUndefined } else { Value::BArray(Array { items: a }) }
-                    }, 
-                    Ok(ndx) => {
-                        if ndx<0 {
-                            Value::BUndefined
-                        } else if (ndx as usize)>=ba.items.len() {
-                            Value::BUndefined
-                        } else {
-                            let v = &ba.items[ndx as usize];
-                            match dot {
-                                None => v.clone(),
-                                Some(dot) => v.find_path(&path[dot + 1..])
-                            }
-                        }
-                    }
-                }
-            },
-            _ => Value::BUndefined
         }
     }
 

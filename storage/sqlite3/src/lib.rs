@@ -223,8 +223,7 @@ fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::Ind
         for t in normspec {
             let k = &t.0;
             let typ = t.1;
-            // TODO convert this to use walk_path()
-            let mut v = new_doc.find_path(k);
+            let mut v = new_doc.walk_path(k).hack_like_find_path();
 
             // now we replace any BUndefined with BNull.  this seems, well,
             // kinda wrong, as it effectively encodes the index entries to
@@ -281,8 +280,7 @@ fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::Ind
                             q(vals, w, s, entries);
                         };
                     } else {
-                        // TODO convert this to use walk_path()
-                        match new_doc.find_path(k) {
+                        match new_doc.walk_path(k).hack_like_find_path() {
                             bson::Value::BUndefined => (),
                             v => {
                                 match v {
@@ -597,8 +595,7 @@ impl MyConn {
         fn contains_phrase(weights: &std::collections::HashMap<String, i32>, doc: &bson::Value, p: &str) -> bool {
             for k in weights.keys() {
                 let found = 
-                    // TODO convert this to use walk_path()
-                    match doc.find_path(k) {
+                    match doc.walk_path(k).hack_like_find_path() {
                         bson::Value::BUndefined => false,
                         v => match v {
                             bson::Value::BString(s) => s.find(p).is_some(),

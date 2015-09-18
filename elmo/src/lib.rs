@@ -586,8 +586,7 @@ impl Projection {
                 // we need to include things that are in ops so we can modify them.
                 for &(ref path, _) in self.ops.iter() {
                     let path = fix_positional(path, pos);
-                    // TODO convert to walk_path
-                    let v = doc.find_path(&path);
+                    let v = doc.walk_path(&path).hack_like_find_path();
                     match try!(d.entry(&path)) {
                         bson::Entry::Found(e) => {
                             // something might already be there from the include loop above,
@@ -3505,6 +3504,8 @@ impl Connection {
                         if subpath.chars().any(|c| c == (0 as char)) {
                             return Err(Error::MongoCode(16419, format!("field path cannot contain NUL char: {:?}", subpath)));
                         }
+                        // note that hack_like_find_path() isn't quite right here, since it
+                        // keeps the empty leaves and we need them to be discarded for this case.
                         let mut vals = v.walk_path(subpath).leaves().filter_map(|leaf| leaf.v).collect::<Vec<_>>();
                         if vals.is_empty() {
                             Ok(bson::Value::BUndefined)
@@ -4285,8 +4286,7 @@ impl Connection {
                 match rr {
                     Ok(row) => {
                         //println!("unwind: {:?}", row);
-                        // TODO convert to walk_path
-                        match row.doc.find_path(&path) {
+                        match row.doc.walk_path(&path).hack_like_find_path() {
                             bson::Value::BUndefined => box std::iter::empty(),
                             bson::Value::BNull => box std::iter::empty(),
                             bson::Value::BArray(a) => {
@@ -4800,8 +4800,7 @@ impl Connection {
         let mut results = HashSet::new();
         for rr in seq {
             let row = try!(rr);
-            // TODO convert to walk_path
-            match row.doc.find_path(key) {
+            match row.doc.walk_path(key).hack_like_find_path() {
                 bson::Value::BUndefined => (),
                 v => {
                     results.insert(v);
