@@ -170,6 +170,11 @@ pub enum WalkRoot<'v, 'p> {
     Document(WalkDocument<'v, 'p>),
     Array(WalkArray<'v, 'p>),
     NotContainer(&'v Value),
+
+    // this happens when given an empty path.
+    // it's a hack to allow a Walk to represent
+    // a single object.
+    Value(&'v Value),
 }
 
 #[derive(Debug)]
@@ -232,6 +237,7 @@ impl<'v, 'p> WalkArray<'v, 'p> {
                 },
                 &WalkRoot::Array(ref p) => (),
                 &WalkRoot::NotContainer(_) => (),
+                &WalkRoot::Value(_) => (),
             }
         }
     }
@@ -262,6 +268,7 @@ impl<'v, 'p> WalkRoot<'v, 'p> {
             &WalkRoot::Document(ref p) => p.get_leaves(&path, &mut a),
             &WalkRoot::Array(ref p) => p.get_leaves(&path, &mut a),
             &WalkRoot::NotContainer(_) => a.push(PathLeaf::empty(path)),
+            &WalkRoot::Value(v) => a.push(PathLeaf::new(v, path)),
         }
         //println!("");
         //println!("LEAVES: {:?}", a);
@@ -362,6 +369,9 @@ impl<'v, 'p> WalkDocumentItem<'v, 'p> {
                         },
                         &WalkRoot::NotContainer(_) => {
                             // mongo tests seem to indicate that doing nothing here is correct
+                        },
+                        &WalkRoot::Value(_) => {
+                            // this can't happen anyway
                         },
                     }
                 }
@@ -1563,10 +1573,14 @@ pub enum Entry<'v,'p> {
 
 impl Value {
     pub fn walk_path<'v, 'p>(&'v self, path: &'p str) -> WalkRoot<'v, 'p> {
-        match self {
-            &Value::BDocument(ref bd) => WalkRoot::Document(bd.walk_path(path)),
-            &Value::BArray(ref ba) => WalkRoot::Array(ba.walk_path(path)),
-            _ => WalkRoot::NotContainer(self),
+        if path.is_empty() {
+            WalkRoot::Value(self)
+        } else {
+            match self {
+                &Value::BDocument(ref bd) => WalkRoot::Document(bd.walk_path(path)),
+                &Value::BArray(ref ba) => WalkRoot::Array(ba.walk_path(path)),
+                _ => WalkRoot::NotContainer(self),
+            }
         }
     }
 
