@@ -337,25 +337,25 @@ fn cmp_gte(d: &bson::Value, lit: &bson::Value) -> bool {
     cmp_lte_gte(d, lit, Ordering::Greater)
 }
 
-fn do_elem_match_objects<F: Fn(usize)>(doc: &QueryDoc, d: &bson::Value, cb_array_pos: &F) -> bool {
-    match d {
+fn do_elem_match_objects<F: Fn(usize)>(doc: &QueryDoc, v: &bson::Value, cb_array_pos: &F) -> bool {
+    match v {
         &bson::Value::BArray(ref ba) => {
-            for vsub in &ba.items {
-                match vsub {
-                    &bson::Value::BArray(_) | &bson::Value::BDocument(_) => {
-                        if match_query_doc(doc, vsub, cb_array_pos) {
-                            return true;
-                        }
-                    },
-                    _ => {
-                    },
-                }
+            let found = 
+                ba.items.iter().position(|vsub| {
+                    match vsub {
+                        &bson::Value::BDocument(_) | &bson::Value::BArray(_) => match_query_doc(doc, vsub, cb_array_pos),
+                        _ => false,
+                    }
+                });
+            match found {
+                Some(n) => {
+                    cb_array_pos(n);
+                    true
+                },
+                None => false
             }
-            false
         },
-        _ => {
-            false
-        },
+        _ => false,
     }
 }
 
@@ -371,25 +371,7 @@ fn match_predicate<F: Fn(usize)>(pred: &Pred, d: &bson::Value, cb_array_pos: &F)
             !any_matches
         },
         &Pred::ElemMatchObjects(ref doc) => {
-            match d {
-                &bson::Value::BArray(ref ba) => {
-                    let found = 
-                        ba.items.iter().position(|vsub| {
-                            match vsub {
-                                &bson::Value::BDocument(_) | &bson::Value::BArray(_) => match_query_doc(doc, vsub, cb_array_pos),
-                                _ => false,
-                            }
-                        });
-                    match found {
-                        Some(n) => {
-                            cb_array_pos(n);
-                            true
-                        },
-                        None => false
-                    }
-                },
-                _ => false,
-            }
+            do_elem_match_objects(doc, d, cb_array_pos)
         },
         &Pred::ElemMatchPreds(ref preds) => {
             match d {
@@ -644,6 +626,21 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
             }
         );
 
+    let elem_match_objects =
+        |doc|
+        walk.leaves().any(
+            |leaf| {
+                match leaf.v {
+                    Some(v) => {
+                        do_elem_match_objects(doc, v, cb_array_pos)
+                    },
+                    None => {
+                        false
+                    },
+                }
+            }
+        );
+
     match pred {
         &Pred::EQ(ref lit) => {
             eq(lit)
@@ -718,9 +715,9 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
         &Pred::Exists(b) => {
             b == walk.exists()
         },
-        &Pred::Not(ref a) => {
+        &Pred::Not(ref preds) => {
             // TODO don't call match_pair recursively
-            let any_matches = a.iter().any(|p| !match_pair(p, path, start, cb_array_pos));
+            let any_matches = preds.iter().any(|p| !match_pair(p, path, start, cb_array_pos));
             any_matches
         },
         &Pred::Nin(ref a) => {
@@ -801,14 +798,48 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
                 )
         },
 
-        &Pred::ElemMatchObjects(_) => {
-            match_pair_other(pred, path, start, false, cb_array_pos)
+        &Pred::ElemMatchObjects(ref doc) => {
+            elem_match_objects(doc)
         },
-        &Pred::ElemMatchPreds(_) => {
-            match_pair_other(pred, path, start, false, cb_array_pos)
+        &Pred::AllElemMatchObjects(ref docs) => {
+            // for each elemMatch doc in the $all array, run it against
+            // the candidate array.  if any elemMatch doc fails, false.
+            docs.iter()
+                .all(
+                    |doc| 
+                    elem_match_objects(doc)
+                )
         },
-        &Pred::AllElemMatchObjects(_) => {
+        &Pred::ElemMatchPreds(ref preds) => {
+            // TODO
             match_pair_other(pred, path, start, false, cb_array_pos)
+            /*
+            walk.leaves().any(
+                |leaf| {
+                    match leaf.v {
+                        Some(v) => {
+                            match v {
+                                &bson::Value::BArray(ref ba) => {
+                                    let found = 
+                                        ba.items.iter().position(|vsub| preds.iter().all(|p| match_pair(p, path, vsub, cb_array_pos)));
+                                    match found {
+                                        Some(n) => {
+                                            cb_array_pos(n);
+                                            true
+                                        },
+                                        None => false
+                                    }
+                                },
+                                _ => false,
+                            }
+                        },
+                        None => {
+                            false
+                        },
+                    }
+                }
+            )
+            */
         },
 
         // TODO don't panic here.  need to return Result<>
