@@ -187,6 +187,8 @@ impl IndexInfo {
     }
 }
 
+// TODO it would be nice if this was a vec of references,
+// not a vec of owned bson values.
 pub type QueryKey = Vec<bson::Value>;
 
 #[derive(Hash,PartialEq,Eq,Debug,Clone)]

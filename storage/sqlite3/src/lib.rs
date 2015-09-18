@@ -198,6 +198,7 @@ fn verify_changes(stmt: &sqlite3::PreparedStatement, shouldbe: u64) -> Result<()
 
 fn copy_dirs_from_normspec_to_vals(normspec: &Vec<(String, elmo::IndexType)>, vals: Vec<bson::Value>) -> Vec<(bson::Value, bool)> {
     // TODO if normspec.len() < vals.len() then panic?
+    // TODO zip?
     let mut a = Vec::new();
     for (i,v) in vals.into_iter().enumerate() {
         let neg = normspec[i].1 == elmo::IndexType::Backward;
@@ -593,20 +594,23 @@ impl MyConn {
         };
 
         fn contains_phrase(weights: &std::collections::HashMap<String, i32>, doc: &bson::Value, p: &str) -> bool {
-            for k in weights.keys() {
-                let found = 
-                    match doc.walk_path(k).hack_like_find_path() {
-                        bson::Value::BUndefined => false,
-                        v => match v {
-                            bson::Value::BString(s) => s.find(p).is_some(),
-                            _ => false,
+            weights.keys().any(
+                |k|
+                doc.walk_path(k).leaves().any(
+                    |leaf|
+                    match leaf.v {
+                        Some(v) => {
+                            match v {
+                                &bson::Value::BString(ref s) => s.find(p).is_some(),
+                                _ => false,
+                            }
                         },
-                    };
-                if found {
-                    return true;
-                }
-            }
-            return false;
+                        None => {
+                            false
+                        },
+                    }
+                    )
+                )
         }
 
         fn check_phrase(terms: &Vec<elmo::TextQueryTerm>, weights: &std::collections::HashMap<String, i32>, doc: &bson::Value) -> bool {
