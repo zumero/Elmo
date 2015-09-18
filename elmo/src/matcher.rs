@@ -596,23 +596,21 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
     let walk = start.walk_path(path);
     let null = bson::Value::BNull;
 
+    let eq = 
+        |lit|
+        walk.leaves().any(
+            |leaf| {
+                let pos = leaf.path.last_array_index();
+                cmp_with_array(cmp_eq, cb_array_pos, pos, leaf.v.unwrap_or(&null), lit)
+            }
+        );
+
     match pred {
         &Pred::EQ(ref lit) => {
-            walk.leaves().any(
-                |leaf| {
-                    let pos = leaf.path.last_array_index();
-                    cmp_with_array(cmp_eq, cb_array_pos, pos, leaf.v.unwrap_or(&null), lit)
-                }
-            )
+            eq(lit)
         },
-        &Pred::NE(ref a) => {
-            // TODO how is NE supposed to work?
-
-            // TODO since this is implemented in matchPredicate, it seems like we should
-            // be able to remove this implementation.  but if we do, some tests fail.
-            // figure out exactly why.
-            // TODO clone below is awful
-            !match_pair(&Pred::EQ(a.clone()), path, start, cb_array_pos)
+        &Pred::NE(ref lit) => {
+            !eq(lit)
         },
         &Pred::LT(ref lit) => {
             walk.leaves().any(
@@ -682,6 +680,7 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
             b == walk.exists()
         },
         &Pred::Not(ref a) => {
+            // TODO don't call match_pair recursively
             let any_matches = a.iter().any(|p| !match_pair(p, path, start, cb_array_pos));
             any_matches
         },
@@ -690,6 +689,7 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
             // be able to remove this implementation.  but if we do, some tests fail.
             // figure out exactly why.
             // TODO clone below is awful
+            // TODO don't call match_pair recursively
             !match_pair(&Pred::In(a.clone()), path, start, cb_array_pos)
         },
         _ => {
