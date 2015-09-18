@@ -587,6 +587,9 @@ fn cmp_with_array<F: Fn(&bson::Value, &bson::Value) -> bool, G: Fn(usize)>(func:
     }
 }
 
+// TODO rather than call cb_array_pos, it would be better if this function simply returned
+// the actual path that matched.
+
 fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_array_pos: &F) -> bool {
     // not all predicates do their path searching in the same way
     
@@ -601,6 +604,15 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
                     cmp_with_array(cmp_eq, cb_array_pos, pos, leaf.v.unwrap_or(&null), lit)
                 }
             )
+        },
+        &Pred::NE(ref a) => {
+            // TODO how is NE supposed to work?
+
+            // TODO since this is implemented in matchPredicate, it seems like we should
+            // be able to remove this implementation.  but if we do, some tests fail.
+            // figure out exactly why.
+            // TODO clone below is awful
+            !match_pair(&Pred::EQ(a.clone()), path, start, cb_array_pos)
         },
         &Pred::LT(ref lit) => {
             walk.leaves().any(
@@ -635,11 +647,35 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
             )
         },
         &Pred::All(ref a) => {
+            // $all doesn't seem to work like it's documented.  the docs say:
+
+            // The $all operator selects the documents where the value of a field is an array that
+            // contains all the specified elements.
+
+            // But the field does not need to be an array.  It can be a number.
+
+            // And the field can be "dive array" as well.
+
+            // A more correct description of the behavior would be:
+
+            // The $all operator selects the documents where each of the given literals (the
+            // array of literals given as an argument to $all) is "equal to" one of the values
+            // resulting from walking the field path, where "equal to" is defined the same
+            // as it is for regular Pred::EQ, meaning that the value can be equal to the literal, 
+            // or the value can be an array which contains any value which is equal to the
+            // literal.
+
             if a.len() == 0 {
                 false
             } else {
-                // TODO clone below is awful
-                a.iter().all(|lit| match_pair(&Pred::EQ(lit.clone()), path, start, cb_array_pos))
+                a.iter().all( 
+                    |lit| 
+                    walk.leaves().any( 
+                        |leaf|
+                        // apparently cb_array_pos doesn't matter here
+                        cmp_with_array(cmp_eq, cb_array_pos, None, leaf.v.unwrap_or(&null), lit)
+                    )
+                )
             }
         },
         &Pred::Exists(b) => {
@@ -648,13 +684,6 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
         &Pred::Not(ref a) => {
             let any_matches = a.iter().any(|p| !match_pair(p, path, start, cb_array_pos));
             any_matches
-        },
-        &Pred::NE(ref a) => {
-            // TODO since this is implemented in matchPredicate, it seems like we should
-            // be able to remove this implementation.  but if we do, some tests fail.
-            // figure out exactly why.
-            // TODO clone below is awful
-            !match_pair(&Pred::EQ(a.clone()), path, start, cb_array_pos)
         },
         &Pred::Nin(ref a) => {
             // TODO since this is implemented in matchPredicate, it seems like we should
@@ -668,123 +697,6 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
         },
     }
 }
-
-/*
-fn match_walk<F: Fn(usize)>(pred: &Pred, walk: &bson::WalkPath, cb_array_pos: &F) -> bool {
-    println!("match_walk: pred = {:?}", pred);
-    println!("match_walk: walk = {:?}", walk);
-    match pred {
-        &Pred::Exists(b) => {
-            b == walk.exists()
-        },
-        &Pred::Not(ref preds) => {
-            let any_matches = preds.iter().any(|p| match_walk(p, walk, cb_array_pos));
-            !any_matches
-        },
-        &Pred::EQ(ref lit) => walk.values().any(|d| cmp_eq(d, lit)),
-        &Pred::NE(ref lit) => walk.values().any(|d| !cmp_eq(d, lit)),
-        &Pred::LT(ref lit) => walk.values().any(|d| cmp_lt(d, lit)),
-        &Pred::GT(ref lit) => walk.values().any(|d| cmp_gt(d, lit)),
-        &Pred::LTE(ref lit) => walk.values().any(|d| cmp_lte(d, lit)),
-        &Pred::GTE(ref lit) => walk.values().any(|d| cmp_gte(d, lit)),
-        &Pred::Type(n) => walk.values().any(|d| (d.getTypeNumber_u8() as i32) == n),
-        &Pred::Size(n) => walk.values().any(|d| 
-            match d {
-                &bson::Value::BArray(ref ba) => ba.items.len() == (n as usize),
-                _ => false,
-            }
-            ),
-        &Pred::Mod(div, rem) => walk.values().any(|d| 
-            match d {
-                &bson::Value::BInt32(n) => ((n as i64) % div) == rem,
-                &bson::Value::BInt64(n) => (n % div) == rem,
-                &bson::Value::BDouble(n) => ((n as i64) % div) == rem,
-                _ => false,
-            }
-            ),
-        &Pred::REGEX(ref re) => walk.values().any(|d| 
-            match d {
-                &bson::Value::BString(ref s) => {
-                    re.is_match(s)
-                },
-                _ => false,
-            }
-            ),
-        &Pred::In(ref lits) => walk.values().any(|d| lits.iter().any(|v| cmp_in(d, v))),
-        &Pred::Nin(ref lits) => walk.values().any(|d| !lits.iter().any(|v| cmp_in(d, v))),
-        &Pred::ElemMatchObjects(ref doc) => walk.values().any(|d|
-            match d {
-                &bson::Value::BArray(ref ba) => {
-                    let found = 
-                        ba.items.iter().position(|vsub| {
-                            match vsub {
-                                &bson::Value::BDocument(_) | &bson::Value::BArray(_) => match_query_doc(doc, vsub, cb_array_pos),
-                                _ => false,
-                            }
-                        });
-                    match found {
-                        Some(n) => {
-                            cb_array_pos(n);
-                            true
-                        },
-                        None => false
-                    }
-                },
-                _ => false,
-            }
-            ),
-        &Pred::ElemMatchPreds(ref preds) => walk.values().any(|d|
-            match d {
-                &bson::Value::BArray(ref ba) => {
-                    let found = 
-                        ba.items.iter().position(|vsub| preds.iter().all(|p| match_predicate(p, vsub, cb_array_pos)));
-                    match found {
-                        Some(n) => {
-                            cb_array_pos(n);
-                            true
-                        },
-                        None => false
-                    }
-                },
-                _ => false,
-            }
-            ),
-        &Pred::AllElemMatchObjects(ref docs) => walk.values().any(|d| 
-            // for each elemMatch doc in the $all array, run it against
-            // the candidate array.  if any elemMatch doc fails, false.
-            docs.iter().all(|doc| do_elem_match_objects(doc, d, cb_array_pos))
-            ),
-        &Pred::All(ref lits) => walk.values().any(|d|
-            if lits.len() == 0 {
-                false
-            } else {
-                !lits.iter().any(|lit| 
-                                                                {
-                    let b =
-                        if cmp_eq(d, lit) {
-                            true
-                        } else {
-                            match d {
-                                &bson::Value::BArray(ref ba) => {
-                                    ba.items.iter().any(|v| cmp_eq(v, lit))
-                                },
-                                _ => false,
-                            }
-                        };
-                    !b
-                                                                }
-                    )
-            }
-                ),
-
-        // TODO don't panic here.  need to return Result<>
-        &Pred::Near(_) => panic!("TODO geo"),
-        &Pred::NearSphere(_) => panic!("TODO geo"),
-        &Pred::GeoWithin(_) => panic!("TODO geo"),
-        &Pred::GeoIntersects(_) => panic!("TODO geo"),
-    }
-}
-*/
 
 fn match_query_item<F: Fn(usize)>(qit: &QueryItem, d: &bson::Value, cb_array_pos: &F) -> bool {
     match qit {
