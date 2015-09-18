@@ -455,6 +455,7 @@ fn match_predicate<F: Fn(usize)>(pred: &Pred, d: &bson::Value, cb_array_pos: &F)
     }
 }
 
+/*
 fn match_pair_other<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, arr: bool, cb_array_pos: &F) -> bool {
     //println!("match_pair_other: pred = {:?}", pred);
     //println!("match_pair_other: path = {:?}", path);
@@ -549,6 +550,7 @@ fn match_pair_other<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, 
         },
     }
 }
+*/
 
 // TODO consider not passing func and lit separately.  instead, have lit captured by the func
 // closure.
@@ -810,28 +812,14 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
                     elem_match_objects(doc)
                 )
         },
-        &Pred::ElemMatchPreds(ref preds) => {
+        &Pred::ElemMatchPreds(_) => {
             // TODO
-            match_pair_other(pred, path, start, false, cb_array_pos)
-            /*
+            //match_pair_other(pred, path, start, false, cb_array_pos)
             walk.leaves().any(
                 |leaf| {
                     match leaf.v {
                         Some(v) => {
-                            match v {
-                                &bson::Value::BArray(ref ba) => {
-                                    let found = 
-                                        ba.items.iter().position(|vsub| preds.iter().all(|p| match_pair(p, path, vsub, cb_array_pos)));
-                                    match found {
-                                        Some(n) => {
-                                            cb_array_pos(n);
-                                            true
-                                        },
-                                        None => false
-                                    }
-                                },
-                                _ => false,
-                            }
+                            match_predicate(pred, v, cb_array_pos)
                         },
                         None => {
                             false
@@ -839,7 +827,6 @@ fn match_pair<F: Fn(usize)>(pred: &Pred, path: &str, start: &bson::Value, cb_arr
                     }
                 }
             )
-            */
         },
 
         // TODO don't panic here.  need to return Result<>
