@@ -592,6 +592,8 @@ impl Projection {
                             // so this is not an error in this case, and we do not overwrite.
                         },
                         bson::Entry::Absent(e) => {
+                            // TODO is hack_like_find_path() what we want here?
+                            // do we NEED the synthesized array behavior here?
                             let v = doc.walk_path(&path).hack_like_find_path();
                             e.insert(v);
                         },
@@ -4285,6 +4287,8 @@ impl Connection {
                 match rr {
                     Ok(row) => {
                         //println!("unwind: {:?}", row);
+                        // TODO is hack_like_find_path() what we want?
+                        // do we NEED the synthesized array behavior?
                         match row.doc.walk_path(&path).hack_like_find_path() {
                             bson::Value::BUndefined => box std::iter::empty(),
                             bson::Value::BNull => box std::iter::empty(),
@@ -4295,6 +4299,7 @@ impl Connection {
                                 } else {
                                     //let row = row.clone();
                                     let unwind = a.items.into_iter().map(|v| -> Result<Row> {
+                                        // TODO clone disaster
                                         let mut d = row.doc.clone();
                                         d.set_path(&path, v.clone());
                                         let r = Row { 
