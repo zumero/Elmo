@@ -876,7 +876,7 @@ fn parse_pred(k: &str, v: bson::Value) -> Result<Pred> {
                         let mut bd = try!(bv.into_document());
                         let (k,v) = bd.pairs.pop().expect("already checked this? TODO");
                         let bd = try!(v.into_document());
-                        let d = try!(parse_query_doc(&bd));
+                        let d = try!(parse_query_doc(bd));
                         let d = QueryDoc::QueryDoc(d);
                         Ok(d)
                     }
@@ -945,7 +945,7 @@ fn parse_pred(k: &str, v: bson::Value) -> Result<Pred> {
         "$elemMatch" => {
             if value_is_query_doc(&v) {
                 let bd = try!(v.into_document());
-                let d = try!(parse_query_doc(&bd));
+                let d = try!(parse_query_doc(bd));
                 let d = QueryDoc::QueryDoc(d);
                 Ok(Pred::ElemMatchObjects(d))
             } else {
@@ -964,7 +964,7 @@ fn parse_pred(k: &str, v: bson::Value) -> Result<Pred> {
     }
 }
 
-pub fn parse_pred_list(pairs: Vec<(String,bson::Value)>) -> Result<Vec<Pred>> {
+pub fn parse_pred_list(pairs: Vec<(String, bson::Value)>) -> Result<Vec<Pred>> {
     let (regex, other): (Vec<_>, Vec<_>) = pairs.into_iter().partition(|&(ref k,_)| k == "$regex" || k == "$options");
     let mut preds = try!(other.into_iter().map(|(k,v)| parse_pred(&k,v)).collect::<Result<Vec<_>>>());
     let (mut expr, mut options): (Vec<_>, Vec<_>) = regex.into_iter().partition(|&(ref k,_)| k == "$regex");
@@ -1007,49 +1007,46 @@ pub fn parse_pred_list(pairs: Vec<(String,bson::Value)>) -> Result<Vec<Pred>> {
     Ok(preds)
 }
 
-fn parse_compare(k: &str, v: &bson::Value) -> Result<QueryItem> {
+fn parse_compare(k: String, v: bson::Value) -> Result<QueryItem> {
     if k.starts_with("$") {
         return Err(super::Error::Misc(String::from("parse_compare $")));
     }
     let qit = 
         match v {
-            &bson::Value::BDocument(ref bd) => {
+            bson::Value::BDocument(bd) => {
                 if bd.is_dbref() {
-                    QueryItem::Compare(String::from(k), vec![Pred::EQ(v.clone())])
+                    QueryItem::Compare(k, vec![Pred::EQ(bson::Value::BDocument(bd))])
                 } else if bd.pairs.iter().any(|&(ref k, _)| k.starts_with("$")) {
-                    // TODO clone
-                    let preds = try!(parse_pred_list(bd.pairs.clone()));
-                    QueryItem::Compare(String::from(k), preds)
+                    let preds = try!(parse_pred_list(bd.pairs));
+                    QueryItem::Compare(k, preds)
                 } else {
-                    QueryItem::Compare(String::from(k), vec![Pred::EQ(v.clone())])
+                    QueryItem::Compare(k, vec![Pred::EQ(bson::Value::BDocument(bd))])
                 }
             },
-            &bson::Value::BRegex(ref expr, ref options) => {
+            bson::Value::BRegex(expr, options) => {
                 // TODO options
-                let re = try!(regex::Regex::new(expr).map_err(super::wrap_err));
-                QueryItem::Compare(String::from(k), vec![Pred::REGEX(re)])
+                let re = try!(regex::Regex::new(&expr).map_err(super::wrap_err));
+                QueryItem::Compare(k, vec![Pred::REGEX(re)])
             },
             _ => {
-                // TODO clone
-                QueryItem::Compare(String::from(k), vec![Pred::EQ(v.clone())])
+                QueryItem::Compare(k, vec![Pred::EQ(v)])
             },
         };
     Ok(qit)
 }
 
-// TODO this func kinda wants to consume its argument
-fn parse_query_doc(bd: &bson::Document) -> Result<Vec<QueryItem>> {
+fn parse_query_doc(bd: bson::Document) -> Result<Vec<QueryItem>> {
     #[derive(Copy,Clone)]
     enum AndOr {
         And,
         Or,
     }
 
-    fn do_and_or(result: &mut Vec<QueryItem>, a: &Vec<bson::Value>, op: AndOr) -> Result<()> {
+    fn do_and_or(result: &mut Vec<QueryItem>, mut a: Vec<bson::Value>, op: AndOr) -> Result<()> {
         if a.len() == 0 {
             return Err(super::Error::Misc(String::from("array arg for $and+$or cannot be empty")));
         } else if a.len() == 1 {
-            let d = try!(a[0].as_document());
+            let d = try!(a.remove(0).into_document());
             let subpairs = try!(parse_query_doc(d));
             for it in subpairs {
                 result.push(it);
@@ -1058,7 +1055,7 @@ fn parse_query_doc(bd: &bson::Document) -> Result<Vec<QueryItem>> {
             // TODO this wants to be a map+closure, but the error handling is weird
             let mut m = Vec::new();
             for d in a {
-                let d = try!(d.as_document());
+                let d = try!(d.into_document());
                 let d = try!(parse_query_doc(d));
                 let d = QueryDoc::QueryDoc(d);
                 m.push(d);
@@ -1072,34 +1069,33 @@ fn parse_query_doc(bd: &bson::Document) -> Result<Vec<QueryItem>> {
     }
 
     let mut result = Vec::new();
-    for &(ref k, ref v) in &bd.pairs {
+    for (k, v) in bd.pairs {
         match k.as_str() {
             "$comment" => {
             },
             "$atomic" => {
             },
             "$where" => {
-                // TODO clone
-                result.push(QueryItem::Where(v.clone()));
+                result.push(QueryItem::Where(v));
                 //return Err(Error::Misc(format!("$where is not supported")));
             },
             "$and" => {
-                let ba = try!(v.as_array());
-                try!(do_and_or(&mut result, &ba.items, AndOr::And));
+                let ba = try!(v.into_array());
+                try!(do_and_or(&mut result, ba.items, AndOr::And));
             },
             "$or" => {
-                let ba = try!(v.as_array());
-                try!(do_and_or(&mut result, &ba.items, AndOr::Or));
+                let ba = try!(v.into_array());
+                try!(do_and_or(&mut result, ba.items, AndOr::Or));
             },
             "$text" => {
                 match v {
-                    &bson::Value::BDocument(ref bd) => {
-                        match bd.pairs.iter().find(|&&(ref k, _)| k == "$search") {
-                            Some(&(_, bson::Value::BString(ref s))) => {
-                                result.push(QueryItem::Text(s.clone()));
+                    bson::Value::BDocument(bd) => {
+                        match bd.pairs.into_iter().find(|&(ref k, _)| k == "$search") {
+                            Some((_, bson::Value::BString(s))) => {
+                                result.push(QueryItem::Text(s));
                             },
                             _ => {
-                                return Err(super::Error::Misc(format!("invalid $text: {:?}", bd)));
+                                return Err(super::Error::Misc(format!("invalid $text")));
                             },
                         }
                     },
@@ -1109,15 +1105,15 @@ fn parse_query_doc(bd: &bson::Document) -> Result<Vec<QueryItem>> {
                 }
             },
             "$nor" => {
-                let ba = try!(v.as_array());
+                let ba = try!(v.into_array());
                 if ba.items.len() == 0 {
                     return Err(super::Error::Misc(String::from("array arg for $nor cannot be empty")));
                 }
                 // TODO what if just one?  canonicalize?
                 // TODO this wants to be a map+closure, but the error handling is weird
                 let mut m = Vec::new();
-                for d in &ba.items {
-                    let d = try!(d.as_document());
+                for d in ba.items {
+                    let d = try!(d.into_document());
                     let d = try!(parse_query_doc(d));
                     let d = QueryDoc::QueryDoc(d);
                     m.push(d);
@@ -1133,7 +1129,7 @@ fn parse_query_doc(bd: &bson::Document) -> Result<Vec<QueryItem>> {
 }
 
 pub fn parse_query(v: bson::Document) -> Result<QueryDoc> {
-    let a = try!(parse_query_doc(&v));
+    let a = try!(parse_query_doc(v));
     let q = QueryDoc::QueryDoc(a);
     Ok(q)
 }
