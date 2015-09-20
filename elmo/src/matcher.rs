@@ -8,6 +8,8 @@ extern crate misc;
 extern crate bson;
 extern crate regex;
 
+// TODO it would be nice if all bson Values in a QueryDoc tree would 
+// be references into the bson Value which was parsed, not clones.
 #[derive(Debug)]
 pub enum QueryDoc {
     QueryDoc(Vec<QueryItem>),

@@ -2270,7 +2270,9 @@ impl Value {
         a
     }
 
-    pub fn encode_multi_for_index(vals: Vec<(&Value, bool)>) -> Vec<u8> {
+    // TODO this doesn't need to take owernship of the bson Values.
+    // arg should be a vec of (&Value, bool)
+    pub fn encode_multi_for_index(vals: Vec<(Value, bool)>) -> Vec<u8> {
         let mut r = Vec::new();
         for (v, neg) in vals {
             let a = Self::encode_one_for_index(&v, neg);
