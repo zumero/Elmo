@@ -189,7 +189,7 @@ impl IndexInfo {
 
 // TODO it would be nice if this was a vec of references,
 // not a vec of owned bson values.
-pub type QueryKey = Vec<bson::Value>;
+pub type QueryKey<'a> = Vec<&'a bson::Value>;
 
 #[derive(Hash,PartialEq,Eq,Debug,Clone)]
 pub enum TextQueryTerm {
@@ -198,24 +198,29 @@ pub enum TextQueryTerm {
 }
 
 #[derive(Debug)]
-pub enum QueryBounds {
-    EQ(QueryKey),
+pub enum QueryBounds<'a> {
+    EQ(QueryKey<'a>),
     // TODO tempted to make the QueryKey in Text be an option
-    Text(QueryKey,Vec<TextQueryTerm>),
-    GT(QueryKey),
-    GTE(QueryKey),
-    LT(QueryKey),
-    LTE(QueryKey),
-    GT_LT(QueryKey, QueryKey),
-    GT_LTE(QueryKey, QueryKey),
-    GTE_LT(QueryKey, QueryKey),
-    GTE_LTE(QueryKey, QueryKey),
+    Text(QueryKey<'a>,Vec<TextQueryTerm>),
+    GT(QueryKey<'a>),
+    GTE(QueryKey<'a>),
+    LT(QueryKey<'a>),
+    LTE(QueryKey<'a>),
+    GT_LT(QueryKey<'a>, QueryKey<'a>),
+    GT_LTE(QueryKey<'a>, QueryKey<'a>),
+    GTE_LT(QueryKey<'a>, QueryKey<'a>),
+    GTE_LTE(QueryKey<'a>, QueryKey<'a>),
+}
+
+struct Comps<'a> {
+    eq: HashMap<&'a str, &'a bson::Value>,
+    ineq: HashMap<&'a str, (Option<(OpGt, &'a bson::Value)>, Option<(OpLt, &'a bson::Value)>)>,
 }
 
 #[derive(Debug)]
-pub struct QueryPlan {
+pub struct QueryPlan<'a> {
     pub ndx: IndexInfo,
-    pub bounds: QueryBounds,
+    pub bounds: QueryBounds<'a>,
 }
 
 #[derive(PartialEq,Copy,Clone)]
@@ -832,7 +837,7 @@ pub trait StorageBase {
     fn list_collections(&self) -> Result<Vec<CollectionInfo>>;
     fn list_indexes(&self) -> Result<Vec<IndexInfo>>;
 
-    fn get_collection_reader(&self, db: &str, coll: &str, plan: Option<QueryPlan>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
+    fn get_collection_reader(&self, db: &str, coll: &str, plan: Option<&QueryPlan>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
 }
 
 pub trait StorageCollectionWriter {
@@ -846,7 +851,7 @@ pub trait StorageCollectionWriter {
 // TODO or is it enough that the actual implementation of this trait impl Drop?
 
 pub trait StorageReader : StorageBase {
-    fn into_collection_reader(self: Box<Self>, db: &str, coll: &str, plan: Option<QueryPlan>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
+    fn into_collection_reader(self: Box<Self>, db: &str, coll: &str, plan: Option<&QueryPlan>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
 }
 
 pub trait StorageWriter : StorageBase {
@@ -1813,7 +1818,7 @@ impl Connection {
         //println!("indexes: {:?}", indexes);
         let plan = try!(Self::choose_index(&indexes, &m, None));
         //println!("plan: {:?}", plan);
-        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(w.get_collection_reader(db, coll, plan));
+        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(w.get_collection_reader(db, coll, plan.as_ref()));
         // TODO we shadow-let here because the type from seq_match_ref() doesn't match the original
         // type because of its explicit lifetime.
         let mut seq = Self::seq_match_ref(seq, &m);
@@ -1944,7 +1949,7 @@ impl Connection {
                                     |ndx| ndx.db == db && ndx.coll == coll
                                     ).collect::<Vec<_>>();
                                 let plan = try!(Self::choose_index(&indexes, &m, None));
-                                let mut seq: Box<Iterator<Item=Result<Row>>> = try!(reader.into_collection_reader(db, coll, plan));
+                                let mut seq: Box<Iterator<Item=Result<Row>>> = try!(reader.into_collection_reader(db, coll, plan.as_ref()));
                                 // TODO we shadow-let here because the type from seq_match_ref() doesn't match the original
                                 // type because of its explicit lifetime.
                                 let seq = Self::seq_match_ref(seq, &m);
@@ -2432,10 +2437,13 @@ impl Connection {
                         |ndx| ndx.db == db && ndx.coll == coll
                         ).collect::<Vec<_>>();
                     //println!("indexes: {:?}", indexes);
+                    let mut seq = {
                     let plan = try!(Self::choose_index(&indexes, &m, None));
                     //println!("plan: {:?}", plan);
                     // TODO is this safe?  or do we need two-conn isolation like update?
-                    let mut seq: Box<Iterator<Item=Result<Row>>> = try!(writer.get_collection_reader(db, coll, plan));
+                    let mut seq: Box<Iterator<Item=Result<Row>>> = try!(writer.get_collection_reader(db, coll, plan.as_ref()));
+                    seq
+                    };
                     seq = Self::seq_match(seq, m);
                     for rr in seq {
                         let row = try!(rr);
@@ -2465,17 +2473,16 @@ impl Connection {
         Ok(result)
     }
 
-    fn parse_index_min_max(v: bson::Value) -> Result<Vec<(String,bson::Value)>> {
-        let v = try!(v.into_document());
-        let matcher::QueryDoc::QueryDoc(items) = try!(matcher::parse_query(v));
-        items.into_iter().map(
+    fn parse_index_min_max<'m>(m: &'m matcher::QueryDoc) -> Result<Vec<(&'m str, &'m bson::Value)>> {
+        let &matcher::QueryDoc::QueryDoc(ref items) = m;
+        items.iter().map(
             |it| match it {
                 // TODO wish we could pattern match on the vec.
-                matcher::QueryItem::Compare(k, mut preds) => {
+                &matcher::QueryItem::Compare(ref k, ref preds) => {
                     if preds.len() == 1 {
-                        match preds.pop().expect("just checked") {
-                            matcher::Pred::EQ(v) => {
-                                Ok((k, v))
+                        match &preds[0] {
+                            &matcher::Pred::EQ(ref v) => {
+                                Ok((k.as_str(), v))
                             },
                             _ => {
                                 Err(Error::Misc(String::from("bad min max")))
@@ -2712,13 +2719,12 @@ impl Connection {
         Ok(m2)
     }
 
-    fn fit_index_to_query(
+    fn fit_index_to_query<'a>(
         ndx: &IndexInfo, 
-        comps_eq: &HashMap<&str, &bson::Value>, 
-        comps_ineq: &HashMap<&str, (Option<(OpGt, &bson::Value)>, Option<(OpLt, &bson::Value)>)>, 
+        comps: &Comps<'a>,
         text_query: &Option<Vec<TextQueryTerm>>
         ) 
-        -> Result<Option<QueryPlan>> 
+        -> Result<Option<QueryPlan<'a>>> 
     {
         let (scalar_keys, weights) = try!(get_normalized_spec(ndx));
         if weights.is_none() && text_query.is_some() {
@@ -2760,7 +2766,7 @@ impl Connection {
                 let matching_ineqs = 
                     scalar_keys.iter().map(
                         |&(ref k,_)| {
-                            match comps_ineq.get(k.as_str()) {
+                            match comps.ineq.get(k.as_str()) {
                                 Some(a) => Some(a),
                                 None => None,
                             }
@@ -2769,10 +2775,9 @@ impl Connection {
                 let mut first_no_eqs = None;
                 let mut matching_eqs = vec![];
                 for (i, &(ref k, _)) in scalar_keys.iter().enumerate() {
-                    match comps_eq.get(k.as_str()) {
+                    match comps.eq.get(k.as_str()) {
                         Some(a) => {
-                            // TODO clone
-                            matching_eqs.push((*a).clone());
+                            matching_eqs.push(*a);
                         },
                         None => {
                             first_no_eqs = Some(i);
@@ -2840,8 +2845,7 @@ impl Connection {
                                     },
                                     Some(&(Some(min),None)) => {
                                         let (op, v) = min;
-                                        // TODO clone
-                                        matching_eqs.push(v.clone());
+                                        matching_eqs.push(v);
                                         match op {
                                             OpGt::GT => {
                                                 let bounds = QueryBounds::GT(matching_eqs);
@@ -2865,8 +2869,7 @@ impl Connection {
                                     },
                                     Some(&(None,Some(max))) => {
                                         let (op, v) = max;
-                                        // TODO clone
-                                        matching_eqs.push(v.clone());
+                                        matching_eqs.push(v);
                                         match op {
                                             OpLt::LT => {
                                                 let bounds = QueryBounds::LT(matching_eqs);
@@ -2896,9 +2899,9 @@ impl Connection {
 
                                         // TODO clone disaster
                                         let mut minvals = matching_eqs.clone();
-                                        minvals.push(vmin.clone());
+                                        minvals.push(vmin);
                                         let mut maxvals = matching_eqs.clone();
-                                        maxvals.push(vmax.clone());
+                                        maxvals.push(vmax);
 
                                         match (op_gt, op_lt) {
                                             (OpGt::GT, OpLt::LT) => {
@@ -3050,7 +3053,7 @@ impl Connection {
         }
     }
 
-    fn find_fit_indexes<'a>(indexes: &'a Vec<IndexInfo>, m: &matcher::QueryDoc) -> Result<(Vec<QueryPlan>, Option<Vec<TextQueryTerm>>)> {
+    fn find_fit_indexes<'a, 'm>(indexes: &'a Vec<IndexInfo>, m: &'m matcher::QueryDoc) -> Result<(Vec<QueryPlan<'m>>, Option<Vec<TextQueryTerm>>)> {
         let text_query = if let Some(s) = try!(Self::find_text_query(m)) {
             let v = s.chars().collect::<Vec<char>>();
             Some(try!(Self::parse_text_query(&v)))
@@ -3059,9 +3062,13 @@ impl Connection {
         };
         let comps_eq = try!(Self::find_compares_eq(m));
         let comps_ineq = try!(Self::find_compares_ineq(m));
+        let comps = Comps {
+            eq: comps_eq,
+            ineq: comps_ineq,
+        };
         let mut fits = Vec::new();
         for ndx in indexes {
-            if let Some(x) = try!(Self::fit_index_to_query(ndx, &comps_eq, &comps_ineq, &text_query)) {
+            if let Some(x) = try!(Self::fit_index_to_query(ndx, &comps, &text_query)) {
                 fits.push(x);
             }
         }
@@ -3087,7 +3094,7 @@ impl Connection {
         }
     }
 
-    fn choose_index<'a>(indexes: &'a Vec<IndexInfo>, m: &matcher::QueryDoc, hint: Option<&IndexInfo>) -> Result<Option<QueryPlan>> {
+    fn choose_index<'a, 'm>(indexes: &'a Vec<IndexInfo>, m: &'m matcher::QueryDoc, hint: Option<&IndexInfo>) -> Result<Option<QueryPlan<'m>>> {
         let (mut fits, text_query) = try!(Self::find_fit_indexes(indexes, m));
         match text_query {
             Some(_) => {
@@ -3119,7 +3126,7 @@ impl Connection {
         }
     }
 
-    fn find_index_for_min_max<'a>(indexes: &'a Vec<IndexInfo>, keys: &Vec<String>) -> Result<Option<&'a IndexInfo>> {
+    fn find_index_for_min_max<'a>(indexes: &'a Vec<IndexInfo>, keys: &Vec<&str>) -> Result<Option<&'a IndexInfo>> {
         for ndx in indexes {
             let (normspec, _) = try!(get_normalized_spec(ndx));
             let a = normspec.iter().map(|&(ref k,_)| k).collect::<Vec<_>>();
@@ -3129,7 +3136,7 @@ impl Connection {
             // TODO this should just be a == *keys, or something similar
             let mut same = true;
             for i in 0 .. a.len() {
-                if a[i] != keys[i].as_str() {
+                if a[i] != keys[i] {
                     same = false;
                     break;
                 }
@@ -4799,7 +4806,7 @@ impl Connection {
         let m = try!(matcher::parse_query(query));
         let plan = try!(Self::choose_index(&indexes, &m, None));
         //println!("plan: {:?}", plan);
-        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(reader.get_collection_reader(db, coll, plan));
+        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(reader.get_collection_reader(db, coll, plan.as_ref()));
         // TODO we shadow-let here because the type from seq_match_ref() doesn't match the original
         // type because of its explicit lifetime.
         let mut seq = Self::seq_match_ref(seq, &m);
@@ -4871,13 +4878,33 @@ impl Connection {
                 },
                 None => (false, None),
             };
+        let min = match min {
+            Some(v) => {
+                let v = try!(v.into_document());
+                Some(try!(matcher::parse_query(v)))
+            },
+            None => {
+                None
+            },
+        };
+        let max = match max {
+            Some(v) => {
+                let v = try!(v.into_document());
+                Some(try!(matcher::parse_query(v)))
+            },
+            None => {
+                None
+            },
+        };
+        let mut seq =
+        {
         let plan =
             // unless we're going to add comparisons to the query,
             // the bounds for min/max need to be precise, since the matcher isn't
             // going to help if they're not.  min is inclusive.  max is
             // exclusive.
-            match (min, max) {
-                (None, None) => {
+            match (&min, &max) {
+                (&None, &None) => {
                     if natural {
                         None
                     } else {
@@ -4888,11 +4915,11 @@ impl Connection {
                     // TODO if natural, then fail?
                     let pair =
                         match (min, max) {
-                            (None, None) => {
+                            (&None, &None) => {
                                 // we handled this case above
                                 unreachable!();
                             },
-                            (Some(min), Some(max)) => {
+                            (&Some(ref min), &Some(ref max)) => {
                                 let min = try!(Self::parse_index_min_max(min));
                                 let max = try!(Self::parse_index_min_max(max));
                                 if min.len() != max.len() {
@@ -4911,7 +4938,7 @@ impl Connection {
                                     },
                                 }
                             },
-                            (Some(min), None) => {
+                            (&Some(ref min), &None) => {
                                 let min = try!(Self::parse_index_min_max(min));
                                 let (keys, minvals): (Vec<_>, Vec<_>) = min.into_iter().unzip();
                                 match try!(Self::find_index_for_min_max(&indexes, &keys)) {
@@ -4924,7 +4951,7 @@ impl Connection {
                                     },
                                 }
                             },
-                            (None, Some(max)) => {
+                            (&None, &Some(ref max)) => {
                                 let max = try!(Self::parse_index_min_max(max));
                                 let (keys, maxvals): (Vec<_>, Vec<_>) = max.into_iter().unzip();
                                 match try!(Self::find_index_for_min_max(&indexes, &keys)) {
@@ -4951,7 +4978,9 @@ impl Connection {
                 }
             };
 
-        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(reader.into_collection_reader(db, coll, plan));
+        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(reader.into_collection_reader(db, coll, plan.as_ref()));
+        seq
+        };
         seq = Self::seq_match(seq, m);
         match orderby {
             Some(ref orderby) => {

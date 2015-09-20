@@ -196,7 +196,7 @@ fn verify_changes(stmt: &sqlite3::PreparedStatement, shouldbe: u64) -> Result<()
     }
 }
 
-fn copy_dirs_from_normspec_to_vals(normspec: &Vec<(String, elmo::IndexType)>, vals: Vec<bson::Value>) -> Vec<(bson::Value, bool)> {
+fn copy_dirs_from_normspec_to_vals<'a>(normspec: &Vec<(String, elmo::IndexType)>, vals: Vec<&'a bson::Value>) -> Vec<(&'a bson::Value, bool)> {
     // TODO if normspec.len() < vals.len() then panic?
     // TODO zip?
     let mut a = Vec::new();
@@ -217,13 +217,19 @@ fn get_table_name_for_index(db: &str, coll: &str, name: &str) -> String {
     format!("ndx.{}.{}.{}", db, coll, name) 
 }
 
-fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::IndexType)>, weights: &Option<std::collections::HashMap<String,i32>>, options: &bson::Document, entries: &mut Vec<Vec<(bson::Value,bool)>>) -> Result<()> {
-    fn find_index_entry_vals(normspec: &Vec<(String, elmo::IndexType)>, new_doc: &bson::Document, sparse: bool) -> Vec<(bson::Value,bool)> {
+// TODO this function has nothing to do with sqlite
+fn get_index_entries<'a>(new_doc: &bson::Document, normspec: &Vec<(String, elmo::IndexType)>, weights: &Option<std::collections::HashMap<String,i32>>, options: &bson::Document) -> Result<Vec<Vec<(&'a bson::Value,bool)>>> {
+    fn find_index_entry_vals<'d>(normspec: &Vec<(String, elmo::IndexType)>, new_doc: &bson::Document, sparse: bool) -> Vec<(&'d bson::Value,bool)> {
         //println!("find_index_entry_vals: sparse = {:?}", sparse);
         let mut r = Vec::new();
         for t in normspec {
             let k = &t.0;
             let typ = t.1;
+
+            // TODO the change to use refs instead of values kinda dies
+            // here because of the use of find_path() and the replace_undefined
+            // call.
+
             let mut v = new_doc.walk_path(k).hack_like_find_path();
 
             // now we replace any BUndefined with BNull.  this seems, well,
@@ -317,7 +323,7 @@ fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::Ind
         v2
     }
 
-    fn maybe_array(vals: &Vec<(bson::Value, bool)>, new_doc: &bson::Document, weights: &Option<std::collections::HashMap<String,i32>>, entries: &mut Vec<Vec<(bson::Value,bool)>>) {
+    fn maybe_array(vals: &Vec<(&bson::Value, bool)>, new_doc: &bson::Document, weights: &Option<std::collections::HashMap<String,i32>>, entries: &mut Vec<Vec<(&bson::Value,bool)>>) {
         //println!("in maybe_array: {:?}", vals);
         // first do the index entries for the document without considering arrays
         maybe_text(vals, new_doc, weights, entries);
@@ -352,11 +358,14 @@ fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::Ind
     };
 
     let vals = find_index_entry_vals(normspec, new_doc, sparse);
-    maybe_array(&vals, new_doc, weights, entries);
+    let entries = vec![];
+    maybe_array(&vals, new_doc, weights, &mut entries);
 
     //println!("entries: {:?}", entries);
 
-    Ok(())
+    // TODO this should probably just return the HashSet
+
+    Ok(entries)
 }
 
 fn get_index_info_from_row(r: &sqlite3::ResultRow) -> Result<elmo::IndexInfo> {
@@ -412,7 +421,7 @@ impl MyConn {
         }
     }
 
-    fn get_stmt_for_index_scan(myconn: &MyConn, plan: elmo::QueryPlan) -> Result<sqlite3::PreparedStatement> {
+    fn get_stmt_for_index_scan(myconn: &MyConn, plan: &elmo::QueryPlan) -> Result<sqlite3::PreparedStatement> {
         //println!("using plan in index scan: {:?}", plan);
         let tbl_coll = get_table_name_for_collection(&plan.ndx.db, &plan.ndx.coll);
         let tbl_ndx = get_table_name_for_index(&plan.ndx.db, &plan.ndx.coll, &plan.ndx.name);
@@ -505,7 +514,7 @@ impl MyConn {
         Ok(rdr)
     }
 
-    fn get_nontext_index_scan_reader(myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, plan: elmo::QueryPlan) -> Result<MyCollectionReader> {
+    fn get_nontext_index_scan_reader(myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, plan: &elmo::QueryPlan) -> Result<MyCollectionReader> {
         let stmt = try!(Self::get_stmt_for_index_scan(&myconn, plan));
 
         // TODO keep track of total keys examined, etc.
@@ -532,7 +541,7 @@ impl MyConn {
                 Some(w) => w,
             };
 
-        fn lookup(stmt: &mut sqlite3::PreparedStatement, vals: &Vec<(bson::Value, bool)>, word: &str) -> Result<Vec<(i64,i32)>> {
+        fn lookup(stmt: &mut sqlite3::PreparedStatement, vals: &Vec<(&bson::Value, bool)>, word: &str) -> Result<Vec<(i64,i32)>> {
             // TODO if we just search for the word without the weight, we could
             // use the add_one trick from EQ.  Probably need key encoding of an array
             // to omit the array length.  See comment there.
@@ -540,10 +549,10 @@ impl MyConn {
             let vmax = bson::Value::BArray(bson::Array {items: vec![bson::Value::BString(String::from(word)), bson::Value::BInt32(100000)]});
 
             let mut minvals = vals.clone();
-            minvals.push((vmin,false));
+            minvals.push((&vmin,false));
 
             let mut maxvals = vals.clone();
-            maxvals.push((vmax,false));
+            maxvals.push((&vmax,false));
 
             let kmin = bson::Value::encode_multi_for_index(minvals);
             let kmax = bson::Value::encode_multi_for_index(maxvals);
@@ -711,7 +720,7 @@ impl MyConn {
         Ok(rdr)
     }
 
-    fn get_collection_reader(&self, myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, db: &str, coll: &str, plan: Option<elmo::QueryPlan>) -> Result<MyCollectionReader> {
+    fn get_collection_reader(&self, myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, db: &str, coll: &str, plan: Option<&elmo::QueryPlan>) -> Result<MyCollectionReader> {
         match try!(self.get_collection_options(db, coll)) {
             None => {
                 let rdr = 
@@ -828,8 +837,7 @@ impl MyCollectionWriter {
     fn update_indexes_insert(indexes: &mut Vec<IndexPrep>, rowid: i64, v: &bson::Document) -> Result<()> {
         for t in indexes {
             let (normspec, weights) = try!(elmo::get_normalized_spec(&t.info));
-            let mut entries = Vec::new();
-            try!(get_index_entries(&v, &normspec, &weights, &t.info.options, &mut entries));
+            let entries = try!(get_index_entries(&v, &normspec, &weights, &t.info.options));
             let entries = entries.into_iter().collect::<std::collections::HashSet<_>>();
             for vals in entries {
                 let k = bson::Value::encode_multi_for_index(vals);
@@ -959,8 +967,7 @@ impl MyWriter {
                                 Some(row) => {
                                     let doc_rowid = row.column_int64(0);
                                     let new_doc = try!(bson::Document::from_bson(&row.column_slice(1).expect("NOT NULL")));
-                                    let mut entries = Vec::new();
-                                    try!(get_index_entries(&new_doc, &normspec, &weights, &info.options, &mut entries));
+                                    let entries = try!(get_index_entries(&new_doc, &normspec, &weights, &info.options));
                                     let entries = entries.into_iter().collect::<std::collections::HashSet<_>>();
                                     for vals in entries {
                                         //println!("index entry: {:?}", vals);
@@ -1279,7 +1286,7 @@ impl Iterator for MyCollectionReader {
 }
 
 impl elmo::StorageBase for MyReader {
-    fn get_collection_reader(&self, db: &str, coll: &str, plan: Option<elmo::QueryPlan>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
+    fn get_collection_reader(&self, db: &str, coll: &str, plan: Option<&elmo::QueryPlan>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
         let rdr = try!(self.myconn.get_collection_reader(self.myconn.clone(), false, db, coll, plan));
         Ok(box rdr)
     }
@@ -1295,7 +1302,7 @@ impl elmo::StorageBase for MyReader {
 }
 
 impl elmo::StorageReader for MyReader {
-    fn into_collection_reader(mut self: Box<Self>, db: &str, coll: &str, plan: Option<elmo::QueryPlan>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
+    fn into_collection_reader(mut self: Box<Self>, db: &str, coll: &str, plan: Option<&elmo::QueryPlan>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
         self.in_tx = false;
         let rdr = try!(self.myconn.get_collection_reader(self.myconn.clone(), true, db, coll, plan));
         Ok(box rdr)
@@ -1304,7 +1311,7 @@ impl elmo::StorageReader for MyReader {
 }
 
 impl elmo::StorageBase for MyWriter {
-    fn get_collection_reader(&self, db: &str, coll: &str, plan: Option<elmo::QueryPlan>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
+    fn get_collection_reader(&self, db: &str, coll: &str, plan: Option<&elmo::QueryPlan>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
         let rdr = try!(self.myconn.get_collection_reader(self.myconn.clone(), false, db, coll, plan));
         Ok(box rdr)
     }
