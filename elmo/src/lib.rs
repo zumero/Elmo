@@ -187,8 +187,8 @@ impl IndexInfo {
     }
 }
 
-// TODO it would be nice if this was a vec of references,
-// not a vec of owned bson values.
+// TODO QueryKey should be already in its encoded form
+// TODO should be called IndexKey?
 pub type QueryKey = Vec<bson::Value>;
 
 #[derive(Hash,PartialEq,Eq,Debug,Clone)]
@@ -197,11 +197,10 @@ pub enum TextQueryTerm {
     Phrase(bool, String),
 }
 
+// TODO should be called IndexBounds?
 #[derive(Debug)]
 pub enum QueryBounds {
     EQ(QueryKey),
-    // TODO tempted to make the QueryKey in Text be an option
-    Text(QueryKey,Vec<TextQueryTerm>),
     GT(QueryKey),
     GTE(QueryKey),
     LT(QueryKey),
@@ -210,6 +209,9 @@ pub enum QueryBounds {
     GT_LTE(QueryKey, QueryKey),
     GTE_LT(QueryKey, QueryKey),
     GTE_LTE(QueryKey, QueryKey),
+
+    // TODO remove Text
+    Text(QueryKey,Vec<TextQueryTerm>),
 }
 
 #[derive(Debug)]
@@ -833,6 +835,7 @@ pub trait StorageBase {
     fn list_indexes(&self) -> Result<Vec<IndexInfo>>;
 
     fn get_reader_collection_scan(&self, db: &str, coll: &str) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
+    // TODO QueryKey in text_index_scan should be an option
     fn get_reader_text_index_scan(&self, ndx: &IndexInfo, eq: QueryKey, terms: Vec<TextQueryTerm>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
     fn get_reader_regular_index_scan(&self, ndx: &IndexInfo, bounds: QueryBounds) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
 }
