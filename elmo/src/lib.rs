@@ -833,6 +833,9 @@ pub trait StorageBase {
     fn list_indexes(&self) -> Result<Vec<IndexInfo>>;
 
     fn get_collection_reader(&self, db: &str, coll: &str, plan: Option<QueryPlan>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
+    fn get_reader_collection_scan(&self, db: &str, coll: &str) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
+    fn get_reader_text_index_scan(&self, ndx: &IndexInfo, eq: QueryKey, terms: Vec<TextQueryTerm>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
+    fn get_reader_regular_index_scan(&self, ndx: &IndexInfo, bounds: QueryBounds) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
 }
 
 pub trait StorageCollectionWriter {
@@ -847,6 +850,9 @@ pub trait StorageCollectionWriter {
 
 pub trait StorageReader : StorageBase {
     fn into_collection_reader(self: Box<Self>, db: &str, coll: &str, plan: Option<QueryPlan>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
+    fn into_reader_collection_scan(self: Box<Self>, db: &str, coll: &str) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
+    fn into_reader_text_index_scan(&self, ndx: &IndexInfo, eq: QueryKey, terms: Vec<TextQueryTerm>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
+    fn into_reader_regular_index_scan(&self, ndx: &IndexInfo, bounds: QueryBounds) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
 }
 
 pub trait StorageWriter : StorageBase {
@@ -1805,6 +1811,69 @@ impl Connection {
         Ok(result)
     }
 
+    fn into_collection_reader(r: Box<StorageReader>, db: &str, coll: &str, plan: Option<QueryPlan>) -> Result<Box<Iterator<Item=Result<Row>>>> {
+        match plan {
+            Some(plan) => {
+                match plan.bounds {
+                    QueryBounds::Text(eq,terms) => {
+                        let rdr = try!(r.into_reader_text_index_scan(&plan.ndx, eq, terms));
+                        return Ok(rdr);
+                    },
+                    _ => {
+                        let rdr = try!(r.into_reader_regular_index_scan(&plan.ndx, plan.bounds));
+                        return Ok(rdr);
+                    },
+                }
+            },
+            None => {
+                let rdr = try!(r.into_reader_collection_scan(db, coll));
+                return Ok(rdr);
+            },
+        };
+    }
+
+    fn get_collection_reader_r(r: &StorageReader, db: &str, coll: &str, plan: Option<QueryPlan>) -> Result<Box<Iterator<Item=Result<Row>>>> {
+        match plan {
+            Some(plan) => {
+                match plan.bounds {
+                    QueryBounds::Text(eq,terms) => {
+                        let rdr = try!(r.get_reader_text_index_scan(&plan.ndx, eq, terms));
+                        return Ok(rdr);
+                    },
+                    _ => {
+                        let rdr = try!(r.get_reader_regular_index_scan(&plan.ndx, plan.bounds));
+                        return Ok(rdr);
+                    },
+                }
+            },
+            None => {
+                let rdr = try!(r.get_reader_collection_scan(db, coll));
+                return Ok(rdr);
+            },
+        };
+    }
+
+    fn get_collection_reader_w(w: &StorageWriter, db: &str, coll: &str, plan: Option<QueryPlan>) -> Result<Box<Iterator<Item=Result<Row>>>> {
+        match plan {
+            Some(plan) => {
+                match plan.bounds {
+                    QueryBounds::Text(eq,terms) => {
+                        let rdr = try!(w.get_reader_text_index_scan(&plan.ndx, eq, terms));
+                        return Ok(rdr);
+                    },
+                    _ => {
+                        let rdr = try!(w.get_reader_regular_index_scan(&plan.ndx, plan.bounds));
+                        return Ok(rdr);
+                    },
+                }
+            },
+            None => {
+                let rdr = try!(w.get_reader_collection_scan(db, coll));
+                return Ok(rdr);
+            },
+        };
+    }
+
     fn get_one_match(db: &str, coll: &str, w: &StorageWriter, m: &matcher::QueryDoc, orderby: Option<&bson::Value>) -> Result<Option<Row>> {
         // TODO dry
         let indexes = try!(w.list_indexes()).into_iter().filter(
@@ -1813,7 +1882,7 @@ impl Connection {
         //println!("indexes: {:?}", indexes);
         let plan = try!(Self::choose_index(&indexes, &m, None));
         //println!("plan: {:?}", plan);
-        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(w.get_collection_reader(db, coll, plan));
+        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(Self::get_collection_reader_w(w, db, coll, plan));
         // TODO we shadow-let here because the type from seq_match_ref() doesn't match the original
         // type because of its explicit lifetime.
         let mut seq = Self::seq_match_ref(seq, &m);
@@ -1944,7 +2013,7 @@ impl Connection {
                                     |ndx| ndx.db == db && ndx.coll == coll
                                     ).collect::<Vec<_>>();
                                 let plan = try!(Self::choose_index(&indexes, &m, None));
-                                let mut seq: Box<Iterator<Item=Result<Row>>> = try!(reader.into_collection_reader(db, coll, plan));
+                                let mut seq: Box<Iterator<Item=Result<Row>>> = try!(Self::into_collection_reader(reader, db, coll, plan));
                                 // TODO we shadow-let here because the type from seq_match_ref() doesn't match the original
                                 // type because of its explicit lifetime.
                                 let seq = Self::seq_match_ref(seq, &m);
@@ -2435,7 +2504,7 @@ impl Connection {
                     let plan = try!(Self::choose_index(&indexes, &m, None));
                     //println!("plan: {:?}", plan);
                     // TODO is this safe?  or do we need two-conn isolation like update?
-                    let mut seq: Box<Iterator<Item=Result<Row>>> = try!(writer.get_collection_reader(db, coll, plan));
+                    let mut seq: Box<Iterator<Item=Result<Row>>> = try!(Self::get_collection_reader_w(&*writer, db, coll, plan));
                     seq = Self::seq_match(seq, m);
                     for rr in seq {
                         let row = try!(rr);
@@ -4748,7 +4817,7 @@ impl Connection {
         // TODO check for plan
         let plan = None;
         let reader = try!(self.conn.begin_read());
-        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(reader.into_collection_reader(db, coll, plan));
+        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(Self::into_collection_reader(reader, db, coll, plan));
         let mut out = None;
         for op in ops {
             match op {
@@ -4799,7 +4868,7 @@ impl Connection {
         let m = try!(matcher::parse_query(query));
         let plan = try!(Self::choose_index(&indexes, &m, None));
         //println!("plan: {:?}", plan);
-        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(reader.get_collection_reader(db, coll, plan));
+        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(Self::get_collection_reader_r(&*reader, db, coll, plan));
         // TODO we shadow-let here because the type from seq_match_ref() doesn't match the original
         // type because of its explicit lifetime.
         let mut seq = Self::seq_match_ref(seq, &m);
@@ -4951,7 +5020,7 @@ impl Connection {
                 }
             };
 
-        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(reader.into_collection_reader(db, coll, plan));
+        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(Self::into_collection_reader(reader, db, coll, plan));
         seq = Self::seq_match(seq, m);
         match orderby {
             Some(ref orderby) => {

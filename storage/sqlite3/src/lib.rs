@@ -140,16 +140,6 @@ impl<'a> Iterator for RefStatementBsonValueIterator<'a> {
     }
 }
 
-// TODO std::iter::Empty?
-struct MyEmptyIterator;
-
-impl Iterator for MyEmptyIterator {
-    type Item = Result<elmo::Row>;
-    fn next(&mut self) -> Option<Self::Item> {
-        None
-    }
-}
-
 struct MyCollectionReader {
     commit_on_drop: bool,
     seq: Box<Iterator<Item=Result<elmo::Row>>>,
@@ -412,14 +402,13 @@ impl MyConn {
         }
     }
 
-    fn get_stmt_for_index_scan(myconn: &MyConn, plan: elmo::QueryPlan) -> Result<sqlite3::PreparedStatement> {
-        //println!("using plan in index scan: {:?}", plan);
-        let tbl_coll = get_table_name_for_collection(&plan.ndx.db, &plan.ndx.coll);
-        let tbl_ndx = get_table_name_for_index(&plan.ndx.db, &plan.ndx.coll, &plan.ndx.name);
+    fn get_stmt_for_index_scan(myconn: &MyConn, ndx: &elmo::IndexInfo, bounds: elmo::QueryBounds) -> Result<sqlite3::PreparedStatement> {
+        let tbl_coll = get_table_name_for_collection(&ndx.db, &ndx.coll);
+        let tbl_ndx = get_table_name_for_index(&ndx.db, &ndx.coll, &ndx.name);
 
         // TODO the following is way too heavy.  all we need is the index types
         // so we can tell if they're supposed to be backwards or not.
-        let (normspec, _weights) = try!(elmo::get_normalized_spec(&plan.ndx));
+        let (normspec, _weights) = try!(elmo::get_normalized_spec(ndx));
 
         fn add_one(ba: &Vec<u8>) -> Vec<u8> {
             let mut a = ba.clone();
@@ -470,7 +459,7 @@ impl MyConn {
             Ok(stmt)
         };
 
-        match plan.bounds {
+        match bounds {
             elmo::QueryBounds::Text(_,_) => unreachable!(),
             elmo::QueryBounds::GT(vals) => f_one(vals, ">"),
             elmo::QueryBounds::LT(vals) => f_one(vals, "<"),
@@ -505,8 +494,8 @@ impl MyConn {
         Ok(rdr)
     }
 
-    fn get_nontext_index_scan_reader(myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, plan: elmo::QueryPlan) -> Result<MyCollectionReader> {
-        let stmt = try!(Self::get_stmt_for_index_scan(&myconn, plan));
+    fn get_nontext_index_scan_reader(myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, ndx: &elmo::IndexInfo, bounds: elmo::QueryBounds) -> Result<MyCollectionReader> {
+        let stmt = try!(Self::get_stmt_for_index_scan(&myconn, ndx, bounds));
 
         // TODO keep track of total keys examined, etc.
         let seq = 
@@ -522,6 +511,7 @@ impl MyConn {
         Ok(rdr)
     }
 
+    // TODO this function has a bunch of logic that would prefer to be up above the storage layer API
     fn get_text_index_scan_reader(myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, ndx: &elmo::IndexInfo,  eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<MyCollectionReader> {
         let tbl_coll = get_table_name_for_collection(&ndx.db, &ndx.coll);
         let tbl_ndx = get_table_name_for_index(&ndx.db, &ndx.coll, &ndx.name);
@@ -717,7 +707,7 @@ impl MyConn {
                 let rdr = 
                     MyCollectionReader {
                         commit_on_drop: commit_on_drop,
-                        seq: box MyEmptyIterator,
+                        seq: box std::iter::empty(),
                         myconn: myconn,
                     };
                 Ok(rdr)
@@ -731,7 +721,7 @@ impl MyConn {
                                 return Ok(rdr);
                             },
                             _ => {
-                                let rdr = try!(Self::get_nontext_index_scan_reader(myconn, commit_on_drop, plan));
+                                let rdr = try!(Self::get_nontext_index_scan_reader(myconn, commit_on_drop, &plan.ndx, plan.bounds));
                                 return Ok(rdr);
                             },
                         }
@@ -741,6 +731,64 @@ impl MyConn {
                         return Ok(rdr);
                     },
                 };
+            },
+        }
+    }
+
+    fn get_reader_collection_scan(&self, myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, db: &str, coll: &str) -> Result<MyCollectionReader> {
+        match try!(self.get_collection_options(db, coll)) {
+            None => {
+                let rdr = 
+                    MyCollectionReader {
+                        commit_on_drop: commit_on_drop,
+                        seq: box std::iter::empty(),
+                        myconn: myconn,
+                    };
+                Ok(rdr)
+            },
+            Some(_) => {
+                let rdr = try!(Self::get_table_scan_reader(myconn, commit_on_drop, db, coll));
+                return Ok(rdr);
+            },
+        }
+    }
+
+    fn get_reader_text_index_scan(&self, myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, ndx: &elmo::IndexInfo, eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<MyCollectionReader> {
+        // TODO is this check right?
+        // should we instead check for the existence of the index?
+        match try!(self.get_collection_options(&ndx.db, &ndx.coll)) {
+            None => {
+                let rdr = 
+                    MyCollectionReader {
+                        commit_on_drop: commit_on_drop,
+                        seq: box std::iter::empty(),
+                        myconn: myconn,
+                    };
+                Ok(rdr)
+            },
+            Some(_) => {
+                let rdr = try!(Self::get_text_index_scan_reader(myconn, commit_on_drop, ndx, eq, terms));
+                return Ok(rdr);
+            },
+        }
+    }
+
+    fn get_reader_regular_index_scan(&self, myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, ndx: &elmo::IndexInfo, bounds: elmo::QueryBounds) -> Result<MyCollectionReader> {
+        // TODO is this check right?
+        // should we instead check for the existence of the index?
+        match try!(self.get_collection_options(&ndx.db, &ndx.coll)) {
+            None => {
+                let rdr = 
+                    MyCollectionReader {
+                        commit_on_drop: commit_on_drop,
+                        seq: box std::iter::empty(),
+                        myconn: myconn,
+                    };
+                Ok(rdr)
+            },
+            Some(_) => {
+                let rdr = try!(Self::get_nontext_index_scan_reader(myconn, commit_on_drop, ndx, bounds));
+                return Ok(rdr);
             },
         }
     }
@@ -1279,6 +1327,21 @@ impl Iterator for MyCollectionReader {
 }
 
 impl elmo::StorageBase for MyReader {
+    fn get_reader_collection_scan(&self, db: &str, coll: &str) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
+        let rdr = try!(self.myconn.get_reader_collection_scan(self.myconn.clone(), false, db, coll));
+        Ok(box rdr)
+    }
+
+    fn get_reader_text_index_scan(&self, ndx: &elmo::IndexInfo, eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
+        let rdr = try!(self.myconn.get_reader_text_index_scan(self.myconn.clone(), false, ndx, eq, terms));
+        Ok(box rdr)
+    }
+
+    fn get_reader_regular_index_scan(&self, ndx: &elmo::IndexInfo, bounds: elmo::QueryBounds) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
+        let rdr = try!(self.myconn.get_reader_regular_index_scan(self.myconn.clone(), false, ndx, bounds));
+        Ok(box rdr)
+    }
+
     fn get_collection_reader(&self, db: &str, coll: &str, plan: Option<elmo::QueryPlan>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
         let rdr = try!(self.myconn.get_collection_reader(self.myconn.clone(), false, db, coll, plan));
         Ok(box rdr)
@@ -1301,9 +1364,40 @@ impl elmo::StorageReader for MyReader {
         Ok(box rdr)
     }
 
+    fn into_reader_collection_scan(mut self: Box<Self>, db: &str, coll: &str) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
+        self.in_tx = false;
+        let rdr = try!(self.myconn.get_reader_collection_scan(self.myconn.clone(), true, db, coll));
+        Ok(box rdr)
+    }
+
+    fn into_reader_text_index_scan(&self, ndx: &elmo::IndexInfo, eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
+        let rdr = try!(self.myconn.get_reader_text_index_scan(self.myconn.clone(), true, ndx, eq, terms));
+        Ok(box rdr)
+    }
+
+    fn into_reader_regular_index_scan(&self, ndx: &elmo::IndexInfo, bounds: elmo::QueryBounds) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
+        let rdr = try!(self.myconn.get_reader_regular_index_scan(self.myconn.clone(), true, ndx, bounds));
+        Ok(box rdr)
+    }
+
 }
 
 impl elmo::StorageBase for MyWriter {
+    fn get_reader_collection_scan(&self, db: &str, coll: &str) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
+        let rdr = try!(self.myconn.get_reader_collection_scan(self.myconn.clone(), false, db, coll));
+        Ok(box rdr)
+    }
+
+    fn get_reader_text_index_scan(&self, ndx: &elmo::IndexInfo, eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
+        let rdr = try!(self.myconn.get_reader_text_index_scan(self.myconn.clone(), false, ndx, eq, terms));
+        Ok(box rdr)
+    }
+
+    fn get_reader_regular_index_scan(&self, ndx: &elmo::IndexInfo, bounds: elmo::QueryBounds) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
+        let rdr = try!(self.myconn.get_reader_regular_index_scan(self.myconn.clone(), false, ndx, bounds));
+        Ok(box rdr)
+    }
+
     fn get_collection_reader(&self, db: &str, coll: &str, plan: Option<elmo::QueryPlan>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
         let rdr = try!(self.myconn.get_collection_reader(self.myconn.clone(), false, db, coll, plan));
         Ok(box rdr)
