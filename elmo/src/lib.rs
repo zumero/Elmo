@@ -213,7 +213,7 @@ pub enum QueryBounds {
 }
 
 #[derive(Debug)]
-pub struct QueryPlan {
+struct QueryPlan {
     pub ndx: IndexInfo,
     pub bounds: QueryBounds,
 }
@@ -832,7 +832,6 @@ pub trait StorageBase {
     fn list_collections(&self) -> Result<Vec<CollectionInfo>>;
     fn list_indexes(&self) -> Result<Vec<IndexInfo>>;
 
-    fn get_collection_reader(&self, db: &str, coll: &str, plan: Option<QueryPlan>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
     fn get_reader_collection_scan(&self, db: &str, coll: &str) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
     fn get_reader_text_index_scan(&self, ndx: &IndexInfo, eq: QueryKey, terms: Vec<TextQueryTerm>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
     fn get_reader_regular_index_scan(&self, ndx: &IndexInfo, bounds: QueryBounds) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
@@ -849,7 +848,6 @@ pub trait StorageCollectionWriter {
 // TODO or is it enough that the actual implementation of this trait impl Drop?
 
 pub trait StorageReader : StorageBase {
-    fn into_collection_reader(self: Box<Self>, db: &str, coll: &str, plan: Option<QueryPlan>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
     fn into_reader_collection_scan(self: Box<Self>, db: &str, coll: &str) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
     fn into_reader_text_index_scan(&self, ndx: &IndexInfo, eq: QueryKey, terms: Vec<TextQueryTerm>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
     fn into_reader_regular_index_scan(&self, ndx: &IndexInfo, bounds: QueryBounds) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;

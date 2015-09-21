@@ -701,40 +701,6 @@ impl MyConn {
         Ok(rdr)
     }
 
-    fn get_collection_reader(&self, myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, db: &str, coll: &str, plan: Option<elmo::QueryPlan>) -> Result<MyCollectionReader> {
-        match try!(self.get_collection_options(db, coll)) {
-            None => {
-                let rdr = 
-                    MyCollectionReader {
-                        commit_on_drop: commit_on_drop,
-                        seq: box std::iter::empty(),
-                        myconn: myconn,
-                    };
-                Ok(rdr)
-            },
-            Some(_) => {
-                match plan {
-                    Some(plan) => {
-                        match plan.bounds {
-                            elmo::QueryBounds::Text(eq,terms) => {
-                                let rdr = try!(Self::get_text_index_scan_reader(myconn, commit_on_drop, &plan.ndx, eq, terms));
-                                return Ok(rdr);
-                            },
-                            _ => {
-                                let rdr = try!(Self::get_nontext_index_scan_reader(myconn, commit_on_drop, &plan.ndx, plan.bounds));
-                                return Ok(rdr);
-                            },
-                        }
-                    },
-                    None => {
-                        let rdr = try!(Self::get_table_scan_reader(myconn, commit_on_drop, db, coll));
-                        return Ok(rdr);
-                    },
-                };
-            },
-        }
-    }
-
     fn get_reader_collection_scan(&self, myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, db: &str, coll: &str) -> Result<MyCollectionReader> {
         match try!(self.get_collection_options(db, coll)) {
             None => {
@@ -1342,11 +1308,6 @@ impl elmo::StorageBase for MyReader {
         Ok(box rdr)
     }
 
-    fn get_collection_reader(&self, db: &str, coll: &str, plan: Option<elmo::QueryPlan>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
-        let rdr = try!(self.myconn.get_collection_reader(self.myconn.clone(), false, db, coll, plan));
-        Ok(box rdr)
-    }
-
     fn list_collections(&self) -> Result<Vec<elmo::CollectionInfo>> {
         self.myconn.base_list_collections()
     }
@@ -1358,12 +1319,6 @@ impl elmo::StorageBase for MyReader {
 }
 
 impl elmo::StorageReader for MyReader {
-    fn into_collection_reader(mut self: Box<Self>, db: &str, coll: &str, plan: Option<elmo::QueryPlan>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
-        self.in_tx = false;
-        let rdr = try!(self.myconn.get_collection_reader(self.myconn.clone(), true, db, coll, plan));
-        Ok(box rdr)
-    }
-
     fn into_reader_collection_scan(mut self: Box<Self>, db: &str, coll: &str) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
         self.in_tx = false;
         let rdr = try!(self.myconn.get_reader_collection_scan(self.myconn.clone(), true, db, coll));
@@ -1395,11 +1350,6 @@ impl elmo::StorageBase for MyWriter {
 
     fn get_reader_regular_index_scan(&self, ndx: &elmo::IndexInfo, bounds: elmo::QueryBounds) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
         let rdr = try!(self.myconn.get_reader_regular_index_scan(self.myconn.clone(), false, ndx, bounds));
-        Ok(box rdr)
-    }
-
-    fn get_collection_reader(&self, db: &str, coll: &str, plan: Option<elmo::QueryPlan>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
-        let rdr = try!(self.myconn.get_collection_reader(self.myconn.clone(), false, db, coll, plan));
         Ok(box rdr)
     }
 
