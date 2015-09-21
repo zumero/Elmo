@@ -406,10 +406,6 @@ impl MyConn {
         let tbl_coll = get_table_name_for_collection(&ndx.db, &ndx.coll);
         let tbl_ndx = get_table_name_for_index(&ndx.db, &ndx.coll, &ndx.name);
 
-        // TODO the following is way too heavy.  all we need is the index types
-        // so we can tell if they're supposed to be backwards or not.
-        let (normspec, _weights) = try!(elmo::get_normalized_spec(ndx));
-
         fn add_one(ba: &Vec<u8>) -> Vec<u8> {
             let mut a = ba.clone();
             let mut i = a.len() - 1;
@@ -436,7 +432,7 @@ impl MyConn {
         //
         // TODO it would be nice if the DISTINCT here was happening on the rowids, not on the blobs
 
-        let f_twok = |kmin: Vec<u8>, kmax: Vec<u8>, op1: &str, op2: &str| -> Result<sqlite3::PreparedStatement> {
+        let f_two = |kmin: elmo::QueryKey, kmax: Vec<u8>, op1: &str, op2: &str| -> Result<sqlite3::PreparedStatement> {
             let sql = format!("SELECT DISTINCT d.bson FROM \"{}\" d INNER JOIN \"{}\" i ON (d.did = i.doc_rowid) WHERE k {} ? AND k {} ?", tbl_coll, tbl_ndx, op1, op2);
             //println!("using sql: {}", sql);
             let mut stmt = try!(myconn.conn.prepare(&sql).map_err(elmo::wrap_err));
@@ -445,14 +441,7 @@ impl MyConn {
             Ok(stmt)
         };
 
-        let f_two = |minvals: elmo::QueryKey, maxvals: elmo::QueryKey, op1: &str, op2: &str| -> Result<sqlite3::PreparedStatement> {
-            let kmin = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&normspec, minvals));
-            let kmax = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&normspec, maxvals));
-            f_twok(kmin, kmax, op1, op2)
-        };
-
-        let f_one = |vals: elmo::QueryKey, op: &str| -> Result<sqlite3::PreparedStatement> {
-            let k = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&normspec, vals));
+        let f_one = |k: elmo::QueryKey, op: &str| -> Result<sqlite3::PreparedStatement> {
             let sql = format!("SELECT DISTINCT d.bson FROM \"{}\" d INNER JOIN \"{}\" i ON (d.did = i.doc_rowid) WHERE k {} ?", tbl_coll, tbl_ndx, op);
             let mut stmt = try!(myconn.conn.prepare(&sql).map_err(elmo::wrap_err));
             try!(stmt.bind_blob(1, &k).map_err(elmo::wrap_err));
@@ -469,10 +458,9 @@ impl MyConn {
             elmo::QueryBounds::GTE_LT(minvals, maxvals) => f_two(minvals, maxvals, ">=", "<"),
             elmo::QueryBounds::GT_LTE(minvals, maxvals) => f_two(minvals, maxvals, ">", "<="),
             elmo::QueryBounds::GTE_LTE(minvals, maxvals) => f_two(minvals, maxvals, ">=", "<="),
-            elmo::QueryBounds::EQ(vals) => {
-                let kmin = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&normspec, vals));
+            elmo::QueryBounds::EQ(kmin) => {
                 let kmax = add_one(&kmin);
-                f_twok(kmin, kmax, ">=", "<")
+                f_two(kmin, kmax, ">=", "<")
             },
         }
     }
@@ -512,7 +500,7 @@ impl MyConn {
     }
 
     // TODO this function has a bunch of logic that would prefer to be up above the storage layer API
-    fn get_text_index_scan_reader(myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, ndx: &elmo::IndexInfo,  eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<MyCollectionReader> {
+    fn get_text_index_scan_reader(myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, ndx: &elmo::IndexInfo,  eq: Vec<bson::Value>, terms: Vec<elmo::TextQueryTerm>) -> Result<MyCollectionReader> {
         let tbl_coll = get_table_name_for_collection(&ndx.db, &ndx.coll);
         let tbl_ndx = get_table_name_for_index(&ndx.db, &ndx.coll, &ndx.name);
         let (normspec, weights) = try!(elmo::get_normalized_spec(&ndx));
@@ -719,7 +707,7 @@ impl MyConn {
         }
     }
 
-    fn get_reader_text_index_scan(&self, myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, ndx: &elmo::IndexInfo, eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<MyCollectionReader> {
+    fn get_reader_text_index_scan(&self, myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, ndx: &elmo::IndexInfo, eq: Vec<bson::Value>, terms: Vec<elmo::TextQueryTerm>) -> Result<MyCollectionReader> {
         // TODO is this check right?
         // should we instead check for the existence of the index?
         match try!(self.get_collection_options(&ndx.db, &ndx.coll)) {
@@ -1298,7 +1286,7 @@ impl elmo::StorageBase for MyReader {
         Ok(box rdr)
     }
 
-    fn get_reader_text_index_scan(&self, ndx: &elmo::IndexInfo, eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
+    fn get_reader_text_index_scan(&self, ndx: &elmo::IndexInfo, eq: Vec<bson::Value>, terms: Vec<elmo::TextQueryTerm>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
         let rdr = try!(self.myconn.get_reader_text_index_scan(self.myconn.clone(), false, ndx, eq, terms));
         Ok(box rdr)
     }
@@ -1325,7 +1313,7 @@ impl elmo::StorageReader for MyReader {
         Ok(box rdr)
     }
 
-    fn into_reader_text_index_scan(&self, ndx: &elmo::IndexInfo, eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
+    fn into_reader_text_index_scan(&self, ndx: &elmo::IndexInfo, eq: Vec<bson::Value>, terms: Vec<elmo::TextQueryTerm>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
         let rdr = try!(self.myconn.get_reader_text_index_scan(self.myconn.clone(), true, ndx, eq, terms));
         Ok(box rdr)
     }
@@ -1343,7 +1331,7 @@ impl elmo::StorageBase for MyWriter {
         Ok(box rdr)
     }
 
-    fn get_reader_text_index_scan(&self, ndx: &elmo::IndexInfo, eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
+    fn get_reader_text_index_scan(&self, ndx: &elmo::IndexInfo, eq: Vec<bson::Value>, terms: Vec<elmo::TextQueryTerm>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
         let rdr = try!(self.myconn.get_reader_text_index_scan(self.myconn.clone(), false, ndx, eq, terms));
         Ok(box rdr)
     }

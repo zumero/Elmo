@@ -187,9 +187,7 @@ impl IndexInfo {
     }
 }
 
-// TODO QueryKey should be already in its encoded form
-// TODO should be called IndexKey?
-pub type QueryKey = Vec<bson::Value>;
+pub type QueryKey = Vec<u8>;
 
 #[derive(Hash,PartialEq,Eq,Debug,Clone)]
 pub enum TextQueryTerm {
@@ -211,7 +209,7 @@ pub enum QueryBounds {
     GTE_LTE(QueryKey, QueryKey),
 
     // TODO remove Text
-    Text(QueryKey,Vec<TextQueryTerm>),
+    Text(Vec<bson::Value>,Vec<TextQueryTerm>),
 }
 
 #[derive(Debug)]
@@ -836,7 +834,7 @@ pub trait StorageBase {
 
     fn get_reader_collection_scan(&self, db: &str, coll: &str) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
     // TODO QueryKey in text_index_scan should be an option
-    fn get_reader_text_index_scan(&self, ndx: &IndexInfo, eq: QueryKey, terms: Vec<TextQueryTerm>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
+    fn get_reader_text_index_scan(&self, ndx: &IndexInfo, eq: Vec<bson::Value>, terms: Vec<TextQueryTerm>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
     fn get_reader_regular_index_scan(&self, ndx: &IndexInfo, bounds: QueryBounds) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
 }
 
@@ -852,7 +850,7 @@ pub trait StorageCollectionWriter {
 
 pub trait StorageReader : StorageBase {
     fn into_reader_collection_scan(self: Box<Self>, db: &str, coll: &str) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
-    fn into_reader_text_index_scan(&self, ndx: &IndexInfo, eq: QueryKey, terms: Vec<TextQueryTerm>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
+    fn into_reader_text_index_scan(&self, ndx: &IndexInfo, eq: Vec<bson::Value>, terms: Vec<TextQueryTerm>) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
     fn into_reader_regular_index_scan(&self, ndx: &IndexInfo, bounds: QueryBounds) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
 }
 
@@ -994,6 +992,17 @@ pub fn get_normalized_spec(info: &IndexInfo) -> Result<(Vec<(String,IndexType)>,
             r
         }
     }
+}
+
+fn copy_dirs_from_normspec_to_vals(normspec: &Vec<(String, IndexType)>, vals: Vec<bson::Value>) -> Vec<(bson::Value, bool)> {
+    // TODO if normspec.len() < vals.len() then panic?
+    // TODO zip?
+    let mut a = Vec::new();
+    for (i,v) in vals.into_iter().enumerate() {
+        let neg = normspec[i].1 == IndexType::Backward;
+        a.push((v, neg));
+    }
+    a
 }
 
 
@@ -2880,6 +2889,7 @@ impl Connection {
                         match first_no_eqs {
                             None => {
                                 if matching_eqs.len() > 0 {
+                                    let matching_eqs = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&scalar_keys, matching_eqs));
                                     let bounds = QueryBounds::EQ(matching_eqs);
                                     let plan = QueryPlan {
                                         // TODO clone
@@ -2896,6 +2906,7 @@ impl Connection {
                                 match matching_ineqs[num_eq] {
                                     None | Some(&(None,None)) => {
                                         if num_eq>0 {
+                                            let matching_eqs = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&scalar_keys, matching_eqs));
                                             let bounds = QueryBounds::EQ(matching_eqs);
                                             let plan = QueryPlan {
                                                 // TODO clone
@@ -2914,6 +2925,7 @@ impl Connection {
                                         matching_eqs.push(v.clone());
                                         match op {
                                             OpGt::GT => {
+                                                let matching_eqs = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&scalar_keys, matching_eqs));
                                                 let bounds = QueryBounds::GT(matching_eqs);
                                                 let plan = QueryPlan {
                                                     // TODO clone
@@ -2923,6 +2935,7 @@ impl Connection {
                                                 Ok(Some(plan))
                                             },
                                             OpGt::GTE => {
+                                                let matching_eqs = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&scalar_keys, matching_eqs));
                                                 let bounds = QueryBounds::GTE(matching_eqs);
                                                 let plan = QueryPlan {
                                                     // TODO clone
@@ -2939,6 +2952,7 @@ impl Connection {
                                         matching_eqs.push(v.clone());
                                         match op {
                                             OpLt::LT => {
+                                                let matching_eqs = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&scalar_keys, matching_eqs));
                                                 let bounds = QueryBounds::LT(matching_eqs);
                                                 let plan = QueryPlan {
                                                     // TODO clone
@@ -2948,6 +2962,7 @@ impl Connection {
                                                 Ok(Some(plan))
                                             },
                                             OpLt::LTE => {
+                                                let matching_eqs = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&scalar_keys, matching_eqs));
                                                 let bounds = QueryBounds::LTE(matching_eqs);
                                                 let plan = QueryPlan {
                                                     // TODO clone
@@ -2969,6 +2984,9 @@ impl Connection {
                                         minvals.push(vmin.clone());
                                         let mut maxvals = matching_eqs.clone();
                                         maxvals.push(vmax.clone());
+
+                                        let minvals = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&scalar_keys, minvals));
+                                        let maxvals = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&scalar_keys, maxvals));
 
                                         match (op_gt, op_lt) {
                                             (OpGt::GT, OpLt::LT) => {
@@ -4973,6 +4991,9 @@ impl Connection {
                                 // TODO minkeys must == maxkeys
                                 match try!(Self::find_index_for_min_max(&indexes, &minkeys)) {
                                     Some(ndx) => {
+                                        let (normspec, _) = try!(get_normalized_spec(ndx));
+                                        let minvals = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&normspec, minvals));
+                                        let maxvals = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&normspec, maxvals));
                                         let bounds = QueryBounds::GTE_LT(minvals, maxvals);
                                         (ndx, bounds)
                                     },
@@ -4986,6 +5007,8 @@ impl Connection {
                                 let (keys, minvals): (Vec<_>, Vec<_>) = min.into_iter().unzip();
                                 match try!(Self::find_index_for_min_max(&indexes, &keys)) {
                                     Some(ndx) => {
+                                        let (normspec, _) = try!(get_normalized_spec(ndx));
+                                        let minvals = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&normspec, minvals));
                                         let bounds = QueryBounds::GTE(minvals);
                                         (ndx, bounds)
                                     },
@@ -4999,6 +5022,8 @@ impl Connection {
                                 let (keys, maxvals): (Vec<_>, Vec<_>) = max.into_iter().unzip();
                                 match try!(Self::find_index_for_min_max(&indexes, &keys)) {
                                     Some(ndx) => {
+                                        let (normspec, _) = try!(get_normalized_spec(ndx));
+                                        let maxvals = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&normspec, maxvals));
                                         let bounds = QueryBounds::LT(maxvals);
                                         (ndx, bounds)
                                     },
