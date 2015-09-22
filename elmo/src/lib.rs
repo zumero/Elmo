@@ -187,9 +187,8 @@ impl IndexInfo {
     }
 }
 
-// TODO QueryKey should be already in its encoded form
 // TODO should be called IndexKey?
-pub type QueryKey = Vec<bson::Value>;
+pub type QueryKey<'a> = Vec<&'a bson::Value>;
 
 #[derive(Hash,PartialEq,Eq,Debug,Clone)]
 pub enum TextQueryTerm {
@@ -199,25 +198,36 @@ pub enum TextQueryTerm {
 
 // TODO should be called IndexBounds?
 #[derive(Debug)]
-pub enum QueryBounds {
-    EQ(QueryKey),
-    GT(QueryKey),
-    GTE(QueryKey),
-    LT(QueryKey),
-    LTE(QueryKey),
-    GT_LT(QueryKey, QueryKey),
-    GT_LTE(QueryKey, QueryKey),
-    GTE_LT(QueryKey, QueryKey),
-    GTE_LTE(QueryKey, QueryKey),
+pub enum QueryBounds<'a> {
+    EQ(QueryKey<'a>),
+    GT(QueryKey<'a>),
+    GTE(QueryKey<'a>),
+    LT(QueryKey<'a>),
+    LTE(QueryKey<'a>),
+    GT_LT(QueryKey<'a>, QueryKey<'a>, QueryKey<'a>),
+    GT_LTE(QueryKey<'a>, QueryKey<'a>, QueryKey<'a>),
+    GTE_LT(QueryKey<'a>, QueryKey<'a>, QueryKey<'a>),
+    GTE_LTE(QueryKey<'a>, QueryKey<'a>, QueryKey<'a>),
+}
 
-    // TODO remove Text
-    Text(QueryKey,Vec<TextQueryTerm>),
+struct Comps<'a> {
+    eq: HashMap<&'a str, &'a bson::Value>,
+    ineq: HashMap<&'a str, (Option<(OpGt, &'a bson::Value)>, Option<(OpLt, &'a bson::Value)>)>,
 }
 
 #[derive(Debug)]
-struct QueryPlan {
-    pub ndx: IndexInfo,
-    pub bounds: QueryBounds,
+enum QueryPlan<'a> {
+    Regular(IndexInfo, QueryBounds<'a>),
+    Text(IndexInfo, QueryKey<'a>, Vec<TextQueryTerm>),
+}
+
+impl<'a> QueryPlan<'a> {
+    fn get_ndx(&self) -> &IndexInfo {
+        match self {
+            &QueryPlan::Regular(ref ndx, _) => ndx,
+            &QueryPlan::Text(ref ndx,_,_) => ndx,
+        }
+    }
 }
 
 #[derive(PartialEq,Copy,Clone)]
@@ -1815,13 +1825,13 @@ impl Connection {
     fn into_collection_reader(r: Box<StorageReader>, db: &str, coll: &str, plan: Option<QueryPlan>) -> Result<Box<Iterator<Item=Result<Row>>>> {
         match plan {
             Some(plan) => {
-                match plan.bounds {
-                    QueryBounds::Text(eq,terms) => {
-                        let rdr = try!(r.into_reader_text_index_scan(&plan.ndx, eq, terms));
+                match plan {
+                    QueryPlan::Text(ndx, eq, terms) => {
+                        let rdr = try!(r.into_reader_text_index_scan(&ndx, eq, terms));
                         return Ok(rdr);
                     },
-                    _ => {
-                        let rdr = try!(r.into_reader_regular_index_scan(&plan.ndx, plan.bounds));
+                    QueryPlan::Regular(ndx, bounds) => {
+                        let rdr = try!(r.into_reader_regular_index_scan(&ndx, bounds));
                         return Ok(rdr);
                     },
                 }
@@ -1836,13 +1846,13 @@ impl Connection {
     fn get_collection_reader_r(r: &StorageReader, db: &str, coll: &str, plan: Option<QueryPlan>) -> Result<Box<Iterator<Item=Result<Row>>>> {
         match plan {
             Some(plan) => {
-                match plan.bounds {
-                    QueryBounds::Text(eq,terms) => {
-                        let rdr = try!(r.get_reader_text_index_scan(&plan.ndx, eq, terms));
+                match plan {
+                    QueryPlan::Text(ndx, eq, terms) => {
+                        let rdr = try!(r.get_reader_text_index_scan(&ndx, eq, terms));
                         return Ok(rdr);
                     },
-                    _ => {
-                        let rdr = try!(r.get_reader_regular_index_scan(&plan.ndx, plan.bounds));
+                    QueryPlan::Regular(ndx, bounds) => {
+                        let rdr = try!(r.get_reader_regular_index_scan(&ndx, bounds));
                         return Ok(rdr);
                     },
                 }
@@ -1857,13 +1867,13 @@ impl Connection {
     fn get_collection_reader_w(w: &StorageWriter, db: &str, coll: &str, plan: Option<QueryPlan>) -> Result<Box<Iterator<Item=Result<Row>>>> {
         match plan {
             Some(plan) => {
-                match plan.bounds {
-                    QueryBounds::Text(eq,terms) => {
-                        let rdr = try!(w.get_reader_text_index_scan(&plan.ndx, eq, terms));
+                match plan {
+                    QueryPlan::Text(ndx, eq, terms) => {
+                        let rdr = try!(w.get_reader_text_index_scan(&ndx, eq, terms));
                         return Ok(rdr);
                     },
-                    _ => {
-                        let rdr = try!(w.get_reader_regular_index_scan(&plan.ndx, plan.bounds));
+                    QueryPlan::Regular(ndx, bounds) => {
+                        let rdr = try!(w.get_reader_regular_index_scan(&ndx, bounds));
                         return Ok(rdr);
                     },
                 }
@@ -2502,10 +2512,13 @@ impl Connection {
                         |ndx| ndx.db == db && ndx.coll == coll
                         ).collect::<Vec<_>>();
                     //println!("indexes: {:?}", indexes);
-                    let plan = try!(Self::choose_index(&indexes, &m, None));
-                    //println!("plan: {:?}", plan);
-                    // TODO is this safe?  or do we need two-conn isolation like update?
-                    let mut seq: Box<Iterator<Item=Result<Row>>> = try!(Self::get_collection_reader_w(&*writer, db, coll, plan));
+                    let mut seq = {
+                        let plan = try!(Self::choose_index(&indexes, &m, None));
+                        //println!("plan: {:?}", plan);
+                        // TODO is this safe?  or do we need two-conn isolation like update?
+                        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(Self::get_collection_reader_w(&*writer, db, coll, plan));
+                        seq
+                    };
                     seq = Self::seq_match(seq, m);
                     for rr in seq {
                         let row = try!(rr);
@@ -2535,17 +2548,16 @@ impl Connection {
         Ok(result)
     }
 
-    fn parse_index_min_max(v: bson::Value) -> Result<Vec<(String,bson::Value)>> {
-        let v = try!(v.into_document());
-        let matcher::QueryDoc::QueryDoc(items) = try!(matcher::parse_query(v));
-        items.into_iter().map(
+    fn parse_index_min_max<'m>(m: &'m matcher::QueryDoc) -> Result<Vec<(&'m str, &'m bson::Value)>> {
+        let &matcher::QueryDoc::QueryDoc(ref items) = m;
+        items.iter().map(
             |it| match it {
                 // TODO wish we could pattern match on the vec.
-                matcher::QueryItem::Compare(k, mut preds) => {
+                &matcher::QueryItem::Compare(ref k, ref preds) => {
                     if preds.len() == 1 {
-                        match preds.pop().expect("just checked") {
-                            matcher::Pred::EQ(v) => {
-                                Ok((k, v))
+                        match &preds[0] {
+                            &matcher::Pred::EQ(ref v) => {
+                                Ok((k.as_str(), v))
                             },
                             _ => {
                                 Err(Error::Misc(String::from("bad min max")))
@@ -2782,13 +2794,12 @@ impl Connection {
         Ok(m2)
     }
 
-    fn fit_index_to_query(
+    fn fit_index_to_query<'a>(
         ndx: &IndexInfo, 
-        comps_eq: &HashMap<&str, &bson::Value>, 
-        comps_ineq: &HashMap<&str, (Option<(OpGt, &bson::Value)>, Option<(OpLt, &bson::Value)>)>, 
+        comps: &Comps<'a>,
         text_query: &Option<Vec<TextQueryTerm>>
         ) 
-        -> Result<Option<QueryPlan>> 
+        -> Result<Option<QueryPlan<'a>>> 
     {
         let (scalar_keys, weights) = try!(get_normalized_spec(ndx));
         if weights.is_none() && text_query.is_some() {
@@ -2807,12 +2818,7 @@ impl Connection {
                             },
                             &Some(ref text_query) => {
                                 // TODO clone
-                                let bounds = QueryBounds::Text(vec![], text_query.clone());
-                                let plan = QueryPlan {
-                                    // TODO clone
-                                    ndx: ndx.clone(),
-                                    bounds: bounds,
-                                };
+                                let plan = QueryPlan::Text(ndx.clone(), vec![], text_query.clone());
                                 Ok(Some(plan))
                             },
                         }
@@ -2830,7 +2836,7 @@ impl Connection {
                 let matching_ineqs = 
                     scalar_keys.iter().map(
                         |&(ref k,_)| {
-                            match comps_ineq.get(k.as_str()) {
+                            match comps.ineq.get(k.as_str()) {
                                 Some(a) => Some(a),
                                 None => None,
                             }
@@ -2839,10 +2845,9 @@ impl Connection {
                 let mut first_no_eqs = None;
                 let mut matching_eqs = vec![];
                 for (i, &(ref k, _)) in scalar_keys.iter().enumerate() {
-                    match comps_eq.get(k.as_str()) {
+                    match comps.eq.get(k.as_str()) {
                         Some(a) => {
-                            // TODO clone
-                            matching_eqs.push((*a).clone());
+                            matching_eqs.push(*a);
                         },
                         None => {
                             first_no_eqs = Some(i);
@@ -2862,12 +2867,7 @@ impl Connection {
                             None => {
                                 // we have an EQ for every key.  this index will work.
                                 // TODO clone
-                                let bounds = QueryBounds::Text(matching_eqs, text_query.clone());
-                                let plan = QueryPlan {
-                                    // TODO clone
-                                    ndx: ndx.clone(),
-                                    bounds: bounds,
-                                };
+                                let plan = QueryPlan::Text(ndx.clone(), matching_eqs, text_query.clone());
                                 Ok(Some(plan))
                             },
                         }
@@ -2880,12 +2880,7 @@ impl Connection {
                         match first_no_eqs {
                             None => {
                                 if matching_eqs.len() > 0 {
-                                    let bounds = QueryBounds::EQ(matching_eqs);
-                                    let plan = QueryPlan {
-                                        // TODO clone
-                                        ndx: ndx.clone(),
-                                        bounds: bounds,
-                                    };
+                                    let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::EQ(matching_eqs));
                                     Ok(Some(plan))
                                 } else {
                                     // we can't use this index at all
@@ -2896,12 +2891,7 @@ impl Connection {
                                 match matching_ineqs[num_eq] {
                                     None | Some(&(None,None)) => {
                                         if num_eq>0 {
-                                            let bounds = QueryBounds::EQ(matching_eqs);
-                                            let plan = QueryPlan {
-                                                // TODO clone
-                                                ndx: ndx.clone(),
-                                                bounds: bounds,
-                                            };
+                                            let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::EQ(matching_eqs));
                                             Ok(Some(plan))
                                         } else {
                                             // we can't use this index at all
@@ -2910,50 +2900,28 @@ impl Connection {
                                     },
                                     Some(&(Some(min),None)) => {
                                         let (op, v) = min;
-                                        // TODO clone
-                                        matching_eqs.push(v.clone());
+                                        matching_eqs.push(v);
                                         match op {
                                             OpGt::GT => {
-                                                let bounds = QueryBounds::GT(matching_eqs);
-                                                let plan = QueryPlan {
-                                                    // TODO clone
-                                                    ndx: ndx.clone(),
-                                                    bounds: bounds,
-                                                };
+                                                let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::GT(matching_eqs));
                                                 Ok(Some(plan))
                                             },
                                             OpGt::GTE => {
-                                                let bounds = QueryBounds::GTE(matching_eqs);
-                                                let plan = QueryPlan {
-                                                    // TODO clone
-                                                    ndx: ndx.clone(),
-                                                    bounds: bounds,
-                                                };
+                                                let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::GTE(matching_eqs));
                                                 Ok(Some(plan))
                                             },
                                         }
                                     },
                                     Some(&(None,Some(max))) => {
                                         let (op, v) = max;
-                                        // TODO clone
-                                        matching_eqs.push(v.clone());
+                                        matching_eqs.push(v);
                                         match op {
                                             OpLt::LT => {
-                                                let bounds = QueryBounds::LT(matching_eqs);
-                                                let plan = QueryPlan {
-                                                    // TODO clone
-                                                    ndx: ndx.clone(),
-                                                    bounds: bounds,
-                                                };
+                                                let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::LT(matching_eqs));
                                                 Ok(Some(plan))
                                             },
                                             OpLt::LTE => {
-                                                let bounds = QueryBounds::LTE(matching_eqs);
-                                                let plan = QueryPlan {
-                                                    // TODO clone
-                                                    ndx: ndx.clone(),
-                                                    bounds: bounds,
-                                                };
+                                                let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::LTE(matching_eqs));
                                                 Ok(Some(plan))
                                             },
                                         }
@@ -2964,47 +2932,21 @@ impl Connection {
                                         let (op_gt, vmin) = min;
                                         let (op_lt, vmax) = max;
 
-                                        // TODO clone disaster
-                                        let mut minvals = matching_eqs.clone();
-                                        minvals.push(vmin.clone());
-                                        let mut maxvals = matching_eqs.clone();
-                                        maxvals.push(vmax.clone());
-
                                         match (op_gt, op_lt) {
                                             (OpGt::GT, OpLt::LT) => {
-                                                let bounds = QueryBounds::GT_LT(minvals, maxvals);
-                                                let plan = QueryPlan {
-                                                    // TODO clone
-                                                    ndx: ndx.clone(),
-                                                    bounds: bounds,
-                                                };
+                                                let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::GT_LT(matching_eqs, vec![vmin], vec![vmax]));
                                                 Ok(Some(plan))
                                             },
                                             (OpGt::GT, OpLt::LTE) => {
-                                                let bounds = QueryBounds::GT_LTE(minvals, maxvals);
-                                                let plan = QueryPlan {
-                                                    // TODO clone
-                                                    ndx: ndx.clone(),
-                                                    bounds: bounds,
-                                                };
+                                                let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::GT_LTE(matching_eqs, vec![vmin], vec![vmax]));
                                                 Ok(Some(plan))
                                             },
                                             (OpGt::GTE, OpLt::LT) => {
-                                                let bounds = QueryBounds::GTE_LT(minvals, maxvals);
-                                                let plan = QueryPlan {
-                                                    // TODO clone
-                                                    ndx: ndx.clone(),
-                                                    bounds: bounds,
-                                                };
+                                                let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::GTE_LT(matching_eqs, vec![vmin], vec![vmax]));
                                                 Ok(Some(plan))
                                             },
                                             (OpGt::GTE, OpLt::LTE) => {
-                                                let bounds = QueryBounds::GTE_LTE(minvals, maxvals);
-                                                let plan = QueryPlan {
-                                                    // TODO clone
-                                                    ndx: ndx.clone(),
-                                                    bounds: bounds,
-                                                };
+                                                let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::GTE_LTE(matching_eqs, vec![vmin], vec![vmax]));
                                                 Ok(Some(plan))
                                             },
                                         }
@@ -3120,7 +3062,7 @@ impl Connection {
         }
     }
 
-    fn find_fit_indexes<'a>(indexes: &'a Vec<IndexInfo>, m: &matcher::QueryDoc) -> Result<(Vec<QueryPlan>, Option<Vec<TextQueryTerm>>)> {
+    fn find_fit_indexes<'a, 'm>(indexes: &'a Vec<IndexInfo>, m: &'m matcher::QueryDoc) -> Result<(Vec<QueryPlan<'m>>, Option<Vec<TextQueryTerm>>)> {
         let text_query = if let Some(s) = try!(Self::find_text_query(m)) {
             let v = s.chars().collect::<Vec<char>>();
             Some(try!(Self::parse_text_query(&v)))
@@ -3129,9 +3071,13 @@ impl Connection {
         };
         let comps_eq = try!(Self::find_compares_eq(m));
         let comps_ineq = try!(Self::find_compares_ineq(m));
+        let comps = Comps {
+            eq: comps_eq,
+            ineq: comps_ineq,
+        };
         let mut fits = Vec::new();
         for ndx in indexes {
-            if let Some(x) = try!(Self::fit_index_to_query(ndx, &comps_eq, &comps_ineq, &text_query)) {
+            if let Some(x) = try!(Self::fit_index_to_query(ndx, &comps, &text_query)) {
                 fits.push(x);
             }
         }
@@ -3149,7 +3095,7 @@ impl Connection {
             // otherwise any index at all.  just take the first one.
             let mut winner = None;
             for plan in possibles {
-                if winner.is_none() || plan.ndx.name == "_id_" {
+                if winner.is_none() || plan.get_ndx().name == "_id_" {
                     winner = Some(plan);
                 }
             }
@@ -3157,7 +3103,7 @@ impl Connection {
         }
     }
 
-    fn choose_index<'a>(indexes: &'a Vec<IndexInfo>, m: &matcher::QueryDoc, hint: Option<&IndexInfo>) -> Result<Option<QueryPlan>> {
+    fn choose_index<'a, 'm>(indexes: &'a Vec<IndexInfo>, m: &'m matcher::QueryDoc, hint: Option<&IndexInfo>) -> Result<Option<QueryPlan<'m>>> {
         let (mut fits, text_query) = try!(Self::find_fit_indexes(indexes, m));
         match text_query {
             Some(_) => {
@@ -3176,7 +3122,7 @@ impl Connection {
 
                 match hint {
                     Some(hint) => {
-                        match fits.iter().position(|plan| plan.ndx.spec == hint.spec) {
+                        match fits.iter().position(|plan| plan.get_ndx().spec == hint.spec) {
                             Some(i) => {
                                 Ok(Some(fits.remove(i)))
                             },
@@ -3189,7 +3135,7 @@ impl Connection {
         }
     }
 
-    fn find_index_for_min_max<'a>(indexes: &'a Vec<IndexInfo>, keys: &Vec<String>) -> Result<Option<&'a IndexInfo>> {
+    fn find_index_for_min_max<'a>(indexes: &'a Vec<IndexInfo>, keys: &Vec<&str>) -> Result<Option<&'a IndexInfo>> {
         for ndx in indexes {
             let (normspec, _) = try!(get_normalized_spec(ndx));
             let a = normspec.iter().map(|&(ref k,_)| k).collect::<Vec<_>>();
@@ -3199,7 +3145,7 @@ impl Connection {
             // TODO this should just be a == *keys, or something similar
             let mut same = true;
             for i in 0 .. a.len() {
-                if a[i] != keys[i].as_str() {
+                if a[i] != keys[i] {
                     same = false;
                     break;
                 }
@@ -4941,87 +4887,104 @@ impl Connection {
                 },
                 None => (false, None),
             };
-        let plan =
-            // unless we're going to add comparisons to the query,
-            // the bounds for min/max need to be precise, since the matcher isn't
-            // going to help if they're not.  min is inclusive.  max is
-            // exclusive.
-            match (min, max) {
-                (None, None) => {
-                    if natural {
-                        None
-                    } else {
-                        try!(Self::choose_index(&indexes, &m, hint))
+        let min = match min {
+            Some(v) => {
+                let v = try!(v.into_document());
+                Some(try!(matcher::parse_query(v)))
+            },
+            None => {
+                None
+            },
+        };
+        let max = match max {
+            Some(v) => {
+                let v = try!(v.into_document());
+                Some(try!(matcher::parse_query(v)))
+            },
+            None => {
+                None
+            },
+        };
+        let mut seq = {
+            let plan =
+                // unless we're going to add comparisons to the query,
+                // the bounds for min/max need to be precise, since the matcher isn't
+                // going to help if they're not.  min is inclusive.  max is
+                // exclusive.
+                match (&min, &max) {
+                    (&None, &None) => {
+                        if natural {
+                            None
+                        } else {
+                            try!(Self::choose_index(&indexes, &m, hint))
+                        }
+                    },
+                    (min, max) => {
+                        // TODO if natural, then fail?
+                        let pair =
+                            match (min, max) {
+                                (&None, &None) => {
+                                    // we handled this case above
+                                    unreachable!();
+                                },
+                                (&Some(ref min), &Some(ref max)) => {
+                                    let min = try!(Self::parse_index_min_max(min));
+                                    let max = try!(Self::parse_index_min_max(max));
+                                    if min.len() != max.len() {
+                                        return Err(Error::Misc(String::from("min/max hints must be same length")));
+                                    }
+                                    let (minkeys, minvals): (Vec<_>, Vec<_>) = min.into_iter().unzip();
+                                    let (maxkeys, maxvals): (Vec<_>, Vec<_>) = max.into_iter().unzip();
+                                    // TODO minkeys must == maxkeys
+                                    match try!(Self::find_index_for_min_max(&indexes, &minkeys)) {
+                                        Some(ndx) => {
+                                            let bounds = QueryBounds::GTE_LT(vec![], minvals, maxvals);
+                                            (ndx, bounds)
+                                        },
+                                        None => {
+                                            return Err(Error::Misc(String::from("index not found. TODO should be None?")));
+                                        },
+                                    }
+                                },
+                                (&Some(ref min), &None) => {
+                                    let min = try!(Self::parse_index_min_max(min));
+                                    let (keys, minvals): (Vec<_>, Vec<_>) = min.into_iter().unzip();
+                                    match try!(Self::find_index_for_min_max(&indexes, &keys)) {
+                                        Some(ndx) => {
+                                            let bounds = QueryBounds::GTE(minvals);
+                                            (ndx, bounds)
+                                        },
+                                        None => {
+                                            return Err(Error::Misc(String::from("index not found. TODO should be None?")));
+                                        },
+                                    }
+                                },
+                                (&None, &Some(ref max)) => {
+                                    let max = try!(Self::parse_index_min_max(max));
+                                    let (keys, maxvals): (Vec<_>, Vec<_>) = max.into_iter().unzip();
+                                    match try!(Self::find_index_for_min_max(&indexes, &keys)) {
+                                        Some(ndx) => {
+                                            let bounds = QueryBounds::LT(maxvals);
+                                            (ndx, bounds)
+                                        },
+                                        None => {
+                                            return Err(Error::Misc(String::from("index not found. TODO should be None?")));
+                                        },
+                                    }
+                                },
+                            };
+
+                        // TODO tests indicate that if there is a $min and/or $max as well as a $hint,
+                        // then we need to error if they don't match each other.
+
+                        let plan = QueryPlan::Regular(pair.0.clone(), pair.1);
+                        Some(plan)
                     }
-                },
-                (min, max) => {
-                    // TODO if natural, then fail?
-                    let pair =
-                        match (min, max) {
-                            (None, None) => {
-                                // we handled this case above
-                                unreachable!();
-                            },
-                            (Some(min), Some(max)) => {
-                                let min = try!(Self::parse_index_min_max(min));
-                                let max = try!(Self::parse_index_min_max(max));
-                                if min.len() != max.len() {
-                                    return Err(Error::Misc(String::from("min/max hints must be same length")));
-                                }
-                                let (minkeys, minvals): (Vec<_>, Vec<_>) = min.into_iter().unzip();
-                                let (maxkeys, maxvals): (Vec<_>, Vec<_>) = max.into_iter().unzip();
-                                // TODO minkeys must == maxkeys
-                                match try!(Self::find_index_for_min_max(&indexes, &minkeys)) {
-                                    Some(ndx) => {
-                                        let bounds = QueryBounds::GTE_LT(minvals, maxvals);
-                                        (ndx, bounds)
-                                    },
-                                    None => {
-                                        return Err(Error::Misc(String::from("index not found. TODO should be None?")));
-                                    },
-                                }
-                            },
-                            (Some(min), None) => {
-                                let min = try!(Self::parse_index_min_max(min));
-                                let (keys, minvals): (Vec<_>, Vec<_>) = min.into_iter().unzip();
-                                match try!(Self::find_index_for_min_max(&indexes, &keys)) {
-                                    Some(ndx) => {
-                                        let bounds = QueryBounds::GTE(minvals);
-                                        (ndx, bounds)
-                                    },
-                                    None => {
-                                        return Err(Error::Misc(String::from("index not found. TODO should be None?")));
-                                    },
-                                }
-                            },
-                            (None, Some(max)) => {
-                                let max = try!(Self::parse_index_min_max(max));
-                                let (keys, maxvals): (Vec<_>, Vec<_>) = max.into_iter().unzip();
-                                match try!(Self::find_index_for_min_max(&indexes, &keys)) {
-                                    Some(ndx) => {
-                                        let bounds = QueryBounds::LT(maxvals);
-                                        (ndx, bounds)
-                                    },
-                                    None => {
-                                        return Err(Error::Misc(String::from("index not found. TODO should be None?")));
-                                    },
-                                }
-                            },
-                        };
+                };
 
-                    // TODO tests indicate that if there is a $min and/or $max as well as a $hint,
-                    // then we need to error if they don't match each other.
-
-                    let plan = QueryPlan {
-                        // TODO clone
-                        ndx: pair.0.clone(),
-                        bounds: pair.1,
-                    };
-                    Some(plan)
-                }
-            };
-
-        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(Self::into_collection_reader(reader, db, coll, plan));
+            let mut seq: Box<Iterator<Item=Result<Row>>> = try!(Self::into_collection_reader(reader, db, coll, plan));
+            seq
+        };
         seq = Self::seq_match(seq, m);
         match orderby {
             Some(ref orderby) => {

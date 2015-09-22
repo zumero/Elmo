@@ -186,7 +186,7 @@ fn verify_changes(stmt: &sqlite3::PreparedStatement, shouldbe: u64) -> Result<()
     }
 }
 
-fn copy_dirs_from_normspec_to_vals(normspec: &Vec<(String, elmo::IndexType)>, vals: Vec<bson::Value>) -> Vec<(bson::Value, bool)> {
+fn copy_dirs_from_normspec_to_vals<'a>(normspec: &Vec<(String, elmo::IndexType)>, vals: Vec<&'a bson::Value>) -> Vec<(&'a bson::Value, bool)> {
     // TODO if normspec.len() < vals.len() then panic?
     // TODO zip?
     let mut a = Vec::new();
@@ -445,14 +445,17 @@ impl MyConn {
             Ok(stmt)
         };
 
-        let f_two = |minvals: elmo::QueryKey, maxvals: elmo::QueryKey, op1: &str, op2: &str| -> Result<sqlite3::PreparedStatement> {
-            let kmin = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&normspec, minvals));
-            let kmax = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&normspec, maxvals));
+        let f_two = |eqvals: elmo::QueryKey, minvals: elmo::QueryKey, maxvals: elmo::QueryKey, op1: &str, op2: &str| -> Result<sqlite3::PreparedStatement> {
+            let eqvals = copy_dirs_from_normspec_to_vals(&normspec, eqvals);
+            let minvals = copy_dirs_from_normspec_to_vals(&normspec, minvals);
+            let maxvals = copy_dirs_from_normspec_to_vals(&normspec, maxvals);
+            let kmin = bson::Value::encode_multi_for_index(&eqvals, Some(&minvals));
+            let kmax = bson::Value::encode_multi_for_index(&eqvals, Some(&maxvals));
             f_twok(kmin, kmax, op1, op2)
         };
 
         let f_one = |vals: elmo::QueryKey, op: &str| -> Result<sqlite3::PreparedStatement> {
-            let k = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&normspec, vals));
+            let k = bson::Value::encode_multi_for_index(&copy_dirs_from_normspec_to_vals(&normspec, vals), None);
             let sql = format!("SELECT DISTINCT d.bson FROM \"{}\" d INNER JOIN \"{}\" i ON (d.did = i.doc_rowid) WHERE k {} ?", tbl_coll, tbl_ndx, op);
             let mut stmt = try!(myconn.conn.prepare(&sql).map_err(elmo::wrap_err));
             try!(stmt.bind_blob(1, &k).map_err(elmo::wrap_err));
@@ -460,17 +463,16 @@ impl MyConn {
         };
 
         match bounds {
-            elmo::QueryBounds::Text(_,_) => unreachable!(),
             elmo::QueryBounds::GT(vals) => f_one(vals, ">"),
             elmo::QueryBounds::LT(vals) => f_one(vals, "<"),
             elmo::QueryBounds::GTE(vals) => f_one(vals, ">="),
             elmo::QueryBounds::LTE(vals) => f_one(vals, "<="),
-            elmo::QueryBounds::GT_LT(minvals, maxvals) => f_two(minvals, maxvals, ">", "<"),
-            elmo::QueryBounds::GTE_LT(minvals, maxvals) => f_two(minvals, maxvals, ">=", "<"),
-            elmo::QueryBounds::GT_LTE(minvals, maxvals) => f_two(minvals, maxvals, ">", "<="),
-            elmo::QueryBounds::GTE_LTE(minvals, maxvals) => f_two(minvals, maxvals, ">=", "<="),
+            elmo::QueryBounds::GT_LT(eqvals, minvals, maxvals) => f_two(eqvals, minvals, maxvals, ">", "<"),
+            elmo::QueryBounds::GTE_LT(eqvals, minvals, maxvals) => f_two(eqvals, minvals, maxvals, ">=", "<"),
+            elmo::QueryBounds::GT_LTE(eqvals, minvals, maxvals) => f_two(eqvals, minvals, maxvals, ">", "<="),
+            elmo::QueryBounds::GTE_LTE(eqvals, minvals, maxvals) => f_two(eqvals, minvals, maxvals, ">=", "<="),
             elmo::QueryBounds::EQ(vals) => {
-                let kmin = bson::Value::encode_multi_for_index(copy_dirs_from_normspec_to_vals(&normspec, vals));
+                let kmin = bson::Value::encode_multi_for_index(&copy_dirs_from_normspec_to_vals(&normspec, vals), None);
                 let kmax = add_one(&kmin);
                 f_twok(kmin, kmax, ">=", "<")
             },
@@ -522,21 +524,15 @@ impl MyConn {
                 Some(w) => w,
             };
 
-        fn lookup(stmt: &mut sqlite3::PreparedStatement, vals: &Vec<(bson::Value, bool)>, word: &str) -> Result<Vec<(i64,i32)>> {
+        fn lookup(stmt: &mut sqlite3::PreparedStatement, vals: &Vec<(&bson::Value, bool)>, word: &str) -> Result<Vec<(i64,i32)>> {
             // TODO if we just search for the word without the weight, we could
             // use the add_one trick from EQ.  Probably need key encoding of an array
             // to omit the array length.  See comment there.
             let vmin = bson::Value::BArray(bson::Array {items: vec![bson::Value::BString(String::from(word)), bson::Value::BInt32(0)]});
             let vmax = bson::Value::BArray(bson::Array {items: vec![bson::Value::BString(String::from(word)), bson::Value::BInt32(100000)]});
 
-            let mut minvals = vals.clone();
-            minvals.push((vmin,false));
-
-            let mut maxvals = vals.clone();
-            maxvals.push((vmax,false));
-
-            let kmin = bson::Value::encode_multi_for_index(minvals);
-            let kmax = bson::Value::encode_multi_for_index(maxvals);
+            let kmin = bson::Value::encode_multi_for_index(vals, Some(&vec![(&vmin, false)]));
+            let kmax = bson::Value::encode_multi_for_index(vals, Some(&vec![(&vmax, false)]));
             stmt.clear_bindings();
             try!(stmt.bind_blob(1, &kmin).map_err(elmo::wrap_err));
             try!(stmt.bind_blob(2, &kmax).map_err(elmo::wrap_err));
@@ -846,7 +842,8 @@ impl MyCollectionWriter {
             try!(get_index_entries(&v, &normspec, &weights, &t.info.options, &mut entries));
             let entries = entries.into_iter().collect::<std::collections::HashSet<_>>();
             for vals in entries {
-                let k = bson::Value::encode_multi_for_index(vals);
+                let vref = vals.iter().map(|&(ref v,neg)| (v,neg)).collect::<Vec<_>>();
+                let k = bson::Value::encode_multi_for_index(&vref, None);
                 try!(index_insert_step(&mut t.stmt_insert, k, rowid));
             }
         }
@@ -978,7 +975,8 @@ impl MyWriter {
                                     let entries = entries.into_iter().collect::<std::collections::HashSet<_>>();
                                     for vals in entries {
                                         //println!("index entry: {:?}", vals);
-                                        let k = bson::Value::encode_multi_for_index(vals);
+                                        let vref = vals.iter().map(|&(ref v,neg)| (v,neg)).collect::<Vec<_>>();
+                                        let k = bson::Value::encode_multi_for_index(&vref, None);
                                         try!(index_insert_step(&mut stmt_insert, k, doc_rowid));
                                     }
                                 },
