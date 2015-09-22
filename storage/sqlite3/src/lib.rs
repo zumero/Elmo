@@ -186,17 +186,6 @@ fn verify_changes(stmt: &sqlite3::PreparedStatement, shouldbe: u64) -> Result<()
     }
 }
 
-fn copy_dirs_from_normspec_to_vals<'a>(normspec: &Vec<(String, elmo::IndexType)>, vals: Vec<&'a bson::Value>) -> Vec<(&'a bson::Value, bool)> {
-    // TODO if normspec.len() < vals.len() then panic?
-    // TODO zip?
-    let mut a = Vec::new();
-    for (i,v) in vals.into_iter().enumerate() {
-        let neg = normspec[i].1 == elmo::IndexType::Backward;
-        a.push((v, neg));
-    }
-    a
-}
-
 fn get_table_name_for_collection(db: &str, coll: &str) -> String { 
     // TODO cleanse?
     format!("docs.{}.{}", db, coll) 
@@ -406,10 +395,6 @@ impl MyConn {
         let tbl_coll = get_table_name_for_collection(&ndx.db, &ndx.coll);
         let tbl_ndx = get_table_name_for_index(&ndx.db, &ndx.coll, &ndx.name);
 
-        // TODO the following is way too heavy.  all we need is the index types
-        // so we can tell if they're supposed to be backwards or not.
-        let (normspec, _weights) = try!(elmo::get_normalized_spec(ndx));
-
         fn add_one(ba: &Vec<u8>) -> Vec<u8> {
             let mut a = ba.clone();
             let mut i = a.len() - 1;
@@ -446,16 +431,13 @@ impl MyConn {
         };
 
         let f_two = |eqvals: elmo::QueryKey, minvals: elmo::QueryKey, maxvals: elmo::QueryKey, op1: &str, op2: &str| -> Result<sqlite3::PreparedStatement> {
-            let eqvals = copy_dirs_from_normspec_to_vals(&normspec, eqvals);
-            let minvals = copy_dirs_from_normspec_to_vals(&normspec, minvals);
-            let maxvals = copy_dirs_from_normspec_to_vals(&normspec, maxvals);
             let kmin = bson::Value::encode_multi_for_index(&eqvals, Some(&minvals));
             let kmax = bson::Value::encode_multi_for_index(&eqvals, Some(&maxvals));
             f_twok(kmin, kmax, op1, op2)
         };
 
         let f_one = |vals: elmo::QueryKey, op: &str| -> Result<sqlite3::PreparedStatement> {
-            let k = bson::Value::encode_multi_for_index(&copy_dirs_from_normspec_to_vals(&normspec, vals), None);
+            let k = bson::Value::encode_multi_for_index(&vals, None);
             let sql = format!("SELECT DISTINCT d.bson FROM \"{}\" d INNER JOIN \"{}\" i ON (d.did = i.doc_rowid) WHERE k {} ?", tbl_coll, tbl_ndx, op);
             let mut stmt = try!(myconn.conn.prepare(&sql).map_err(elmo::wrap_err));
             try!(stmt.bind_blob(1, &k).map_err(elmo::wrap_err));
@@ -472,7 +454,7 @@ impl MyConn {
             elmo::QueryBounds::GT_LTE(eqvals, minvals, maxvals) => f_two(eqvals, minvals, maxvals, ">", "<="),
             elmo::QueryBounds::GTE_LTE(eqvals, minvals, maxvals) => f_two(eqvals, minvals, maxvals, ">=", "<="),
             elmo::QueryBounds::EQ(vals) => {
-                let kmin = bson::Value::encode_multi_for_index(&copy_dirs_from_normspec_to_vals(&normspec, vals), None);
+                let kmin = bson::Value::encode_multi_for_index(&vals, None);
                 let kmax = add_one(&kmin);
                 f_twok(kmin, kmax, ">=", "<")
             },
@@ -517,7 +499,8 @@ impl MyConn {
     fn get_text_index_scan_reader(myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, ndx: &elmo::IndexInfo,  eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<MyCollectionReader> {
         let tbl_coll = get_table_name_for_collection(&ndx.db, &ndx.coll);
         let tbl_ndx = get_table_name_for_index(&ndx.db, &ndx.coll, &ndx.name);
-        let (normspec, weights) = try!(elmo::get_normalized_spec(&ndx));
+        // TODO we wish we didn't have to call get_normalized_spec() here just to get weights
+        let (_, weights) = try!(elmo::get_normalized_spec(&ndx));
         let weights = 
             match weights {
                 None => return Err(elmo::Error::Misc(String::from("non text index"))),
@@ -552,8 +535,6 @@ impl MyConn {
             Ok(entries)
         };
 
-        let vals = copy_dirs_from_normspec_to_vals(&normspec, eq);
-
         let sql = format!("SELECT k, doc_rowid FROM \"{}\" i WHERE k > ? AND k < ?", tbl_ndx);
         let mut stmt = try!(myconn.conn.prepare(&sql).map_err(elmo::wrap_err));
 
@@ -562,7 +543,7 @@ impl MyConn {
             let entries = 
                 match term {
                     &elmo::TextQueryTerm::Word(neg, ref s) => {
-                        let entries = try!(lookup(&mut stmt, &vals, &s));
+                        let entries = try!(lookup(&mut stmt, &eq, &s));
                         entries
                     },
                     &elmo::TextQueryTerm::Phrase(neg, ref s) => {
@@ -570,7 +551,7 @@ impl MyConn {
                         let words = s.split(" ");
                         let mut entries = Vec::new();
                         for w in words {
-                            entries.push_all(&try!(lookup(&mut stmt, &vals, w)));
+                            entries.push_all(&try!(lookup(&mut stmt, &eq, w)));
                         }
                         entries
                     },

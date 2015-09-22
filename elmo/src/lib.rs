@@ -188,7 +188,7 @@ impl IndexInfo {
 }
 
 // TODO should be called IndexKey?
-pub type QueryKey<'a> = Vec<&'a bson::Value>;
+pub type QueryKey<'a> = Vec<(&'a bson::Value, bool)>;
 
 #[derive(Hash,PartialEq,Eq,Debug,Clone)]
 pub enum TextQueryTerm {
@@ -214,6 +214,8 @@ struct Comps<'a> {
     eq: HashMap<&'a str, &'a bson::Value>,
     ineq: HashMap<&'a str, (Option<(OpGt, &'a bson::Value)>, Option<(OpLt, &'a bson::Value)>)>,
 }
+
+// TODO the IndexInfos below should be references
 
 #[derive(Debug)]
 enum QueryPlan<'a> {
@@ -2835,19 +2837,23 @@ impl Connection {
                 // for every scalar key, find comparisons from the query.
                 let matching_ineqs = 
                     scalar_keys.iter().map(
-                        |&(ref k,_)| {
+                        |&(ref k, ndx_type)| {
                             match comps.ineq.get(k.as_str()) {
-                                Some(a) => Some(a),
+                                Some(&(gt, lt)) => {
+                                    let gt = gt.map(|(c,v)| (c,(v,ndx_type == IndexType::Backward)));
+                                    let lt = lt.map(|(c,v)| (c,(v,ndx_type == IndexType::Backward)));
+                                    Some((gt, lt))
+                                },
                                 None => None,
                             }
                         }
                         ).collect::<Vec<_>>();
                 let mut first_no_eqs = None;
                 let mut matching_eqs = vec![];
-                for (i, &(ref k, _)) in scalar_keys.iter().enumerate() {
+                for (i, &(ref k, ndx_type)) in scalar_keys.iter().enumerate() {
                     match comps.eq.get(k.as_str()) {
                         Some(a) => {
-                            matching_eqs.push(*a);
+                            matching_eqs.push((*a, ndx_type == IndexType::Backward));
                         },
                         None => {
                             first_no_eqs = Some(i);
@@ -2889,7 +2895,7 @@ impl Connection {
                             },
                             Some(num_eq) => {
                                 match matching_ineqs[num_eq] {
-                                    None | Some(&(None,None)) => {
+                                    None | Some((None,None)) => {
                                         if num_eq>0 {
                                             let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::EQ(matching_eqs));
                                             Ok(Some(plan))
@@ -2898,7 +2904,7 @@ impl Connection {
                                             Ok(None)
                                         }
                                     },
-                                    Some(&(Some(min),None)) => {
+                                    Some((Some(min),None)) => {
                                         let (op, v) = min;
                                         matching_eqs.push(v);
                                         match op {
@@ -2912,7 +2918,7 @@ impl Connection {
                                             },
                                         }
                                     },
-                                    Some(&(None,Some(max))) => {
+                                    Some((None,Some(max))) => {
                                         let (op, v) = max;
                                         matching_eqs.push(v);
                                         match op {
@@ -2926,7 +2932,7 @@ impl Connection {
                                             },
                                         }
                                     },
-                                    Some(&(Some(min),Some(max))) => {
+                                    Some((Some(min),Some(max))) => {
                                         // this can probably only happen when the comps came
                                         // from an elemMatch
                                         let (op_gt, vmin) = min;
@@ -4921,6 +4927,17 @@ impl Connection {
                     },
                     (min, max) => {
                         // TODO if natural, then fail?
+                        fn copy_dirs_from_normspec_to_vals<'a>(normspec: &Vec<(String, IndexType)>, vals: Vec<&'a bson::Value>) -> Vec<(&'a bson::Value, bool)> {
+                            // TODO if normspec.len() < vals.len() then panic?
+                            // TODO zip?
+                            let mut a = Vec::new();
+                            for (i,v) in vals.into_iter().enumerate() {
+                                let neg = normspec[i].1 == IndexType::Backward;
+                                a.push((v, neg));
+                            }
+                            a
+                        }
+
                         let pair =
                             match (min, max) {
                                 (&None, &None) => {
@@ -4938,6 +4955,11 @@ impl Connection {
                                     // TODO minkeys must == maxkeys
                                     match try!(Self::find_index_for_min_max(&indexes, &minkeys)) {
                                         Some(ndx) => {
+                                            // TODO the following is way too heavy.  all we need is the index types
+                                            // so we can tell if they're supposed to be backwards or not.
+                                            let (normspec, _) = try!(get_normalized_spec(ndx));
+                                            let minvals = copy_dirs_from_normspec_to_vals(&normspec, minvals);
+                                            let maxvals = copy_dirs_from_normspec_to_vals(&normspec, maxvals);
                                             let bounds = QueryBounds::GTE_LT(vec![], minvals, maxvals);
                                             (ndx, bounds)
                                         },
@@ -4951,6 +4973,10 @@ impl Connection {
                                     let (keys, minvals): (Vec<_>, Vec<_>) = min.into_iter().unzip();
                                     match try!(Self::find_index_for_min_max(&indexes, &keys)) {
                                         Some(ndx) => {
+                                            // TODO the following is way too heavy.  all we need is the index types
+                                            // so we can tell if they're supposed to be backwards or not.
+                                            let (normspec, _) = try!(get_normalized_spec(ndx));
+                                            let minvals = copy_dirs_from_normspec_to_vals(&normspec, minvals);
                                             let bounds = QueryBounds::GTE(minvals);
                                             (ndx, bounds)
                                         },
@@ -4964,6 +4990,10 @@ impl Connection {
                                     let (keys, maxvals): (Vec<_>, Vec<_>) = max.into_iter().unzip();
                                     match try!(Self::find_index_for_min_max(&indexes, &keys)) {
                                         Some(ndx) => {
+                                            // TODO the following is way too heavy.  all we need is the index types
+                                            // so we can tell if they're supposed to be backwards or not.
+                                            let (normspec, _) = try!(get_normalized_spec(ndx));
+                                            let maxvals = copy_dirs_from_normspec_to_vals(&normspec, maxvals);
                                             let bounds = QueryBounds::LT(maxvals);
                                             (ndx, bounds)
                                         },
