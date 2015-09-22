@@ -218,16 +218,16 @@ struct Comps<'a> {
 // TODO the IndexInfos below should be references
 
 #[derive(Debug)]
-enum QueryPlan<'a> {
-    Regular(IndexInfo, QueryBounds<'a>),
-    Text(IndexInfo, QueryKey<'a>, Vec<TextQueryTerm>),
+enum QueryPlan<'a,'i> {
+    Regular(&'i IndexInfo, QueryBounds<'a>),
+    Text(&'i IndexInfo, QueryKey<'a>, Vec<TextQueryTerm>),
 }
 
-impl<'a> QueryPlan<'a> {
-    fn get_ndx(&self) -> &IndexInfo {
+impl<'a,'i> QueryPlan<'a,'i> {
+    fn get_ndx(&self) -> &'i IndexInfo {
         match self {
-            &QueryPlan::Regular(ref ndx, _) => ndx,
-            &QueryPlan::Text(ref ndx,_,_) => ndx,
+            &QueryPlan::Regular(ndx, _) => ndx,
+            &QueryPlan::Text(ndx,_,_) => ndx,
         }
     }
 }
@@ -1829,11 +1829,11 @@ impl Connection {
             Some(plan) => {
                 match plan {
                     QueryPlan::Text(ndx, eq, terms) => {
-                        let rdr = try!(r.into_reader_text_index_scan(&ndx, eq, terms));
+                        let rdr = try!(r.into_reader_text_index_scan(ndx, eq, terms));
                         return Ok(rdr);
                     },
                     QueryPlan::Regular(ndx, bounds) => {
-                        let rdr = try!(r.into_reader_regular_index_scan(&ndx, bounds));
+                        let rdr = try!(r.into_reader_regular_index_scan(ndx, bounds));
                         return Ok(rdr);
                     },
                 }
@@ -1850,11 +1850,11 @@ impl Connection {
             Some(plan) => {
                 match plan {
                     QueryPlan::Text(ndx, eq, terms) => {
-                        let rdr = try!(r.get_reader_text_index_scan(&ndx, eq, terms));
+                        let rdr = try!(r.get_reader_text_index_scan(ndx, eq, terms));
                         return Ok(rdr);
                     },
                     QueryPlan::Regular(ndx, bounds) => {
-                        let rdr = try!(r.get_reader_regular_index_scan(&ndx, bounds));
+                        let rdr = try!(r.get_reader_regular_index_scan(ndx, bounds));
                         return Ok(rdr);
                     },
                 }
@@ -1871,11 +1871,11 @@ impl Connection {
             Some(plan) => {
                 match plan {
                     QueryPlan::Text(ndx, eq, terms) => {
-                        let rdr = try!(w.get_reader_text_index_scan(&ndx, eq, terms));
+                        let rdr = try!(w.get_reader_text_index_scan(ndx, eq, terms));
                         return Ok(rdr);
                     },
                     QueryPlan::Regular(ndx, bounds) => {
-                        let rdr = try!(w.get_reader_regular_index_scan(&ndx, bounds));
+                        let rdr = try!(w.get_reader_regular_index_scan(ndx, bounds));
                         return Ok(rdr);
                     },
                 }
@@ -2796,12 +2796,12 @@ impl Connection {
         Ok(m2)
     }
 
-    fn fit_index_to_query<'a>(
-        ndx: &IndexInfo, 
+    fn fit_index_to_query<'a,'i>(
+        ndx: &'i IndexInfo, 
         comps: &Comps<'a>,
         text_query: &Option<Vec<TextQueryTerm>>
         ) 
-        -> Result<Option<QueryPlan<'a>>> 
+        -> Result<Option<QueryPlan<'a,'i>>> 
     {
         let (scalar_keys, weights) = try!(get_normalized_spec(ndx));
         if weights.is_none() && text_query.is_some() {
@@ -2820,7 +2820,7 @@ impl Connection {
                             },
                             &Some(ref text_query) => {
                                 // TODO clone
-                                let plan = QueryPlan::Text(ndx.clone(), vec![], text_query.clone());
+                                let plan = QueryPlan::Text(&ndx, vec![], text_query.clone());
                                 Ok(Some(plan))
                             },
                         }
@@ -2873,7 +2873,7 @@ impl Connection {
                             None => {
                                 // we have an EQ for every key.  this index will work.
                                 // TODO clone
-                                let plan = QueryPlan::Text(ndx.clone(), matching_eqs, text_query.clone());
+                                let plan = QueryPlan::Text(&ndx, matching_eqs, text_query.clone());
                                 Ok(Some(plan))
                             },
                         }
@@ -2886,7 +2886,7 @@ impl Connection {
                         match first_no_eqs {
                             None => {
                                 if matching_eqs.len() > 0 {
-                                    let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::EQ(matching_eqs));
+                                    let plan = QueryPlan::Regular(&ndx, QueryBounds::EQ(matching_eqs));
                                     Ok(Some(plan))
                                 } else {
                                     // we can't use this index at all
@@ -2897,7 +2897,7 @@ impl Connection {
                                 match matching_ineqs[num_eq] {
                                     None | Some((None,None)) => {
                                         if num_eq>0 {
-                                            let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::EQ(matching_eqs));
+                                            let plan = QueryPlan::Regular(&ndx, QueryBounds::EQ(matching_eqs));
                                             Ok(Some(plan))
                                         } else {
                                             // we can't use this index at all
@@ -2909,11 +2909,11 @@ impl Connection {
                                         matching_eqs.push(v);
                                         match op {
                                             OpGt::GT => {
-                                                let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::GT(matching_eqs));
+                                                let plan = QueryPlan::Regular(&ndx, QueryBounds::GT(matching_eqs));
                                                 Ok(Some(plan))
                                             },
                                             OpGt::GTE => {
-                                                let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::GTE(matching_eqs));
+                                                let plan = QueryPlan::Regular(&ndx, QueryBounds::GTE(matching_eqs));
                                                 Ok(Some(plan))
                                             },
                                         }
@@ -2923,11 +2923,11 @@ impl Connection {
                                         matching_eqs.push(v);
                                         match op {
                                             OpLt::LT => {
-                                                let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::LT(matching_eqs));
+                                                let plan = QueryPlan::Regular(&ndx, QueryBounds::LT(matching_eqs));
                                                 Ok(Some(plan))
                                             },
                                             OpLt::LTE => {
-                                                let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::LTE(matching_eqs));
+                                                let plan = QueryPlan::Regular(&ndx, QueryBounds::LTE(matching_eqs));
                                                 Ok(Some(plan))
                                             },
                                         }
@@ -2940,19 +2940,19 @@ impl Connection {
 
                                         match (op_gt, op_lt) {
                                             (OpGt::GT, OpLt::LT) => {
-                                                let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::GT_LT(matching_eqs, vec![vmin], vec![vmax]));
+                                                let plan = QueryPlan::Regular(&ndx, QueryBounds::GT_LT(matching_eqs, vec![vmin], vec![vmax]));
                                                 Ok(Some(plan))
                                             },
                                             (OpGt::GT, OpLt::LTE) => {
-                                                let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::GT_LTE(matching_eqs, vec![vmin], vec![vmax]));
+                                                let plan = QueryPlan::Regular(&ndx, QueryBounds::GT_LTE(matching_eqs, vec![vmin], vec![vmax]));
                                                 Ok(Some(plan))
                                             },
                                             (OpGt::GTE, OpLt::LT) => {
-                                                let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::GTE_LT(matching_eqs, vec![vmin], vec![vmax]));
+                                                let plan = QueryPlan::Regular(&ndx, QueryBounds::GTE_LT(matching_eqs, vec![vmin], vec![vmax]));
                                                 Ok(Some(plan))
                                             },
                                             (OpGt::GTE, OpLt::LTE) => {
-                                                let plan = QueryPlan::Regular(ndx.clone(), QueryBounds::GTE_LTE(matching_eqs, vec![vmin], vec![vmax]));
+                                                let plan = QueryPlan::Regular(&ndx, QueryBounds::GTE_LTE(matching_eqs, vec![vmin], vec![vmax]));
                                                 Ok(Some(plan))
                                             },
                                         }
@@ -3068,7 +3068,7 @@ impl Connection {
         }
     }
 
-    fn find_fit_indexes<'a, 'm>(indexes: &'a Vec<IndexInfo>, m: &'m matcher::QueryDoc) -> Result<(Vec<QueryPlan<'m>>, Option<Vec<TextQueryTerm>>)> {
+    fn find_fit_indexes<'a, 'm>(indexes: &'a Vec<IndexInfo>, m: &'m matcher::QueryDoc) -> Result<(Vec<QueryPlan<'m,'a>>, Option<Vec<TextQueryTerm>>)> {
         let text_query = if let Some(s) = try!(Self::find_text_query(m)) {
             let v = s.chars().collect::<Vec<char>>();
             Some(try!(Self::parse_text_query(&v)))
@@ -3090,7 +3090,7 @@ impl Connection {
         Ok((fits, text_query))
     }
 
-    fn choose_from_possibles(possibles: Vec<QueryPlan>) -> Option<QueryPlan> {
+    fn choose_from_possibles<'a,'b>(possibles: Vec<QueryPlan<'a,'b>>) -> Option<QueryPlan<'a,'b>> {
         if possibles.len() == 0 {
             None
         } else {
@@ -3109,7 +3109,7 @@ impl Connection {
         }
     }
 
-    fn choose_index<'a, 'm>(indexes: &'a Vec<IndexInfo>, m: &'m matcher::QueryDoc, hint: Option<&IndexInfo>) -> Result<Option<QueryPlan<'m>>> {
+    fn choose_index<'a, 'm>(indexes: &'a Vec<IndexInfo>, m: &'m matcher::QueryDoc, hint: Option<&IndexInfo>) -> Result<Option<QueryPlan<'m,'a>>> {
         let (mut fits, text_query) = try!(Self::find_fit_indexes(indexes, m));
         match text_query {
             Some(_) => {
@@ -5007,7 +5007,7 @@ impl Connection {
                         // TODO tests indicate that if there is a $min and/or $max as well as a $hint,
                         // then we need to error if they don't match each other.
 
-                        let plan = QueryPlan::Regular(pair.0.clone(), pair.1);
+                        let plan = QueryPlan::Regular(&pair.0, pair.1);
                         Some(plan)
                     }
                 };
