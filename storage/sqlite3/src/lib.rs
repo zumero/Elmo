@@ -19,6 +19,7 @@
 #![feature(vec_push_all)]
 #![feature(iter_arith)]
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 extern crate bson;
@@ -198,7 +199,7 @@ fn get_table_name_for_index(db: &str, coll: &str, name: &str) -> String {
     format!("ndx.{}.{}.{}", db, coll, name) 
 }
 
-fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::IndexType)>, weights: &Option<std::collections::HashMap<String,i32>>, options: &bson::Document) -> Result<HashSet<Vec<(bson::Value,bool)>>> {
+fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::IndexType)>, weights: &Option<HashMap<String,i32>>, options: &bson::Document) -> Result<HashSet<Vec<(bson::Value,bool)>>> {
     fn find_index_entry_vals(normspec: &Vec<(String, elmo::IndexType)>, new_doc: &bson::Document, sparse: bool) -> Vec<(bson::Value,bool)> {
         //println!("find_index_entry_vals: sparse = {:?}", sparse);
         let mut r = Vec::new();
@@ -249,7 +250,7 @@ fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::Ind
         }
     }
 
-    fn maybe_text(vals: &Vec<(bson::Value, bool)>, new_doc: &bson::Document, weights: &Option<std::collections::HashMap<String,i32>>, entries: &mut Vec<Vec<(bson::Value,bool)>>) {
+    fn maybe_text(vals: &Vec<(bson::Value, bool)>, new_doc: &bson::Document, weights: &Option<HashMap<String,i32>>, entries: &mut Vec<Vec<(bson::Value,bool)>>) {
         //println!("in maybe_text: {:?}", vals);
         match weights {
             &Some(ref weights) => {
@@ -298,7 +299,7 @@ fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::Ind
         v2
     }
 
-    fn maybe_array(vals: &Vec<(bson::Value, bool)>, new_doc: &bson::Document, weights: &Option<std::collections::HashMap<String,i32>>, entries: &mut Vec<Vec<(bson::Value,bool)>>) {
+    fn maybe_array(vals: &Vec<(bson::Value, bool)>, new_doc: &bson::Document, weights: &Option<HashMap<String,i32>>, entries: &mut Vec<Vec<(bson::Value,bool)>>) {
         //println!("in maybe_array: {:?}", vals);
         // first do the index entries for the document without considering arrays
         maybe_text(vals, new_doc, weights, entries);
@@ -565,7 +566,7 @@ impl MyConn {
             found.push(v);
         };
 
-        fn contains_phrase(weights: &std::collections::HashMap<String, i32>, doc: &bson::Value, p: &str) -> bool {
+        fn contains_phrase(weights: &HashMap<String, i32>, doc: &bson::Value, p: &str) -> bool {
             weights.keys().any(
                 |k|
                 doc.walk_path(k).leaves().any(
@@ -585,7 +586,7 @@ impl MyConn {
                 )
         }
 
-        fn check_phrase(terms: &Vec<elmo::TextQueryTerm>, weights: &std::collections::HashMap<String, i32>, doc: &bson::Value) -> bool {
+        fn check_phrase(terms: &Vec<elmo::TextQueryTerm>, weights: &HashMap<String, i32>, doc: &bson::Value) -> bool {
             for term in terms {
                 let b = 
                     match term {
@@ -638,7 +639,7 @@ impl MyConn {
             }
         }
 
-        let mut doc_weights: std::collections::HashMap<i64, Vec<i32>> = std::collections::HashMap::new();
+        let mut doc_weights: HashMap<i64, Vec<i32>> = HashMap::new();
         for t in remaining {
             let (did, w) = t;
             if doc_weights.contains_key(&did) {
