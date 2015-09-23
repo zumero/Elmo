@@ -4355,8 +4355,8 @@ impl Connection {
 
     fn init_eval_ctx(d: bson::Value) -> bson::Document {
         let mut ctx = bson::Document::new();
+        ctx.set("ROOT", d.clone());
         ctx.set("CURRENT", d);
-        // TODO ROOT
         // TODO use string constants for the stuff below
         ctx.set("DESCEND", bson::Value::BString(String::from("__descend__")));
         ctx.set("PRUNE", bson::Value::BString(String::from("__prune__")));
