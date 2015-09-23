@@ -19,6 +19,8 @@
 #![feature(vec_push_all)]
 #![feature(iter_arith)]
 
+use std::collections::HashSet;
+
 extern crate bson;
 
 extern crate elmo;
@@ -196,7 +198,7 @@ fn get_table_name_for_index(db: &str, coll: &str, name: &str) -> String {
     format!("ndx.{}.{}.{}", db, coll, name) 
 }
 
-fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::IndexType)>, weights: &Option<std::collections::HashMap<String,i32>>, options: &bson::Document, entries: &mut Vec<Vec<(bson::Value,bool)>>) -> Result<()> {
+fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::IndexType)>, weights: &Option<std::collections::HashMap<String,i32>>, options: &bson::Document) -> Result<HashSet<Vec<(bson::Value,bool)>>> {
     fn find_index_entry_vals(normspec: &Vec<(String, elmo::IndexType)>, new_doc: &bson::Document, sparse: bool) -> Vec<(bson::Value,bool)> {
         //println!("find_index_entry_vals: sparse = {:?}", sparse);
         let mut r = Vec::new();
@@ -236,7 +238,7 @@ fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::Ind
     fn q(vals: &Vec<(bson::Value, bool)>, w: i32, s: &str, entries: &mut Vec<Vec<(bson::Value,bool)>>) {
         // TODO tokenize properly
         let a = s.split(" ");
-        let a = a.into_iter().collect::<std::collections::HashSet<_>>();
+        let a = a.into_iter().collect::<HashSet<_>>();
         for s in a {
             let s = String::from(s);
             let v = bson::Value::BArray(bson::Array {items: vec![bson::Value::BString(s), bson::Value::BInt32(w)]});
@@ -266,7 +268,7 @@ fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::Ind
                                 match v {
                                     bson::Value::BString(s) => q(&vals, weights[k], &s, entries),
                                     bson::Value::BArray(ba) => {
-                                        let a = ba.items.into_iter().collect::<std::collections::HashSet<_>>();
+                                        let a = ba.items.into_iter().collect::<HashSet<_>>();
                                         for v in a {
                                             match v {
                                                 bson::Value::BString(s) => q(&vals, weights[k], &s, entries),
@@ -312,7 +314,7 @@ fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::Ind
             let typ = t.1;
             match v {
                 &bson::Value::BArray(ref ba) => {
-                    let a = ba.items.iter().collect::<std::collections::HashSet<_>>();
+                    let a = ba.items.iter().collect::<HashSet<_>>();
                     for av in a {
                         // TODO clone is ugly
                         let replaced = replace_array_element(vals, i, (av.clone(), typ));
@@ -331,11 +333,14 @@ fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, elmo::Ind
     };
 
     let vals = find_index_entry_vals(normspec, new_doc, sparse);
-    maybe_array(&vals, new_doc, weights, entries);
+    let mut entries = Vec::new();
+    maybe_array(&vals, new_doc, weights, &mut entries);
 
     //println!("entries: {:?}", entries);
 
-    Ok(())
+    let entries = entries.into_iter().collect::<HashSet<_>>();
+
+    Ok(entries)
 }
 
 fn get_index_info_from_row(r: &sqlite3::ResultRow) -> Result<elmo::IndexInfo> {
@@ -624,7 +629,7 @@ impl MyConn {
             };
         }
 
-        let neg_docids = neg_entries.into_iter().map(|t| t.0).collect::<std::collections::HashSet<_>>();
+        let neg_docids = neg_entries.into_iter().map(|t| t.0).collect::<HashSet<_>>();
         let mut remaining = Vec::new();
         for t in pos_entries {
             let (did, w) = t;
@@ -819,9 +824,7 @@ impl MyCollectionWriter {
     fn update_indexes_insert(indexes: &mut Vec<IndexPrep>, rowid: i64, v: &bson::Document) -> Result<()> {
         for t in indexes {
             let (normspec, weights) = try!(elmo::get_normalized_spec(&t.info));
-            let mut entries = Vec::new();
-            try!(get_index_entries(&v, &normspec, &weights, &t.info.options, &mut entries));
-            let entries = entries.into_iter().collect::<std::collections::HashSet<_>>();
+            let entries = try!(get_index_entries(&v, &normspec, &weights, &t.info.options));
             for vals in entries {
                 let vref = vals.iter().map(|&(ref v,neg)| (v,neg)).collect::<Vec<_>>();
                 let k = bson::Value::encode_multi_for_index(&vref, None);
@@ -951,9 +954,7 @@ impl MyWriter {
                                 Some(row) => {
                                     let doc_rowid = row.column_int64(0);
                                     let new_doc = try!(bson::Document::from_bson(&row.column_slice(1).expect("NOT NULL")));
-                                    let mut entries = Vec::new();
-                                    try!(get_index_entries(&new_doc, &normspec, &weights, &info.options, &mut entries));
-                                    let entries = entries.into_iter().collect::<std::collections::HashSet<_>>();
+                                    let entries = try!(get_index_entries(&new_doc, &normspec, &weights, &info.options));
                                     for vals in entries {
                                         //println!("index entry: {:?}", vals);
                                         let vref = vals.iter().map(|&(ref v,neg)| (v,neg)).collect::<Vec<_>>();
