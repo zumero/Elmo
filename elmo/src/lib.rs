@@ -4630,6 +4630,24 @@ impl Connection {
 
         let c = matcher::cmpdir(va, vb, backward);
         c
+/*
+For server6125 (agg sort), the following code seems a little
+more correct than the cmpdir line above.  The agg notion of
+sort is apparently different from the orderby with find().
+The latter does the "sort arrays by their first element"
+trick, but agg sort apparently does not.
+
+Nonetheless, even with the following, server6125 still doesn't
+pass because of the DBPointer entry, which is arriving to Elmo
+looking EXACTLY like a plain objectid entry.
+
+        let c = matcher::cmp(va, vb);
+        if backward {
+            c.reverse()
+        } else {
+            c
+        }
+*/
     }
 
     fn do_sort_docs(a: &mut Vec<bson::Value>, orderby: &bson::Value) -> Result<()> {

@@ -77,6 +77,14 @@ printfn "Pattern: %A" pattern
 let path_mongo_shell = "/Users/eric/Downloads/mongodb-osx-x86_64-3.0.1/bin/mongo"
 let path_mongo_src = "/Users/eric/m/mongo"
 let all_tests = [
+    "jstests/core/existsa.js"; // issue with sparse index
+    "jstests/core/upsert_fields.js"; // also fails in mongo 2.6
+    "jstests/core/update_replace.js"; // some good validation stuff, but uses a second connection
+    "jstests/core/or4.js"; // $group
+    "jstests/core/or5.js"; // cursor,batchSize
+    "jstests/core/server9547.js"; // comment in test says that mongo SHOULD be giving the result we are giving
+    "jstests/core/elemMatchProjection.js"; // jira server-1013, partial
+    
     "jstests/core/fts1.js"; // missing info from listIndexes for a text index
     "jstests/core/fts6.js"; // $or
     "jstests/core/fts_blog.js"; // stemming, write vs writing
@@ -96,7 +104,7 @@ let all_tests = [
     "jstests/core/fts_score_sort.js";
     "jstests/core/fts_spanish.js";
     "jstests/aggregation/bugs/server11675.js"; // $text fts?
-    "jstests/aggregation/bugs/server6125.js"; // sort.  test case seems wrong.  array containing 1 should sort before 2L.
+    "jstests/aggregation/bugs/server6125.js"; // sort.  see notes in code.  array sort?  or DBPointer?
     "jstests/aggregation/bugs/server6177.js"; // $project:{ 'x':{ $add:[ 1 ] }, 'x.b':1 } } should fail even when doc is {}, broke on fix of 6185
     "jstests/aggregation/bugs/server6192_server6193.js"; // explain
     "jstests/aggregation/bugs/server6529.js"; // {$project:{foo:{$add:[{b:1}]}}} is supposed to complain about field inclusion?!?  16420.
@@ -106,11 +114,9 @@ let all_tests = [
     "jstests/aggregation/bugs/server9840.js"; // $const.  also, japanese variable name seen as invalid.
     "jstests/aggregation/bugs/substr.js"; // "fails" because unicode support is more complete
     "jstests/core/drop.js"; // seems to require listIndexes on a non-existent collection to return empty instead of error
-    // "jstests/core/elemMatchProjection.js"; // jira server-1013, partial
     // "jstests/core/remove_undefined.js"; // test is broken.  doesn't drop its coll first.
     // "jstests/aggregation/bugs/server5932.js"; // unwind, exceeds message size
     "jstests/core/count_hint.js";
-    // "jstests/core/server9547.js"; // comment in test says that mongo SHOULD be giving the result we are giving
     // "jstests/aggregation/bugs/server9444.js"; // huge
     // "jstests/aggregation/bugs/server14969.js"; // outofmemory ?
     // "jstests/aggregation/bugs/server10530.js"; // huge
@@ -119,7 +125,6 @@ let all_tests = [
 
     "jstests/aggregation/bugs/server6189.js"; // date operators with dates before 1970.  date formatting ?
     "jstests/aggregation/bugs/server6184.js"; // project b:{a:1} should be an inclusion of b.a, not {a:1} as a doc literal for b
-    "jstests/core/or5.js"; // cursor,batchSize
     "jstests/core/regex2.js"; // dot all syntax, Singleline mode
 
     "jstests/aggregation/bugs/server6238.js"; // error codes on invalid $ in paths, project and group
@@ -209,7 +214,6 @@ let all_tests = [
     "jstests/core/or6.js"; // cursor
     "jstests/core/oro.js"; // batchSize, cursor, explain
     // "jstests/core/find9.js"; // huge
-    // "jstests/core/or4.js"; // $group
     "jstests/core/cursor1.js";
     "jstests/core/cursor2.js";
     "jstests/core/cursor3.js";
@@ -370,7 +374,6 @@ let all_tests = [
     "jstests/core/update_mul_examples.js";
     "jstests/core/update_multi3.js";
     "jstests/core/update_multi4.js";
-    // "jstests/core/update_replace.js"; // some good validation stuff, but uses a second connection
 
     "jstests/core/all.js";
     "jstests/core/all2.js";
@@ -491,8 +494,6 @@ let all_tests = [
     // "jstests/core/group8.js"; // js
     
     // "jstests/core/arrayfind8.js"; // unexpected count in unindexed standard query, SERVER-1264, unresolved
-    // "jstests/core/existsa.js"; // issue with sparse index
-    // "jstests/core/upsert_fields.js"; // also fails in mongo 2.6
 
 
     // "jstests/core/or2.js"; // explain, analyze_plan.js
