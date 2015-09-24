@@ -77,9 +77,6 @@ printfn "Pattern: %A" pattern
 let path_mongo_shell = "/Users/eric/Downloads/mongodb-osx-x86_64-3.0.1/bin/mongo"
 let path_mongo_src = "/Users/eric/m/mongo"
 let all_tests = [
-    "jstests/core/orh.js"; // disallow use of a sparse index on y for query {y:null}
-    "jstests/core/null.js"; // disallow use of a sparse index on y for query {y:null}
-    "jstests/core/exists9.js"; // bad index on {a.0}
     "jstests/core/fts1.js"; // missing info from listIndexes for a text index
     "jstests/core/fts6.js"; // $or
     "jstests/core/fts_blog.js"; // stemming, write vs writing
@@ -181,6 +178,9 @@ let all_tests = [
     "jstests/aggregation/bugs/server6232.js";
     "jstests/aggregation/bugs/server6165.js"; // long_dublong case.  mongo results seems wrong.
 
+    "jstests/core/exists9.js"; // bad index on {a.0}
+    "jstests/core/orh.js"; // disallow use of a sparse index on y for query {y:null}
+    "jstests/core/null.js"; // disallow use of a sparse index on y for query {y:null}
     "jstests/core/minmax.js"; // min/max query modifier, 2 Compares
     "jstests/core/fts2.js";
     "jstests/core/fts3.js";

@@ -185,6 +185,13 @@ impl IndexInfo {
     pub fn full_collection_name(&self) -> String {
         format!("{}.{}", self.db, self.coll)
     }
+
+    fn is_sparse(&self) -> bool {
+        match self.options.get("sparse") {
+            Some(&bson::Value::BBoolean(b)) => b,
+            _ => false,
+        }
+    }
 }
 
 // TODO should be called IndexKey?
@@ -2853,7 +2860,12 @@ impl Connection {
                 for (i, &(ref k, ndx_type)) in scalar_keys.iter().enumerate() {
                     match comps.eq.get(k.as_str()) {
                         Some(a) => {
-                            matching_eqs.push((*a, ndx_type == IndexType::Backward));
+                            if a.is_null() && ndx.is_sparse() {
+                                first_no_eqs = Some(i);
+                                break;
+                            } else {
+                                matching_eqs.push((*a, ndx_type == IndexType::Backward));
+                            }
                         },
                         None => {
                             first_no_eqs = Some(i);
