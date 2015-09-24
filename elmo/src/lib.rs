@@ -3412,9 +3412,47 @@ impl Connection {
                                     };
                                     let e_input = try!(Self::parse_expr(arg_input));
                                     let v_as = try!(arg_as.into_string());
-                                    let e_in = try!(Self::parse_expr(arg_in));
-                                    let t = (e_input, v_as, e_in);
+                                    let expr_in = try!(Self::parse_expr(arg_in));
+                                    let t = (e_input, v_as, expr_in);
                                     Ok(Expr::Map(box t))
+                                }
+                            },
+
+                            "$let" => {
+                                match v {
+                                    bson::Value::BDocument(mut v) => {
+                                        if v.pairs.iter().any(|&(ref k,_)| k != "vars" && k != "in") {
+                                            Err(Error::MongoCode(16875, String::from("unrecognized $let arg")))
+                                        } else {
+                                            let arg_vars = match v.remove("vars") {
+                                                Some(bson::Value::BDocument(bd)) => {
+                                                    bd
+                                                },
+                                                Some(_) => {
+                                                    return Err(Error::MongoCode(16876, String::from("$let vars must be a document")));
+                                                },
+                                                None => {
+                                                    return Err(Error::MongoCode(16876, String::from("$let missing vars")));
+                                                },
+                                            };
+                                            let arg_in = match v.remove("in") {
+                                                Some(v) => v,
+                                                None => {
+                                                    return Err(Error::MongoCode(16877, String::from("$let missing in")));
+                                                },
+                                            };
+                                            let mut vars = vec![];
+                                            for (k,v) in arg_vars.pairs {
+                                                let e = try!(Self::parse_expr(v));
+                                                vars.push((k,e));
+                                            }
+                                            let expr_in = try!(Self::parse_expr(arg_in));
+                                            Ok(Expr::Let(vars, box expr_in))
+                                        }
+                                    },
+                                    _ => {
+                                        return Err(Error::MongoCode(16874, String::from("$let requires a document as its argument")));
+                                    },
                                 }
                             },
 
@@ -3471,8 +3509,6 @@ impl Connection {
                                 let date = try!(Self::parse_expr(date));
                                 Ok(Expr::DateToString(format, box date))
                             },
-
-                            // TODO let
 
                             _ => {
                                 Err(Error::MongoCode(15999, format!("invalid expression operator: {}", k)))
@@ -3997,6 +4033,18 @@ impl Connection {
                     },
                 }
             },
+            &Expr::Let(ref vars, ref expr_in) => {
+                let mut ctx = ctx.clone();
+                for &(ref name, ref e) in vars.iter() {
+                    if !Self::is_legal_var_name(name) {
+                        return Err(Error::MongoCode(16867, format!("illegal variable name{:?}", name)));
+                    }
+                    let v = try!(Self::eval(&ctx, e));
+                    ctx.set(name, v);
+                }
+                let v = try!(Self::eval(&ctx, expr_in));
+                Ok(v)
+            },
             &Expr::SetDifference(_) => {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
@@ -4010,9 +4058,6 @@ impl Connection {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
             &Expr::SetUnion(_) => {
-                Err(Error::Misc(format!("TODO eval {:?}", e)))
-            },
-            &Expr::Let(_,_) => {
                 Err(Error::Misc(format!("TODO eval {:?}", e)))
             },
         }
