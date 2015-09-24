@@ -2866,6 +2866,8 @@ impl Connection {
                 for (i, &(ref k, ndx_type)) in scalar_keys.iter().enumerate() {
                     match comps.eq.get(k.as_str()) {
                         Some(a) => {
+                            // TODO not sure this check belongs here.  might want to do it later so
+                            // hint can force it.
                             if a.is_null() && ndx.is_sparse() {
                                 first_no_eqs = Some(i);
                                 break;
@@ -3093,6 +3095,8 @@ impl Connection {
         } else {
             None
         };
+        // TODO er, we don't know how to use an index for any other kind of
+        // predicate.  like $exists
         let comps_eq = try!(Self::find_compares_eq(m));
         let comps_ineq = try!(Self::find_compares_ineq(m));
         let comps = Comps {
@@ -3105,10 +3109,11 @@ impl Connection {
                 fits.push(x);
             }
         }
+        //println!("fits: {:?}", fits);
         Ok((fits, text_query))
     }
 
-    fn choose_from_possibles<'a,'b>(possibles: Vec<QueryPlan<'a,'b>>) -> Option<QueryPlan<'a,'b>> {
+    fn choose_from_possibles<'a,'b>(m: &matcher::QueryDoc, possibles: Vec<QueryPlan<'a,'b>>) -> Option<QueryPlan<'a,'b>> {
         if possibles.len() == 0 {
             None
         } else {
@@ -3120,7 +3125,12 @@ impl Connection {
             let mut winner = None;
             for plan in possibles {
                 if winner.is_none() || plan.get_ndx().name == "_id_" {
-                    winner = Some(plan);
+                    //if matcher::uses_exists_false(m) && plan.get_ndx().is_sparse() {
+                        // ineligible
+                        //println!("INELIGIBLE");
+                    //} else {
+                        winner = Some(plan);
+                    //}
                 }
             }
             winner
@@ -3150,10 +3160,12 @@ impl Connection {
                             Some(i) => {
                                 Ok(Some(fits.remove(i)))
                             },
-                            None => Ok(Self::choose_from_possibles(fits))
+                            None => Ok(Self::choose_from_possibles(m, fits))
                         }
                     },
-                    None => Ok(Self::choose_from_possibles(fits))
+                    None => {
+                        Ok(Self::choose_from_possibles(m, fits))
+                    },
                 }
             },
         }

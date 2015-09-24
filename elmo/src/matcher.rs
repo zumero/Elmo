@@ -699,6 +699,22 @@ pub fn uses_near(m: &QueryDoc) -> bool {
         })
 }
 
+pub fn uses_exists_false(m: &QueryDoc) -> bool {
+    let &QueryDoc::QueryDoc(ref items) = m;
+    items.iter().any(
+        |q| match q {
+            &QueryItem::Compare(_, ref preds) => {
+                preds.iter().any(
+                    |p| match p {
+                        &Pred::Exists(false) => true,
+                        _ => false,
+                    }
+                    )
+            },
+            _ => false,
+        })
+}
+
 fn contains_no_dollar_keys(v: &bson::Value) -> bool {
     match v {
         &bson::Value::BDocument(ref bd) => {

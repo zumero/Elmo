@@ -77,11 +77,11 @@ printfn "Pattern: %A" pattern
 let path_mongo_shell = "/Users/eric/Downloads/mongodb-osx-x86_64-3.0.1/bin/mongo"
 let path_mongo_src = "/Users/eric/m/mongo"
 let all_tests = [
-    "jstests/core/existsa.js"; // issue with sparse index
+    "jstests/core/existsa.js"; // $exists doesn't know how to use index.  then special case sparse for exists:false
     "jstests/core/upsert_fields.js"; // also fails in mongo 2.6
     "jstests/core/update_replace.js"; // some good validation stuff, but uses a second connection
-    "jstests/core/or4.js"; // $group
-    "jstests/core/or5.js"; // cursor,batchSize
+    //"jstests/core/or4.js"; // $group (old, pre-agg form of group)
+    "jstests/core/or5.js"; // geo
     "jstests/core/server9547.js"; // comment in test says that mongo SHOULD be giving the result we are giving
     "jstests/core/elemMatchProjection.js"; // jira server-1013, partial
     
@@ -109,7 +109,7 @@ let all_tests = [
     "jstests/aggregation/bugs/server6192_server6193.js"; // explain
     "jstests/aggregation/bugs/server6529.js"; // {$project:{foo:{$add:[{b:1}]}}} is supposed to complain about field inclusion?!?  16420.
     "jstests/aggregation/bugs/server6530.js"; // no $near in match, but syntax looks wrong anyway?
-    "jstests/aggregation/bugs/server6531.js"; // support $within
+    "jstests/aggregation/bugs/server6531.js"; // support $within (old form of geo stuff)
     "jstests/aggregation/bugs/server7781.js"; // $geoNear
     "jstests/aggregation/bugs/server9840.js"; // $const.  also, japanese variable name seen as invalid.
     "jstests/aggregation/bugs/substr.js"; // "fails" because unicode support is more complete
