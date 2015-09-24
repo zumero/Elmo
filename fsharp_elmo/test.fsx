@@ -96,7 +96,6 @@ let all_tests = [
     "jstests/core/fts_score_sort.js";
     "jstests/core/fts_spanish.js";
     "jstests/aggregation/bugs/server11675.js"; // $text fts?
-    "jstests/aggregation/bugs/server5209.js"; // group by 24 vs 24L vs 24.0
     "jstests/aggregation/bugs/server6125.js"; // sort.  test case seems wrong.  array containing 1 should sort before 2L.
     "jstests/aggregation/bugs/server6177.js"; // $project:{ 'x':{ $add:[ 1 ] }, 'x.b':1 } } should fail even when doc is {}, broke on fix of 6185
     "jstests/aggregation/bugs/server6192_server6193.js"; // explain
@@ -178,6 +177,7 @@ let all_tests = [
     "jstests/aggregation/bugs/server6232.js";
     "jstests/aggregation/bugs/server6165.js"; // long_dublong case.  mongo results seems wrong.
 
+    "jstests/aggregation/bugs/server5209.js"; // group by 24 vs 24L vs 24.0
     "jstests/core/exists9.js"; // bad index on {a.0}
     "jstests/core/orh.js"; // disallow use of a sparse index on y for query {y:null}
     "jstests/core/null.js"; // disallow use of a sparse index on y for query {y:null}

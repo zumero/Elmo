@@ -4382,9 +4382,30 @@ impl Connection {
             let row = try!(rr);
             let mut ctx = Self::init_eval_ctx(row.doc);
             let idval = try!(Self::eval(&ctx, &id));
-            // TODO if the idval is numeric, we are apparently supposed to collapse them.
-            // for example the same value in i32 and i64 are a match.  double too, if it's
-            // an integral value.  server5209
+            // to the extent possible, we collapse numeric values here.
+            // i64 stays
+            // i32 becomes i64
+            // f64 becomes i64 if it's an integer
+            // TODO server9840 seems to not like this.  do we use i32 if it fits?
+            let idval = 
+                match idval {
+                    bson::Value::BInt32(n) => {
+                        bson::Value::BInt64(n as i64)
+                    },
+                    bson::Value::BInt64(n) => {
+                        idval
+                    },
+                    bson::Value::BDouble(f) => {
+                        if f64_can_be_i64(f) {
+                            bson::Value::BInt64(f as i64)
+                        } else {
+                            idval
+                        }
+                    },
+                    _ => {
+                        idval
+                    },
+                };
             // TODO avoid clone() in following line
             let acc = match mapa.entry(idval.clone()) {
                 std::collections::hash_map::Entry::Vacant(e) => {
