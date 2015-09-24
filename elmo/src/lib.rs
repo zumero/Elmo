@@ -297,6 +297,12 @@ pub enum ProjectionOperator {
     ElemMatch(matcher::QueryDoc),
 }
 
+fn i64_can_be_i32(f: i64) -> bool {
+    let n = f as i32;
+    let f2 = n as i64;
+    f == f2
+}
+
 fn f64_can_be_i32(f: f64) -> bool {
     let n = f as i32;
     let f2 = n as f64;
@@ -4382,22 +4388,24 @@ impl Connection {
             let row = try!(rr);
             let mut ctx = Self::init_eval_ctx(row.doc);
             let idval = try!(Self::eval(&ctx, &id));
-            // to the extent possible, we collapse numeric values here.
-            // i64 stays
-            // i32 becomes i64
-            // f64 becomes i64 if it's an integer
-            // TODO server9840 seems to not like this.  do we use i32 if it fits?
+            // to the extent possible, we normalize numeric values here.
+            // it appears that mongo converts everything that fits to i32.
+            // server9840 and server5209
             let idval = 
                 match idval {
                     bson::Value::BInt32(n) => {
-                        bson::Value::BInt64(n as i64)
-                    },
-                    bson::Value::BInt64(n) => {
                         idval
                     },
+                    bson::Value::BInt64(n) => {
+                        if i64_can_be_i32(n) {
+                            bson::Value::BInt32(n as i32)
+                        } else {
+                            idval
+                        }
+                    },
                     bson::Value::BDouble(f) => {
-                        if f64_can_be_i64(f) {
-                            bson::Value::BInt64(f as i64)
+                        if f64_can_be_i32(f) {
+                            bson::Value::BInt32(f as i32)
                         } else {
                             idval
                         }
