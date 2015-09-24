@@ -1346,6 +1346,7 @@ impl elmo::StorageBase for MyWriter {
 
 impl elmo::StorageConnection for MyPublicConn {
     fn begin_write(&self) -> Result<Box<elmo::StorageWriter + 'static>> {
+        // TODO retry/sleep loop here
         try!(self.myconn.conn.exec("BEGIN IMMEDIATE TRANSACTION").map_err(elmo::wrap_err));
         let w = MyWriter {
             myconn: self.myconn.clone(),
@@ -1369,9 +1370,37 @@ fn base_connect(name: &str) -> sqlite3::SqliteResult<sqlite3::DatabaseConnection
     let conn = try!(sqlite3::DatabaseConnection::new(access));
     try!(conn.exec("PRAGMA journal_mode=WAL"));
     try!(conn.exec("PRAGMA foreign_keys=ON"));
-    // TODO might need BEGIN IMMEDIATE here.  and maybe wait/retry on busy.
-    try!(conn.exec("CREATE TABLE IF NOT EXISTS \"collections\" (dbName TEXT NOT NULL, collName TEXT NOT NULL, options BLOB NOT NULL, PRIMARY KEY (dbName,collName))"));
-    try!(conn.exec("CREATE TABLE IF NOT EXISTS \"indexes\" (dbName TEXT NOT NULL, collName TEXT NOT NULL, ndxName TEXT NOT NULL, spec BLOB NOT NULL, options BLOB NOT NULL, PRIMARY KEY (dbName, collName, ndxName), FOREIGN KEY (dbName,collName) REFERENCES \"collections\" ON DELETE CASCADE ON UPDATE CASCADE, UNIQUE (spec,dbName,collName))"));
+    let mut tries = 0;
+    loop {
+        tries = tries + 1;
+        match conn.exec("BEGIN IMMEDIATE TRANSACTION") {
+            Ok(_) => {
+                try!(conn.exec("CREATE TABLE IF NOT EXISTS \"collections\" (dbName TEXT NOT NULL, collName TEXT NOT NULL, options BLOB NOT NULL, PRIMARY KEY (dbName,collName))"));
+                try!(conn.exec("CREATE TABLE IF NOT EXISTS \"indexes\" (dbName TEXT NOT NULL, collName TEXT NOT NULL, ndxName TEXT NOT NULL, spec BLOB NOT NULL, options BLOB NOT NULL, PRIMARY KEY (dbName, collName, ndxName), FOREIGN KEY (dbName,collName) REFERENCES \"collections\" ON DELETE CASCADE ON UPDATE CASCADE, UNIQUE (spec,dbName,collName))"));
+                try!(conn.exec("COMMIT TRANSACTION"));
+                break;
+            },
+            Err(e) => {
+                // TODO we could maaaaaybe just punt here if we get SQLITE_BUSY.
+                // the idea would be that if somebody else has the write lock, then
+                // the tables we want to create are already created.  So just ignore
+                // the error.
+
+                if e.kind == sqlite3::SqliteErrorCode::SQLITE_BUSY {
+                    if tries > 10 {
+                        return Err(e);
+                    }
+
+                    println!("error on begin immediate: {:?}", e);
+                    println!("tries: {:?}", tries);
+                    println!("sleeping to try again");
+                    std::thread::sleep_ms(50);
+                } else {
+                    return Err(e);
+                }
+            },
+        }
+    }
 
     Ok(conn)
 }

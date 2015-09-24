@@ -2009,6 +2009,13 @@ impl Connection {
     pub fn update(&self, db: &str, coll: &str, updates: &mut Vec<bson::Document>, factory: &ConnectionFactory) -> Result<Vec<Result<(i32, i32, Option<bson::Value>)>>> {
         let mut results = Vec::new();
         {
+            // rconn needs to be opened here.  if we try to open it later,
+            // just before the case where we actually need it, we can't,
+            // because the process of opening a connection tries to create
+            // the tables if they don't exist, which means it asks for a
+            // write lock, which it can't get, because we're holding it
+            // ourself.
+            let rconn = try!(factory.open());
             let writer = try!(self.conn.begin_write());
             {
                 let mut collwriter = try!(writer.get_collection_writer(db, coll));
@@ -2032,7 +2039,6 @@ impl Connection {
                         //println!("ops: {:?}", ops);
                         let (count_matches, count_modified) =
                             if multi {
-                                let rconn = try!(factory.open());
                                 let reader = try!(rconn.conn.begin_read());
                                 // TODO DRY
                                 let indexes = try!(reader.list_indexes()).into_iter().filter(

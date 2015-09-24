@@ -322,7 +322,7 @@ let all_tests = [
     // "jstests/core/sortj.js"; // really long test, huge, crashes
     // "jstests/core/sortk.js"; // stats
     "jstests/core/sort_numeric.js";
-    // "jstests/core/distinct3.js"; // parallel
+    // "jstests/core/distinct3.js"; // parallel, passes, but there is an error printed.
     // "jstests/core/drop2.js"; // parallel
     // "jstests/core/finda.js"; // batch size, covered index
     "jstests/core/query1.js"; // $comment
