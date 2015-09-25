@@ -3989,7 +3989,19 @@ impl Connection {
                 Ok(bson::Value::BInt32(tm.tm_year + 1900))
             },
             &Expr::DateToString(ref format, ref v) => {
+                {
+                    // when given a bad format string as well as an invalid expression,
+                    // mongo returns the error for the bad format string.  to emulate this
+                    // behavior, we format the current time using the given format string
+                    // before we do anything else.  server11118.js
+                    let ts = time::get_time();
+                    let tm = time::at_utc(ts);
+                    let _s = try!(mongo_strftime(&format, &tm));
+                }
                 let d = try!(Self::eval(ctx, v));
+                // TODO this could use eval_tm, except that it is supposed to
+                // return null when the date is null.  are other places supposed
+                // to do this?
                 if d.is_null() {
                     Ok(bson::Value::BNull)
                 } else {
@@ -4004,7 +4016,7 @@ impl Connection {
                         };
                     let (sec, ms) = misc::fix_ms(n);
                     let ts = time::Timespec::new(sec, (ms * 1000000) as i32);
-                    let tm = try!(eval_tm(v));
+                    let tm = time::at_utc(ts);
                     let s = try!(mongo_strftime(&format, &tm));
                     Ok(bson::Value::BString(s))
                 }
@@ -4160,6 +4172,9 @@ impl Connection {
                         "$match" => {
                             let v = try!(v.into_document());
                             let m = try!(matcher::parse_query(v));
+                            // TODO it would seem that mongo expects the following error checks to
+                            // be done BEFORE parsing the query, and whether the query can
+                            // successfully be parsed or not.  jstests/aggregation/bugs/match.js
                             if matcher::uses_where(&m) {
                                 return Err(Error::MongoCode(16395, String::from("$where not allowed in agg match")))
                             }
