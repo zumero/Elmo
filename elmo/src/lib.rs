@@ -318,10 +318,20 @@ fn f64_can_be_i64(f: f64) -> bool {
 fn fix_positional(s: &str, pos: Option<usize>) -> String {
     match pos {
         None => String::from(s),
-        Some(i) => {
-            // TODO is format!() really the best way to convert
-            // a usize to a string?
-            s.replace(".$", &format!(".{}", i))
+        Some(pos) => {
+            //s.replace(".$", &format!(".{}", i))
+            let mut parts = s.split('.').map(|s| String::from(s)).collect::<Vec<_>>();
+            match parts.iter().position(|s| *s=="$") {
+                Some(i) => {
+                    // TODO is format!() really the best way to convert
+                    // a usize to a string?
+                    parts[i] = format!("{}", pos);
+                    parts.join(".")
+                },
+                None => {
+                    parts.join(".")
+                },
+            }
         },
     }
 }
