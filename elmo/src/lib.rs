@@ -616,7 +616,7 @@ impl Projection {
                 for &(ref path, _) in self.ops.iter() {
                     let path = fix_positional(path, pos);
                     match try!(d.entry(&path)) {
-                        bson::Entry::Found(e) => {
+                        bson::Entry::Found(_) => {
                             // something might already be there from the include loop above,
                             // so this is not an error in this case, and we do not overwrite.
                         },
@@ -624,7 +624,7 @@ impl Projection {
                             // TODO is hack_like_find_path() what we want here?
                             // do we NEED the synthesized array behavior here?
                             let v = doc.walk_path(&path).hack_like_find_path();
-                            e.insert(v);
+                            try!(e.insert(v));
                         },
                     }
                 }
@@ -665,7 +665,7 @@ impl Projection {
                                 },
                             }
                         },
-                        bson::Entry::Absent(e) => {
+                        bson::Entry::Absent(_) => {
                             // test slice1.js thinks this should not be an error
                             // return Err(Error::Misc(format!("projection $slice.1 got an absent")));
                         },
@@ -711,7 +711,7 @@ impl Projection {
                                 },
                             }
                         },
-                        bson::Entry::Absent(e) => {
+                        bson::Entry::Absent(_) => {
                             return Err(Error::Misc(format!("projection $slice.2 got an absent")));
                         },
                     }
@@ -724,7 +724,7 @@ impl Projection {
                             e.replace(bson::Value::BDouble(score));
                         },
                         bson::Entry::Absent(e) => {
-                            e.insert(bson::Value::BDouble(score));
+                            try!(e.insert(bson::Value::BDouble(score)));
                         },
                     }
                 },
@@ -740,7 +740,7 @@ impl Projection {
                                 },
                             }
                         },
-                        bson::Entry::Absent(e) => {
+                        bson::Entry::Absent(_) => {
                             return Err(Error::Misc(format!("projection $elemMatch got an absent")));
                         },
                     }
@@ -751,18 +751,18 @@ impl Projection {
         match (self.id, self.mode) {
             (Some(true), ProjectionMode::Include) => {
                 match try!(d.entry("_id")) {
-                    bson::Entry::Found(e) => {
+                    bson::Entry::Found(_) => {
                         return Err(Error::Misc(format!("projection error: _id should not be here yet")));
                     },
                     bson::Entry::Absent(e) => {
-                        e.insert(original_id);
+                        try!(e.insert(original_id));
                     },
                 }
                 let _ = try!(d.validate_id());
             },
             (Some(false), ProjectionMode::Include) => {
                 match try!(d.entry("_id")) {
-                    bson::Entry::Found(e) => {
+                    bson::Entry::Found(_) => {
                         return Err(Error::Misc(format!("projection error: _id should not be here yet")));
                     },
                     bson::Entry::Absent(e) => {
@@ -772,10 +772,10 @@ impl Projection {
             },
             (Some(true), ProjectionMode::Exclude) => {
                 match try!(d.entry("_id")) {
-                    bson::Entry::Found(e) => {
+                    bson::Entry::Found(_) => {
                         // already there.  as it should be.
                     },
-                    bson::Entry::Absent(e) => {
+                    bson::Entry::Absent(_) => {
                         return Err(Error::Misc(format!("projection error: _id should be here")));
                     },
                 }
@@ -785,7 +785,7 @@ impl Projection {
                     bson::Entry::Found(e) => {
                         e.remove();
                     },
-                    bson::Entry::Absent(e) => {
+                    bson::Entry::Absent(_) => {
                         return Err(Error::Misc(format!("projection error: _id should be here")));
                     },
                 }
@@ -794,11 +794,11 @@ impl Projection {
                 // if a projection for the _id was not specified, and if the mode
                 // is Include, the _id gets included.
                 match try!(d.entry("_id")) {
-                    bson::Entry::Found(e) => {
+                    bson::Entry::Found(_) => {
                         return Err(Error::Misc(format!("projection error: _id should not be here yet")));
                     },
                     bson::Entry::Absent(e) => {
-                        e.insert(original_id);
+                        try!(e.insert(original_id));
                     },
                 }
                 let _ = try!(d.validate_id());
@@ -806,9 +806,9 @@ impl Projection {
             (None, ProjectionMode::Exclude) => {
                 match try!(d.entry("_id")) {
                     bson::Entry::Found(e) => {
-                        // the id is here, as we expect, but should it be?
+                        // TODO the id is here, as we expect, but should it be?
                     },
-                    bson::Entry::Absent(e) => {
+                    bson::Entry::Absent(_) => {
                         return Err(Error::Misc(format!("projection error: _id should be here")));
                     },
                 }
@@ -1163,7 +1163,7 @@ impl Connection {
                         },
                         bson::Entry::Absent(e) => {
                             // when the key isn't found, this works like $set
-                            e.insert(v.clone());
+                            try!(e.insert(v.clone()));
                         },
                     }
                 },
@@ -1178,7 +1178,7 @@ impl Connection {
                         },
                         bson::Entry::Absent(e) => {
                             // when the key isn't found, this works like $set
-                            e.insert(v.clone());
+                            try!(e.insert(v.clone()));
                         },
                     }
                 },
@@ -1206,7 +1206,7 @@ impl Connection {
                         },
                         bson::Entry::Absent(e) => {
                             // when the key isn't found, this works like $set
-                            e.insert(v.clone());
+                            try!(e.insert(v.clone()));
                         },
                     }
                 },
@@ -1232,7 +1232,7 @@ impl Connection {
                         },
                         bson::Entry::Absent(e) => {
                             // when the key isn't found, this works like $set
-                            e.insert(v.clone());
+                            try!(e.insert(v.clone()));
                         },
                     }
                 },
@@ -1282,7 +1282,7 @@ impl Connection {
                             }
                         },
                         bson::Entry::Absent(e) => {
-                            e.insert(each.clone().into_value());
+                            try!(e.insert(each.clone().into_value()));
                         },
                     }
                 },
@@ -1297,7 +1297,7 @@ impl Connection {
                                 _ => return Err(Error::Misc(format!("$pull not an array: {}", path))),
                             }
                         },
-                        bson::Entry::Absent(e) => {
+                        bson::Entry::Absent(_) => {
                             return Err(Error::Misc(format!("$pull path not found: {}", path)));
                         },
                     }
@@ -1322,7 +1322,7 @@ impl Connection {
                                 _ => return Err(Error::Misc(format!("can't $bit.and to this type"))),
                             }
                         },
-                        bson::Entry::Absent(e) => {
+                        bson::Entry::Absent(_) => {
                             return Err(Error::Misc(format!("$bit.and path not found")));
                         },
                     }
@@ -1341,7 +1341,7 @@ impl Connection {
                                 _ => return Err(Error::Misc(format!("can't $bit.or to this type"))),
                             }
                         },
-                        bson::Entry::Absent(e) => {
+                        bson::Entry::Absent(_) => {
                             return Err(Error::Misc(format!("$bit.or path not found")));
                         },
                     }
@@ -1360,7 +1360,7 @@ impl Connection {
                                 _ => return Err(Error::Misc(format!("can't $bit.xor to this type"))),
                             }
                         },
-                        bson::Entry::Absent(e) => {
+                        bson::Entry::Absent(_) => {
                             return Err(Error::Misc(format!("$bit.xor path not found")));
                         },
                     }
@@ -1418,7 +1418,7 @@ impl Connection {
                             bson::Entry::Absent(e) => {
                                 let mut ba = bson::Array::new();
                                 ba.push(v.clone());
-                                e.insert(ba.into_value());
+                                try!(e.insert(ba.into_value()));
                             },
                         }
                     }
@@ -1435,7 +1435,7 @@ impl Connection {
                                     _ => return Err(Error::Misc(format!("$pull not an array: {}", path))),
                                 }
                             },
-                            bson::Entry::Absent(e) => {
+                            bson::Entry::Absent(_) => {
                                 return Err(Error::Misc(format!("$pull path not found: {}", path)));
                             },
                         }
@@ -1452,7 +1452,7 @@ impl Connection {
                                 _ => return Err(Error::Misc(format!("$pull not an array: {}", path))),
                             }
                         },
-                        bson::Entry::Absent(e) => {
+                        bson::Entry::Absent(_) => {
                             return Err(Error::Misc(format!("$pull path not found: {}", path)));
                         },
                     }
@@ -1468,7 +1468,7 @@ impl Connection {
                                 _ => return Err(Error::Misc(format!("$pull not an array: {}", path))),
                             }
                         },
-                        bson::Entry::Absent(e) => {
+                        bson::Entry::Absent(_) => {
                             return Err(Error::Misc(format!("$pull path not found: {}", path)));
                         },
                     }
@@ -1492,7 +1492,7 @@ impl Connection {
                                 _ => return Err(Error::Misc(format!("$pop not an array: {}", path))),
                             }
                         },
-                        bson::Entry::Absent(e) => {
+                        bson::Entry::Absent(_) => {
                             // do nothing
                         },
                     }
@@ -1628,7 +1628,7 @@ impl Connection {
                         match v {
                             bson::Value::BDocument(mut bd) => {
                                 fn extract(bd: &mut bson::Document, s: &str) -> Option<bson::Value> {
-                                    match bd.pairs.iter().position(|&(ref k, ref v)| k == s) {
+                                    match bd.pairs.iter().position(|&(ref k, _)| k == s) {
                                         Some(i) => {
                                             let (_,v) = bd.pairs.remove(i);
                                             Some(v)
@@ -1908,7 +1908,7 @@ impl Connection {
         //println!("indexes: {:?}", indexes);
         let plan = try!(Self::choose_index(&indexes, &m, None));
         //println!("plan: {:?}", plan);
-        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(Self::get_collection_reader_w(w, db, coll, plan));
+        let seq: Box<Iterator<Item=Result<Row>>> = try!(Self::get_collection_reader_w(w, db, coll, plan));
         // TODO we shadow-let here because the type from seq_match_ref() doesn't match the original
         // type because of its explicit lifetime.
         let mut seq = Self::seq_match_ref(seq, &m);
@@ -2045,7 +2045,7 @@ impl Connection {
                                     |ndx| ndx.db == db && ndx.coll == coll
                                     ).collect::<Vec<_>>();
                                 let plan = try!(Self::choose_index(&indexes, &m, None));
-                                let mut seq: Box<Iterator<Item=Result<Row>>> = try!(Self::into_collection_reader(reader, db, coll, plan));
+                                let seq: Box<Iterator<Item=Result<Row>>> = try!(Self::into_collection_reader(reader, db, coll, plan));
                                 // TODO we shadow-let here because the type from seq_match_ref() doesn't match the original
                                 // type because of its explicit lifetime.
                                 let seq = Self::seq_match_ref(seq, &m);
@@ -2266,8 +2266,7 @@ impl Connection {
                         let ops = try!(Self::parse_update_doc(u));
                         let mut new_doc = try!(Self::build_upsert_with_update_operators(&m, &ops));
                         let id = try!(Self::validate_for_storage(&mut new_doc));
-                        // TODO handle error in following line
-                        collwriter.insert(&new_doc);
+                        try!(collwriter.insert(&new_doc));
                          changed = true;
                         upserted = Some(id);
                         if new {
@@ -2277,8 +2276,7 @@ impl Connection {
                         let mut new_doc = u;
                         try!(Self::build_simple_upsert(q_id, &mut new_doc));
                         let id = try!(Self::validate_for_storage(&mut new_doc));
-                        // TODO handle error in following line
-                        collwriter.insert(&new_doc);
+                        try!(collwriter.insert(&new_doc));
                         changed = true;
                         upserted = Some(id);
                         if new {
@@ -2537,7 +2535,7 @@ impl Connection {
                         let plan = try!(Self::choose_index(&indexes, &m, None));
                         //println!("plan: {:?}", plan);
                         // TODO is this safe?  or do we need two-conn isolation like update?
-                        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(Self::get_collection_reader_w(&*writer, db, coll, plan));
+                        let seq: Box<Iterator<Item=Result<Row>>> = try!(Self::get_collection_reader_w(&*writer, db, coll, plan));
                         seq
                     };
                     seq = Self::seq_match(seq, m);
@@ -2622,7 +2620,7 @@ impl Connection {
         let mut comps = vec![];
         find(m, &mut comps);
 
-        let mut mc = misc::group_by_key(comps);
+        let mc = misc::group_by_key(comps);
 
         // query for x=3 && x=4 is legit in mongo.
         // it can match a doc where x is an array that contains both 3 and 4
@@ -2738,7 +2736,7 @@ impl Connection {
         let mut comps = vec![];
         find(m, &mut comps);
 
-        let mut mc = misc::group_by_key(comps);
+        let mc = misc::group_by_key(comps);
 
         let mut m2 = HashMap::new();
 
@@ -3249,7 +3247,7 @@ impl Connection {
             }
         };
 
-        let parse_vec = |mut v: bson::Value| -> Result<Vec<Expr>> {
+        let parse_vec = |v: bson::Value| -> Result<Vec<Expr>> {
             let a = try!(v.into_array());
             a.items.into_iter().map(|v| Self::parse_expr(v)).collect::<Result<Vec<_>>>()
         };
@@ -4006,7 +4004,6 @@ impl Connection {
                         };
                     let (sec, ms) = misc::fix_ms(n);
                     let ts = time::Timespec::new(sec, (ms * 1000000) as i32);
-                    let tm = time::at_utc(ts);
                     let tm = try!(eval_tm(v));
                     let s = try!(mongo_strftime(&format, &tm));
                     Ok(bson::Value::BString(s))
@@ -4307,7 +4304,7 @@ impl Connection {
         // TODO the clone() in the following line is sad.  but cases below
         // need the document.  should we get it back from CURRENT?  or make
         // a copy just for the purpose of eval() ?
-        let mut ctx = Self::init_eval_ctx(doc.clone().into_value());
+        let ctx = Self::init_eval_ctx(doc.clone().into_value());
         let v = try!(Self::eval(&ctx, &e));
         match v {
             bson::Value::BString(ref s) => {
@@ -4406,7 +4403,7 @@ impl Connection {
                                     let unwind = a.items.into_iter().map(|v| -> Result<Row> {
                                         // TODO clone disaster
                                         let mut d = row.doc.clone();
-                                        d.set_path(&path, v.clone());
+                                        try!(d.set_path(&path, v.clone()));
                                         let r = Row { 
                                             doc: d,
                                             pos: row.pos,
@@ -4449,14 +4446,14 @@ impl Connection {
         let mut mapa = HashMap::new();
         for rr in seq {
             let row = try!(rr);
-            let mut ctx = Self::init_eval_ctx(row.doc);
+            let ctx = Self::init_eval_ctx(row.doc);
             let idval = try!(Self::eval(&ctx, &id));
             // to the extent possible, we normalize numeric values here.
             // it appears that mongo converts everything that fits to i32.
             // server9840 and server5209
             let idval = 
                 match idval {
-                    bson::Value::BInt32(n) => {
+                    bson::Value::BInt32(_) => {
                         idval
                     },
                     bson::Value::BInt64(n) => {
@@ -4495,11 +4492,11 @@ impl Connection {
                     &GroupAccum::First(ref e) => {
                         let v = try!(Self::eval(&ctx, &e));
                         match try!(acc.entry(k)) {
-                            bson::Entry::Found(e) => {
+                            bson::Entry::Found(_) => {
                                 // do nothing
                             },
                             bson::Entry::Absent(e) => {
-                                e.insert(v);
+                                try!(e.insert(v));
                             },
                         }
                     },
@@ -4517,7 +4514,7 @@ impl Connection {
                                 }
                             },
                             bson::Entry::Absent(e) => {
-                                e.insert(v);
+                                try!(e.insert(v));
                             },
                         }
                     },
@@ -4530,7 +4527,7 @@ impl Connection {
                                 }
                             },
                             bson::Entry::Absent(e) => {
-                                e.insert(v);
+                                try!(e.insert(v));
                             },
                         }
                     },
@@ -4551,7 +4548,7 @@ impl Connection {
                             bson::Entry::Absent(e) => {
                                 let mut a = bson::Array::new();
                                 a.items.push(v);
-                                e.insert(bson::Value::BArray(a));
+                                try!(e.insert(bson::Value::BArray(a)));
                             },
                         }
                     },
@@ -4581,7 +4578,7 @@ impl Connection {
                                         let mut pair = bson::Document::new();
                                         pair.set_i32("count", 1);
                                         pair.set_f64("sum", v);
-                                        e.insert(bson::Value::BDocument(pair));
+                                        try!(e.insert(bson::Value::BDocument(pair)));
                                     },
                                 }
                             },
@@ -4600,7 +4597,7 @@ impl Connection {
                                 e.replace(bson::Value::BDouble(cur + v));
                             },
                             bson::Entry::Absent(e) => {
-                                e.insert(bson::Value::BDouble(v));
+                                try!(e.insert(bson::Value::BDouble(v)));
                             },
                         }
                     },
@@ -4853,12 +4850,12 @@ looking EXACTLY like a plain objectid entry.
                                     let v = try!(Self::eval(&ctx, e));
                                     //println!("v: {:?}", v);
                                     match try!(d.entry(path)) {
-                                        bson::Entry::Found(e) => {
+                                        bson::Entry::Found(_) => {
                                             return Err(Error::Misc(format!("16400 already: {}", path)))
                                         },
                                         bson::Entry::Absent(e) => {
                                             if !v.is_undefined() {
-                                                e.insert(v);
+                                                try!(e.insert(v));
                                             }
                                         },
                                     }
@@ -4943,10 +4940,10 @@ looking EXACTLY like a plain objectid entry.
         let m = try!(matcher::parse_query(query));
         let plan = try!(Self::choose_index(&indexes, &m, None));
         //println!("plan: {:?}", plan);
-        let mut seq: Box<Iterator<Item=Result<Row>>> = try!(Self::get_collection_reader_r(&*reader, db, coll, plan));
+        let seq: Box<Iterator<Item=Result<Row>>> = try!(Self::get_collection_reader_r(&*reader, db, coll, plan));
         // TODO we shadow-let here because the type from seq_match_ref() doesn't match the original
         // type because of its explicit lifetime.
-        let mut seq = Self::seq_match_ref(seq, &m);
+        let seq = Self::seq_match_ref(seq, &m);
         let mut results = HashSet::new();
         for rr in seq {
             let row = try!(rr);
@@ -5134,7 +5131,7 @@ looking EXACTLY like a plain objectid entry.
                     }
                 };
 
-            let mut seq: Box<Iterator<Item=Result<Row>>> = try!(Self::into_collection_reader(reader, db, coll, plan));
+            let seq: Box<Iterator<Item=Result<Row>>> = try!(Self::into_collection_reader(reader, db, coll, plan));
             seq
         };
         seq = Self::seq_match(seq, m);

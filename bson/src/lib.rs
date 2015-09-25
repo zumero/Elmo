@@ -280,7 +280,7 @@ impl<'v, 'p> WalkArray<'v, 'p> {
                 &WalkRoot::Document(ref p) => {
                     p.get_leaves(&path.append_index(i), a);
                 },
-                &WalkRoot::Array(ref p) => (),
+                &WalkRoot::Array(_) => (),
                 &WalkRoot::NotContainer(_) => (),
                 &WalkRoot::Fake(_) => (),
             }
@@ -372,11 +372,11 @@ impl<'v, 'p> WalkArrayItemDirect<'v, 'p> {
             &WalkArrayItemDirect::Value(i, v) => {
                 a.push(PathLeaf::new(v, path.append_index(i)));
             },
-            &WalkArrayItemDirect::NotContainer(i, v) => {
+            &WalkArrayItemDirect::NotContainer(_, _) => {
             },
-            &WalkArrayItemDirect::Invalid(s) => {
+            &WalkArrayItemDirect::Invalid(_) => {
             },
-            &WalkArrayItemDirect::OutOfBounds(i) => {
+            &WalkArrayItemDirect::OutOfBounds(_) => {
             },
         }
     }
@@ -444,7 +444,7 @@ impl<'v, 'p> WalkDocumentItem<'v, 'p> {
                             try!(p.project(&mut sub));
                             a.items.push(sub.into_value());
                         },
-                        &WalkRoot::Array(ref p) => {
+                        &WalkRoot::Array(_) => {
                             // TODO not sure what to do with this, but I believe
                             // that doing nothing is correct.
                         },
@@ -572,7 +572,7 @@ impl Document {
     }
 
     pub fn validate_id(&mut self) -> Result<Value> {
-        match self.pairs.iter().position(|&(ref k, ref v)| k == "_id") {
+        match self.pairs.iter().position(|&(ref k, _)| k == "_id") {
             Some(i) => {
                 if self.pairs[i].1.is_array() {
                     return Err(Error::Misc(String::from("_id cannot be an array")));
@@ -701,7 +701,7 @@ impl Document {
                         let e = Entry::Absent(e);
                         Ok(e)
                     },
-                    Some(dot) => {
+                    Some(_) => {
                         // gotta dive more.  but there is nothing to dive into.
                         let e = EntryAbsent::DocumentAncestor(self, path);
                         let e = Entry::Absent(e);
@@ -810,7 +810,7 @@ impl Document {
             Entry::Found(e) => {
                 Ok(Some(e.unset()))
             },
-            Entry::Absent(e) => {
+            Entry::Absent(_) => {
                 Ok(None)
             },
         }
@@ -866,7 +866,7 @@ impl Document {
         w.push_all(&i32_to_bytes_le(0));
         for t in self.pairs.iter() {
             let (ref ksub, ref vsub) = *t;
-            w.push(vsub.getTypeNumber_u8());
+            w.push(vsub.get_type_number());
             vec_push_c_string(w, &ksub);;
             vsub.to_bson(w);
         }
@@ -1212,7 +1212,7 @@ impl Array {
             Entry::Found(e) => {
                 Ok(Some(e.unset()))
             },
-            Entry::Absent(e) => {
+            Entry::Absent(_) => {
                 Ok(None)
             },
         }
@@ -1277,7 +1277,7 @@ impl Array {
         // placeholder for length
         w.push_all(&i32_to_bytes_le(0));
         for (i, vsub) in self.items.iter().enumerate() {
-            w.push(vsub.getTypeNumber_u8());
+            w.push(vsub.get_type_number());
             let s = format!("{}", i);
             vec_push_c_string(w, &s);
             vsub.to_bson(w);
@@ -1290,34 +1290,6 @@ impl Array {
     fn find_all_strings<'a>(&'a self, dest: &mut Vec<&'a str>) {
         for v in &self.items {
             v.find_all_strings(dest);
-        }
-    }
-
-    fn tryGetValueAtIndex(&self, ndx: usize) -> Option<&Value> {
-        if ndx<0 {
-            return None
-        } else if ndx >= self.items.len() {
-            return None
-        } else {
-            return Some(&self.items[ndx])
-        }
-    }
-
-    fn setValueAtIndex(&mut self, ndx: usize, v: Value) {
-        if ndx > 1500001 { panic!( "too big"); } // TODO this limit passes test set7.js, but is a bad idea
-        if ndx >= self.items.len() {
-            // TODO
-        }
-        self.items[ndx] = v;
-    }
-
-    fn removeValueAtIndex(&mut self, ndx: usize) {
-        self.items.remove(ndx);
-    }
-
-    fn unsetValueAtIndex(&mut self, ndx: usize) {
-        if ndx >=0 && ndx < self.items.len() {
-            self.items[ndx] = Value::BNull;
         }
     }
 
@@ -1334,7 +1306,7 @@ pub enum Value {
     BNull,
     BRegex(String, String),
     BJSCode(String),
-    BJSCodeWithScope(String),
+    BJSCodeWithScope(String, Document),
     BBinary(u8, Vec<u8>),
     BMinKey,
     BMaxKey,
@@ -1432,6 +1404,7 @@ fn slurp_bson_value(ba: &[u8], i: &mut usize, valtype: u8) -> Result<Value> {
 fn slurp_deprecated_12(ba: &[u8], i: &mut usize) -> Result<Value> {
     // deprecated
     let a = try!(slurp_bson_string(ba, i));
+    // TODO what do we do with this?
     Ok(slurp_objectid(ba, i))
 }
 
@@ -1446,7 +1419,7 @@ fn slurp_js_with_scope(ba: &[u8], i: &mut usize) -> Result<Value> {
 
     let a = try!(slurp_bson_string(ba, i));
     let scope = try!(slurp_document(ba, i));
-    Ok(Value::BJSCodeWithScope(a))
+    Ok(Value::BJSCodeWithScope(a, scope))
 }
 
 fn slurp_regex(ba: &[u8], i: &mut usize) -> Result<Value> {
@@ -1610,7 +1583,7 @@ impl<'v,'p> EntryAbsent<'v,'p> {
                 let name = &path[0 .. dot];
                 let subpath = &path[dot + 1 ..];
                 match name.parse::<usize>() {
-                    Ok(n) => {
+                    Ok(_) => {
                         let sub = bd.set_array(name, Array::new());
                         try!(sub.set_path(subpath, v));
                     },
@@ -1670,20 +1643,6 @@ impl Value {
             &mut Value::BArray(ref mut ba) => ba.entry(path),
             // TODO the following line should probably be Err
             _ => unreachable!(),
-        }
-    }
-
-    pub fn tryGetValueEither(&self, k: &str) -> Option<&Value> {
-        match self {
-            &Value::BDocument(ref bd) => bd.get(k),
-            &Value::BArray(ref ba) => {
-                match k.parse::<usize>() {
-                    Ok(n) => ba.tryGetValueAtIndex(n),
-                    // TODO or should we propagate the error?
-                    Err(_) => None,
-                }
-            },
-            _ => None,
         }
     }
 
@@ -1885,13 +1844,6 @@ impl Value {
         }
     }
 
-    fn getDate(&self) -> Result<i64> {
-        match self {
-            &Value::BDateTime(ref s) => Ok(*s),
-            _ => Err(Error::Misc(String::from("must be DateTime"))),
-        }
-    }
-
     pub fn i32_or_panic(&self) -> i32 {
         match self {
             &Value::BInt32(n) => n,
@@ -1969,57 +1921,7 @@ impl Value {
         }
     }
 
-    fn getAsExprBool(&self) -> bool {
-        match self {
-            &Value::BBoolean(false) => false,
-            &Value::BNull => false,
-            &Value::BUndefined => false,
-            &Value::BInt32(0) => false,
-            &Value::BInt64(0) => false,
-            &Value::BDouble(0.0) => false,
-            _ => true,
-        }
-    }
-
-    fn getAsBool(&self) -> Result<bool> {
-        match self {
-        &Value::BBoolean(b) => Ok(b),
-        &Value::BInt32(i) => Ok(i!=0),
-        &Value::BInt64(i) => Ok(i!=0),
-        &Value::BDouble(f) => Ok((f as i32)!=0),
-        _ => Err(Error::Misc(String::from("must be convertible to bool"))),
-        }
-    }
-
-    fn getAsInt32(&self) -> Result<i32> {
-        match self {
-        &Value::BInt32(a) => Ok(a),
-        &Value::BInt64(a) => Ok(a as i32),
-        &Value::BDouble(a) => Ok(a as i32),
-        _ => Err(Error::Misc(String::from("must be convertible to int32"))),
-        }
-    }
-
-    fn getAsInt64(&self) -> Result<i64> {
-        match self {
-        &Value::BInt32(a) => Ok(a as i64),
-        &Value::BInt64(a) => Ok(a),
-        &Value::BDouble(a) => Ok(a as i64),
-        &Value::BDateTime(a) => Ok(a as i64),
-        _ => Err(Error::Misc(String::from("must be convertible to int64"))),
-        }
-    }
-
-    fn getAsDouble(&self) -> Result<f64> {
-        match self {
-        &Value::BInt32(a) => Ok(a as f64),
-        &Value::BInt64(a) => Ok(a as f64),
-        &Value::BDouble(a) => Ok(a),
-        _ => Err(Error::Misc(String::from("must be convertible to f64"))),
-        }
-    }
-
-    pub fn getTypeNumber_u8(&self) -> u8 {
+    pub fn get_type_number(&self) -> u8 {
         match self {
             &Value::BDouble(_) => 1,
             &Value::BString(_) => 2,
@@ -2033,7 +1935,7 @@ impl Value {
             &Value::BNull => 10,
             &Value::BRegex(_, _) => 11,
             &Value::BJSCode(_) => 13,
-            &Value::BJSCodeWithScope(_) => 15,
+            &Value::BJSCodeWithScope(_,_) => 15,
             &Value::BInt32(_) => 16,
             &Value::BTimeStamp(_) => 17,
             &Value::BInt64(_) => 18,
@@ -2056,7 +1958,7 @@ impl Value {
             &Value::BNull => "null",
             &Value::BRegex(_, _) => "regex",
             &Value::BJSCode(_) => "jscode",
-            &Value::BJSCodeWithScope(_) => "jscodewithscope",
+            &Value::BJSCodeWithScope(_,_) => "jscodewithscope",
             &Value::BInt32(_) => "i32",
             &Value::BTimeStamp(_) => "timestamp",
             &Value::BInt64(_) => "i64",
@@ -2087,7 +1989,7 @@ impl Value {
             &Value::BNull => (),
             &Value::BRegex(_, _) => (),
             &Value::BJSCode(_) => (),
-            &Value::BJSCodeWithScope(_) => (),
+            &Value::BJSCodeWithScope(_,_) => (),
             &Value::BInt32(_) => (),
             &Value::BTimeStamp(_) => (),
             &Value::BInt64(_) => (),
@@ -2110,7 +2012,7 @@ impl Value {
             &Value::BNull => (),
             &Value::BRegex(_, _) => (),
             &Value::BJSCode(_) => (),
-            &Value::BJSCodeWithScope(_) => (),
+            &Value::BJSCodeWithScope(_,_) => (),
             &Value::BInt32(_) => (),
             &Value::BTimeStamp(_) => (),
             &Value::BInt64(_) => (),
@@ -2189,7 +2091,7 @@ impl Value {
             &Value::BTimeStamp(_) => 47,
             &Value::BRegex(_, _) => 50,
             &Value::BJSCode(_) => 60,
-            &Value::BJSCodeWithScope(_) => 65,
+            &Value::BJSCodeWithScope(_,_) => 65,
             &Value::BMinKey => -1,
             &Value::BMaxKey => 127,
         }
@@ -2242,7 +2144,7 @@ impl Value {
                 vec_push_c_string(w, &opt);
             },
             &Value::BJSCode(ref s) => vec_push_c_string(w, &s),
-            &Value::BJSCodeWithScope(ref s) => vec_push_c_string(w, &s),
+            &Value::BJSCodeWithScope(ref s, ref scope) => vec_push_c_string(w, &s),
             &Value::BDateTime(n) => {
                 misc::Sqlite4Num::from_i64(n).encode_for_index(w);
             },
@@ -2342,7 +2244,7 @@ impl Value {
             },
             &Value::BUndefined => (),
             &Value::BJSCode(ref s) => vec_push_bson_string(w, &s),
-            &Value::BJSCodeWithScope(ref s) => panic!("TODO write BJSCodeWithScope"),
+            &Value::BJSCodeWithScope(ref s, ref scope) => panic!("TODO write BJSCodeWithScope"),
             &Value::BBinary(subtype, ref ba) => {
                 w.push_all(&i32_to_bytes_le(ba.len() as i32));
                 w.push(subtype);

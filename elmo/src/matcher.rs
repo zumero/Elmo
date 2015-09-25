@@ -513,7 +513,7 @@ fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, 
                     match leaf.v {
                         Some(v) => {
                             let pos = leaf.path.last_array_index();
-                            cmp_with_array(|v| (v.getTypeNumber_u8() as i32) == n, cb_array_pos, pos, leaf.v.unwrap_or(&null))
+                            cmp_with_array(|v| (v.get_type_number() as i32) == n, cb_array_pos, pos, v)
                         },
                         None => {
                             false
@@ -636,7 +636,7 @@ fn match_query_item<F: Fn(usize)>(qit: &QueryItem, d: &bson::Value, cb_array_pos
             // TODO no panic here.  need to return Result.
             panic!("TODO $where is not supported"); //16395 in agg
         },
-        &QueryItem::Text(ref s) => {
+        &QueryItem::Text(_) => {
             // TODO is there more work to do here?  or does the index code deal with it all now?
             true
         },
@@ -733,12 +733,13 @@ fn is_valid_within_in(v: &bson::Value) -> bool {
 }
 
 // TODO I suppose this func could return &str slices into the QueryDoc?
+// TODO this func should be used to get paths to verify posop projection, I think
 fn get_paths(q: &QueryDoc) -> Vec<String> {
     fn f(a: &mut Vec<String>, q: &QueryDoc) {
         let &QueryDoc::QueryDoc(ref items) = q;
         for qit in items {
             match qit {
-                &QueryItem::Compare(ref path, ref preds) => {
+                &QueryItem::Compare(ref path, _) => {
                     a.push(path.clone());
                 },
                 &QueryItem::AND(ref docs) => {
@@ -830,7 +831,7 @@ fn parse_pred(k: &str, v: bson::Value) -> Result<Pred> {
             let v = 
                 match v {
                     bson::Value::BString(s) => s,
-                    bson::Value::BRegex(s,options) => s,
+                    bson::Value::BRegex(s, options) => s,
                     _ => {
                         return Err(super::Error::Misc(String::from("invalid type for regex")));
                     },
@@ -990,7 +991,7 @@ pub fn parse_pred_list(pairs: Vec<(String, bson::Value)>) -> Result<Vec<Pred>> {
             let expr = 
                 match expr {
                     bson::Value::BString(s) => s,
-                    bson::Value::BRegex(s,options) => s,
+                    bson::Value::BRegex(s, options) => s,
                     _ => {
                         return Err(super::Error::Misc(String::from("invalid type for regex")));
                     },
@@ -1003,7 +1004,7 @@ pub fn parse_pred_list(pairs: Vec<(String, bson::Value)>) -> Result<Vec<Pred>> {
             let expr = 
                 match expr {
                     bson::Value::BString(s) => s,
-                    bson::Value::BRegex(s,options) => s,
+                    bson::Value::BRegex(s, options) => s,
                     _ => {
                         return Err(super::Error::Misc(String::from("invalid type for regex")));
                     },
