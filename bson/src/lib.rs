@@ -385,6 +385,10 @@ impl<'v, 'p> WalkArrayItemDirect<'v, 'p> {
 
 impl<'v, 'p> WalkDocumentItem<'v, 'p> {
     fn get_leaves(&self, path: ActualPath, a: &mut Vec<PathLeaf<'v>>) {
+        // TODO without the following gratuitous println, a release build
+        // of the server will crash when running test case updatel.js.
+        // I suspect the println is causing a change to what gets inlined?
+        println!("at {}:{}", file!(), line!());
         match self {
             &WalkDocumentItem::Document(ref p) => {
                 p.get_leaves(&path, a)
