@@ -384,11 +384,12 @@ impl<'v, 'p> WalkArrayItemDirect<'v, 'p> {
 }
 
 impl<'v, 'p> WalkDocumentItem<'v, 'p> {
+
+    // TODO without the following inline(never), a release build
+    // of the server will crash when running test case updatel.js.
+    // on rustc 1.5.0-nightly (5ca60d943 2015-09-24)
+    #[inline(never)]
     fn get_leaves(&self, path: ActualPath, a: &mut Vec<PathLeaf<'v>>) {
-        // TODO without the following gratuitous println, a release build
-        // of the server will crash when running test case updatel.js.
-        // I suspect the println is causing a change to what gets inlined?
-        println!("at {}:{}", file!(), line!());
         match self {
             &WalkDocumentItem::Document(ref p) => {
                 p.get_leaves(&path, a)
