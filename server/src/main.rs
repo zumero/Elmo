@@ -23,7 +23,6 @@
 #![feature(convert)]
 #![feature(associated_consts)]
 #![feature(vec_push_all)]
-#![feature(result_expect)]
 
 extern crate misc;
 
@@ -36,9 +35,7 @@ extern crate elmo;
 
 extern crate elmo_sqlite3;
 
-use std::io;
 use std::io::Read;
-use std::io::Write;
 
 use elmo::Error;
 use elmo::Result;
@@ -216,14 +213,6 @@ fn create_reply(req_id: i32, docs: Vec<bson::Document>, cursor_id: i64) -> Reply
         docs: docs,
     };
     msg
-}
-
-fn reply_code(req_id: i32, err: Error) -> Reply {
-    let mut doc = bson::Document::new();
-    doc.set_string("errmsg", format!("{:?}", err));
-    // TODO pairs.push(("code", BInt32(code)));
-    doc.set_i32("ok", 0);
-    create_reply(req_id, vec![doc], 0)
 }
 
 fn reply_err(req_id: i32, err: Error) -> Reply {
@@ -1419,7 +1408,6 @@ impl<'b> Server<'b> {
     }
 
     fn reply_2005(&mut self, req: MsgGetMore) -> Reply {
-        // TODO this function should be using reply_code
         match self.cursors.remove(&req.cursor_id) {
             Some((ns, conn, mut seq)) => {
                 match Self::do_limit(&ns, &mut seq, req.number_to_return) {
