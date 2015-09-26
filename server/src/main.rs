@@ -280,8 +280,8 @@ impl<'b> Server<'b> {
     }
 
     fn reply_whatsmyuri(&self, req: &MsgQuery) -> Result<Reply> {
-        println!("----------------------------------------------------------------");
-        println!("----------------------------------------------------------------");
+        //println!("----------------------------------------------------------------");
+        //println!("----------------------------------------------------------------");
         let mut doc = bson::Document::new();
         doc.set_str("you", "127.0.0.1:65460");
         doc.set_i32("ok", 1);
@@ -1160,7 +1160,7 @@ impl<'b> Server<'b> {
                 self.remove_cursors_for_collection(&full_coll);
                 try!(conn2.clear_collection(db, &new_coll_name));
                 let results = try!(conn2.insert_seq(db, &new_coll_name, seq));
-                println!("OUT results: {:?}", results);
+                //println!("OUT results: {:?}", results);
                 let mut errors = Vec::new();
                 for i in 0 .. results.len() {
                     if results[i].is_err() {
@@ -1414,7 +1414,7 @@ impl<'b> Server<'b> {
                     }
                 }
             };
-        println!("reply: {:?}", r);
+        //println!("reply: {:?}", r);
         r
     }
 
@@ -1472,13 +1472,13 @@ impl<'b> Server<'b> {
         let ba = try!(read_message_bytes(stream));
         match ba {
             None => {
-                println!("no request");
+                //println!("no request");
                 Ok(false)
             },
             Some(ba) => {
                 //println!("{:?}", ba);
                 let msg = try!(parse_request(&ba));
-                println!("request: {:?}", msg);
+                //println!("request: {:?}", msg);
                 match msg {
                     Request::KillCursors(req) => {
                         for cursor_id in req.cursor_ids {
@@ -1500,7 +1500,7 @@ impl<'b> Server<'b> {
                     },
                     Request::GetMore(req) => {
                         let resp = self.reply_2005(req);
-                        println!("2005 reply: {:?}", resp);
+                        //println!("2005 reply: {:?}", resp);
                         send_reply(stream, resp)
                     },
                 }
