@@ -5181,3 +5181,148 @@ looking EXACTLY like a plain objectid entry.
     }
 }
 
+pub fn get_index_entries(new_doc: &bson::Document, normspec: &Vec<(String, IndexType)>, weights: &Option<HashMap<String,i32>>, options: &bson::Document) -> Result<HashSet<Vec<(bson::Value,bool)>>> {
+    fn find_index_entry_vals(normspec: &Vec<(String, IndexType)>, new_doc: &bson::Document, sparse: bool) -> Vec<(bson::Value,bool)> {
+        //println!("find_index_entry_vals: sparse = {:?}", sparse);
+        let mut r = Vec::new();
+        for t in normspec {
+            let k = &t.0;
+            let typ = t.1;
+            let mut v = new_doc.walk_path(k).hack_like_find_path();
+
+            // now we replace any BUndefined with BNull.  this seems, well,
+            // kinda wrong, as it effectively encodes the index entries to
+            // contain information that is slightly incorrect, since BNull
+            // means "it was present and explicitly null", whereas BUndefined
+            // means "it was absent".  Still, this appears to be the exact
+            // behavior of Mongo.  Note that this only affects index entries.
+            // The matcher can and must still distinguish between null and
+            // undefined.
+
+            let keep =
+                if sparse {
+                    match v {
+                        bson::Value::BUndefined => false,
+                        _ => true,
+                    }
+                } else {
+                    true
+                };
+            if keep {
+                v.replace_undefined();
+                let neg = IndexType::Backward == typ;
+                r.push((v,neg));
+            }
+        }
+        r
+    }
+
+    // TODO what should the name of this func actually be?
+    fn q(vals: &Vec<(bson::Value, bool)>, w: i32, s: &str, entries: &mut Vec<Vec<(bson::Value,bool)>>) {
+        // TODO tokenize properly
+        let a = s.split(" ");
+        let a = a.into_iter().collect::<HashSet<_>>();
+        for s in a {
+            let s = String::from(s);
+            let v = bson::Value::BArray(bson::Array {items: vec![bson::Value::BString(s), bson::Value::BInt32(w)]});
+            // TODO clone is ugly
+            let mut vals = vals.clone();
+            vals.push((v, false));
+            entries.push(vals);
+        }
+    }
+
+    fn maybe_text(vals: &Vec<(bson::Value, bool)>, new_doc: &bson::Document, weights: &Option<HashMap<String,i32>>, entries: &mut Vec<Vec<(bson::Value,bool)>>) {
+        //println!("in maybe_text: {:?}", vals);
+        match weights {
+            &Some(ref weights) => {
+                for k in weights.keys() {
+                    if k == "$**" {
+                        let mut a = Vec::new();
+                        new_doc.find_all_strings(& mut a);
+                        let w = weights[k];
+                        for s in a {
+                            q(vals, w, s, entries);
+                        };
+                    } else {
+                        match new_doc.walk_path(k).hack_like_find_path() {
+                            bson::Value::BUndefined => (),
+                            v => {
+                                match v {
+                                    bson::Value::BString(s) => q(&vals, weights[k], &s, entries),
+                                    bson::Value::BArray(ba) => {
+                                        let a = ba.items.into_iter().collect::<HashSet<_>>();
+                                        for v in a {
+                                            match v {
+                                                bson::Value::BString(s) => q(&vals, weights[k], &s, entries),
+                                                _ => (),
+                                            }
+                                        }
+                                    },
+                                    _ => (),
+                                }
+                            },
+                        }
+                    }
+                }
+            },
+            &None => {
+                // TODO clone is ugly
+                //println!("in maybe_text, pushing to entries: {:?}", vals);
+                entries.push(vals.clone());
+            },
+        }
+    }
+
+    fn replace_array_element<T:Clone>(vals: &Vec<T>, i: usize, v: T) -> Vec<T> {
+        // TODO horrifying clone
+        let mut v2 = vals.clone();
+        v2[i] = v;
+        v2
+    }
+
+    fn maybe_array(vals: &Vec<(bson::Value, bool)>, new_doc: &bson::Document, weights: &Option<HashMap<String,i32>>, entries: &mut Vec<Vec<(bson::Value,bool)>>) {
+        //println!("in maybe_array: {:?}", vals);
+        // first do the index entries for the document without considering arrays
+        maybe_text(vals, new_doc, weights, entries);
+
+        // now, if any of the vals in the key are an array, we need
+        // to generate more index entries for this document, one
+        // for each item in the array.  Mongo calls this a
+        // multikey index.
+
+        for i in 0 .. vals.len() {
+            let t = &vals[i];
+            let v = &t.0;
+            let typ = t.1;
+            match v {
+                &bson::Value::BArray(ref ba) => {
+                    let a = ba.items.iter().collect::<HashSet<_>>();
+                    for av in a {
+                        // TODO clone is ugly
+                        let replaced = replace_array_element(vals, i, (av.clone(), typ));
+                        //println!("replaced for index: {:?}", replaced);
+                        maybe_array(&replaced, new_doc, weights, entries);
+                    }
+                },
+                _ => ()
+            }
+        }
+    }
+
+    let sparse = match options.get("sparse") {
+        Some(&bson::Value::BBoolean(b)) => b,
+        _ => false,
+    };
+
+    let vals = find_index_entry_vals(normspec, new_doc, sparse);
+    let mut entries = Vec::new();
+    maybe_array(&vals, new_doc, weights, &mut entries);
+
+    //println!("entries: {:?}", entries);
+
+    let entries = entries.into_iter().collect::<HashSet<_>>();
+
+    Ok(entries)
+}
+
