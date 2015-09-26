@@ -1247,11 +1247,8 @@ impl Connection {
                     }
                 },
                 &UpdateOp::Set(ref path, ref v) => {
-                    println!("at {}:{}", file!(), line!());
                     let path = fix_positional(path, pos);
-                    println!("at {}:{}", file!(), line!());
                     try!(doc.set_path(&path, v.clone()));
-                    println!("at {}:{}", file!(), line!());
                 },
                 &UpdateOp::Push(ref path, ref each, slice, ref sort, position) => {
                     let path = fix_positional(path, pos);
@@ -1915,46 +1912,28 @@ impl Connection {
 
     fn get_one_match(db: &str, coll: &str, w: &StorageWriter, m: &matcher::QueryDoc, orderby: Option<&bson::Value>) -> Result<Option<Row>> {
         // TODO dry
-                    println!("at {}:{}", file!(), line!());
         let indexes = try!(w.list_indexes()).into_iter().filter(
             |ndx| ndx.db == db && ndx.coll == coll
             ).collect::<Vec<_>>();
         //println!("indexes: {:?}", indexes);
-                    println!("at {}:{}", file!(), line!());
         let plan = try!(Self::choose_index(&indexes, &m, None));
-                    println!("at {}:{}", file!(), line!());
         //println!("plan: {:?}", plan);
         let seq: Box<Iterator<Item=Result<Row>>> = try!(Self::get_collection_reader_w(w, db, coll, plan));
         // TODO we shadow-let here because the type from seq_match_ref() doesn't match the original
         // type because of its explicit lifetime.
         let mut seq = Self::seq_match_ref(seq, &m);
-                    println!("at {}:{}", file!(), line!());
         match orderby {
             None => (),
             Some(orderby) => {
-                    println!("at {}:{}", file!(), line!());
                 let mut a = try!(seq.collect::<Result<Vec<_>>>());
-                    println!("at {}:{}", file!(), line!());
                 try!(Self::do_sort(&mut a, orderby));
-                    println!("at {}:{}", file!(), line!());
                 seq = box a.into_iter().map(|d| Ok(d));
-                    println!("at {}:{}", file!(), line!());
             },
         }
-                    println!("at {}:{}", file!(), line!());
         match seq.next() {
-            None => {
-                    println!("at {}:{}", file!(), line!());
-                Ok(None)
-            },
-            Some(Ok(v)) => {
-                    println!("at {}:{}", file!(), line!());
-                Ok(Some(v))
-            },
-            Some(Err(e)) => {
-                    println!("at {}:{}", file!(), line!());
-                Err(e)
-            },
+            None => Ok(None),
+            Some(Ok(v)) => Ok(Some(v)),
+            Some(Err(e)) => Err(e),
         }
     }
 
@@ -2064,12 +2043,9 @@ impl Connection {
                             None => None,
                         };
                     let m = try!(matcher::parse_query(q));
-                    println!("at {}:{}", file!(), line!());
                     let has_update_operators = u.pairs.iter().any(|&(ref k, _)| k.starts_with("$"));
                     if has_update_operators {
-                    println!("at {}:{}", file!(), line!());
                         let ops = try!(Self::parse_update_doc(u));
-                    println!("at {}:{}", file!(), line!());
                         //println!("ops: {:?}", ops);
                         let (count_matches, count_modified) =
                             if multi {
@@ -2103,48 +2079,36 @@ impl Connection {
                                 }
                                 (matches, mods)
                             } else {
-                    println!("at {}:{}", file!(), line!());
                                 match try!(Self::get_one_match(db, coll, &*writer, &m, None)) {
                                     Some(row) => {
-                    println!("at {}:{}", file!(), line!());
                                         //println!("row found for update: {:?}", row);
                                         let old_doc = try!(row.doc.into_document());
                                         let mut new_doc = old_doc.clone();
-                    println!("at {}:{}", file!(), line!());
                                         try!(Self::apply_update_ops(&mut new_doc, &ops, false, row.pos));
-                    println!("at {}:{}", file!(), line!());
                                         if try!(Self::id_changed(&old_doc, &new_doc)) {
                                             return Err(Error::Misc(String::from("cannot change _id")));
                                         }
-                    println!("at {}:{}", file!(), line!());
                                         if new_doc != old_doc {
-                    println!("at {}:{}", file!(), line!());
                                             let id = try!(Self::validate_for_storage(&mut new_doc));
-                    println!("at {}:{}", file!(), line!());
                                             try!(collwriter.update(&new_doc));
-                    println!("at {}:{}", file!(), line!());
                                             (1, 1)
                                         } else {
                                             (1, 0)
                                         }
                                     },
                                     None => {
-                    println!("at {}:{}", file!(), line!());
                                         //println!("get_one_match found nothing");
                                         (0, 0)
                                     },
                                 }
                             };
-                    println!("at {}:{}", file!(), line!());
                         if count_matches == 0 {
-                    println!("at {}:{}", file!(), line!());
                             if upsert {
                                 let mut doc = try!(Self::build_upsert_with_update_operators(&m, &ops));
                                 let id = try!(Self::validate_for_storage(&mut doc));
                                 try!(collwriter.insert(&doc));
                                 Ok((0,0,Some(id)))
                             } else {
-                    println!("at {}:{}", file!(), line!());
                                 Ok((0,0,None))
                             }
                         } else {
@@ -2201,19 +2165,12 @@ impl Connection {
                     }
                 };
 
-                    println!("at {}:{}", file!(), line!());
                 for upd in updates {
-                    println!("at {}:{}", file!(), line!());
                     let r = one_update_or_upsert(upd);
-                    println!("at {}:{}", file!(), line!());
                     results.push(r);
-                    println!("at {}:{}", file!(), line!());
                 }
-                    println!("at {}:{}", file!(), line!());
             }
-                    println!("at {}:{}", file!(), line!());
             try!(writer.commit());
-                    println!("at {}:{}", file!(), line!());
         }
         Ok(results)
     }
@@ -4857,32 +4814,25 @@ looking EXACTLY like a plain objectid entry.
     }
 
     fn guts_matcher_filter_map(rr: Result<Row>, m: &matcher::QueryDoc) -> Option<Result<Row>> {
-                    println!("at {}:{}", file!(), line!());
         match rr {
             Ok(row) => {
-                    println!("at {}:{}", file!(), line!());
                 //println!("looking at row: {:?}", row);
                 //println!("matcher is: {:?}", m);
                 let (b, pos) = matcher::match_query(&m, &row.doc);
-                    println!("at {}:{}", file!(), line!());
                 if b {
                     //println!("    matched");
-                    println!("at {}:{}", file!(), line!());
                     let r = Row {
                         doc: row.doc,
                         pos: pos,
                         score: row.score,
                     };
-                    println!("at {}:{}", file!(), line!());
                     Some(Ok(r))
                 } else {
                     //println!("    no");
-                    println!("at {}:{}", file!(), line!());
                     None
                 }
             },
             Err(e) => {
-                    println!("at {}:{}", file!(), line!());
                 Some(Err(e))
             },
         }

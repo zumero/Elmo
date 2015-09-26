@@ -109,7 +109,6 @@ fn simple_mongo_strftime(fmt: &str, tm: &time::Tm) -> String {
 // values to BUndefined and clones all the values, returning multiples
 // in a new array if needed, like find_path() did.
 fn leaves_to_cloned<'v, T: Iterator<Item=PathLeaf<'v>>>(leaves: T) -> Value {
-                    //println!("at {}:{}", file!(), line!());
     let mut vals = 
         leaves
         .map(
@@ -153,11 +152,8 @@ impl ActualPath {
     }
 
     fn append_name(&self, s: &str) -> ActualPath {
-                    println!("at {}:{}", file!(), line!());
         let mut a = self.a.clone();
-                    println!("at {}:{}", file!(), line!());
         a.push(PathKey::Name(String::from(s)));
-                    println!("at {}:{}", file!(), line!());
         ActualPath {
             a: a
         }
@@ -172,7 +168,6 @@ impl ActualPath {
     }
 
     pub fn last_array_index(&self) -> Option<usize> {
-                    println!("at {}:{}", file!(), line!());
         self.a
             .iter()
             .rev()
@@ -275,15 +270,12 @@ impl<'v, 'p> WalkArray<'v, 'p> {
         // we do not consider that a leaf when it is a direct
         // child of an array.  Anything else, we descend.
 
-                    println!("at {}:{}", file!(), line!());
         self.direct.get_leaves(path, a);
-                    //println!("at {}:{}", file!(), line!());
 
         // for the dive case, descend when the array element is
         // a subdoc, but nothing else results in a leaf.
 
         for (i, p) in self.dive.iter().enumerate() {
-                    //println!("at {}:{}", file!(), line!());
             match p {
                 &WalkRoot::Document(ref p) => {
                     p.get_leaves(&path.append_index(i), a);
@@ -302,9 +294,7 @@ impl<'v, 'p> WalkDocument<'v, 'p> {
     }
 
     fn get_leaves(&self, path: &ActualPath, a: &mut Vec<PathLeaf<'v>>) {
-                    println!("at {}:{}", file!(), line!());
         self.item.get_leaves(path.append_name(self.name), a);
-                    println!("at {}:{}", file!(), line!());
     }
 
     pub fn project(&self, d: &mut Document) -> Result<()> {
@@ -316,13 +306,9 @@ impl<'v, 'p> WalkDocument<'v, 'p> {
         // TODO this is a lousy way to do this.  much better would be
         // to keep track of the state and move forward on each call to
         // next().  but very complicated.
-                    println!("at {}:{}", file!(), line!());
         let mut a = vec![];
-                    //println!("at {}:{}", file!(), line!());
         let path = ActualPath::new();
-                    //println!("at {}:{}", file!(), line!());
         self.get_leaves(&path, &mut a);
-                    //println!("at {}:{}", file!(), line!());
 
         // TODO should we catch the case here where a is empty and
         // add an empty leaf?
@@ -349,18 +335,14 @@ impl<'v, 'p> WalkRoot<'v, 'p> {
         // TODO this is a lousy way to do this.  much better would be
         // to keep track of the state and move forward on each call to
         // next().  but very complicated.
-                    println!("at {}:{}", file!(), line!());
         let mut a = vec![];
-                    println!("at {}:{}", file!(), line!());
         let path = ActualPath::new();
-                    println!("at {}:{}", file!(), line!());
         match self {
             &WalkRoot::Document(ref p) => p.get_leaves(&path, &mut a),
             &WalkRoot::Array(ref p) => p.get_leaves(&path, &mut a),
             &WalkRoot::NotContainer(_) => a.push(PathLeaf::empty(path)),
             &WalkRoot::Fake(v) => a.push(PathLeaf::new(v, path)),
         }
-                    println!("at {}:{}", file!(), line!());
 
         // TODO should we catch the case here where a is empty and
         // add an empty leaf?
@@ -380,7 +362,6 @@ impl<'v, 'p> WalkRoot<'v, 'p> {
 
 impl<'v, 'p> WalkArrayItemDirect<'v, 'p> {
     fn get_leaves(&self, path: &ActualPath, a: &mut Vec<PathLeaf<'v>>) {
-                    //println!("at {}:{}", file!(), line!());
         match self {
             &WalkArrayItemDirect::Document(i, ref p) => {
                 p.get_leaves(&path.append_index(i), a)
@@ -404,8 +385,6 @@ impl<'v, 'p> WalkArrayItemDirect<'v, 'p> {
 
 impl<'v, 'p> WalkDocumentItem<'v, 'p> {
     fn get_leaves(&self, path: ActualPath, a: &mut Vec<PathLeaf<'v>>) {
-        // TODO this line does it:
-                    //println!("at {}:{}", file!(), line!());
         match self {
             &WalkDocumentItem::Document(ref p) => {
                 p.get_leaves(&path, a)

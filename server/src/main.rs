@@ -425,9 +425,7 @@ impl<'b> Server<'b> {
         let mut updates = try!(vec_values_to_docs(updates.items));
         // TODO ordered
         // TODO do we need to keep ownership of updates?
-                    println!("at {}:{}", file!(), line!());
         let results = try!(self.conn.update(db, &coll, &mut updates, &*self.factory));
-                    println!("at {}:{}", file!(), line!());
         let mut matches = 0;
         let mut mods = 0;
         let mut upserts = bson::Array::new();
@@ -1372,7 +1370,6 @@ impl<'b> Server<'b> {
                     //"features" => reply_features &req db
                     _ => Err(Error::Misc(format!("unknown cmd: {}", cmd)))
                 };
-                    println!("at {}:{}", file!(), line!());
             res
         }
     }
@@ -1417,7 +1414,6 @@ impl<'b> Server<'b> {
                     }
                 }
             };
-                    println!("at {}:{}", file!(), line!());
         println!("reply: {:?}", r);
         r
     }

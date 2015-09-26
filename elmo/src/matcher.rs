@@ -69,7 +69,6 @@ fn cmp_f64(m: f64, litv: f64) -> Ordering {
 
 // TODO should probably be impl Ord
 pub fn cmp(d: &bson::Value, lit: &bson::Value) -> Ordering {
-                    println!("at {}:{}", file!(), line!());
     match (d,lit) {
         (&bson::Value::BObjectID(m), &bson::Value::BObjectID(litv)) => {
             m.cmp(&litv)
@@ -159,12 +158,9 @@ pub fn cmp(d: &bson::Value, lit: &bson::Value) -> Ordering {
             lenm.cmp(&lenlitv)
         },
         _ => {
-                    println!("at {}:{}", file!(), line!());
             let torder_d = d.get_type_order();
             let torder_lit = lit.get_type_order();
-                    println!("at {}:{}", file!(), line!());
             assert!(torder_d != torder_lit);
-                    println!("at {}:{}", file!(), line!());
             torder_d.cmp(&torder_lit)
         },
     }
@@ -254,17 +250,12 @@ fn cmp_regex(d: &bson::Value, re: &regex::Regex) -> bool {
 }
 
 fn cmp_eq(d: &bson::Value, lit: &bson::Value) -> bool {
-                    println!("at {}:{}", file!(), line!());
     let torder_d = d.get_type_order();
-                    println!("at {}:{}", file!(), line!());
     let torder_lit = lit.get_type_order();
-                    println!("at {}:{}", file!(), line!());
 
     if torder_d == torder_lit {
-                    println!("at {}:{}", file!(), line!());
         cmp(d, lit) == Ordering::Equal
     } else {
-                    println!("at {}:{}", file!(), line!());
         false
     }
 }
@@ -369,9 +360,7 @@ fn do_elem_match_objects<F: Fn(usize)>(doc: &QueryDoc, v: &bson::Value, cb_array
 }
 
 fn cmp_with_array<F: Fn(&bson::Value) -> bool, G: Fn(usize)>(func: F, cb_array_pos: &G, pos: Option<usize>, v: &bson::Value) -> bool {
-                    println!("at {}:{}", file!(), line!());
     if func(v) {
-                    println!("at {}:{}", file!(), line!());
         match pos {
             Some(i) => {
                 cb_array_pos(i);
@@ -381,7 +370,6 @@ fn cmp_with_array<F: Fn(&bson::Value) -> bool, G: Fn(usize)>(func: F, cb_array_p
         }
         true
     } else {
-                    println!("at {}:{}", file!(), line!());
         match v {
             &bson::Value::BArray(ref ba) => {
                 match ba.items.iter().position(|v| func(v)) {
@@ -403,22 +391,16 @@ fn cmp_with_array<F: Fn(&bson::Value) -> bool, G: Fn(usize)>(func: F, cb_array_p
 // the actual path that matched.
 
 fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, cb_array_pos: &F) -> bool {
-                    println!("at {}:{}", file!(), line!());
     let null = bson::Value::BNull;
 
     let eq = 
-        |lit| {
+        |lit|
         walk.leaves().any(
             |leaf| {
-                    println!("at {}:{}", file!(), line!());
                 let pos = leaf.path.last_array_index();
-                    println!("at {}:{}", file!(), line!());
                 cmp_with_array(|v| cmp_eq(v, lit), cb_array_pos, pos, leaf.v.unwrap_or(&null))
             }
-        )
-        }
-        ;
-                    println!("at {}:{}", file!(), line!());
+        );
 
     let elem_match_objects =
         |doc|
@@ -434,19 +416,15 @@ fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, 
                 }
             }
         );
-                    println!("at {}:{}", file!(), line!());
 
     match pred {
         &Pred::EQ(ref lit) => {
-                    println!("at {}:{}", file!(), line!());
             eq(lit)
         },
         &Pred::NE(ref lit) => {
-                    println!("at {}:{}", file!(), line!());
             !eq(lit)
         },
         &Pred::LT(ref lit) => {
-                    println!("at {}:{}", file!(), line!());
             walk.leaves().any(
                 |leaf| {
                     let pos = leaf.path.last_array_index();
@@ -455,7 +433,6 @@ fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, 
             )
         },
         &Pred::GT(ref lit) => {
-                    println!("at {}:{}", file!(), line!());
             walk.leaves().any(
                 |leaf| {
                     let pos = leaf.path.last_array_index();
@@ -464,7 +441,6 @@ fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, 
             )
         },
         &Pred::LTE(ref lit) => {
-                    println!("at {}:{}", file!(), line!());
             walk.leaves().any(
                 |leaf| {
                     let pos = leaf.path.last_array_index();
@@ -473,7 +449,6 @@ fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, 
             )
         },
         &Pred::GTE(ref lit) => {
-                    println!("at {}:{}", file!(), line!());
             walk.leaves().any(
                 |leaf| {
                     let pos = leaf.path.last_array_index();
@@ -514,7 +489,6 @@ fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, 
             }
         },
         &Pred::Exists(b) => {
-                    println!("at {}:{}", file!(), line!());
             b == walk.exists()
         },
         &Pred::Not(ref preds) => {
@@ -646,30 +620,23 @@ fn match_walk<'v, 'p, F: Fn(usize)>(pred: &Pred, walk: &bson::WalkRoot<'v, 'p>, 
 fn match_query_item<F: Fn(usize)>(qit: &QueryItem, d: &bson::Value, cb_array_pos: &F) -> bool {
     match qit {
         &QueryItem::Compare(ref path, ref preds) => {
-                    println!("at {}:{}", file!(), line!());
             let walk = d.walk_path(path);
-                    println!("at {}:{}", file!(), line!());
             preds.iter().all(|p| match_walk(p, &walk, cb_array_pos))
         },
         &QueryItem::AND(ref qd) => {
-                    println!("at {}:{}", file!(), line!());
             qd.iter().all(|v| match_query_doc(v, d, cb_array_pos))
         },
         &QueryItem::OR(ref qd) => {
-                    println!("at {}:{}", file!(), line!());
             qd.iter().any(|v| match_query_doc(v, d, cb_array_pos))
         },
         &QueryItem::NOR(ref qd) => {
-                    println!("at {}:{}", file!(), line!());
             !qd.iter().any(|v| match_query_doc(v, d, cb_array_pos))
         },
         &QueryItem::Where(ref v) => {
             // TODO no panic here.  need to return Result.
-                    println!("at {}:{}", file!(), line!());
             panic!("TODO $where is not supported"); //16395 in agg
         },
         &QueryItem::Text(_) => {
-                    println!("at {}:{}", file!(), line!());
             // TODO is there more work to do here?  or does the index code deal with it all now?
             true
         },
@@ -680,9 +647,7 @@ fn match_query_doc<F: Fn(usize)>(q: &QueryDoc, d: &bson::Value, cb_array_pos: &F
     let &QueryDoc::QueryDoc(ref items) = q;
     // AND
     for qit in items {
-                    println!("at {}:{}", file!(), line!());
         if !match_query_item(qit, d, cb_array_pos) {
-                    println!("at {}:{}", file!(), line!());
             return false;
         }
     }
@@ -700,17 +665,12 @@ pub fn match_pred_list(preds: &Vec<Pred>, d: &bson::Value) -> (bool,Option<usize
 }
 
 pub fn match_query(m: &QueryDoc, d: &bson::Value) -> (bool,Option<usize>) {
-                    println!("at {}:{}", file!(), line!());
     let pos = std::cell::Cell::new(None);
-                    println!("at {}:{}", file!(), line!());
     let cb = |n: usize| {
         // TODO error if it is already set?
-                    println!("at {}:{}", file!(), line!());
         pos.set(Some(n));
     };
-                    println!("at {}:{}", file!(), line!());
     let b = match_query_doc(m, d, &cb);
-                    println!("at {}:{}", file!(), line!());
     (b, pos.get())
 }
 
