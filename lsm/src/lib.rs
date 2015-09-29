@@ -437,17 +437,17 @@ pub enum SeekOp {
     SEEK_GE = 2,
 }
 
-struct CursorIterator<'a> {
-    csr: MultiCursor<'a>
+struct CursorIterator {
+    csr: MultiCursor
 }
 
-impl<'a> CursorIterator<'a> {
+impl CursorIterator {
     fn new(it: MultiCursor) -> CursorIterator {
         CursorIterator { csr: it }
     }
 }
 
-impl<'a> Iterator for CursorIterator<'a> {
+impl Iterator for CursorIterator {
     type Item = Result<kvp>;
     fn next(&mut self) -> Option<Result<kvp>> {
         if self.csr.IsValid() {
@@ -836,14 +836,14 @@ enum Direction {
     WANDERING = 2,
 }
 
-struct MultiCursor<'a> { 
-    subcursors: Box<[SegmentCursor<'a>]>, 
+struct MultiCursor { 
+    subcursors: Box<[SegmentCursor]>, 
     sorted: Box<[(usize,Option<Ordering>)]>,
     cur: Option<usize>, 
     dir: Direction,
 }
 
-impl<'a> MultiCursor<'a> {
+impl MultiCursor {
     fn sort(&mut self, want_max: bool) -> Result<()> {
         if self.subcursors.is_empty() {
             return Ok(())
@@ -997,7 +997,7 @@ impl<'a> MultiCursor<'a> {
 
 }
 
-impl<'a> ICursor<'a> for MultiCursor<'a> {
+impl<'a> ICursor<'a> for MultiCursor {
     fn IsValid(&self) -> bool {
         match self.cur {
             Some(i) => self.subcursors[i].IsValid(),
@@ -1274,11 +1274,11 @@ impl<'a> ICursor<'a> for MultiCursor<'a> {
 
 }
 
-pub struct LivingCursor<'a> { 
-    chain : MultiCursor<'a>
+pub struct LivingCursor { 
+    chain : MultiCursor
 }
 
-impl<'a> LivingCursor<'a> {
+impl LivingCursor {
     fn skipTombstonesForward(&mut self) -> Result<()> {
         while self.chain.IsValid() && try!(self.chain.ValueLength()).is_none() {
             try!(self.chain.Next());
@@ -1298,7 +1298,7 @@ impl<'a> LivingCursor<'a> {
     }
 }
 
-impl<'a> ICursor<'a> for LivingCursor<'a> {
+impl<'a> ICursor<'a> for LivingCursor {
     fn First(&mut self) -> Result<()> {
         try!(self.chain.First());
         try!(self.skipTombstonesForward());
@@ -2474,17 +2474,9 @@ fn readOverflow(path: &str, pgsz: usize, firstPage: PageNum, buf: &mut [u8]) -> 
     Ok(res)
 }
 
-struct SegmentCursor<'a> {
+struct SegmentCursor {
     path: String,
-
-    // TODO in the f# version, these three were a closure.
-    // it would be nice to make it work that way again.
-    // so that this code would not have specific knowledge
-    // of the InnerPart type.
-    inner: &'a InnerPart,
-    segnum: SegmentNum,
-    csrnum: u64,
-
+    done: Box<Fn() -> ()>,
     blocks: Vec<PageBlock>, // TODO will be needed later for stray checking
     fs: File,
     len: u64,
@@ -2499,15 +2491,13 @@ struct SegmentCursor<'a> {
     lastLeaf: PageNum,
 }
 
-impl<'a> SegmentCursor<'a> {
+impl SegmentCursor {
     fn new(path: &str, 
            pgsz: usize, 
            rootPage: PageNum, 
            blocks: Vec<PageBlock>,
-           inner: &'a InnerPart, 
-           segnum: SegmentNum, 
-           csrnum: u64
-          ) -> Result<SegmentCursor<'a>> {
+           done: Box<Fn() -> ()>
+          ) -> Result<SegmentCursor> {
 
         // TODO consider not passsing in the path, and instead,
         // making the cursor call back to inner.OpenForReading...
@@ -2525,9 +2515,7 @@ impl<'a> SegmentCursor<'a> {
             path: String::from(path),
             fs: f,
             blocks: blocks,
-            inner: inner,
-            segnum: segnum,
-            csrnum: csrnum,
+            done: done,
             len: len,
             rootPage: rootPage,
             pr: PageBuffer::new(pgsz),
@@ -2691,7 +2679,7 @@ impl<'a> SegmentCursor<'a> {
         Ok(())
     }
 
-    fn keyInLeaf2(&'a self, n: usize) -> Result<KeyRef<'a>> { 
+    fn keyInLeaf2<'a>(&'a self, n: usize) -> Result<KeyRef<'a>> { 
         let mut cur = self.leafKeys[n as usize];
         let kflag = self.pr.GetByte(&mut cur);
         let klen = self.pr.GetVarint(&mut cur) as usize;
@@ -3033,13 +3021,13 @@ impl<'a> SegmentCursor<'a> {
 
 }
 
-impl<'a> Drop for SegmentCursor<'a> {
+impl Drop for SegmentCursor {
     fn drop(&mut self) {
-        self.inner.cursor_dropped(self.segnum, self.csrnum);
+        (*self.done)();
     }
 }
 
-impl<'a> ICursor<'a> for SegmentCursor<'a> {
+impl<'a> ICursor<'a> for SegmentCursor {
     fn IsValid(&self) -> bool {
         self.leafIsValid()
     }
@@ -3536,7 +3524,7 @@ impl db {
     // stuff publicly.
 
     pub fn OpenCursor(&self) -> Result<LivingCursor> {
-        self.inner.OpenCursor()
+        InnerPart::OpenCursor(&self.inner)
     }
 
     pub fn WriteSegmentFromSortedSequence<I>(&self, source: I) -> Result<SegmentNum> where I:Iterator<Item=Result<kvp>> {
@@ -3552,7 +3540,7 @@ impl db {
     }
 
     pub fn merge(&self, level: u32, min: usize, max: Option<usize>) -> Result<Option<SegmentNum>> {
-        self.inner.merge(level, min, max)
+        InnerPart::merge(&self.inner, level, min, max)
     }
 }
 
@@ -3789,7 +3777,7 @@ impl InnerPart {
     // TODO this function looks for the segment in the header.segments,
     // which means it cannot be used to open a cursor on a pendingSegment,
     // which we think we might need in the future.
-    fn getCursor(&self, 
+    fn getCursor(inner: &std::sync::Arc<InnerPart>, 
                  st: &SafeHeader,
                  g: SegmentNum
                 ) -> Result<SegmentCursor> {
@@ -3797,9 +3785,13 @@ impl InnerPart {
             None => Err(Error::Misc("getCursor: segment not found")),
             Some(seg) => {
                 let rootPage = seg.root;
-                let mut cursors = try!(self.cursors.lock());
+                let mut cursors = try!(inner.cursors.lock());
                 let csrnum = cursors.nextCursorNum;
-                let csr = try!(SegmentCursor::new(&self.path, self.pgsz, rootPage, seg.blocks.clone(), &self, g, csrnum));
+                let foo = inner.clone();
+                let done = move || -> () {
+                    foo.cursor_dropped(g, csrnum);
+                };
+                let csr = try!(SegmentCursor::new(&inner.path, inner.pgsz, rootPage, seg.blocks.clone(), box done));
 
                 cursors.nextCursorNum = cursors.nextCursorNum + 1;
                 let was = cursors.cursors.insert(csrnum, g);
@@ -3810,17 +3802,17 @@ impl InnerPart {
     }
 
     // TODO we also need a way to open a cursor on segments in waiting
-    fn OpenCursor(&self) -> Result<LivingCursor> {
+    fn OpenCursor(inner: &std::sync::Arc<InnerPart>) -> Result<LivingCursor> {
         // TODO this cursor needs to expose the changeCounter and segment list
         // on which it is based. for optimistic writes. caller can grab a cursor,
         // do their writes, then grab the writelock, and grab another cursor, then
         // compare the two cursors to see if anything important changed.  if not,
         // commit their writes.  if so, nevermind the written segments and start over.
 
-        let st = try!(self.header.lock());
+        let st = try!(inner.header.lock());
         let mut clist = Vec::with_capacity(st.header.currentState.len());
         for g in st.header.currentState.iter() {
-            clist.push(try!(self.getCursor(&*st, *g)));
+            clist.push(try!(Self::getCursor(inner, &*st, *g)));
         }
         let mc = MultiCursor::Create(clist);
         let lc = LivingCursor::Create(mc);
@@ -3935,9 +3927,9 @@ impl InnerPart {
         Ok(g)
     }
 
-    fn merge(&self, level: u32, min: usize, max: Option<usize>) -> Result<Option<SegmentNum>> {
+    fn merge(inner: &std::sync::Arc<InnerPart>, level: u32, min: usize, max: Option<usize>) -> Result<Option<SegmentNum>> {
         let mrg = {
-            let st = try!(self.header.lock());
+            let st = try!(inner.header.lock());
 
             if st.header.currentState.len() == 0 {
                 return Ok(None)
@@ -3962,7 +3954,7 @@ impl InnerPart {
 
             let mut segs = Vec::new();
 
-            let mut mergeStuff = try!(self.mergeStuff.lock());
+            let mut mergeStuff = try!(inner.mergeStuff.lock());
 
             // we can merge any contiguous set of not-already-being-merged 
             // segments at the end of the group.  if we merge something
@@ -3987,7 +3979,7 @@ impl InnerPart {
                 segs.reverse();
                 let mut clist = Vec::with_capacity(segs.len());
                 for g in segs.iter() {
-                    clist.push(try!(self.getCursor(&st, *g)));
+                    clist.push(try!(Self::getCursor(inner, &st, *g)));
                 }
                 for g in segs.iter() {
                     mergeStuff.merging.insert(*g);
@@ -4000,11 +3992,11 @@ impl InnerPart {
         match mrg {
             Some((segs,clist)) => {
                 let mut mc = MultiCursor::Create(clist);
-                let mut fs = try!(self.OpenForWriting());
+                let mut fs = try!(inner.OpenForWriting());
                 try!(mc.First());
-                let (g,_) = try!(CreateFromSortedSequenceOfKeyValuePairs(&mut fs, self, CursorIterator::new(mc)));
+                let (g,_) = try!(CreateFromSortedSequenceOfKeyValuePairs(&mut fs, &**inner, CursorIterator::new(mc)));
                 //printfn "merged %A to get %A" segs g
-                let mut mergeStuff = try!(self.mergeStuff.lock());
+                let mut mergeStuff = try!(inner.mergeStuff.lock());
                 mergeStuff.pendingMerges.insert(g, segs);
                 Ok(Some(g))
             },
