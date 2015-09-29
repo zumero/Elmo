@@ -3440,29 +3440,28 @@ struct InnerPart {
     cursors: Mutex<SafeCursors>,
 }
 
-pub struct WriteLock<'a> {
-    inner: Option<&'a InnerPart>
+pub struct WriteLock {
+    inner: std::sync::Arc<InnerPart>
 }
 
-impl<'a> WriteLock<'a> {
+impl WriteLock {
     pub fn commitSegments(&self, newSegs: Vec<SegmentNum>) -> Result<()> {
-        self.inner.unwrap().commitSegments(newSegs)
+        self.inner.commitSegments(newSegs)
     }
 
     pub fn commitMerge(&self, newSegNum:SegmentNum) -> Result<()> {
-        self.inner.unwrap().commitMerge(newSegNum)
+        self.inner.commitMerge(newSegNum)
     }
 }
 
 // TODO rename this
-pub struct db<'a> {
-
-    inner: InnerPart,
-    write_lock: Mutex<WriteLock<'a>>,
+pub struct db {
+    inner: std::sync::Arc<InnerPart>,
+    write_lock: Mutex<WriteLock>,
 }
 
-impl<'a> db<'a> {
-    pub fn new(path: String, settings : DbSettings) -> Result<db<'a>> {
+impl db {
+    pub fn new(path: String, settings : DbSettings) -> Result<db> {
 
         let mut f = try!(OpenOptions::new()
                 .read(true)
@@ -3517,12 +3516,8 @@ impl<'a> db<'a> {
             cursors: Mutex::new(cursors),
         };
 
-        // WriteLock contains a reference to another part of
-        // the struct it is in.  So we wrap it in an option,
-        // and set it to null for now.  We set it later when
-        // somebody actually asks for the lock.
-
-        let lck = WriteLock { inner: None };
+        let inner = std::sync::Arc::new(inner);
+        let lck = WriteLock { inner: inner.clone() };
         let res = db {
             inner: inner,
             write_lock: Mutex::new(lck),
@@ -3532,10 +3527,8 @@ impl<'a> db<'a> {
 
     // TODO func to ask for the write lock without blocking?
 
-    pub fn GetWriteLock(&'a self) -> Result<std::sync::MutexGuard<WriteLock<'a>>> {
-        let mut lck = try!(self.write_lock.lock());
-        // set the inner reference
-        lck.inner = Some(&self.inner);
+    pub fn GetWriteLock(&self) -> Result<std::sync::MutexGuard<WriteLock>> {
+        let lck = try!(self.write_lock.lock());
         Ok(lck)
     }
 
