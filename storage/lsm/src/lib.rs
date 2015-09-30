@@ -24,6 +24,7 @@ use std::collections::HashSet;
 
 extern crate bson;
 
+extern crate misc;
 extern crate elmo;
 extern crate lsm;
 
@@ -101,6 +102,7 @@ struct MyReader {
 struct MyWriter<'a> {
     myconn: std::rc::Rc<MyConn>,
     tx: std::sync::MutexGuard<'a, lsm::WriteLock>,
+    // TODO maybe we should have the HashMap here?
 }
 
 struct MyConn {
@@ -131,6 +133,9 @@ pub const NEXT_INDEX_ID: u8 = 2;
 ///     collid (varint)
 pub const NAME_TO_COLLECTION_ID: u8 = 3;
 
+// TODO maybe the options should just go with above
+// instead of in a separate record?
+
 /// key:
 ///     (tag)
 ///     collid (varint)
@@ -140,31 +145,44 @@ pub const COLLECTION_ID_TO_OPTIONS: u8 = 4;
 
 /// key:
 ///     (tag)
-///     db name (len + str)
-///     coll name (len + str)
+///     collid (varint)
 ///     index name (len + str)
 /// value:
 ///     indexid (varint)
 pub const NAME_TO_INDEX_ID: u8 = 5;
+
+// TODO maybe the spec/options should just go with above
+// instead of in a separate record?
 
 /// key:
 ///     (tag)
 ///     indexid (varint)
 /// value:
 ///     spec (bson)
+pub const INDEX_ID_TO_SPEC: u8 = 6;
+
+/// key:
+///     (tag)
+///     indexid (varint)
+/// value:
 ///     options (bson)
-pub const INDEX_ID_TO_INFO: u8 = 6;
+pub const INDEX_ID_TO_OPTIONS: u8 = 7;
 
 // TODO should we have record ids?  or just have the _id of each record
-// be its actual key?  the pk can be big, and it will be duplicated,
+// be its actual key?  
+//
+// the pk can be big, and it will be duplicated,
 // once in the key, and once in the bson doc itself.
+//
+// the pk or id is also duplicated in the index entries.
+// and in their backlinks.
 
 /// key:
 ///     (tag)
 ///     collid (varint)
 /// value:
 ///     recid (varint)
-pub const NEXT_RECORD_ID: u8 = 7;
+pub const NEXT_RECORD_ID: u8 = 8;
 
 /// key:
 ///     (tag)
@@ -172,7 +190,7 @@ pub const NEXT_RECORD_ID: u8 = 7;
 ///     recid (varint)
 /// value:
 ///     doc (bson)
-pub const RECORD: u8 = 8;
+pub const RECORD: u8 = 9;
 
 // TODO do we actually need the two kinds of index entries to be
 // different tags?
@@ -184,7 +202,7 @@ pub const RECORD: u8 = 8;
 ///     recid (varint)
 /// value:
 ///    (none)
-pub const INDEX_ENTRY_PLAIN: u8 = 9;
+pub const INDEX_ENTRY_PLAIN: u8 = 10;
 
 /// key:
 ///     (tag)
@@ -192,7 +210,7 @@ pub const INDEX_ENTRY_PLAIN: u8 = 9;
 ///     k (len + bytes)
 /// value:
 ///     recid (varint)
-pub const INDEX_ENTRY_UNIQUE: u8 = 10;
+pub const INDEX_ENTRY_UNIQUE: u8 = 11;
 
 /// key:
 ///     (tag)
@@ -201,13 +219,12 @@ pub const INDEX_ENTRY_UNIQUE: u8 = 10;
 ///     (complete index key)
 /// value:
 ///    (none)
-pub const RECORD_ID_TO_INDEX_ENTRY: u8 = 11;
+pub const RECORD_ID_TO_INDEX_ENTRY: u8 = 12;
 
-fn encode_collection_key(db: &str, coll: &str) -> Vec<u8> {
-    // TODO maybe the options should just go here in the key too?
-
+fn encode_key_name_to_collection_id(db: &str, coll: &str) -> Box<[u8]> {
+    // TODO capacity
     let mut k = vec![];
-    k.push(1u8);
+    k.push(NAME_TO_COLLECTION_ID);
 
     // From the mongo docs:
     // The maximum length of the collection namespace, which includes the database name, the dot
@@ -221,15 +238,10 @@ fn encode_collection_key(db: &str, coll: &str) -> Vec<u8> {
     k.push(b.len() as u8);
     k.push_all(b);
 
-    k
+    k.into_boxed_slice()
 }
 
-fn lsm_map_to_string(ba: &[u8]) -> lsm::Result<String> {
-    let s = try!(std::str::from_utf8(&ba));
-    Ok(String::from(s))
-}
-
-fn decode_collection_key(k: &lsm::KeyRef) -> Result<(String, String)> {
+fn decode_key_name_to_collection_id(k: &lsm::KeyRef) -> Result<(String, String)> {
     let len_db = try!(k.u8_at(1).map_err(elmo::wrap_err)) as usize;
     let begin_db = 2;
     let db = try!(k.map_range(begin_db, begin_db + len_db, lsm_map_to_string).map_err(elmo::wrap_err));
@@ -239,6 +251,72 @@ fn decode_collection_key(k: &lsm::KeyRef) -> Result<(String, String)> {
     Ok((db, coll))
 }
 
+fn encode_key_tag_and_varint(tag: u8, id: u64) -> Box<[u8]> {
+    // TODO capacity
+    let mut k = vec![];
+    k.push(tag);
+
+    let mut buf = [0; 9];
+    let mut cur = 0;
+    misc::varint::write(&mut buf, &mut cur, id);
+    k.push_all(&buf[0 .. cur]);
+
+    k.into_boxed_slice()
+}
+
+fn encode_key_collection_id_to_options(id: u64) -> Box<[u8]> {
+    encode_key_tag_and_varint(COLLECTION_ID_TO_OPTIONS, id)
+}
+
+fn encode_key_index_id_to_spec(id: u64) -> Box<[u8]> {
+    encode_key_tag_and_varint(INDEX_ID_TO_SPEC, id)
+}
+
+fn encode_key_index_id_to_options(id: u64) -> Box<[u8]> {
+    encode_key_tag_and_varint(INDEX_ID_TO_OPTIONS, id)
+}
+
+fn encode_key_name_to_index_id(collection_id: u64, name: &str) -> Box<[u8]> {
+    // TODO capacity
+    let mut k = vec![];
+    k.push(NAME_TO_INDEX_ID);
+
+    // From the mongo docs:
+    // The maximum length of the collection namespace, which includes the database name, the dot
+    // (.) separator, and the collection name (i.e. <database>.<collection>), is 120 bytes.
+
+    let ba = u64_to_boxed_varint(collection_id);
+    k.push_all(&ba);
+
+    let b = name.as_bytes();
+    k.push(b.len() as u8);
+    k.push_all(b);
+
+    k.into_boxed_slice()
+}
+
+fn lsm_map_to_string(ba: &[u8]) -> lsm::Result<String> {
+    let s = try!(std::str::from_utf8(&ba));
+    Ok(String::from(s))
+}
+
+fn lsm_map_to_varint(ba: &[u8]) -> lsm::Result<u64> {
+    let mut cur = 0;
+    let n = misc::varint::read(ba, &mut cur);
+    // TODO assert cur used up all of ba?
+    Ok(n)
+}
+
+fn u64_to_boxed_varint(n: u64) -> Box<[u8]> {
+    let mut buf = [0; 9];
+    let mut cur = 0;
+    misc::varint::write(&mut buf, &mut cur, n);
+    let mut v = Vec::with_capacity(cur);
+    v.push_all(&buf[0 .. cur]);
+    let v = v.into_boxed_slice();
+    v
+}
+
 fn lsm_map_to_bson(ba: &[u8]) -> lsm::Result<bson::Document> {
     let r = bson::Document::from_bson(ba);
     let r = r.map_err(lsm::wrap_err);
@@ -246,7 +324,32 @@ fn lsm_map_to_bson(ba: &[u8]) -> lsm::Result<bson::Document> {
 }
 
 impl MyConn {
+    fn get_value_for_key_as_varint(&self, k: &[u8]) -> Result<Option<u64>> {
+        let mut csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        try!(csr.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
+        if csr.IsValid() {
+            let v = try!(csr.LiveValueRef().map_err(elmo::wrap_err));
+            let id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
+            Ok(Some(id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn get_value_for_key_as_bson(&self, k: &[u8]) -> Result<Option<bson::Document>> {
+        let mut csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        try!(csr.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
+        if csr.IsValid() {
+            let v = try!(csr.LiveValueRef().map_err(elmo::wrap_err));
+            let id = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
+            Ok(Some(id))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn get_collection_options(&self, k: &[u8]) -> Result<Option<bson::Document>> {
+        // TODO this is all wrong now
         let mut csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
         try!(csr.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
         if csr.IsValid() {
@@ -276,21 +379,26 @@ impl MyConn {
 
     fn base_list_collections(&self) -> Result<Vec<elmo::CollectionInfo>> {
         let mut csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
-        let k = [1u8];
+        let k = [NAME_TO_COLLECTION_ID];
         try!(csr.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_GE).map_err(elmo::wrap_err));
         let mut a = vec![];
         // TODO might need to sort by the coll name
         while csr.IsValid() {
             {
                 let k = try!(csr.KeyRef().map_err(elmo::wrap_err));
-                if try!(k.u8_at(0).map_err(elmo::wrap_err)) != 1 {
-                    // TODO maybe we should have an easy way to iterate over
+                if try!(k.u8_at(0).map_err(elmo::wrap_err)) != NAME_TO_COLLECTION_ID {
+                    // TODO maybe lsm should have an easy way to iterate over
                     // all keys in a prefix?
                     break;
                 }
-                let (db, coll) = try!(decode_collection_key(&k));
+                let (db, coll) = try!(decode_key_name_to_collection_id(&k));
+
                 let v = try!(csr.LiveValueRef().map_err(elmo::wrap_err));
-                let options = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
+                let id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
+
+                let k = encode_key_collection_id_to_options(id);
+                let options = try!(self.get_value_for_key_as_bson(&k)).unwrap_or(bson::Document::new());
+
                 let info = elmo::CollectionInfo {
                     db: db,
                     coll: coll,
@@ -329,17 +437,67 @@ impl elmo::StorageCollectionWriter for MyCollectionWriter {
 }
 
 impl<'a> MyWriter<'a> {
+    fn get_next_id(&self, tag: &[u8]) -> Result<u64> {
+
+        let mut k = Vec::with_capacity(1);
+        k.push_all(tag);
+        let k = k.into_boxed_slice();
+
+        let n = {
+            let mut csr = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+            try!(csr.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
+            if csr.IsValid() {
+                let v = try!(csr.LiveValueRef().map_err(elmo::wrap_err));
+                let n = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
+                n
+            } else {
+                1
+            }
+        };
+
+        let v = u64_to_boxed_varint(n+1);
+        let mut d = HashMap::new();
+        d.insert(k, v);
+        let g = try!(self.myconn.conn.WriteSegment(d).map_err(elmo::wrap_err));
+        try!(self.tx.commitSegments(vec![g]).map_err(elmo::wrap_err));
+
+        Ok(n)
+    }
+
     fn base_create_collection(&self, db: &str, coll: &str, options: bson::Document) -> Result<bool> {
-        let k = encode_collection_key(db, coll);
-        match try!(self.myconn.get_collection_options(&k)) {
+        let k = encode_key_name_to_collection_id(db, coll);
+        match try!(self.myconn.get_value_for_key_as_varint(&k)) {
             Some(_) => Ok(false),
             None => {
-                let v_options = options.to_bson_array();
                 let mut d = std::collections::HashMap::new();
-                d.insert(k.into_boxed_slice(), v_options.into_boxed_slice());
+
+                let collection_id = try!(self.get_next_id(&[NEXT_COLLECTION_ID]));
+                d.insert(k, u64_to_boxed_varint(collection_id));
+
+                let k = encode_key_collection_id_to_options(collection_id);
+                d.insert(k, options.to_bson_array().into_boxed_slice());
+
+                // now create mongo index for _id
+                match options.get("autoIndexId") {
+                    Some(&bson::Value::BBoolean(false)) => {
+                    },
+                    _ => {
+                        let index_id = try!(self.get_next_id(&[NEXT_INDEX_ID]));
+                        let k = encode_key_name_to_index_id(collection_id, "_id_");
+                        d.insert(k, u64_to_boxed_varint(index_id));
+
+                        let spec = bson::Document {pairs: vec![(String::from("_id"), bson::Value::BInt32(1))]};
+                        let k = encode_key_index_id_to_spec(index_id);
+                        d.insert(k, spec.to_bson_array().into_boxed_slice());
+
+                        let options = bson::Document {pairs: vec![(String::from("unique"), bson::Value::BBoolean(true))]};
+                        let k = encode_key_index_id_to_options(index_id);
+                        d.insert(k, spec.to_bson_array().into_boxed_slice());
+                    },
+                }
+
                 let g = try!(self.myconn.conn.WriteSegment(d).map_err(elmo::wrap_err));
                 try!(self.tx.commitSegments(vec![g]).map_err(elmo::wrap_err));
-                // TODO gotta create the _id index here
                 Ok(true)
             },
         }
