@@ -13,6 +13,7 @@ fn into_utf8(s : String) -> Box<[u8]> {
 }
 
 fn str_to_utf8(s : &str) -> Box<[u8]> {
+    // TODO use str::as_bytes()
     s.to_string().into_bytes().into_boxed_slice()
 }
 

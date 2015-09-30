@@ -67,7 +67,7 @@ pub enum Blob {
 }
 
 #[derive(Debug)]
-enum Error {
+pub enum Error {
     // TODO remove Misc
     Misc(&'static str),
 
@@ -82,6 +82,7 @@ enum Error {
     InvalidPageType,
     RootPageNotInSegmentBlockList,
     Poisoned,
+    Whatever(Box<std::error::Error>),
 }
 
 impl std::fmt::Display for Error {
@@ -96,6 +97,7 @@ impl std::fmt::Display for Error {
             Error::InvalidPageNumber => write!(f, "Invalid page number"),
             Error::InvalidPageType => write!(f, "Invalid page type"),
             Error::RootPageNotInSegmentBlockList => write!(f, "Root page not in segment block list"),
+            Error::Whatever(ref err) => write!(f, "Other error: {}", err),
         }
     }
 }
@@ -112,10 +114,15 @@ impl std::error::Error for Error {
             Error::InvalidPageNumber => "invalid page number",
             Error::InvalidPageType => "invalid page type",
             Error::RootPageNotInSegmentBlockList => "Root page not in segment block list",
+            Error::Whatever(ref err) => std::error::Error::description(&**err),
         }
     }
 
     // TODO cause
+}
+
+pub fn wrap_err<E: std::error::Error + 'static>(err: E) -> Error {
+    Error::Whatever(box err)
 }
 
 impl From<io::Error> for Error {
@@ -378,6 +385,27 @@ impl<'a> ValueRef<'a> {
             },
             ValueRef::Overflowed(len, r) => Blob::Stream(r),
             ValueRef::Tombstone => Blob::Tombstone,
+        }
+    }
+
+    // TODO name this
+    // TODO if LivingCursor returned a different ValueRef, one that did not
+    // include Tombstone, then this wouldn't have to return Option<T>.
+    pub fn plok<T, F: Fn(&[u8]) -> Result<T>>(self, func: F) -> Result<Option<T>> {
+        match self {
+            ValueRef::Array(a) => {
+                let t = try!(func(a));
+                Ok(Some(t))
+            },
+            ValueRef::Overflowed(len, mut strm) => {
+                let mut a = Vec::with_capacity(len);
+                try!(strm.read_to_end(&mut a));
+                let t = try!(func(&a));
+                Ok(Some(t))
+            },
+            ValueRef::Tombstone => {
+                Ok(None)
+            },
         }
     }
 }

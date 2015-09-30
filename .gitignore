@@ -20,3 +20,4 @@ Cargo.lock
 /elmo/target
 /rust-sqlite/target
 /storage/sqlite3/target
+/storage/lsm/target

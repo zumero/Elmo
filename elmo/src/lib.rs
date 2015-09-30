@@ -1033,7 +1033,7 @@ pub fn get_normalized_spec(info: &IndexInfo) -> Result<(Vec<(String,IndexType)>,
 
 
 pub trait StorageConnection {
-    fn begin_write(&self) -> Result<Box<StorageWriter + 'static>>;
+    fn begin_write<'a>(&'a self) -> Result<Box<StorageWriter + 'a>>;
     fn begin_read(&self) -> Result<Box<StorageReader + 'static>>;
     // TODO note that only one tx can exist at a time per connection.
 
