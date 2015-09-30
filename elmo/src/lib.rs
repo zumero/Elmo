@@ -91,12 +91,23 @@ impl From<std::io::Error> for Error {
     }
 }
 
-// TODO not sure this is useful
+/*
+// this doesn't seem to help
 impl From<Box<std::error::Error>> for Error {
     fn from(err: Box<std::error::Error>) -> Error {
         Error::Whatever(err)
     }
 }
+*/
+
+/*
+// compiler won't allow this
+impl<T> From<T> for Error where T: std::error::Error {
+    fn from(err: T) -> Error {
+        Error::Whatever(box err)
+    }
+}
+*/
 
 impl From<std::str::Utf8Error> for Error {
     fn from(err: std::str::Utf8Error) -> Error {

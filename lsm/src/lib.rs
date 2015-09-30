@@ -228,7 +228,96 @@ impl<'a> KeyRef<'a> {
         match *self {
             KeyRef::Overflowed(ref a) => a.len(),
             KeyRef::Array(a) => a.len(),
-            KeyRef::Prefixed(front,back) => front.len() + back.len(),
+            KeyRef::Prefixed(front, back) => front.len() + back.len(),
+        }
+    }
+
+    pub fn u8_at(&self, i: usize) -> Result<u8> {
+        match self {
+            &KeyRef::Overflowed(ref a) => {
+                if i < a.len() {
+                    Ok(a[i])
+                } else {
+                    Err(Error::Misc("out of range"))
+                }
+            },
+            &KeyRef::Array(a) => {
+                if i < a.len() {
+                    Ok(a[i])
+                } else {
+                    Err(Error::Misc("out of range"))
+                }
+            },
+            &KeyRef::Prefixed(front, back) => {
+                if i < front.len() {
+                    Ok(front[i])
+                } else {
+                    let i = i - front.len();
+                    if i < back.len() {
+                        Ok(back[i])
+                    } else {
+                        Err(Error::Misc("out of range"))
+                    }
+                }
+            },
+        }
+    }
+
+    /// A KeyRef is conceptually just a bunch of bytes, but it can be represented in
+    /// three different ways, depending on whether the key in the page was overflowed
+    /// or prefixed or neither.  This function accepts a func which is to be applied
+    /// to a range of the key.  Whenever possible, the func is called without allocation.
+    /// But if the requested range crosses the front/back boundary of a prefixed key,
+    /// then an alloc+copy will be needed.
+    pub fn map_range<T, F: Fn(&[u8]) -> Result<T>>(&self, begin: usize, end: usize, func: F) -> Result<T> {
+        if end <= begin {
+            return Err(Error::Misc("illegal range"));
+        }
+        match self {
+            &KeyRef::Array(a) => {
+                if end < a.len() {
+                    let t = try!(func(&a[begin .. end]));
+                    Ok(t)
+                } else {
+                    Err(Error::Misc("out of range"))
+                }
+            },
+            &KeyRef::Overflowed(ref a) => {
+                if end < a.len() {
+                    let t = try!(func(&a[begin .. end]));
+                    Ok(t)
+                } else {
+                    Err(Error::Misc("out of range"))
+                }
+            },
+            &KeyRef::Prefixed(front, back) => {
+                if end < front.len() {
+                    let t = try!(func(&front[begin .. end]));
+                    Ok(t)
+                } else if begin >= front.len() {
+                    let begin = begin - front.len();
+                    let end = end - front.len();
+                    if end < back.len() {
+                        let t = try!(func(&back[begin .. end]));
+                        Ok(t)
+                    } else {
+                        Err(Error::Misc("out of range"))
+                    }
+                } else {
+                    // the range we want is split across the front and back.
+                    // in this case we have to alloc.
+                    let mut a = Vec::with_capacity(end - begin);
+                    a.push_all(&front[begin .. ]);
+                    let end = end - front.len();
+                    if end < back.len() {
+                        a.push_all(&back[0 .. end]);
+                        let t = try!(func(&a));
+                        Ok(t)
+                    } else {
+                        Err(Error::Misc("out of range"))
+                    }
+                }
+            },
         }
     }
 
@@ -361,6 +450,62 @@ impl<'a> KeyRef<'a> {
 }
 
 
+/// Like a ValueRef, but cannot represent a tombstone.  Available
+/// only from a LivingCursor.
+pub enum LiveValueRef<'a> {
+    Array(&'a [u8]),
+    Overflowed(usize, Box<Read>),
+}
+
+impl<'a> LiveValueRef<'a> {
+    pub fn len(&self) -> usize {
+        match *self {
+            LiveValueRef::Array(a) => a.len(),
+            LiveValueRef::Overflowed(len, _) => len,
+        }
+    }
+
+    pub fn into_blob(self) -> Blob {
+        match self {
+            LiveValueRef::Array(a) => {
+                let mut k = Vec::with_capacity(a.len());
+                k.push_all(a);
+                Blob::Array(k.into_boxed_slice())
+            },
+            LiveValueRef::Overflowed(len, r) => Blob::Stream(r),
+        }
+    }
+
+    /// A LiveValueRef is conceptually just a bunch of bytes, but it can be represented in
+    /// two different ways, depending on whether the value in the page was overflowed
+    /// or not.  This function accepts a func which is to be applied to the value.
+    /// If the value was overflowed, it will be read into memory.  Otherwise, the func
+    /// gets called without alloc or copy.
+    pub fn map<T, F: Fn(&[u8]) -> Result<T>>(self, func: F) -> Result<T> {
+        match self {
+            LiveValueRef::Array(a) => {
+                let t = try!(func(a));
+                Ok(t)
+            },
+            LiveValueRef::Overflowed(len, mut strm) => {
+                let mut a = Vec::with_capacity(len);
+                try!(strm.read_to_end(&mut a));
+                let t = try!(func(&a));
+                Ok(t)
+            },
+        }
+    }
+}
+
+impl<'a> std::fmt::Debug for LiveValueRef<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
+        match *self {
+            LiveValueRef::Array(a) => write!(f, "Array, len={:?}", a),
+            LiveValueRef::Overflowed(klen,_) => write!(f, "Overflowed, len={}", klen),
+        }
+    }
+}
+
 pub enum ValueRef<'a> {
     Array(&'a [u8]),
     Overflowed(usize, Box<Read>),
@@ -388,26 +533,6 @@ impl<'a> ValueRef<'a> {
         }
     }
 
-    // TODO name this
-    // TODO if LivingCursor returned a different ValueRef, one that did not
-    // include Tombstone, then this wouldn't have to return Option<T>.
-    pub fn plok<T, F: Fn(&[u8]) -> Result<T>>(self, func: F) -> Result<Option<T>> {
-        match self {
-            ValueRef::Array(a) => {
-                let t = try!(func(a));
-                Ok(Some(t))
-            },
-            ValueRef::Overflowed(len, mut strm) => {
-                let mut a = Vec::with_capacity(len);
-                try!(strm.read_to_end(&mut a));
-                let t = try!(func(&a));
-                Ok(Some(t))
-            },
-            ValueRef::Tombstone => {
-                Ok(None)
-            },
-        }
-    }
 }
 
 impl<'a> std::fmt::Debug for ValueRef<'a> {
@@ -1307,6 +1432,14 @@ pub struct LivingCursor {
 }
 
 impl LivingCursor {
+    pub fn LiveValueRef<'a>(&'a self) -> Result<LiveValueRef<'a>> {
+        match try!(self.chain.ValueRef()) {
+            ValueRef::Array(a) => Ok(LiveValueRef::Array(a)),
+            ValueRef::Overflowed(len, r) => Ok(LiveValueRef::Overflowed(len, r)),
+            ValueRef::Tombstone => Err(Error::Misc("LiveValueRef tombstone TODO unreachable")),
+        }
+    }
+
     fn skipTombstonesForward(&mut self) -> Result<()> {
         while self.chain.IsValid() && try!(self.chain.ValueLength()).is_none() {
             try!(self.chain.Next());
