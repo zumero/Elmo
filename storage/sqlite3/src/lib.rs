@@ -667,6 +667,9 @@ impl MyCollectionWriter {
         }
     }
 
+}
+
+impl MyWriter {
     fn update_indexes_delete(indexes: &mut Vec<IndexPrep>, rowid: i64) -> Result<()> {
         for t in indexes {
             t.stmt_delete.clear_bindings();
@@ -690,71 +693,47 @@ impl MyCollectionWriter {
         Ok(())
     }
 
-}
-
-impl elmo::StorageCollectionWriter for MyCollectionWriter {
-    fn update(&mut self, v: &bson::Document) -> Result<()> {
-        match v.get("_id") {
-            None => Err(elmo::Error::Misc(String::from("cannot update without _id"))),
-            Some(id) => {
-                match try!(self.find_rowid(&id).map_err(elmo::wrap_err)) {
-                    None => Err(elmo::Error::Misc(String::from("update but does not exist"))),
-                    Some(rowid) => {
-                                let ba = v.to_bson_array();
-                                self.update.clear_bindings();
-                                try!(self.update.bind_blob(1,&ba).map_err(elmo::wrap_err));
-                                try!(self.update.bind_int64(2, rowid).map_err(elmo::wrap_err));
-                                try!(step_done(&mut self.update));
-                                try!(verify_changes(&self.update, 1));
-                                self.update.reset();
-                                try!(Self::update_indexes_delete(&mut self.indexes, rowid));
-                                try!(Self::update_indexes_insert(&mut self.indexes, rowid, &v));
-                                Ok(())
-                            },
-                }
-            },
+    fn get_collection_writer(&self, db: &str, coll: &str) -> Result<MyCollectionWriter> {
+        let _created = try!(self.base_create_collection(db, coll, bson::Document::new()));
+        let tbl = get_table_name_for_collection(db, coll);
+        let stmt_insert = try!(self.myconn.conn.prepare(&format!("INSERT INTO \"{}\" (bson) VALUES (?)", tbl)).map_err(elmo::wrap_err));
+        let stmt_delete = try!(self.myconn.conn.prepare(&format!("DELETE FROM \"{}\" WHERE rowid=?", tbl)).map_err(elmo::wrap_err));
+        let stmt_update = try!(self.myconn.conn.prepare(&format!("UPDATE \"{}\" SET bson=? WHERE rowid=?", tbl)).map_err(elmo::wrap_err));
+        let indexes = try!(self.myconn.base_list_indexes());
+        let indexes = indexes.into_iter().filter(
+            |ndx| ndx.db == db && ndx.coll == coll
+            ).collect::<Vec<_>>();
+        let mut find_rowid = None;
+        for info in &indexes {
+            if info.name == "_id_" {
+                let tbl = get_table_name_for_index(db, coll, &info.name);
+                find_rowid = Some(try!(self.myconn.conn.prepare(&format!("SELECT doc_rowid FROM \"{}\" WHERE k=?", tbl)).map_err(elmo::wrap_err)));
+                break;
+            }
         }
-    }
-
-    fn delete(&mut self, v: &bson::Value) -> Result<bool> {
-        // TODO is v supposed to be the id?
-        match try!(self.find_rowid(&v).map_err(elmo::wrap_err)) {
-            None => Ok(false),
-            Some(rowid) => {
-                self.delete.clear_bindings();
-                try!(self.delete.bind_int64(1, rowid).map_err(elmo::wrap_err));
-                try!(step_done(&mut self.delete));
-                self.delete.reset();
-                let count = self.myconn.conn.changes();
-                if count == 1 {
-                    // TODO might not need index update here.  foreign key cascade?
-                    try!(Self::update_indexes_delete(&mut self.indexes, rowid));
-                    Ok(true)
-                } else if count == 0 {
-                    Ok(false)
-                } else {
-                    Err(elmo::Error::Misc(String::from("changes() after delete is wrong")))
-                }
-            },
+        let mut index_stmts = Vec::new();
+        for info in indexes {
+            let tbl_ndx = get_table_name_for_index(db, coll, &info.name);
+            let stmt_insert = try!(self.prepare_index_insert(&tbl_ndx));
+            let stmt_delete = try!(self.myconn.conn.prepare(&format!("DELETE FROM \"{}\" WHERE doc_rowid=?", tbl_ndx)).map_err(elmo::wrap_err));
+            let t = IndexPrep {
+                info: info, 
+                stmt_insert: stmt_insert, 
+                stmt_delete: stmt_delete
+            };
+            index_stmts.push(t);
         }
+        let c = MyCollectionWriter {
+            insert: stmt_insert,
+            delete: stmt_delete,
+            update: stmt_update,
+            stmt_find_rowid: find_rowid,
+            indexes: index_stmts,
+            myconn: self.myconn.clone(),
+        };
+        Ok(c)
     }
 
-    fn insert(&mut self, v: &bson::Document) -> Result<()> {
-        let ba = v.to_bson_array();
-        self.insert.clear_bindings();
-        try!(self.insert.bind_blob(1,&ba).map_err(elmo::wrap_err));
-        try!(step_done(&mut self.insert));
-        try!(verify_changes(&self.insert, 1));
-        self.insert.reset();
-        let rowid = self.myconn.conn.last_insert_rowid();
-        try!(Self::update_indexes_delete(&mut self.indexes, rowid));
-        try!(Self::update_indexes_insert(&mut self.indexes, rowid, &v));
-        Ok(())
-    }
-
-}
-
-impl MyWriter {
     fn prepare_index_insert(&self, tbl: &str) -> Result<sqlite3::PreparedStatement> {
         let stmt = try!(self.myconn.conn.prepare(&format!("INSERT INTO \"{}\" (k,doc_rowid) VALUES (?,?)",tbl)).map_err(elmo::wrap_err));
         Ok(stmt)
@@ -996,45 +975,66 @@ impl MyWriter {
 }
 
 impl elmo::StorageWriter for MyWriter {
-    fn get_collection_writer(&self, db: &str, coll: &str) -> Result<Box<elmo::StorageCollectionWriter + 'static>> {
-        let _created = try!(self.base_create_collection(db, coll, bson::Document::new()));
-        let tbl = get_table_name_for_collection(db, coll);
-        let stmt_insert = try!(self.myconn.conn.prepare(&format!("INSERT INTO \"{}\" (bson) VALUES (?)", tbl)).map_err(elmo::wrap_err));
-        let stmt_delete = try!(self.myconn.conn.prepare(&format!("DELETE FROM \"{}\" WHERE rowid=?", tbl)).map_err(elmo::wrap_err));
-        let stmt_update = try!(self.myconn.conn.prepare(&format!("UPDATE \"{}\" SET bson=? WHERE rowid=?", tbl)).map_err(elmo::wrap_err));
-        let indexes = try!(self.myconn.base_list_indexes());
-        let indexes = indexes.into_iter().filter(
-            |ndx| ndx.db == db && ndx.coll == coll
-            ).collect::<Vec<_>>();
-        let mut find_rowid = None;
-        for info in &indexes {
-            if info.name == "_id_" {
-                let tbl = get_table_name_for_index(db, coll, &info.name);
-                find_rowid = Some(try!(self.myconn.conn.prepare(&format!("SELECT doc_rowid FROM \"{}\" WHERE k=?", tbl)).map_err(elmo::wrap_err)));
-                break;
-            }
+    fn update(&mut self, db: &str, coll: &str, v: &bson::Document) -> Result<()> {
+        match v.get("_id") {
+            None => Err(elmo::Error::Misc(String::from("cannot update without _id"))),
+            Some(id) => {
+                let mut cw = try!(self.get_collection_writer(db, coll));
+                match try!(cw.find_rowid(&id).map_err(elmo::wrap_err)) {
+                    None => Err(elmo::Error::Misc(String::from("update but does not exist"))),
+                    Some(rowid) => {
+                                let ba = v.to_bson_array();
+                                cw.update.clear_bindings();
+                                try!(cw.update.bind_blob(1,&ba).map_err(elmo::wrap_err));
+                                try!(cw.update.bind_int64(2, rowid).map_err(elmo::wrap_err));
+                                try!(step_done(&mut cw.update));
+                                try!(verify_changes(&cw.update, 1));
+                                cw.update.reset();
+                                try!(Self::update_indexes_delete(&mut cw.indexes, rowid));
+                                try!(Self::update_indexes_insert(&mut cw.indexes, rowid, &v));
+                                Ok(())
+                            },
+                }
+            },
         }
-        let mut index_stmts = Vec::new();
-        for info in indexes {
-            let tbl_ndx = get_table_name_for_index(db, coll, &info.name);
-            let stmt_insert = try!(self.prepare_index_insert(&tbl_ndx));
-            let stmt_delete = try!(self.myconn.conn.prepare(&format!("DELETE FROM \"{}\" WHERE doc_rowid=?", tbl_ndx)).map_err(elmo::wrap_err));
-            let t = IndexPrep {
-                info: info, 
-                stmt_insert: stmt_insert, 
-                stmt_delete: stmt_delete
-            };
-            index_stmts.push(t);
+    }
+
+    fn delete(&mut self, db: &str, coll: &str, v: &bson::Value) -> Result<bool> {
+        // TODO is v supposed to be the id?
+        let mut cw = try!(self.get_collection_writer(db, coll));
+        match try!(cw.find_rowid(&v).map_err(elmo::wrap_err)) {
+            None => Ok(false),
+            Some(rowid) => {
+                cw.delete.clear_bindings();
+                try!(cw.delete.bind_int64(1, rowid).map_err(elmo::wrap_err));
+                try!(step_done(&mut cw.delete));
+                cw.delete.reset();
+                let count = self.myconn.conn.changes();
+                if count == 1 {
+                    // TODO might not need index update here.  foreign key cascade?
+                    try!(Self::update_indexes_delete(&mut cw.indexes, rowid));
+                    Ok(true)
+                } else if count == 0 {
+                    Ok(false)
+                } else {
+                    Err(elmo::Error::Misc(String::from("changes() after delete is wrong")))
+                }
+            },
         }
-        let c = MyCollectionWriter {
-            insert: stmt_insert,
-            delete: stmt_delete,
-            update: stmt_update,
-            stmt_find_rowid: find_rowid,
-            indexes: index_stmts,
-            myconn: self.myconn.clone(),
-        };
-        Ok(box c)
+    }
+
+    fn insert(&mut self, db: &str, coll: &str, v: &bson::Document) -> Result<()> {
+        let mut cw = try!(self.get_collection_writer(db, coll));
+        let ba = v.to_bson_array();
+        cw.insert.clear_bindings();
+        try!(cw.insert.bind_blob(1,&ba).map_err(elmo::wrap_err));
+        try!(step_done(&mut cw.insert));
+        try!(verify_changes(&cw.insert, 1));
+        cw.insert.reset();
+        let rowid = self.myconn.conn.last_insert_rowid();
+        try!(Self::update_indexes_delete(&mut cw.indexes, rowid));
+        try!(Self::update_indexes_insert(&mut cw.indexes, rowid, &v));
+        Ok(())
     }
 
     fn commit(mut self: Box<Self>) -> Result<()> {
@@ -1051,31 +1051,31 @@ impl elmo::StorageWriter for MyWriter {
 
     // TODO maybe just move all the stuff below from the private section into here?
 
-    fn create_collection(&self, db: &str, coll: &str, options: bson::Document) -> Result<bool> {
+    fn create_collection(&mut self, db: &str, coll: &str, options: bson::Document) -> Result<bool> {
         self.base_create_collection(db, coll, options)
     }
 
-    fn drop_collection(&self, db: &str, coll: &str) -> Result<bool> {
+    fn drop_collection(&mut self, db: &str, coll: &str) -> Result<bool> {
         self.base_drop_collection(db, coll)
     }
 
-    fn create_indexes(&self, what: Vec<elmo::IndexInfo>) -> Result<Vec<bool>> {
+    fn create_indexes(&mut self, what: Vec<elmo::IndexInfo>) -> Result<Vec<bool>> {
         self.base_create_indexes(what)
     }
 
-    fn rename_collection(&self, old_name: &str, new_name: &str, drop_target: bool) -> Result<bool> {
+    fn rename_collection(&mut self, old_name: &str, new_name: &str, drop_target: bool) -> Result<bool> {
         self.base_rename_collection(old_name, new_name, drop_target)
     }
 
-    fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<bool> {
+    fn drop_index(&mut self, db: &str, coll: &str, name: &str) -> Result<bool> {
         self.base_drop_index(db, coll, name)
     }
 
-    fn drop_database(&self, db: &str) -> Result<bool> {
+    fn drop_database(&mut self, db: &str) -> Result<bool> {
         self.base_drop_database(db)
     }
 
-    fn clear_collection(&self, db: &str, coll: &str) -> Result<bool> {
+    fn clear_collection(&mut self, db: &str, coll: &str) -> Result<bool> {
         self.base_clear_collection(db, coll)
     }
 

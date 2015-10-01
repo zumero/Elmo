@@ -886,12 +886,6 @@ pub trait StorageBase {
     fn get_reader_regular_index_scan(&self, ndx: &IndexInfo, bounds: QueryBounds) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
 }
 
-pub trait StorageCollectionWriter {
-    fn insert(&mut self, v: &bson::Document) -> Result<()>;
-    fn update(&mut self, v: &bson::Document) -> Result<()>;
-    fn delete(&mut self, v: &bson::Value) -> Result<bool>;
-}
-
 // TODO should implement Drop = rollback
 // TODO do we need to declare that StorageWriter must implement Drop ?
 // TODO or is it enough that the actual implementation of this trait impl Drop?
@@ -903,17 +897,19 @@ pub trait StorageReader : StorageBase {
 }
 
 pub trait StorageWriter : StorageBase {
-    fn create_collection(&self, db: &str, coll: &str, options: bson::Document) -> Result<bool>;
-    fn rename_collection(&self, old_name: &str, new_name: &str, drop_target: bool) -> Result<bool>;
-    fn clear_collection(&self, db: &str, coll: &str) -> Result<bool>;
-    fn drop_collection(&self, db: &str, coll: &str) -> Result<bool>;
+    fn create_collection(&mut self, db: &str, coll: &str, options: bson::Document) -> Result<bool>;
+    fn rename_collection(&mut self, old_name: &str, new_name: &str, drop_target: bool) -> Result<bool>;
+    fn clear_collection(&mut self, db: &str, coll: &str) -> Result<bool>;
+    fn drop_collection(&mut self, db: &str, coll: &str) -> Result<bool>;
 
-    fn create_indexes(&self, Vec<IndexInfo>) -> Result<Vec<bool>>;
-    fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<bool>;
+    fn create_indexes(&mut self, Vec<IndexInfo>) -> Result<Vec<bool>>;
+    fn drop_index(&mut self, db: &str, coll: &str, name: &str) -> Result<bool>;
 
-    fn drop_database(&self, db: &str) -> Result<bool>;
+    fn drop_database(&mut self, db: &str) -> Result<bool>;
 
-    fn get_collection_writer<'a>(&'a self, db: &str, coll: &str) -> Result<Box<StorageCollectionWriter + 'a>>;
+    fn insert(&mut self, db: &str, coll: &str, v: &bson::Document) -> Result<()>;
+    fn update(&mut self, db: &str, coll: &str, v: &bson::Document) -> Result<()>;
+    fn delete(&mut self, db: &str, coll: &str, v: &bson::Value) -> Result<bool>;
 
     fn commit(self: Box<Self>) -> Result<()>;
     fn rollback(self: Box<Self>) -> Result<()>;
@@ -2037,9 +2033,8 @@ impl Connection {
             // write lock, which it can't get, because we're holding it
             // ourself.
             let rconn = try!(factory.open());
-            let writer = try!(self.conn.begin_write());
+            let mut writer = try!(self.conn.begin_write());
             {
-                let mut collwriter = try!(writer.get_collection_writer(db, coll));
                 // TODO why does this closure need to be mut?
                 let mut one_update_or_upsert = |upd: &mut bson::Document| -> Result<(i32, i32, Option<bson::Value>)> {
                     //println!("in closure: {:?}", upd);
@@ -2084,7 +2079,7 @@ impl Connection {
                                     matches = matches + 1;
                                     if new_doc != old_doc {
                                         let id = try!(Self::validate_for_storage(&mut new_doc));
-                                        try!(collwriter.update(&new_doc));
+                                        try!(writer.update(db, coll, &new_doc));
                                         mods = mods + 1;
                                     }
                                 }
@@ -2101,7 +2096,7 @@ impl Connection {
                                         }
                                         if new_doc != old_doc {
                                             let id = try!(Self::validate_for_storage(&mut new_doc));
-                                            try!(collwriter.update(&new_doc));
+                                            try!(writer.update(db, coll, &new_doc));
                                             (1, 1)
                                         } else {
                                             (1, 0)
@@ -2117,7 +2112,7 @@ impl Connection {
                             if upsert {
                                 let mut doc = try!(Self::build_upsert_with_update_operators(&m, &ops));
                                 let id = try!(Self::validate_for_storage(&mut doc));
-                                try!(collwriter.insert(&doc));
+                                try!(writer.insert(db, coll, &doc));
                                 Ok((0,0,Some(id)))
                             } else {
                                 Ok((0,0,None))
@@ -2154,7 +2149,7 @@ impl Connection {
                                 }
                                 if new_doc != old_doc {
                                     let id = try!(Self::validate_for_storage(&mut new_doc));
-                                    try!(collwriter.update(&new_doc));
+                                    try!(writer.update(db, coll, &new_doc));
                                     Ok((1,1,None))
                                 } else {
                                     Ok((1,0,None))
@@ -2166,7 +2161,7 @@ impl Connection {
                                     try!(Self::build_simple_upsert(q_id, &mut new_doc));
                                     // TODO what if this doesn't have an id yet?
                                     let id = try!(Self::validate_for_storage(&mut new_doc));
-                                    try!(collwriter.insert(&new_doc));
+                                    try!(writer.insert(db, coll, &new_doc));
                                     Ok((0, 0, Some(id)))
                                 } else {
                                     Ok((0, 0, None))
@@ -2206,7 +2201,7 @@ impl Connection {
             let m = try!(matcher::parse_query(q));
             (m, id)
         };
-        let writer = try!(self.conn.begin_write());
+        let mut writer = try!(self.conn.begin_write());
         let found = match Self::get_one_match(db, coll, &*writer, &m, sort.as_ref()) {
             Ok(v) => v,
             Err(e) => return Ok((false,Some(e),false,None,None)),
@@ -2215,7 +2210,6 @@ impl Connection {
         let was_found = found.is_some();
         let inner = || -> Result<(bool,Option<bson::Value>,Option<bson::Document>)> {
             let (changed, upserted, result) = {
-                let mut collwriter = try!(writer.get_collection_writer(db, coll));
                 if remove.is_some() && upsert {
                     return Err(Error::Misc(String::from("find_and_modify: invalid. no upsert with remove.")))
                 }
@@ -2243,7 +2237,7 @@ impl Connection {
                             }
                             if old_doc != new_doc {
                                 let id = try!(Self::validate_for_storage(&mut new_doc));
-                                try!(collwriter.update(&new_doc));
+                                try!(writer.update(db, coll, &new_doc));
                                 changed = true;
                             }
                             result = 
@@ -2268,7 +2262,7 @@ impl Connection {
                             new_doc.set("_id", old_id);
                             if old_doc != new_doc {
                                 let id = try!(Self::validate_for_storage(&mut new_doc));
-                                try!(collwriter.update(&new_doc));
+                                try!(writer.update(db, coll, &new_doc));
                                 changed = true;
                             }
                             result = 
@@ -2288,7 +2282,7 @@ impl Connection {
                                 let ops = try!(Self::parse_update_doc(u));
                                 let mut new_doc = try!(Self::build_upsert_with_update_operators(&m, &ops));
                                 let id = try!(Self::validate_for_storage(&mut new_doc));
-                                try!(collwriter.insert(&new_doc));
+                                try!(writer.insert(db, coll, &new_doc));
                                  changed = true;
                                 upserted = Some(id);
                                 if new {
@@ -2298,7 +2292,7 @@ impl Connection {
                                 let mut new_doc = u;
                                 try!(Self::build_simple_upsert(q_id, &mut new_doc));
                                 let id = try!(Self::validate_for_storage(&mut new_doc));
-                                try!(collwriter.insert(&new_doc));
+                                try!(writer.insert(db, coll, &new_doc));
                                 changed = true;
                                 upserted = Some(id);
                                 if new {
@@ -2312,7 +2306,7 @@ impl Connection {
                         let old_doc = try!(row.doc.into_document());
                         {
                             let id = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated"))));
-                            if try!(collwriter.delete(id)) {
+                            if try!(writer.delete(db, coll, id)) {
                                 changed = true;
                             }
                         }
@@ -2341,9 +2335,8 @@ impl Connection {
     pub fn insert_seq(&self, db: &str, coll: &str, docs: Box<Iterator<Item=Result<Row>>>) -> Result<Vec<Result<()>>> {
         let mut results = Vec::new();
         {
-            let writer = try!(self.conn.begin_write());
+            let mut writer = try!(self.conn.begin_write());
             {
-                let mut collwriter = try!(writer.get_collection_writer(db, coll));
                 for rr in docs {
                     match rr {
                         Ok(row) => {
@@ -2352,7 +2345,7 @@ impl Connection {
                                 Ok(mut doc) => {
                                     doc.ensure_id();
                                     let id = try!(Self::validate_for_storage(&mut doc));
-                                    let r = collwriter.insert(&doc);
+                                    let r = writer.insert(db, coll, &doc);
                                     results.push(r);
                                 },
                                 Err(e) => {
@@ -2378,12 +2371,11 @@ impl Connection {
         }
         let mut results = Vec::new();
         {
-            let writer = try!(self.conn.begin_write());
+            let mut writer = try!(self.conn.begin_write());
             {
-                let mut collwriter = try!(writer.get_collection_writer(db, coll));
                 for mut doc in docs {
                     let id = try!(Self::validate_for_storage(&mut doc));
-                    let r = collwriter.insert(doc);
+                    let r = writer.insert(db, coll, doc);
                     results.push(r);
                 }
             }
@@ -2465,7 +2457,7 @@ impl Connection {
     }
 
     pub fn delete_indexes(&self, db: &str, coll: &str, index: &bson::Value) -> Result<(usize, usize)> {
-        let writer = try!(self.conn.begin_write());
+        let mut writer = try!(self.conn.begin_write());
         // TODO DRY
         let indexes = try!(writer.list_indexes()).into_iter().filter(
             |ndx| ndx.db == db && ndx.coll == coll
@@ -2495,7 +2487,7 @@ impl Connection {
     }
 
     pub fn create_indexes(&self, indexes: Vec<IndexInfo>) -> Result<Vec<bool>> {
-        let writer = try!(self.conn.begin_write());
+        let mut writer = try!(self.conn.begin_write());
         let results = try!(writer.create_indexes(indexes));
         try!(writer.commit());
         Ok(results)
@@ -2503,7 +2495,7 @@ impl Connection {
 
     pub fn drop_collection(&self, db: &str, coll: &str) -> Result<bool> {
         let deleted = {
-            let writer = try!(self.conn.begin_write());
+            let mut writer = try!(self.conn.begin_write());
             let deleted = try!(writer.drop_collection(db, coll));
             try!(writer.commit());
             deleted
@@ -2513,7 +2505,7 @@ impl Connection {
 
     pub fn clear_collection(&self, db: &str, coll: &str) -> Result<bool> {
         let b = {
-            let writer = try!(self.conn.begin_write());
+            let mut writer = try!(self.conn.begin_write());
             let b = try!(writer.clear_collection(db, coll));
             try!(writer.commit());
             b
@@ -2523,7 +2515,7 @@ impl Connection {
 
     pub fn rename_collection(&self, old_name: &str, new_name: &str, drop_target: bool) -> Result<bool> {
         let done = {
-            let writer = try!(self.conn.begin_write());
+            let mut writer = try!(self.conn.begin_write());
             let done = try!(writer.rename_collection(old_name, new_name, drop_target));
             try!(writer.commit());
             done
@@ -2533,7 +2525,7 @@ impl Connection {
 
     pub fn drop_database(&self, db: &str) -> Result<bool> {
         let deleted = {
-            let writer = try!(self.conn.begin_write());
+            let mut writer = try!(self.conn.begin_write());
             let deleted = try!(writer.drop_database(db));
             try!(writer.commit());
             deleted
@@ -2544,9 +2536,8 @@ impl Connection {
     pub fn delete(&self, db: &str, coll: &str, items: Vec<bson::Document>) -> Result<usize> {
         let mut count = 0;
         {
-            let writer = try!(self.conn.begin_write());
+            let mut writer = try!(self.conn.begin_write());
             {
-                let mut collwriter = try!(writer.get_collection_writer(db, coll));
                 for mut del in items {
                     let q = try!(del.must_remove_document("q"));
                     let limit = del.get("limit");
@@ -2568,7 +2559,7 @@ impl Connection {
                         let d = try!(row.doc.into_document());
                         match d.get("_id") {
                             Some(id) => {
-                                if try!(collwriter.delete(id)) {
+                                if try!(writer.delete(db, coll, id)) {
                                     count = count + 1;
                                 }
                             },
@@ -2585,7 +2576,7 @@ impl Connection {
     }
 
     pub fn create_collection(&self, db: &str, coll: &str, options: bson::Document) -> Result<bool> {
-        let writer = try!(self.conn.begin_write());
+        let mut writer = try!(self.conn.begin_write());
         let result = try!(writer.create_collection(db, coll, options));
         try!(writer.commit());
         Ok(result)
