@@ -37,12 +37,13 @@ struct IndexPrep {
 }
 
 struct MyCollectionWriter {
+    db: String,
+    coll: String,
     insert: sqlite3::PreparedStatement,
     delete: sqlite3::PreparedStatement,
     update: sqlite3::PreparedStatement,
     stmt_find_rowid: Option<sqlite3::PreparedStatement>,
     indexes: Vec<IndexPrep>,
-    myconn: std::rc::Rc<MyConn>,
 }
 
 struct StatementBsonValueIterator {
@@ -158,6 +159,7 @@ struct MyReader {
 
 struct MyWriter {
     myconn: std::rc::Rc<MyConn>,
+    cw: Option<MyCollectionWriter>,
     in_tx: bool,
 }
 
@@ -724,14 +726,34 @@ impl MyWriter {
             index_stmts.push(t);
         }
         let c = MyCollectionWriter {
+            db: String::from(db),
+            coll: String::from(coll),
             insert: stmt_insert,
             delete: stmt_delete,
             update: stmt_update,
             stmt_find_rowid: find_rowid,
             indexes: index_stmts,
-            myconn: self.myconn.clone(),
         };
         Ok(c)
+    }
+
+    fn prep_collection_writer(&mut self, db: &str, coll: &str) -> Result<()> {
+        let need_cw =
+            if self.cw.is_none() {
+                true
+            } else {
+                let cw = self.cw.as_ref().unwrap();
+                if cw.db != db || cw.coll != coll {
+                    true
+                } else {
+                    false
+                }
+            };
+        if need_cw {
+            let cw = try!(self.get_collection_writer(db, coll));
+            self.cw = Some(cw);
+        }
+        Ok(())
     }
 
     fn prepare_index_insert(&self, tbl: &str) -> Result<sqlite3::PreparedStatement> {
@@ -979,7 +1001,8 @@ impl elmo::StorageWriter for MyWriter {
         match v.get("_id") {
             None => Err(elmo::Error::Misc(String::from("cannot update without _id"))),
             Some(id) => {
-                let mut cw = try!(self.get_collection_writer(db, coll));
+                try!(self.prep_collection_writer(db, coll));
+                let mut cw = self.cw.as_mut().unwrap();
                 match try!(cw.find_rowid(&id).map_err(elmo::wrap_err)) {
                     None => Err(elmo::Error::Misc(String::from("update but does not exist"))),
                     Some(rowid) => {
@@ -1001,7 +1024,8 @@ impl elmo::StorageWriter for MyWriter {
 
     fn delete(&mut self, db: &str, coll: &str, v: &bson::Value) -> Result<bool> {
         // TODO is v supposed to be the id?
-        let mut cw = try!(self.get_collection_writer(db, coll));
+        try!(self.prep_collection_writer(db, coll));
+        let mut cw = self.cw.as_mut().unwrap();
         match try!(cw.find_rowid(&v).map_err(elmo::wrap_err)) {
             None => Ok(false),
             Some(rowid) => {
@@ -1024,7 +1048,8 @@ impl elmo::StorageWriter for MyWriter {
     }
 
     fn insert(&mut self, db: &str, coll: &str, v: &bson::Document) -> Result<()> {
-        let mut cw = try!(self.get_collection_writer(db, coll));
+        try!(self.prep_collection_writer(db, coll));
+        let mut cw = self.cw.as_mut().unwrap();
         let ba = v.to_bson_array();
         cw.insert.clear_bindings();
         try!(cw.insert.bind_blob(1,&ba).map_err(elmo::wrap_err));
@@ -1206,6 +1231,7 @@ impl elmo::StorageConnection for MyPublicConn {
         let w = MyWriter {
             myconn: self.myconn.clone(),
             in_tx: true,
+            cw: None,
         };
         Ok(box w)
     }
