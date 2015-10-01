@@ -574,8 +574,10 @@ let results =
         p.StartInfo <- ps
         p.Start() |> ignore // TODO
         let stdout = p.StandardOutput.ReadToEnd()
+        p.StandardOutput.Close()
         printf "%s" stdout
         let stderr = p.StandardError.ReadToEnd()
+        p.StandardError.Close()
         printf "%s" stderr
         p.WaitForExit()
         let t2 = DateTime.Now
