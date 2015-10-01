@@ -737,7 +737,7 @@ impl MyWriter {
         Ok(c)
     }
 
-    fn prep_collection_writer(&mut self, db: &str, coll: &str) -> Result<()> {
+    fn prep_collection_writer(&mut self, db: &str, coll: &str) -> Result<&mut MyCollectionWriter> {
         let need_cw =
             if self.cw.is_none() {
                 true
@@ -753,7 +753,8 @@ impl MyWriter {
             let cw = try!(self.get_collection_writer(db, coll));
             self.cw = Some(cw);
         }
-        Ok(())
+        let mut cw = self.cw.as_mut().unwrap();
+        Ok(cw)
     }
 
     fn prepare_index_insert(&self, tbl: &str) -> Result<sqlite3::PreparedStatement> {
@@ -1001,8 +1002,7 @@ impl elmo::StorageWriter for MyWriter {
         match v.get("_id") {
             None => Err(elmo::Error::Misc(String::from("cannot update without _id"))),
             Some(id) => {
-                try!(self.prep_collection_writer(db, coll));
-                let mut cw = self.cw.as_mut().unwrap();
+                let mut cw = try!(self.prep_collection_writer(db, coll));
                 match try!(cw.find_rowid(&id).map_err(elmo::wrap_err)) {
                     None => Err(elmo::Error::Misc(String::from("update but does not exist"))),
                     Some(rowid) => {
@@ -1024,8 +1024,7 @@ impl elmo::StorageWriter for MyWriter {
 
     fn delete(&mut self, db: &str, coll: &str, v: &bson::Value) -> Result<bool> {
         // TODO is v supposed to be the id?
-        try!(self.prep_collection_writer(db, coll));
-        let mut cw = self.cw.as_mut().unwrap();
+        let mut cw = try!(self.prep_collection_writer(db, coll));
         match try!(cw.find_rowid(&v).map_err(elmo::wrap_err)) {
             None => Ok(false),
             Some(rowid) => {
@@ -1048,8 +1047,7 @@ impl elmo::StorageWriter for MyWriter {
     }
 
     fn insert(&mut self, db: &str, coll: &str, v: &bson::Document) -> Result<()> {
-        try!(self.prep_collection_writer(db, coll));
-        let mut cw = self.cw.as_mut().unwrap();
+        let mut cw = try!(self.prep_collection_writer(db, coll));
         let ba = v.to_bson_array();
         cw.insert.clear_bindings();
         try!(cw.insert.bind_blob(1,&ba).map_err(elmo::wrap_err));

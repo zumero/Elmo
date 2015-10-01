@@ -83,8 +83,8 @@ struct MyIndexInfo {
     options: bson::Document,
 }
 
-struct MyCollectionWriter<'a> {
-    mywriter: std::rc::Rc<MyWriter<'a>>,
+struct MyCollectionWriter {
+    // TODO might want db and coll names here for caching
     indexes: Vec<MyIndexInfo>,
     collection_id: u64,
 }
@@ -106,10 +106,7 @@ struct MyWriter<'a> {
     myconn: std::rc::Rc<MyConn>,
     tx: std::sync::MutexGuard<'a, lsm::WriteLock>,
     pending: HashMap<Box<[u8]>,lsm::Blob>,
-}
-
-struct MyPublicWriter<'a> {
-    mywriter: std::rc::Rc<MyWriter<'a>>,
+    // TODO cache the collection writer
 }
 
 struct MyConn {
@@ -471,35 +468,17 @@ impl MyConn {
 
 }
 
-impl<'a> elmo::StorageCollectionWriter for MyCollectionWriter<'a> {
-    fn update(&mut self, v: &bson::Document) -> Result<()> {
-        match v.get("_id") {
-            None => Err(elmo::Error::Misc(String::from("cannot update without _id"))),
-            Some(id) => {
-                unimplemented!();
-            },
-        }
-    }
-
-    fn delete(&mut self, v: &bson::Value) -> Result<bool> {
-        unimplemented!();
-    }
-
-    fn insert(&mut self, v: &bson::Document) -> Result<()> {
-        let mut k = encode_key_tag_and_varint(NEXT_RECORD_ID, self.collection_id);
-        let record_id = try!(self.mywriter.get_next_id(&[NEXT_COLLECTION_ID]));
-        push_varint(&mut k, record_id);
-        //let mut d = HashMap::new();
-        //self.mywriter.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(v.to_bson_array().into_boxed_slice()));
-        //let g = try!(self.mywriter.myconn.conn.WriteSegment(d).map_err(elmo::wrap_err));
-        //try!(self.mywriter.tx.commitSegments(vec![g]).map_err(elmo::wrap_err));
-        // TODO update the indexes
-        unimplemented!();
-    }
-
-}
-
 impl<'a> MyWriter<'a> {
+    fn get_collection_writer(&self, db: &str, coll: &str) -> Result<MyCollectionWriter> {
+        let (_created, collection_id) = try!(self.base_create_collection(db, coll, bson::Document::new()));
+        let indexes = try!(self.myconn.list_indexes_for_collection(collection_id));
+        let c = MyCollectionWriter {
+            indexes: indexes,
+            collection_id: collection_id,
+        };
+        Ok(c)
+    }
+
     fn get_next_id(&self, tag: &[u8]) -> Result<u64> {
 
         let mut k = Vec::with_capacity(1);
@@ -568,16 +547,31 @@ impl<'a> MyWriter<'a> {
 
 }
 
-impl<'a> elmo::StorageWriter for MyPublicWriter<'a> {
-    fn get_collection_writer<'b>(&'b self, db: &str, coll: &str) -> Result<Box<elmo::StorageCollectionWriter + 'b>> {
-        let (_created, collection_id) = try!(self.mywriter.base_create_collection(db, coll, bson::Document::new()));
-        let indexes = try!(self.mywriter.myconn.list_indexes_for_collection(collection_id));
-        let c = MyCollectionWriter {
-            mywriter: self.mywriter.clone(),
-            indexes: indexes,
-            collection_id: collection_id,
-        };
-        Ok(box c)
+impl<'a> elmo::StorageWriter for MyWriter<'a> {
+    fn update(&mut self, db: &str, coll: &str, v: &bson::Document) -> Result<()> {
+        match v.get("_id") {
+            None => Err(elmo::Error::Misc(String::from("cannot update without _id"))),
+            Some(id) => {
+                unimplemented!();
+            },
+        }
+    }
+
+    fn delete(&mut self, db: &str, coll: &str, v: &bson::Value) -> Result<bool> {
+        unimplemented!();
+    }
+
+    fn insert(&mut self, db: &str, coll: &str, v: &bson::Document) -> Result<()> {
+        let cw = try!(self.get_collection_writer(db, coll));
+        let mut k = encode_key_tag_and_varint(NEXT_RECORD_ID, cw.collection_id);
+        let record_id = try!(self.get_next_id(&[NEXT_COLLECTION_ID]));
+        push_varint(&mut k, record_id);
+        //let mut d = HashMap::new();
+        //self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(v.to_bson_array().into_boxed_slice()));
+        //let g = try!(self.myconn.conn.WriteSegment(d).map_err(elmo::wrap_err));
+        //try!(self.tx.commitSegments(vec![g]).map_err(elmo::wrap_err));
+        // TODO update the indexes
+        unimplemented!();
     }
 
     fn commit(mut self: Box<Self>) -> Result<()> {
@@ -588,32 +582,32 @@ impl<'a> elmo::StorageWriter for MyPublicWriter<'a> {
         unimplemented!();
     }
 
-    fn create_collection(&self, db: &str, coll: &str, options: bson::Document) -> Result<bool> {
-        let (created, _collection_id) = try!(self.mywriter.base_create_collection(db, coll, options));
+    fn create_collection(&mut self, db: &str, coll: &str, options: bson::Document) -> Result<bool> {
+        let (created, _collection_id) = try!(self.base_create_collection(db, coll, options));
         Ok(created)
     }
 
-    fn drop_collection(&self, db: &str, coll: &str) -> Result<bool> {
+    fn drop_collection(&mut self, db: &str, coll: &str) -> Result<bool> {
         unimplemented!();
     }
 
-    fn create_indexes(&self, what: Vec<elmo::IndexInfo>) -> Result<Vec<bool>> {
+    fn create_indexes(&mut self, what: Vec<elmo::IndexInfo>) -> Result<Vec<bool>> {
         unimplemented!();
     }
 
-    fn rename_collection(&self, old_name: &str, new_name: &str, drop_target: bool) -> Result<bool> {
+    fn rename_collection(&mut self, old_name: &str, new_name: &str, drop_target: bool) -> Result<bool> {
         unimplemented!();
     }
 
-    fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<bool> {
+    fn drop_index(&mut self, db: &str, coll: &str, name: &str) -> Result<bool> {
         unimplemented!();
     }
 
-    fn drop_database(&self, db: &str) -> Result<bool> {
+    fn drop_database(&mut self, db: &str) -> Result<bool> {
         unimplemented!();
     }
 
-    fn clear_collection(&self, db: &str, coll: &str) -> Result<bool> {
+    fn clear_collection(&mut self, db: &str, coll: &str) -> Result<bool> {
         unimplemented!();
     }
 
@@ -688,28 +682,28 @@ impl elmo::StorageReader for MyReader {
 
 }
 
-impl<'a> elmo::StorageBase for MyPublicWriter<'a> {
+impl<'a> elmo::StorageBase for MyWriter<'a> {
     fn get_reader_collection_scan(&self, db: &str, coll: &str) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
-        let rdr = try!(self.mywriter.myconn.get_reader_collection_scan(self.mywriter.myconn.clone(), false, db, coll));
+        let rdr = try!(self.myconn.get_reader_collection_scan(self.myconn.clone(), false, db, coll));
         Ok(box rdr)
     }
 
     fn get_reader_text_index_scan(&self, ndx: &elmo::IndexInfo, eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
-        let rdr = try!(self.mywriter.myconn.get_reader_text_index_scan(self.mywriter.myconn.clone(), false, ndx, eq, terms));
+        let rdr = try!(self.myconn.get_reader_text_index_scan(self.myconn.clone(), false, ndx, eq, terms));
         Ok(box rdr)
     }
 
     fn get_reader_regular_index_scan(&self, ndx: &elmo::IndexInfo, bounds: elmo::QueryBounds) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
-        let rdr = try!(self.mywriter.myconn.get_reader_regular_index_scan(self.mywriter.myconn.clone(), false, ndx, bounds));
+        let rdr = try!(self.myconn.get_reader_regular_index_scan(self.myconn.clone(), false, ndx, bounds));
         Ok(box rdr)
     }
 
     fn list_collections(&self) -> Result<Vec<elmo::CollectionInfo>> {
-        self.mywriter.myconn.base_list_collections()
+        self.myconn.base_list_collections()
     }
 
     fn list_indexes(&self) -> Result<Vec<elmo::IndexInfo>> {
-        self.mywriter.myconn.base_list_indexes()
+        self.myconn.base_list_indexes()
     }
 
 }
@@ -721,9 +715,6 @@ impl elmo::StorageConnection for MyPublicConn {
             myconn: self.myconn.clone(),
             tx: tx,
             pending: HashMap::new(),
-        };
-        let w = MyPublicWriter {
-            mywriter: std::rc::Rc::new(w)
         };
         Ok(box w)
     }
