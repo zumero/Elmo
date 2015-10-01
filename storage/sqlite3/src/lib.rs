@@ -721,35 +721,35 @@ impl elmo::StorageCollectionWriter for MyCollectionWriter {
         match try!(self.find_rowid(&v).map_err(elmo::wrap_err)) {
             None => Ok(false),
             Some(rowid) => {
-                        self.delete.clear_bindings();
-                        try!(self.delete.bind_int64(1, rowid).map_err(elmo::wrap_err));
-                        try!(step_done(&mut self.delete));
-                        self.delete.reset();
-                        let count = self.myconn.conn.changes();
-                        if count == 1 {
-                            // TODO might not need index update here.  foreign key cascade?
-                            try!(Self::update_indexes_delete(&mut self.indexes, rowid));
-                            Ok(true)
-                        } else if count == 0 {
-                            Ok(false)
-                        } else {
-                            Err(elmo::Error::Misc(String::from("changes() after delete is wrong")))
-                        }
-                    },
+                self.delete.clear_bindings();
+                try!(self.delete.bind_int64(1, rowid).map_err(elmo::wrap_err));
+                try!(step_done(&mut self.delete));
+                self.delete.reset();
+                let count = self.myconn.conn.changes();
+                if count == 1 {
+                    // TODO might not need index update here.  foreign key cascade?
+                    try!(Self::update_indexes_delete(&mut self.indexes, rowid));
+                    Ok(true)
+                } else if count == 0 {
+                    Ok(false)
+                } else {
+                    Err(elmo::Error::Misc(String::from("changes() after delete is wrong")))
                 }
+            },
+        }
     }
 
     fn insert(&mut self, v: &bson::Document) -> Result<()> {
-                let ba = v.to_bson_array();
-                self.insert.clear_bindings();
-                try!(self.insert.bind_blob(1,&ba).map_err(elmo::wrap_err));
-                try!(step_done(&mut self.insert));
-                try!(verify_changes(&self.insert, 1));
-                self.insert.reset();
-                let rowid = self.myconn.conn.last_insert_rowid();
-                try!(Self::update_indexes_delete(&mut self.indexes, rowid));
-                try!(Self::update_indexes_insert(&mut self.indexes, rowid, &v));
-                Ok(())
+        let ba = v.to_bson_array();
+        self.insert.clear_bindings();
+        try!(self.insert.bind_blob(1,&ba).map_err(elmo::wrap_err));
+        try!(step_done(&mut self.insert));
+        try!(verify_changes(&self.insert, 1));
+        self.insert.reset();
+        let rowid = self.myconn.conn.last_insert_rowid();
+        try!(Self::update_indexes_delete(&mut self.indexes, rowid));
+        try!(Self::update_indexes_insert(&mut self.indexes, rowid, &v));
+        Ok(())
     }
 
 }

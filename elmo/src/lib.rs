@@ -913,7 +913,7 @@ pub trait StorageWriter : StorageBase {
 
     fn drop_database(&self, db: &str) -> Result<bool>;
 
-    fn get_collection_writer(&self, db: &str, coll: &str) -> Result<Box<StorageCollectionWriter + 'static>>;
+    fn get_collection_writer<'a>(&'a self, db: &str, coll: &str) -> Result<Box<StorageCollectionWriter + 'a>>;
 
     fn commit(self: Box<Self>) -> Result<()>;
     fn rollback(self: Box<Self>) -> Result<()>;
@@ -2207,7 +2207,6 @@ impl Connection {
             (m, id)
         };
         let writer = try!(self.conn.begin_write());
-        let mut collwriter = try!(writer.get_collection_writer(db, coll));
         let found = match Self::get_one_match(db, coll, &*writer, &m, sort.as_ref()) {
             Ok(v) => v,
             Err(e) => return Ok((false,Some(e),false,None,None)),
@@ -2215,114 +2214,118 @@ impl Connection {
         //println!("find_and_modify: {:?}", found);
         let was_found = found.is_some();
         let inner = || -> Result<(bool,Option<bson::Value>,Option<bson::Document>)> {
-        if remove.is_some() && upsert {
-            return Err(Error::Misc(String::from("find_and_modify: invalid. no upsert with remove.")))
-        }
-        let mut changed = false;
-        let mut upserted = None;
-        let mut result = None;
-        match (update, remove, found) {
-            (Some(_), Some(_), _) => {
-                return Err(Error::Misc(String::from("find_and_modify: invalid. both update and remove.")))
-            },
-            (None, None, _) => {
-                return Err(Error::Misc(String::from("find_and_modify: invalid. neither update nor remove.")))
-            },
-            (Some(u), None, Some(row)) => {
-                // update, found
-                let u = try!(u.into_document());
-                let has_update_operators = u.pairs.iter().any(|&(ref k, _)| k.starts_with("$"));
-                if has_update_operators {
-                    let ops = try!(Self::parse_update_doc(u));
-                    let old_doc = try!(row.doc.into_document());
-                    let mut new_doc = old_doc.clone();
-                    try!(Self::apply_update_ops(&mut new_doc, &ops, false, row.pos));
-                    if try!(Self::id_changed(&old_doc, &new_doc)) {
-                        return Err(Error::Misc(String::from("cannot change _id")));
-                    }
-                    if old_doc != new_doc {
-                        let id = try!(Self::validate_for_storage(&mut new_doc));
-                        try!(collwriter.update(&new_doc));
-                        changed = true;
-                    }
-                    result = 
-                        if new {
-                            Some(new_doc)
-                        } else {
-                            Some(old_doc)
-                        };
-                } else {
-                    let old_doc = try!(row.doc.into_document());
-                    let old_id = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated")))).clone();
-                    match u.get("_id") {
-                        Some(new_id) => {
-                            if old_id != *new_id {
+            let (changed, upserted, result) = {
+                let mut collwriter = try!(writer.get_collection_writer(db, coll));
+                if remove.is_some() && upsert {
+                    return Err(Error::Misc(String::from("find_and_modify: invalid. no upsert with remove.")))
+                }
+                let mut changed = false;
+                let mut upserted = None;
+                let mut result = None;
+                match (update, remove, found) {
+                    (Some(_), Some(_), _) => {
+                        return Err(Error::Misc(String::from("find_and_modify: invalid. both update and remove.")))
+                    },
+                    (None, None, _) => {
+                        return Err(Error::Misc(String::from("find_and_modify: invalid. neither update nor remove.")))
+                    },
+                    (Some(u), None, Some(row)) => {
+                        // update, found
+                        let u = try!(u.into_document());
+                        let has_update_operators = u.pairs.iter().any(|&(ref k, _)| k.starts_with("$"));
+                        if has_update_operators {
+                            let ops = try!(Self::parse_update_doc(u));
+                            let old_doc = try!(row.doc.into_document());
+                            let mut new_doc = old_doc.clone();
+                            try!(Self::apply_update_ops(&mut new_doc, &ops, false, row.pos));
+                            if try!(Self::id_changed(&old_doc, &new_doc)) {
                                 return Err(Error::Misc(String::from("cannot change _id")));
                             }
-                        },
-                        None => {
-                        },
-                    }
-                    let mut new_doc = u;
-                    new_doc.set("_id", old_id);
-                    if old_doc != new_doc {
-                        let id = try!(Self::validate_for_storage(&mut new_doc));
-                        try!(collwriter.update(&new_doc));
-                        changed = true;
-                    }
-                    result = 
-                        if new {
-                            Some(new_doc)
+                            if old_doc != new_doc {
+                                let id = try!(Self::validate_for_storage(&mut new_doc));
+                                try!(collwriter.update(&new_doc));
+                                changed = true;
+                            }
+                            result = 
+                                if new {
+                                    Some(new_doc)
+                                } else {
+                                    Some(old_doc)
+                                };
                         } else {
-                            Some(old_doc)
-                        };
-                }
-            },
-            (Some(u), None, None) => {
-                // update, not found, maybe upsert
-                let u = try!(u.into_document());
-                if upsert {
-                    let has_update_operators = u.pairs.iter().any(|&(ref k, _)| k.starts_with("$"));
-                    if has_update_operators {
-                        let ops = try!(Self::parse_update_doc(u));
-                        let mut new_doc = try!(Self::build_upsert_with_update_operators(&m, &ops));
-                        let id = try!(Self::validate_for_storage(&mut new_doc));
-                        try!(collwriter.insert(&new_doc));
-                         changed = true;
-                        upserted = Some(id);
-                        if new {
-                            result = Some(new_doc);
+                            let old_doc = try!(row.doc.into_document());
+                            let old_id = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated")))).clone();
+                            match u.get("_id") {
+                                Some(new_id) => {
+                                    if old_id != *new_id {
+                                        return Err(Error::Misc(String::from("cannot change _id")));
+                                    }
+                                },
+                                None => {
+                                },
+                            }
+                            let mut new_doc = u;
+                            new_doc.set("_id", old_id);
+                            if old_doc != new_doc {
+                                let id = try!(Self::validate_for_storage(&mut new_doc));
+                                try!(collwriter.update(&new_doc));
+                                changed = true;
+                            }
+                            result = 
+                                if new {
+                                    Some(new_doc)
+                                } else {
+                                    Some(old_doc)
+                                };
                         }
-                    } else {
-                        let mut new_doc = u;
-                        try!(Self::build_simple_upsert(q_id, &mut new_doc));
-                        let id = try!(Self::validate_for_storage(&mut new_doc));
-                        try!(collwriter.insert(&new_doc));
-                        changed = true;
-                        upserted = Some(id);
-                        if new {
-                            result = Some(new_doc);
+                    },
+                    (Some(u), None, None) => {
+                        // update, not found, maybe upsert
+                        let u = try!(u.into_document());
+                        if upsert {
+                            let has_update_operators = u.pairs.iter().any(|&(ref k, _)| k.starts_with("$"));
+                            if has_update_operators {
+                                let ops = try!(Self::parse_update_doc(u));
+                                let mut new_doc = try!(Self::build_upsert_with_update_operators(&m, &ops));
+                                let id = try!(Self::validate_for_storage(&mut new_doc));
+                                try!(collwriter.insert(&new_doc));
+                                 changed = true;
+                                upserted = Some(id);
+                                if new {
+                                    result = Some(new_doc);
+                                }
+                            } else {
+                                let mut new_doc = u;
+                                try!(Self::build_simple_upsert(q_id, &mut new_doc));
+                                let id = try!(Self::validate_for_storage(&mut new_doc));
+                                try!(collwriter.insert(&new_doc));
+                                changed = true;
+                                upserted = Some(id);
+                                if new {
+                                    result = Some(new_doc);
+                                }
+                            }
                         }
-                    }
+                    },
+                    (None, Some(_), Some(row)) => {
+                        // remove, found
+                        let old_doc = try!(row.doc.into_document());
+                        {
+                            let id = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated"))));
+                            if try!(collwriter.delete(id)) {
+                                changed = true;
+                            }
+                        }
+                        result = Some(old_doc);
+                    },
+                    (None, Some(_), None) => {
+                        // remove, not found, nothing to do
+                    },
                 }
-            },
-            (None, Some(_), Some(row)) => {
-                // remove, found
-                let old_doc = try!(row.doc.into_document());
-                {
-                    let id = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated"))));
-                    if try!(collwriter.delete(id)) {
-                        changed = true;
-                    }
-                }
-                result = Some(old_doc);
-            },
-            (None, Some(_), None) => {
-                // remove, not found, nothing to do
-            },
-        }
-        try!(writer.commit());
-        Ok((changed, upserted, result))
+                (changed, upserted, result)
+            };
+            try!(writer.commit());
+            Ok((changed, upserted, result))
         };
 
         match inner() {
