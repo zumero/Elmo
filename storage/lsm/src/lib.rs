@@ -93,11 +93,54 @@ struct MyCollectionWriter {
 }
 
 struct MyCollectionReader {
-    commit_on_drop: bool,
     seq: Box<Iterator<Item=Result<elmo::Row>>>,
     myconn: std::rc::Rc<MyConn>,
 
     // TODO need counts here
+}
+
+struct CursorBsonValueIterator {
+    cursor: lsm::PrefixLivingCursor,
+}
+
+impl CursorBsonValueIterator {
+    fn iter_next(&mut self) -> Result<Option<elmo::Row>> {
+        try!(self.cursor.Next().map_err(elmo::wrap_err));
+        if self.cursor.IsValid() {
+            let v = try!(self.cursor.LiveValueRef().map_err(elmo::wrap_err));
+            let v = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
+            let v = v.into_value();
+            let row = elmo::Row {
+                doc: v,
+                pos: None,
+                score: None,
+            };
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl Iterator for CursorBsonValueIterator {
+    type Item = Result<elmo::Row>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.iter_next() {
+            Err(e) => {
+                return Some(Err(e));
+            },
+            Ok(v) => {
+                match v {
+                    None => {
+                        return None;
+                    },
+                    Some(v) => {
+                        return Some(Ok(v));
+                    }
+                }
+            },
+        }
+    }
 }
 
 struct MyReader {
@@ -392,8 +435,36 @@ impl MyConn {
         }
     }
 
-    fn get_reader_collection_scan(&self, myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, db: &str, coll: &str) -> Result<MyCollectionReader> {
-        unimplemented!();
+    fn get_reader_collection_scan(&self, myconn: std::rc::Rc<MyConn>, db: &str, coll: &str) -> Result<MyCollectionReader> {
+        let k = encode_key_name_to_collection_id(db, coll);
+        match try!(self.get_value_for_key_as_varint(&k)) {
+            None => {
+                let rdr = 
+                    MyCollectionReader {
+                        seq: box std::iter::empty(),
+                        myconn: myconn,
+                    };
+                Ok(rdr)
+            },
+            Some(id) => {
+                let csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+                let mut k = vec![];
+                k.push(RECORD);
+                let ba_collection_id = u64_to_boxed_varint(id);
+                k.push_all(&ba_collection_id);
+                let cursor = lsm::PrefixLivingCursor::new(csr, k.into_boxed_slice());
+                let seq = 
+                    CursorBsonValueIterator {
+                        cursor: cursor,
+                    };
+                let rdr = 
+                    MyCollectionReader {
+                        seq: box seq,
+                        myconn: myconn,
+                    };
+                Ok(rdr)
+            },
+        }
     }
 
     fn get_reader_text_index_scan(&self, myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, ndx: &elmo::IndexInfo, eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<MyCollectionReader> {
@@ -410,26 +481,12 @@ impl MyConn {
 
     fn list_indexes_for_collection(&self, collection_id: u64) -> Result<Vec<MyIndexPrep>> {
         let q = encode_key_tag_and_varint(NAME_TO_INDEX_ID, collection_id);
-        let mut csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
-        try!(csr.SeekRef(&lsm::KeyRef::for_slice(&q), lsm::SeekOp::SEEK_GE).map_err(elmo::wrap_err));
+        let csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        let csr = lsm::PrefixLivingCursor::new(csr, q.into_boxed_slice());
         let mut a = vec![];
 
         while csr.IsValid() {
-            let k = try!(csr.KeyRef().map_err(elmo::wrap_err));
-            
-            // if q is not a prefix of k, stop
-            if k.len() < q.len() {
-                break;
-            }
-
-            let check_prefix = |ba: &[u8]| -> lsm::Result<bool> {
-                Ok(ba == &*q)
-            };
-
-            if !try!(k.map_range(0, q.len(), check_prefix).map_err(elmo::wrap_err)) {
-                break;
-            }
-
+            // let k = try!(csr.KeyRef().map_err(elmo::wrap_err));
             // the name of the index is on the end of this key, but we don't need it
 
             let v = try!(csr.LiveValueRef().map_err(elmo::wrap_err));
@@ -468,19 +525,13 @@ impl MyConn {
     }
 
     fn base_list_collections(&self) -> Result<Vec<elmo::CollectionInfo>> {
-        let mut csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
-        let k = [NAME_TO_COLLECTION_ID];
-        try!(csr.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_GE).map_err(elmo::wrap_err));
+        let csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        let mut csr = lsm::PrefixLivingCursor::new(csr, box [NAME_TO_COLLECTION_ID]);
         let mut a = vec![];
         // TODO might need to sort by the coll name
         while csr.IsValid() {
             {
                 let k = try!(csr.KeyRef().map_err(elmo::wrap_err));
-                if try!(k.u8_at(0).map_err(elmo::wrap_err)) != NAME_TO_COLLECTION_ID {
-                    // TODO maybe lsm should have an easy way to iterate over
-                    // all keys in a prefix?
-                    break;
-                }
                 let (db, coll) = try!(decode_key_name_to_collection_id(&k));
 
                 let v = try!(csr.LiveValueRef().map_err(elmo::wrap_err));
@@ -745,7 +796,7 @@ impl Iterator for MyCollectionReader {
 
 impl elmo::StorageBase for MyReader {
     fn get_reader_collection_scan(&self, db: &str, coll: &str) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
-        let rdr = try!(self.myconn.get_reader_collection_scan(self.myconn.clone(), false, db, coll));
+        let rdr = try!(self.myconn.get_reader_collection_scan(self.myconn.clone(), db, coll));
         Ok(box rdr)
     }
 
@@ -771,7 +822,7 @@ impl elmo::StorageBase for MyReader {
 
 impl elmo::StorageReader for MyReader {
     fn into_reader_collection_scan(mut self: Box<Self>, db: &str, coll: &str) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
-        let rdr = try!(self.myconn.get_reader_collection_scan(self.myconn.clone(), true, db, coll));
+        let rdr = try!(self.myconn.get_reader_collection_scan(self.myconn.clone(), db, coll));
         Ok(box rdr)
     }
 
@@ -789,7 +840,7 @@ impl elmo::StorageReader for MyReader {
 
 impl<'a> elmo::StorageBase for MyWriter<'a> {
     fn get_reader_collection_scan(&self, db: &str, coll: &str) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
-        let rdr = try!(self.myconn.get_reader_collection_scan(self.myconn.clone(), false, db, coll));
+        let rdr = try!(self.myconn.get_reader_collection_scan(self.myconn.clone(), db, coll));
         Ok(box rdr)
     }
 

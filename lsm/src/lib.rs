@@ -263,6 +263,30 @@ impl<'a> KeyRef<'a> {
         }
     }
 
+    pub fn starts_with(&self, k: &[u8]) -> bool {
+        if self.len() < k.len() {
+            return false;
+        } else {
+            match self {
+                &KeyRef::Overflowed(ref a) => {
+                    k == &a[0 .. k.len()]
+                },
+                &KeyRef::Array(a) => {
+                    k == &a[0 .. k.len()]
+                },
+                &KeyRef::Prefixed(front, back) => {
+                    if k.len() <= front.len() {
+                        k == &front[0 .. k.len()]
+                    } else {
+                        &k[0 .. front.len()] == &front[0 .. front.len()]
+                        && 
+                        &k[front.len() ..] == &back[0 .. k.len() - front.len()]
+                    }
+                },
+            }
+        }
+    }
+
     /// A KeyRef is conceptually just a bunch of bytes, but it can be represented in
     /// three different ways, depending on whether the key in the page was overflowed
     /// or prefixed or neither.  This function accepts a func which is to be applied
@@ -1457,6 +1481,51 @@ impl LivingCursor {
     fn Create(ch : MultiCursor) -> LivingCursor {
         LivingCursor { chain : ch }
     }
+}
+
+pub struct PrefixLivingCursor { 
+    chain : LivingCursor,
+    prefix: Box<[u8]>,
+}
+
+impl PrefixLivingCursor {
+    pub fn new(ch: LivingCursor, prefix: Box<[u8]>) -> PrefixLivingCursor {
+        PrefixLivingCursor { 
+            chain : ch,
+            prefix: prefix,
+        }
+    }
+
+    pub fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
+        if self.IsValid() {
+            self.chain.KeyRef()
+        } else {
+            Err(Error::CursorNotValid)
+        }
+    }
+
+    pub fn LiveValueRef<'a>(&'a self) -> Result<LiveValueRef<'a>> {
+        if self.IsValid() {
+            self.chain.LiveValueRef()
+        } else {
+            Err(Error::CursorNotValid)
+        }
+    }
+
+    pub fn IsValid(&self) -> bool {
+        self.chain.IsValid() 
+            && 
+            self.chain.KeyRef().unwrap().starts_with(&self.prefix)
+    }
+
+    pub fn First(&mut self) -> Result<SeekResult> {
+        self.chain.SeekRef(&KeyRef::for_slice(&self.prefix), SeekOp::SEEK_GE)
+    }
+
+    pub fn Next(&mut self) -> Result<()> {
+        self.chain.Next()
+    }
+
 }
 
 impl<'a> ICursor<'a> for LivingCursor {
