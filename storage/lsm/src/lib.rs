@@ -94,6 +94,8 @@ struct MyCollectionWriter {
 
 struct MyCollectionReader {
     seq: Box<Iterator<Item=Result<elmo::Row>>>,
+
+    // TODO do we need myconn?  sqlite storage only needed it for COMMIT at the end?
     myconn: std::rc::Rc<MyConn>,
 
     // TODO need counts here
@@ -145,7 +147,6 @@ impl Iterator for CursorBsonValueIterator {
 
 struct MyReader {
     myconn: std::rc::Rc<MyConn>,
-    cursor: lsm::LivingCursor,
 }
 
 struct MyWriter<'a> {
@@ -869,6 +870,7 @@ impl elmo::StorageConnection for MyPublicConn {
         let tx = try!(self.myconn.conn.GetWriteLock().map_err(elmo::wrap_err));
         // TODO we should use one cursor/seek to get all three of these.
         // configure their keys so that they will be all together.
+        // or maybe just put all three of them in the same record value.
         let next_collection_id = try!(self.myconn.get_next_id(NEXT_COLLECTION_ID));
         let next_index_id = try!(self.myconn.get_next_id(NEXT_INDEX_ID));
         let next_record_id = try!(self.myconn.get_next_id(NEXT_RECORD_ID));
@@ -887,10 +889,8 @@ impl elmo::StorageConnection for MyPublicConn {
     }
 
     fn begin_read(&self) -> Result<Box<elmo::StorageReader + 'static>> {
-        let csr = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
         let r = MyReader {
             myconn: self.myconn.clone(),
-            cursor: csr,
         };
         Ok(box r)
     }
