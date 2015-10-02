@@ -81,6 +81,9 @@ struct MyIndexInfo {
     index_id: u64,
     spec: bson::Document,
     options: bson::Document,
+    normspec: Vec<(String,elmo::IndexType)>,
+    weights: Option<HashMap<String,i32>>,
+    // TODO maybe keep the options we need here directly, sparse and unique
 }
 
 struct MyCollectionWriter {
@@ -135,49 +138,6 @@ pub const NEXT_COLLECTION_ID: u8 = 1;
 ///     varint
 pub const NEXT_INDEX_ID: u8 = 2;
 
-/// key:
-///     (tag)
-///     db name (len + str)
-///     coll name (len + str)
-/// value:
-///     collid (varint)
-pub const NAME_TO_COLLECTION_ID: u8 = 3;
-
-// TODO maybe the options should just go with above
-// instead of in a separate record?
-
-/// key:
-///     (tag)
-///     collid (varint)
-/// value:
-///     options (bson)
-pub const COLLECTION_ID_TO_OPTIONS: u8 = 4;
-
-/// key:
-///     (tag)
-///     collid (varint)
-///     index name (len + str)
-/// value:
-///     indexid (varint)
-pub const NAME_TO_INDEX_ID: u8 = 5;
-
-// TODO maybe the spec/options should just go with above
-// instead of in a separate record?
-
-/// key:
-///     (tag)
-///     indexid (varint)
-/// value:
-///     spec (bson)
-pub const INDEX_ID_TO_SPEC: u8 = 6;
-
-/// key:
-///     (tag)
-///     indexid (varint)
-/// value:
-///     options (bson)
-pub const INDEX_ID_TO_OPTIONS: u8 = 7;
-
 // TODO should we have record ids?  or just have the _id of each record
 // be its actual key?  
 //
@@ -194,7 +154,50 @@ pub const INDEX_ID_TO_OPTIONS: u8 = 7;
 ///     (tag)
 /// value:
 ///     recid (varint)
-pub const NEXT_RECORD_ID: u8 = 8;
+pub const NEXT_RECORD_ID: u8 = 3;
+
+/// key:
+///     (tag)
+///     db name (len + str)
+///     coll name (len + str)
+/// value:
+///     collid (varint)
+pub const NAME_TO_COLLECTION_ID: u8 = 10;
+
+// TODO maybe the options should just go with above
+// instead of in a separate record?
+
+/// key:
+///     (tag)
+///     collid (varint)
+/// value:
+///     options (bson)
+pub const COLLECTION_ID_TO_OPTIONS: u8 = 11;
+
+/// key:
+///     (tag)
+///     collid (varint)
+///     index name (len + str)
+/// value:
+///     indexid (varint)
+pub const NAME_TO_INDEX_ID: u8 = 20;
+
+// TODO maybe the spec/options should just go with above
+// instead of in a separate record?
+
+/// key:
+///     (tag)
+///     indexid (varint)
+/// value:
+///     spec (bson)
+pub const INDEX_ID_TO_SPEC: u8 = 21;
+
+/// key:
+///     (tag)
+///     indexid (varint)
+/// value:
+///     options (bson)
+pub const INDEX_ID_TO_OPTIONS: u8 = 22;
 
 /// key:
 ///     (tag)
@@ -202,27 +205,16 @@ pub const NEXT_RECORD_ID: u8 = 8;
 ///     recid (varint)
 /// value:
 ///     doc (bson)
-pub const RECORD: u8 = 9;
-
-// TODO do we actually need the two kinds of index entries to be
-// different tags?
+pub const RECORD: u8 = 30;
 
 /// key:
 ///     (tag)
 ///     indexid (varint)
 ///     k (len + bytes)
-///     recid (varint)
+///     recid (varint) (not present when index option unique)
 /// value:
-///    (none)
-pub const INDEX_ENTRY_PLAIN: u8 = 10;
-
-/// key:
-///     (tag)
-///     indexid (varint)
-///     k (len + bytes)
-/// value:
-///     recid (varint)
-pub const INDEX_ENTRY_UNIQUE: u8 = 11;
+///     recid (varint) (present only when index option unique?)
+pub const INDEX_ENTRY: u8 = 40;
 
 /// key:
 ///     (tag)
@@ -231,7 +223,7 @@ pub const INDEX_ENTRY_UNIQUE: u8 = 11;
 ///     (complete index key)
 /// value:
 ///    (none)
-pub const RECORD_ID_TO_INDEX_ENTRY: u8 = 12;
+pub const RECORD_ID_TO_INDEX_ENTRY: u8 = 41;
 
 fn encode_key_name_to_collection_id(db: &str, coll: &str) -> Box<[u8]> {
     // TODO capacity
@@ -446,10 +438,25 @@ impl MyConn {
             let k = encode_key_index_id_to_options(index_id);
             let options = try!(self.get_value_for_key_as_bson(&k)).unwrap_or(bson::Document::new());
             
+            let unique = 
+                match options.get("unique") {
+                    Some(&bson::Value::BBoolean(b)) => b,
+                    _ => false,
+                };
+
+            let sparse = 
+                match options.get("sparse") {
+                    Some(&bson::Value::BBoolean(b)) => b,
+                    _ => false,
+                };
+
+            let (normspec, weights) = try!(elmo::get_normalized_spec(&spec, &options));
             let info = MyIndexInfo {
                 index_id: index_id,
                 spec: spec,
                 options: options,
+                normspec: normspec,
+                weights: weights,
             };
 
             a.push(info);
@@ -584,14 +591,39 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
         let cw = try!(self.get_collection_writer(db, coll));
         let mut k = encode_key_tag_and_varint(RECORD, cw.collection_id);
         let record_id = self.use_next_record_id();
-        push_varint(&mut k, record_id);
+        let ba_record_id = u64_to_boxed_varint(record_id);
+        k.push_all(&ba_record_id);
         self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(v.to_bson_array().into_boxed_slice()));
-        // TODO update the indexes
+
+        for ndx in cw.indexes {
+            let (normspec, weights) = try!(elmo::get_normalized_spec(&ndx.spec, &ndx.options));
+            let entries = try!(elmo::get_index_entries(&v, &normspec, &weights, &ndx.options));
+            let unique = 
+                match ndx.options.get("unique") {
+                    Some(&bson::Value::BBoolean(b)) => b,
+                    _ => false,
+                };
+            for vals in entries {
+                let vref = vals.iter().map(|&(ref v,neg)| (v,neg)).collect::<Vec<_>>();
+                let k = bson::Value::encode_multi_for_index(&vref, None);
+                // TODO capacity
+                let mut index_entry = vec![];
+                index_entry.push(INDEX_ENTRY);
+                push_varint(&mut index_entry, ndx.index_id);
+                push_varint(&mut index_entry, k.len() as u64);
+                index_entry.push_all(&k);
+                if !unique {
+                    index_entry.push_all(&ba_record_id);
+                }
+                self.pending.insert(index_entry.into_boxed_slice(), lsm::Blob::Array(ba_record_id.clone()));
+
+                // TODO need to add the backward index entry as well
+            }
+        }
         unimplemented!();
     }
 
     fn commit(mut self: Box<Self>) -> Result<()> {
-        // if pending is empty, do nothing
         if self.next_collection_id != self.orig_next_collection_id {
             let t = self.next_collection_id;
             self.pend_next_id(NEXT_COLLECTION_ID, t);
@@ -746,7 +778,8 @@ impl<'a> elmo::StorageBase for MyWriter<'a> {
 impl elmo::StorageConnection for MyPublicConn {
     fn begin_write<'a>(&'a self) -> Result<Box<elmo::StorageWriter + 'a>> {
         let tx = try!(self.myconn.conn.GetWriteLock().map_err(elmo::wrap_err));
-        let mut csr = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+        // TODO we should use one cursor/seek to get all three of these.
+        // configure their keys so that they will be all together.
         let next_collection_id = try!(self.myconn.get_next_id(NEXT_COLLECTION_ID));
         let next_index_id = try!(self.myconn.get_next_id(NEXT_INDEX_ID));
         let next_record_id = try!(self.myconn.get_next_id(NEXT_RECORD_ID));

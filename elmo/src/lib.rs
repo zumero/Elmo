@@ -970,14 +970,13 @@ fn slice_find(pairs: &[(String, bson::Value)], s: &str) -> Option<usize> {
 // for the purpose of grabbing their data later when used as a covering
 // index, which we're ignoring.
 //
-pub fn get_normalized_spec(info: &IndexInfo) -> Result<(Vec<(String,IndexType)>,Option<HashMap<String,i32>>)> {
-    //println!("info: {:?}", info);
-    let first_text = slice_find(&info.spec.pairs, "text");
+pub fn get_normalized_spec(spec: &bson::Document, options: &bson::Document) -> Result<(Vec<(String,IndexType)>,Option<HashMap<String,i32>>)> {
+    let first_text = slice_find(&spec.pairs, "text");
     //println!("first_text: {:?}", first_text);
-    let w1 = info.options.get("weights");
+    let w1 = options.get("weights");
     match (first_text, w1) {
         (None, None) => {
-            let decoded = try!(info.spec.pairs.iter().map(|&(ref k, ref v)| Ok((k.clone(), try!(decode_index_type(v))))).collect::<Result<Vec<(String,IndexType)>>>());
+            let decoded = try!(spec.pairs.iter().map(|&(ref k, ref v)| Ok((k.clone(), try!(decode_index_type(v))))).collect::<Result<Vec<(String,IndexType)>>>());
             //printfn "no text index: %A" decoded
             Ok((decoded, None))
         },
@@ -985,10 +984,10 @@ pub fn get_normalized_spec(info: &IndexInfo) -> Result<(Vec<(String,IndexType)>,
             let (scalar_keys, text_keys) = 
                 match first_text {
                     Some(i) => {
-                        let scalar_keys = &info.spec.pairs[0 .. i];
+                        let scalar_keys = &spec.pairs[0 .. i];
                         // note that any non-text index after the first text index is getting discarded
                         let mut text_keys = Vec::new();
-                        for t in &info.spec.pairs {
+                        for t in &spec.pairs {
                             match t.1 {
                                 bson::Value::BString(ref s) => {
                                     if s == "text" {
@@ -1000,7 +999,7 @@ pub fn get_normalized_spec(info: &IndexInfo) -> Result<(Vec<(String,IndexType)>,
                         }
                         (scalar_keys, text_keys)
                     },
-                    None => (&info.spec.pairs[0 ..], Vec::new())
+                    None => (&spec.pairs[0 ..], Vec::new())
                 };
             //println!("scalar_keys: {:?}", scalar_keys);
             //println!("text_keys: {:?}", text_keys);
@@ -2835,7 +2834,7 @@ impl Connection {
         ) 
         -> Result<Option<QueryPlan<'a,'i>>> 
     {
-        let (scalar_keys, weights) = try!(get_normalized_spec(ndx));
+        let (scalar_keys, weights) = try!(get_normalized_spec(&ndx.spec, &ndx.options));
         if weights.is_none() && text_query.is_some() {
             // if there is a textQuery but this is not a text index, give up now
             Ok(None)
@@ -3192,7 +3191,7 @@ impl Connection {
 
     fn find_index_for_min_max<'a>(indexes: &'a Vec<IndexInfo>, keys: &Vec<&str>) -> Result<Option<&'a IndexInfo>> {
         for ndx in indexes {
-            let (normspec, _) = try!(get_normalized_spec(ndx));
+            let (normspec, _) = try!(get_normalized_spec(&ndx.spec, &ndx.options));
             let a = normspec.iter().map(|&(ref k,_)| k).collect::<Vec<_>>();
             if a.len() != keys.len() {
                 continue;
@@ -5106,7 +5105,7 @@ looking EXACTLY like a plain objectid entry.
                                         Some(ndx) => {
                                             // TODO the following is way too heavy.  all we need is the index types
                                             // so we can tell if they're supposed to be backwards or not.
-                                            let (normspec, _) = try!(get_normalized_spec(ndx));
+                                            let (normspec, _) = try!(get_normalized_spec(&ndx.spec, &ndx.options));
                                             let minvals = copy_dirs_from_normspec_to_vals(&normspec, minvals);
                                             let maxvals = copy_dirs_from_normspec_to_vals(&normspec, maxvals);
                                             let bounds = QueryBounds::GTE_LT(vec![], minvals, maxvals);
@@ -5124,7 +5123,7 @@ looking EXACTLY like a plain objectid entry.
                                         Some(ndx) => {
                                             // TODO the following is way too heavy.  all we need is the index types
                                             // so we can tell if they're supposed to be backwards or not.
-                                            let (normspec, _) = try!(get_normalized_spec(ndx));
+                                            let (normspec, _) = try!(get_normalized_spec(&ndx.spec, &ndx.options));
                                             let minvals = copy_dirs_from_normspec_to_vals(&normspec, minvals);
                                             let bounds = QueryBounds::GTE(minvals);
                                             (ndx, bounds)
@@ -5141,7 +5140,7 @@ looking EXACTLY like a plain objectid entry.
                                         Some(ndx) => {
                                             // TODO the following is way too heavy.  all we need is the index types
                                             // so we can tell if they're supposed to be backwards or not.
-                                            let (normspec, _) = try!(get_normalized_spec(ndx));
+                                            let (normspec, _) = try!(get_normalized_spec(&ndx.spec, &ndx.options));
                                             let maxvals = copy_dirs_from_normspec_to_vals(&normspec, maxvals);
                                             let bounds = QueryBounds::LT(maxvals);
                                             (ndx, bounds)

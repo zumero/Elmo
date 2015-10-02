@@ -34,6 +34,8 @@ struct IndexPrep {
     info: elmo::IndexInfo,
     stmt_insert: sqlite3::PreparedStatement,
     stmt_delete: sqlite3::PreparedStatement,
+    normspec: Vec<(String,elmo::IndexType)>,
+    weights: Option<HashMap<String,i32>>,
 }
 
 struct MyCollectionWriter {
@@ -363,7 +365,7 @@ impl MyConn {
         let tbl_coll = get_table_name_for_collection(&ndx.db, &ndx.coll);
         let tbl_ndx = get_table_name_for_index(&ndx.db, &ndx.coll, &ndx.name);
         // TODO we wish we didn't have to call get_normalized_spec() here just to get weights
-        let (_, weights) = try!(elmo::get_normalized_spec(&ndx));
+        let (_, weights) = try!(elmo::get_normalized_spec(&ndx.spec, &ndx.options));
         let weights = 
             match weights {
                 None => return Err(elmo::Error::Misc(String::from("non text index"))),
@@ -684,8 +686,7 @@ impl MyWriter {
 
     fn update_indexes_insert(indexes: &mut Vec<IndexPrep>, rowid: i64, v: &bson::Document) -> Result<()> {
         for t in indexes {
-            let (normspec, weights) = try!(elmo::get_normalized_spec(&t.info));
-            let entries = try!(elmo::get_index_entries(&v, &normspec, &weights, &t.info.options));
+            let entries = try!(elmo::get_index_entries(&v, &t.normspec, &t.weights, &t.info.options));
             for vals in entries {
                 let vref = vals.iter().map(|&(ref v,neg)| (v,neg)).collect::<Vec<_>>();
                 let k = bson::Value::encode_multi_for_index(&vref, None);
@@ -718,10 +719,13 @@ impl MyWriter {
             let tbl_ndx = get_table_name_for_index(db, coll, &info.name);
             let stmt_insert = try!(self.prepare_index_insert(&tbl_ndx));
             let stmt_delete = try!(self.myconn.conn.prepare(&format!("DELETE FROM \"{}\" WHERE doc_rowid=?", tbl_ndx)).map_err(elmo::wrap_err));
+            let (normspec, weights) = try!(elmo::get_normalized_spec(&info.spec, &info.options));
             let t = IndexPrep {
                 info: info, 
                 stmt_insert: stmt_insert, 
-                stmt_delete: stmt_delete
+                stmt_delete: stmt_delete,
+                normspec: normspec,
+                weights: weights,
             };
             index_stmts.push(t);
         }
@@ -737,7 +741,7 @@ impl MyWriter {
         Ok(c)
     }
 
-    fn prep_collection_writer(&mut self, db: &str, coll: &str) -> Result<&mut MyCollectionWriter> {
+    fn prep_collection_writer(&mut self, db: &str, coll: &str) -> Result<()> {
         let need_cw =
             if self.cw.is_none() {
                 true
@@ -753,8 +757,7 @@ impl MyWriter {
             let cw = try!(self.get_collection_writer(db, coll));
             self.cw = Some(cw);
         }
-        let mut cw = self.cw.as_mut().unwrap();
-        Ok(cw)
+        Ok(())
     }
 
     fn prepare_index_insert(&self, tbl: &str) -> Result<sqlite3::PreparedStatement> {
@@ -803,7 +806,7 @@ impl MyWriter {
                         try!(self.myconn.conn.exec(&s).map_err(elmo::wrap_err));
                         try!(self.myconn.conn.exec(&format!("CREATE INDEX \"childndx_{}\" ON \"{}\" (doc_rowid)", tbl_ndx, tbl_ndx)).map_err(elmo::wrap_err));
                         // now insert index entries for every doc that already exists
-                        let (normspec, weights) = try!(elmo::get_normalized_spec(&info));
+                        let (normspec, weights) = try!(elmo::get_normalized_spec(&info.spec, &info.options));
                         let mut stmt2 = try!(self.myconn.conn.prepare(&format!("SELECT did,bson FROM \"{}\"", tbl_coll)).map_err(elmo::wrap_err));
                         let mut stmt_insert = try!(self.prepare_index_insert(&tbl_ndx));
                         loop {
@@ -1002,7 +1005,8 @@ impl elmo::StorageWriter for MyWriter {
         match v.get("_id") {
             None => Err(elmo::Error::Misc(String::from("cannot update without _id"))),
             Some(id) => {
-                let mut cw = try!(self.prep_collection_writer(db, coll));
+                try!(self.prep_collection_writer(db, coll));
+                let mut cw = self.cw.as_mut().unwrap();
                 match try!(cw.find_rowid(&id).map_err(elmo::wrap_err)) {
                     None => Err(elmo::Error::Misc(String::from("update but does not exist"))),
                     Some(rowid) => {
@@ -1024,7 +1028,8 @@ impl elmo::StorageWriter for MyWriter {
 
     fn delete(&mut self, db: &str, coll: &str, v: &bson::Value) -> Result<bool> {
         // TODO is v supposed to be the id?
-        let mut cw = try!(self.prep_collection_writer(db, coll));
+        try!(self.prep_collection_writer(db, coll));
+        let mut cw = self.cw.as_mut().unwrap();
         match try!(cw.find_rowid(&v).map_err(elmo::wrap_err)) {
             None => Ok(false),
             Some(rowid) => {
@@ -1047,7 +1052,8 @@ impl elmo::StorageWriter for MyWriter {
     }
 
     fn insert(&mut self, db: &str, coll: &str, v: &bson::Document) -> Result<()> {
-        let mut cw = try!(self.prep_collection_writer(db, coll));
+        try!(self.prep_collection_writer(db, coll));
+        let mut cw = self.cw.as_mut().unwrap();
         let ba = v.to_bson_array();
         cw.insert.clear_bindings();
         try!(cw.insert.bind_blob(1,&ba).map_err(elmo::wrap_err));
