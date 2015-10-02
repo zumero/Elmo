@@ -3696,6 +3696,9 @@ impl db {
         self.inner.WriteSegment(pairs)
     }
 
+    // TODO consider whether we could use one of the other rust collections to get
+    // sorting as things are inserted.
+
     pub fn WriteSegment2(&self, pairs: HashMap<Box<[u8]>,Blob>) -> Result<SegmentNum> {
         self.inner.WriteSegment2(pairs)
     }

@@ -1061,6 +1061,8 @@ impl elmo::StorageWriter for MyWriter {
         try!(verify_changes(&cw.insert, 1));
         cw.insert.reset();
         let rowid = self.myconn.conn.last_insert_rowid();
+        // TODO why do we need update_indexes_delete() here?
+        // is it because the rowid might get reused?
         try!(Self::update_indexes_delete(&mut cw.indexes, rowid));
         try!(Self::update_indexes_insert(&mut cw.indexes, rowid, &v));
         Ok(())
