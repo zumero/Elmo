@@ -1039,8 +1039,9 @@ impl elmo::StorageWriter for MyWriter {
                 cw.delete.reset();
                 let count = self.myconn.conn.changes();
                 if count == 1 {
-                    // TODO might not need index update here.  foreign key cascade?
-                    try!(Self::update_indexes_delete(&mut cw.indexes, rowid));
+                    // because of foreign key cascade, we don't need to explicitly
+                    // update_indexes_delete()
+                    // try!(Self::update_indexes_delete(&mut cw.indexes, rowid));
                     Ok(true)
                 } else if count == 0 {
                     Ok(false)
@@ -1061,9 +1062,10 @@ impl elmo::StorageWriter for MyWriter {
         try!(verify_changes(&cw.insert, 1));
         cw.insert.reset();
         let rowid = self.myconn.conn.last_insert_rowid();
-        // TODO why do we need update_indexes_delete() here?
-        // is it because the rowid might get reused?
-        try!(Self::update_indexes_delete(&mut cw.indexes, rowid));
+        // we don't need to do update_indexes_delete() here because
+        // a rowid won't get reused until a 64 bit integer wraps,
+        // at which time we will have other, more severe problems.
+        // try!(Self::update_indexes_delete(&mut cw.indexes, rowid));
         try!(Self::update_indexes_insert(&mut cw.indexes, rowid, &v));
         Ok(())
     }
