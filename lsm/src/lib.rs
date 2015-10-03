@@ -263,6 +263,20 @@ impl<'a> KeyRef<'a> {
         }
     }
 
+    pub fn compare_with(&self, k: &[u8]) -> Ordering {
+        match self {
+            &KeyRef::Overflowed(ref a) => {
+                bcmp::Compare(&a, &k)
+            },
+            &KeyRef::Array(a) => {
+                bcmp::Compare(&a, &k)
+            },
+            &KeyRef::Prefixed(front, back) => {
+                Self::compare_px_y(front, back, k)
+            },
+        }
+    }
+
     pub fn starts_with(&self, k: &[u8]) -> bool {
         if self.len() < k.len() {
             return false;
@@ -708,7 +722,7 @@ pub trait ICursor<'a> {
     // way to detect whether a value is a tombstone or not.
     fn ValueLength(&self) -> Result<Option<usize>>; // tombstone is None
 
-    // TODO maybe rm KeyCompare
+    // TODO maybe rm KeyCompare.  now that KeyRef never copies, we shouldn't need this.
     fn KeyCompare(&self, k: &KeyRef) -> Result<Ordering>;
 }
 
@@ -1452,7 +1466,7 @@ impl<'a> ICursor<'a> for MultiCursor {
 }
 
 pub struct LivingCursor { 
-    chain : MultiCursor
+    chain: MultiCursor
 }
 
 impl LivingCursor {
@@ -1483,14 +1497,175 @@ impl LivingCursor {
     }
 }
 
-pub struct PrefixLivingCursor { 
+#[derive(PartialEq,Copy,Clone)]
+pub enum OpLt {
+    LT,
+    LTE,
+}
+
+#[derive(PartialEq,Copy,Clone)]
+pub enum OpGt {
+    GT,
+    GTE,
+}
+
+pub struct Min {
+    k: Box<[u8]>,
+    cmp: OpGt,
+}
+
+impl Min {
+    pub fn new(k: Box<[u8]>, cmp: OpGt) -> Self {
+        Min {
+            k: k,
+            cmp: cmp,
+        }
+    }
+
+    fn is_in_bounds(&self, k: &KeyRef) -> bool {
+        let c = k.compare_with(&self.k);
+        match (self.cmp, c) {
+            (OpGt::GT, Ordering::Greater) => true,
+            (OpGt::GT, Ordering::Less) => false,
+            (OpGt::GT, Ordering::Equal) => false,
+            (OpGt::GTE, Ordering::Greater) => true,
+            (OpGt::GTE, Ordering::Less) => false,
+            (OpGt::GTE, Ordering::Equal) => true,
+        }
+    }
+}
+
+pub struct Max {
+    k: Box<[u8]>,
+    cmp: OpLt,
+}
+
+impl Max {
+    pub fn new(k: Box<[u8]>, cmp: OpLt) -> Self {
+        Max {
+            k: k,
+            cmp: cmp,
+        }
+    }
+
+    fn is_in_bounds(&self, k: &KeyRef) -> bool {
+        let c = k.compare_with(&self.k);
+        match (self.cmp, c) {
+            (OpLt::LT, Ordering::Greater) => false,
+            (OpLt::LT, Ordering::Less) => true,
+            (OpLt::LT, Ordering::Equal) => false,
+            (OpLt::LTE, Ordering::Greater) => false,
+            (OpLt::LTE, Ordering::Less) => true,
+            (OpLt::LTE, Ordering::Equal) => true,
+        }
+    }
+}
+
+pub struct RangeCursor { 
+    chain: LivingCursor,
+    min: Option<Min>,
+    max: Option<Max>,
+}
+
+impl RangeCursor {
+    pub fn new(ch: LivingCursor, min: Option<Min>, max: Option<Max>) -> RangeCursor {
+        RangeCursor { 
+            chain : ch,
+            min: min,
+            max: max,
+        }
+    }
+
+    pub fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
+        if self.IsValid() {
+            self.chain.KeyRef()
+        } else {
+            Err(Error::CursorNotValid)
+        }
+    }
+
+    pub fn LiveValueRef<'a>(&'a self) -> Result<LiveValueRef<'a>> {
+        if self.IsValid() {
+            self.chain.LiveValueRef()
+        } else {
+            Err(Error::CursorNotValid)
+        }
+    }
+
+    fn is_min_in_bounds(&self, k: &KeyRef) -> bool {
+        match self.min {
+            Some(ref min) => min.is_in_bounds(k),
+            None => true,
+        }
+    }
+
+    fn is_max_in_bounds(&self, k: &KeyRef) -> bool {
+        match self.max {
+            Some(ref max) => max.is_in_bounds(k),
+            None => true,
+        }
+    }
+
+    pub fn IsValid(&self) -> bool {
+        self.chain.IsValid() 
+            && {
+                let k = self.chain.KeyRef().unwrap();
+                self.is_min_in_bounds(&k) && self.is_max_in_bounds(&k)
+            }
+    }
+
+    pub fn First(&mut self) -> Result<()> {
+        match self.min {
+            Some(ref min) => {
+                try!(self.chain.SeekRef(&KeyRef::for_slice(&min.k), SeekOp::SEEK_GE));
+                let skip =
+                    match min.cmp {
+                        OpGt::GT => {
+                            if self.chain.IsValid() {
+                                let k = try!(self.chain.KeyRef());
+                                k.compare_with(&min.k) == std::cmp::Ordering::Equal
+                            } else {
+                                false
+                            }
+                        },
+                        OpGt::GTE => {
+                            false
+                        },
+                    };
+                if skip {
+                    try!(self.chain.Next());
+                }
+            },
+            None => {
+                try!(self.chain.First());
+            },
+        }
+        Ok(())
+    }
+
+    pub fn Next(&mut self) -> Result<()> {
+        if self.IsValid() {
+            self.chain.Next()
+        } else {
+            Err(Error::CursorNotValid)
+        }
+    }
+
+    // TODO this one could support Last/Prev I suppose
+}
+
+pub struct PrefixCursor { 
     chain : LivingCursor,
     prefix: Box<[u8]>,
 }
 
-impl PrefixLivingCursor {
-    pub fn new(ch: LivingCursor, prefix: Box<[u8]>) -> PrefixLivingCursor {
-        PrefixLivingCursor { 
+// PrefixCursor could be implemented in terms of RangeCursor,
+// but I'm not sure it would actually be less code, and it would probably be
+// slower.
+
+impl PrefixCursor {
+    pub fn new(ch: LivingCursor, prefix: Box<[u8]>) -> PrefixCursor {
+        PrefixCursor { 
             chain : ch,
             prefix: prefix,
         }
@@ -1523,7 +1698,11 @@ impl PrefixLivingCursor {
     }
 
     pub fn Next(&mut self) -> Result<()> {
-        self.chain.Next()
+        if self.IsValid() {
+            self.chain.Next()
+        } else {
+            Err(Error::CursorNotValid)
+        }
     }
 
 }

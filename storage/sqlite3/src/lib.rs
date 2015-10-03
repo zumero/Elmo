@@ -584,6 +584,8 @@ impl MyConn {
     fn get_reader_regular_index_scan(&self, myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, ndx: &elmo::IndexInfo, bounds: elmo::QueryBounds) -> Result<MyCollectionReader> {
         // TODO is this check right?
         // should we instead check for the existence of the index?
+        // in theory, if the index passed into us is valid, then we already know
+        // the collection exists.
         match try!(self.get_collection_options(&ndx.db, &ndx.coll)) {
             None => {
                 let rdr = 

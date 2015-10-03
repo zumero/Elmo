@@ -95,17 +95,18 @@ struct MyCollectionWriter {
 struct MyCollectionReader {
     seq: Box<Iterator<Item=Result<elmo::Row>>>,
 
-    // TODO do we need myconn?  sqlite storage only needed it for COMMIT at the end?
-    myconn: std::rc::Rc<MyConn>,
-
     // TODO need counts here
 }
 
-struct CursorBsonValueIterator {
-    cursor: lsm::PrefixLivingCursor,
+// TODO LivingCursorBsonValueIterator
+// and PrefixCursorBsonValueIterator 
+// are basically identical.
+
+struct LivingCursorBsonValueIterator {
+    cursor: lsm::LivingCursor,
 }
 
-impl CursorBsonValueIterator {
+impl LivingCursorBsonValueIterator {
     fn iter_next(&mut self) -> Result<Option<elmo::Row>> {
         try!(self.cursor.Next().map_err(elmo::wrap_err));
         if self.cursor.IsValid() {
@@ -124,8 +125,90 @@ impl CursorBsonValueIterator {
     }
 }
 
-impl Iterator for CursorBsonValueIterator {
+impl Iterator for LivingCursorBsonValueIterator {
     type Item = Result<elmo::Row>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.iter_next() {
+            Err(e) => {
+                return Some(Err(e));
+            },
+            Ok(v) => {
+                match v {
+                    None => {
+                        return None;
+                    },
+                    Some(v) => {
+                        return Some(Ok(v));
+                    }
+                }
+            },
+        }
+    }
+}
+
+struct PrefixCursorBsonValueIterator {
+    cursor: lsm::PrefixCursor,
+}
+
+impl PrefixCursorBsonValueIterator {
+    fn iter_next(&mut self) -> Result<Option<elmo::Row>> {
+        try!(self.cursor.Next().map_err(elmo::wrap_err));
+        if self.cursor.IsValid() {
+            let v = try!(self.cursor.LiveValueRef().map_err(elmo::wrap_err));
+            let v = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
+            let v = v.into_value();
+            let row = elmo::Row {
+                doc: v,
+                pos: None,
+                score: None,
+            };
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl Iterator for PrefixCursorBsonValueIterator {
+    type Item = Result<elmo::Row>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.iter_next() {
+            Err(e) => {
+                return Some(Err(e));
+            },
+            Ok(v) => {
+                match v {
+                    None => {
+                        return None;
+                    },
+                    Some(v) => {
+                        return Some(Ok(v));
+                    }
+                }
+            },
+        }
+    }
+}
+
+struct RangeCursorVarintIterator {
+    cursor: lsm::RangeCursor,
+}
+
+impl RangeCursorVarintIterator {
+    fn iter_next(&mut self) -> Result<Option<u64>> {
+        try!(self.cursor.Next().map_err(elmo::wrap_err));
+        if self.cursor.IsValid() {
+            let v = try!(self.cursor.LiveValueRef().map_err(elmo::wrap_err));
+            let v = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
+            Ok(Some(v))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl Iterator for RangeCursorVarintIterator {
+    type Item = Result<u64>;
     fn next(&mut self) -> Option<Self::Item> {
         match self.iter_next() {
             Err(e) => {
@@ -423,45 +506,30 @@ impl MyConn {
         }
     }
 
-    fn get_collection_options(&self, k: &[u8]) -> Result<Option<bson::Document>> {
-        // TODO this is all wrong now
-        let mut csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
-        try!(csr.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
-        if csr.IsValid() {
-            let v = try!(csr.LiveValueRef().map_err(elmo::wrap_err));
-            let doc = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
-            Ok(Some(doc))
-        } else {
-            Ok(None)
-        }
-    }
-
     fn get_reader_collection_scan(&self, myconn: std::rc::Rc<MyConn>, db: &str, coll: &str) -> Result<MyCollectionReader> {
+        // check to see if the collection exists and get its id
         let k = encode_key_name_to_collection_id(db, coll);
         match try!(self.get_value_for_key_as_varint(&k)) {
             None => {
                 let rdr = 
                     MyCollectionReader {
                         seq: box std::iter::empty(),
-                        myconn: myconn,
                     };
                 Ok(rdr)
             },
-            Some(id) => {
-                let csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+            Some(collection_id) => {
                 let mut k = vec![];
                 k.push(RECORD);
-                let ba_collection_id = u64_to_boxed_varint(id);
-                k.push_all(&ba_collection_id);
-                let cursor = lsm::PrefixLivingCursor::new(csr, k.into_boxed_slice());
+                push_varint(&mut k, collection_id);
+                let cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+                let cursor = lsm::PrefixCursor::new(cursor, k.into_boxed_slice());
                 let seq = 
-                    CursorBsonValueIterator {
+                    PrefixCursorBsonValueIterator {
                         cursor: cursor,
                     };
                 let rdr = 
                     MyCollectionReader {
                         seq: box seq,
-                        myconn: myconn,
                     };
                 Ok(rdr)
             },
@@ -472,8 +540,145 @@ impl MyConn {
         unimplemented!();
     }
 
-    fn get_reader_regular_index_scan(&self, myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, ndx: &elmo::IndexInfo, bounds: elmo::QueryBounds) -> Result<MyCollectionReader> {
-        unimplemented!();
+    fn get_reader_regular_index_scan(&self, myconn: std::rc::Rc<MyConn>, ndx: &elmo::IndexInfo, bounds: elmo::QueryBounds) -> Result<MyCollectionReader> {
+        let collection_id = 
+            match try!(self.get_value_for_key_as_varint(&encode_key_name_to_collection_id(&ndx.db, &ndx.coll))) {
+                Some(id) => id,
+                None => return Err(elmo::Error::Misc(String::from("collection does not exist"))),
+            };
+        let index_id = 
+            match try!(self.get_value_for_key_as_varint(&encode_key_name_to_index_id(collection_id, &ndx.name))) {
+                Some(id) => id,
+                None => return Err(elmo::Error::Misc(String::from("index does not exist"))),
+            };
+
+        fn add_one(ba: &Vec<u8>) -> Vec<u8> {
+            let mut a = ba.clone();
+            let mut i = a.len() - 1;
+            loop {
+                if a[i] == 255 {
+                    a[i] = 0;
+                    if i == 0 {
+                        panic!("TODO handle case where add_one to binary array overflows the first byte");
+                    } else {
+                        i = i - 1;
+                    }
+                } else {
+                    a[i] = a[i] + 1;
+                    break;
+                }
+            }
+            a
+        }
+
+        fn f_twok(cursor: lsm::LivingCursor, kmin: Box<[u8]>, kmax: Box<[u8]>, min_cmp: lsm::OpGt, max_cmp: lsm::OpLt) -> lsm::RangeCursor {
+            let min = lsm::Min::new(kmin, min_cmp);
+            let max = lsm::Max::new(kmax, max_cmp);
+            let cursor = lsm::RangeCursor::new(cursor, Some(min), Some(max));
+            cursor
+        }
+
+        fn f_two(preface: Vec<u8>, cursor: lsm::LivingCursor, eqvals: elmo::QueryKey, minvals: elmo::QueryKey, maxvals: elmo::QueryKey, min_cmp: lsm::OpGt, max_cmp: lsm::OpLt) -> lsm::RangeCursor {
+            let mut kmin = preface.clone();
+            bson::Value::push_encode_multi_for_index(&mut kmin, &eqvals, Some(&minvals));
+            let mut kmax = preface;
+            bson::Value::push_encode_multi_for_index(&mut kmax, &eqvals, Some(&maxvals));
+            let kmin = kmin.into_boxed_slice();
+            let kmax = kmax.into_boxed_slice();
+            f_twok(cursor, kmin, kmax, min_cmp, max_cmp)
+        }
+
+        fn f_gt(preface: Vec<u8>, cursor: lsm::LivingCursor, vals: elmo::QueryKey, min_cmp: lsm::OpGt) -> lsm::RangeCursor {
+            let mut kmin = preface.clone();
+            bson::Value::push_encode_multi_for_index(&mut kmin, &vals, None);
+            let kmin = kmin.into_boxed_slice();
+            let min = lsm::Min::new(kmin, min_cmp);
+            let cursor = lsm::RangeCursor::new(cursor, Some(min), None);
+            cursor
+        }
+
+        fn f_lt(preface: Vec<u8>, cursor: lsm::LivingCursor, vals: elmo::QueryKey, max_cmp: lsm::OpLt) -> lsm::RangeCursor {
+            let mut kmax = preface.clone();
+            bson::Value::push_encode_multi_for_index(&mut kmax, &vals, None);
+            let kmax = kmax.into_boxed_slice();
+            let max = lsm::Max::new(kmax, max_cmp);
+            let cursor = lsm::RangeCursor::new(cursor, None, Some(max));
+            cursor
+        }
+
+        let mut key_preface = vec![];
+        key_preface.push(INDEX_ENTRY);
+        push_varint(&mut key_preface, index_id);
+
+        let cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        let cursor =
+            match bounds {
+                elmo::QueryBounds::GT(vals) => f_gt(key_preface, cursor, vals, lsm::OpGt::GT),
+                elmo::QueryBounds::GTE(vals) => f_gt(key_preface, cursor, vals, lsm::OpGt::GTE),
+                elmo::QueryBounds::LT(vals) => f_lt(key_preface, cursor, vals, lsm::OpLt::LT),
+                elmo::QueryBounds::LTE(vals) => f_lt(key_preface, cursor, vals, lsm::OpLt::LTE),
+                elmo::QueryBounds::GT_LT(eqvals, minvals, maxvals) => f_two(key_preface, cursor, eqvals, minvals, maxvals, lsm::OpGt::GT, lsm::OpLt::LT),
+                elmo::QueryBounds::GTE_LT(eqvals, minvals, maxvals) => f_two(key_preface, cursor, eqvals, minvals, maxvals, lsm::OpGt::GTE, lsm::OpLt::LT),
+                elmo::QueryBounds::GT_LTE(eqvals, minvals, maxvals) => f_two(key_preface, cursor, eqvals, minvals, maxvals, lsm::OpGt::GT, lsm::OpLt::LTE),
+                elmo::QueryBounds::GTE_LTE(eqvals, minvals, maxvals) => f_two(key_preface, cursor, eqvals, minvals, maxvals, lsm::OpGt::GTE, lsm::OpLt::LTE),
+                elmo::QueryBounds::EQ(vals) => {
+                    let mut kmin = key_preface.clone();
+                    bson::Value::push_encode_multi_for_index(&mut kmin, &vals, None);
+                    let kmax = add_one(&kmin);
+                    let kmin = kmin.into_boxed_slice();
+                    let kmax = kmax.into_boxed_slice();
+                    f_twok(cursor, kmin, kmax, lsm::OpGt::GTE, lsm::OpLt::LT)
+                },
+            };
+
+        let seq = 
+            RangeCursorVarintIterator {
+                cursor: cursor,
+            };
+
+        // TODO DISTINCT problem here? we don't want this producing the same record twice
+
+        // the iterator above yields record ids.
+        // now we need something that, for each record id yielded by an
+        // index entry, looks up the actual record and yields THAT.  in
+        // sqlite, this was a join.
+
+        let mut cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        let seq = seq.map(
+            move |record_id: Result<u64>| -> Result<elmo::Row> {
+                match record_id {
+                    Ok(record_id) => {
+                        let mut k = vec![];
+                        k.push(RECORD);
+                        push_varint(&mut k, collection_id);
+                        push_varint(&mut k, record_id);
+                        try!(cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
+                        if cursor.IsValid() {
+                            let v = try!(cursor.LiveValueRef().map_err(elmo::wrap_err));
+                            let v = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
+                            let v = v.into_value();
+                            let row = elmo::Row {
+                                doc: v,
+                                pos: None,
+                                score: None,
+                            };
+                            Ok(row)
+                        } else {
+                            Err(elmo::Error::Misc(String::from("record id not found?!?")))
+                        }
+                    },
+                    Err(e) => {
+                        Err(e)
+                    },
+                }
+            });
+
+        let rdr = 
+            MyCollectionReader {
+                seq: box seq,
+            };
+
+        Ok(rdr)
     }
 
     fn base_list_indexes(&self) -> Result<Vec<elmo::IndexInfo>> {
@@ -483,7 +688,7 @@ impl MyConn {
     fn list_indexes_for_collection(&self, collection_id: u64) -> Result<Vec<MyIndexPrep>> {
         let q = encode_key_tag_and_varint(NAME_TO_INDEX_ID, collection_id);
         let csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
-        let csr = lsm::PrefixLivingCursor::new(csr, q.into_boxed_slice());
+        let csr = lsm::PrefixCursor::new(csr, q.into_boxed_slice());
         let mut a = vec![];
 
         while csr.IsValid() {
@@ -527,7 +732,7 @@ impl MyConn {
 
     fn base_list_collections(&self) -> Result<Vec<elmo::CollectionInfo>> {
         let csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
-        let mut csr = lsm::PrefixLivingCursor::new(csr, box [NAME_TO_COLLECTION_ID]);
+        let mut csr = lsm::PrefixCursor::new(csr, box [NAME_TO_COLLECTION_ID]);
         let mut a = vec![];
         // TODO might need to sort by the coll name
         while csr.IsValid() {
@@ -807,7 +1012,7 @@ impl elmo::StorageBase for MyReader {
     }
 
     fn get_reader_regular_index_scan(&self, ndx: &elmo::IndexInfo, bounds: elmo::QueryBounds) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
-        let rdr = try!(self.myconn.get_reader_regular_index_scan(self.myconn.clone(), false, ndx, bounds));
+        let rdr = try!(self.myconn.get_reader_regular_index_scan(self.myconn.clone(), ndx, bounds));
         Ok(box rdr)
     }
 
@@ -833,7 +1038,7 @@ impl elmo::StorageReader for MyReader {
     }
 
     fn into_reader_regular_index_scan(&self, ndx: &elmo::IndexInfo, bounds: elmo::QueryBounds) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
-        let rdr = try!(self.myconn.get_reader_regular_index_scan(self.myconn.clone(), true, ndx, bounds));
+        let rdr = try!(self.myconn.get_reader_regular_index_scan(self.myconn.clone(), ndx, bounds));
         Ok(box rdr)
     }
 
@@ -851,7 +1056,7 @@ impl<'a> elmo::StorageBase for MyWriter<'a> {
     }
 
     fn get_reader_regular_index_scan(&self, ndx: &elmo::IndexInfo, bounds: elmo::QueryBounds) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
-        let rdr = try!(self.myconn.get_reader_regular_index_scan(self.myconn.clone(), false, ndx, bounds));
+        let rdr = try!(self.myconn.get_reader_regular_index_scan(self.myconn.clone(), ndx, bounds));
         Ok(box rdr)
     }
 

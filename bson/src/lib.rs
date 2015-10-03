@@ -2177,8 +2177,7 @@ impl Value {
         a
     }
 
-    pub fn encode_multi_for_index(vals: &Vec<(&Value, bool)>, extra: Option<&Vec<(&Value, bool)>>) -> Vec<u8> {
-        let mut r = Vec::new();
+    pub fn push_encode_multi_for_index(r: &mut Vec<u8>, vals: &Vec<(&Value, bool)>, extra: Option<&Vec<(&Value, bool)>>) {
         for &(v, neg) in vals {
             let a = Self::encode_one_for_index(v, neg);
             r.push_all(&a);
@@ -2193,6 +2192,11 @@ impl Value {
             None => {
             },
         }
+    }
+
+    pub fn encode_multi_for_index(vals: &Vec<(&Value, bool)>, extra: Option<&Vec<(&Value, bool)>>) -> Vec<u8> {
+        let mut r = Vec::new();
+        Self::push_encode_multi_for_index(&mut r, vals, extra);
         r
     }
 
