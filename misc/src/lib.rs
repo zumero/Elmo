@@ -348,7 +348,7 @@ pub mod varint {
         else { 9 }
     }
 
-    pub fn first_byte_to_space_needed(a0: u8) -> usize {
+    pub fn first_byte_to_len(a0: u8) -> usize {
         if a0 <= 240 { 
             1
         } else if a0 <= 248 {

@@ -90,6 +90,47 @@ struct MyCollectionWriter {
     // TODO might want db and coll names here for caching
     indexes: Vec<MyIndexPrep>,
     collection_id: u64,
+    max_record_id: Option<u64>,
+}
+
+impl MyCollectionWriter {
+    fn use_next_record_id(&mut self, myconn: &MyConn) -> Result<u64> {
+        match self.max_record_id {
+            Some(n) => {
+                let n = n + 1;
+                self.max_record_id = Some(n);
+                Ok(n)
+            },
+            None => {
+                let n = {
+                    let mut csr = try!(myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+                    // TODO capacity
+                    let mut k = vec![];
+                    k.push(RECORD);
+                    push_varint(&mut k, self.collection_id + 1);
+                    try!(csr.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
+                    if csr.IsValid() {
+                        let k = try!(csr.KeyRef().map_err(elmo::wrap_err));
+                        if try!(k.u8_at(0).map_err(elmo::wrap_err)) == RECORD {
+                            let (k_collection_id, record_id) = try!(decode_key_record(&k));
+                            if self.collection_id == k_collection_id {
+                                1 + record_id
+                            } else {
+                                1
+                            }
+                        } else {
+                            1
+                        }
+                    } else {
+                        1
+                    }
+                };
+                self.max_record_id = Some(n);
+                Ok(n)
+            },
+        }
+    }
+
 }
 
 struct MyCollectionReader {
@@ -237,12 +278,7 @@ struct MyWriter<'a> {
     tx: std::sync::MutexGuard<'a, lsm::WriteLock>,
     pending: HashMap<Box<[u8]>,lsm::Blob>,
     // TODO cache the collection writer
-    orig_next_collection_id: u64,
-    orig_next_index_id: u64,
-    orig_next_record_id: u64,
-    next_collection_id: u64,
-    next_index_id: u64,
-    next_record_id: u64,
+    max_collection_id: Option<u64>,
 }
 
 struct MyConn {
@@ -252,18 +288,6 @@ struct MyConn {
 struct MyPublicConn {
     myconn: std::rc::Rc<MyConn>,
 }
-
-/// key:
-///     (tag)
-/// value:
-///     varint
-pub const NEXT_COLLECTION_ID: u8 = 1;
-
-/// key:
-///     (tag)
-/// value:
-///     varint
-pub const NEXT_INDEX_ID: u8 = 2;
 
 // TODO should we have record ids?  or just have the _id of each record
 // be its actual key?  
@@ -276,12 +300,6 @@ pub const NEXT_INDEX_ID: u8 = 2;
 //
 // if we don't have a recid, how would we store a document that doesn't
 // have any _id at all?
-
-/// key:
-///     (tag)
-/// value:
-///     recid (varint)
-pub const NEXT_RECORD_ID: u8 = 3;
 
 /// key:
 ///     (tag)
@@ -300,6 +318,7 @@ pub const NAME_TO_COLLECTION_ID: u8 = 10;
 ///         c: coll name (str)
 ///         o: options (document)
 pub const COLLECTION_ID_TO_PROPERTIES: u8 = 11;
+pub const COLLECTION_ID_BOUNDARY: u8 = COLLECTION_ID_TO_PROPERTIES + 1;
 
 /// key:
 ///     (tag)
@@ -311,6 +330,7 @@ pub const NAME_TO_INDEX_ID: u8 = 20;
 
 /// key:
 ///     (tag)
+///     collid (varint)
 ///     indexid (varint)
 /// value:
 ///     properties (bson):
@@ -318,6 +338,8 @@ pub const NAME_TO_INDEX_ID: u8 = 20;
 ///         s: spec (bson)
 ///         o: options (bson)
 pub const INDEX_ID_TO_PROPERTIES: u8 = 21;
+
+pub const PRIMARY_INDEX_ID: u64 = 0;
 
 /// key:
 ///     (tag)
@@ -327,11 +349,9 @@ pub const INDEX_ID_TO_PROPERTIES: u8 = 21;
 ///     doc (bson)
 pub const RECORD: u8 = 30;
 
-// TODO do we want the collid included below as well?  so we can
-// do a range delete and get all index entries for a given coll?
-
 /// key:
 ///     (tag)
+///     collid (varint)
 ///     indexid (varint)
 ///     k (len + bytes)
 ///     recid (varint) (not present when index option unique)
@@ -368,23 +388,52 @@ fn encode_key_name_to_collection_id(db: &str, coll: &str) -> Box<[u8]> {
     k.into_boxed_slice()
 }
 
+fn decode_string_from_key(k: &lsm::KeyRef, cur: usize) -> Result<(String, usize)> {
+    // TODO should we treat the len before the string as a varint instead of always a byte?
+    let len = try!(k.u8_at(cur).map_err(elmo::wrap_err)) as usize;
+    let cur = cur + 1;
+    let s = try!(k.map_range(cur, cur + len, lsm_map_to_string).map_err(elmo::wrap_err));
+    let cur = cur + len;
+    Ok((s, cur))
+}
+
+fn decode_varint_from_key(k: &lsm::KeyRef, cur: usize) -> Result<(u64, usize)> {
+    let first_byte = try!(k.u8_at(cur).map_err(elmo::wrap_err));
+    let len = misc::varint::first_byte_to_len(first_byte);
+    let v = try!(k.map_range(cur, cur + len, lsm_map_to_varint).map_err(elmo::wrap_err));
+    let cur = cur + len;
+    Ok((v, cur))
+}
+
 fn decode_key_name_to_collection_id(k: &lsm::KeyRef) -> Result<(String, String)> {
-    let len_db = try!(k.u8_at(1).map_err(elmo::wrap_err)) as usize;
-    let begin_db = 2;
-    let db = try!(k.map_range(begin_db, begin_db + len_db, lsm_map_to_string).map_err(elmo::wrap_err));
-    let len_coll = try!(k.u8_at(begin_db + len_db).map_err(elmo::wrap_err)) as usize;
-    let begin_coll = begin_db + len_db + 1;
-    let coll = try!(k.map_range(begin_coll, begin_coll + len_coll, lsm_map_to_string).map_err(elmo::wrap_err));
+    // k[0] must be NAME_TO_COLLECTION_ID
+    let cur = 1;
+    let (db, cur) = try!(decode_string_from_key(k, cur));
+    let (coll, cur) = try!(decode_string_from_key(k, cur));
     Ok((db, coll))
 }
 
 fn decode_key_name_to_index_id(k: &lsm::KeyRef) -> Result<(u64, String)> {
-    let first_byte_of_collection_id = try!(k.u8_at(1).map_err(elmo::wrap_err));
-    let size_of_collection_id = misc::varint::first_byte_to_space_needed(first_byte_of_collection_id);
-    let collection_id = try!(k.map_range(1, 1 + size_of_collection_id, lsm_map_to_varint).map_err(elmo::wrap_err));
-    let begin_name = 1 + size_of_collection_id;
-    let name = try!(k.map_range(begin_name, k.len(), lsm_map_to_string).map_err(elmo::wrap_err));
+    // k[0] must be NAME_TO_INDEX_ID
+    let cur = 1;
+    let (collection_id, cur) = try!(decode_varint_from_key(k, cur));
+    let (name, cur) = try!(decode_string_from_key(k, cur));
     Ok((collection_id, name))
+}
+
+fn decode_key_record(k: &lsm::KeyRef) -> Result<(u64, u64)> {
+    // k[0] must be RECORD
+    let cur = 1;
+    let (collection_id, cur) = try!(decode_varint_from_key(k, cur));
+    let (record_id, cur) = try!(decode_varint_from_key(k, cur));
+    Ok((collection_id, record_id))
+}
+
+fn decode_key_collection_id_to_properties(k: &lsm::KeyRef) -> Result<(u64)> {
+    // k[0] must be COLLECTION_ID_TO_PROPERTIES
+    let cur = 1;
+    let (collection_id, cur) = try!(decode_varint_from_key(k, cur));
+    Ok(collection_id)
 }
 
 fn push_varint(v: &mut Vec<u8>, n: u64) {
@@ -404,12 +453,17 @@ fn encode_key_tag_and_varint(tag: u8, id: u64) -> Vec<u8> {
     k
 }
 
-fn encode_key_collection_id_to_properties(id: u64) -> Vec<u8> {
-    encode_key_tag_and_varint(COLLECTION_ID_TO_PROPERTIES, id)
+fn encode_key_collection_id_to_properties(collection_id: u64) -> Vec<u8> {
+    encode_key_tag_and_varint(COLLECTION_ID_TO_PROPERTIES, collection_id)
 }
 
-fn encode_key_index_id_to_properties(id: u64) -> Vec<u8> {
-    encode_key_tag_and_varint(INDEX_ID_TO_PROPERTIES, id)
+fn encode_key_index_id_to_properties(collection_id: u64, index_id: u64) -> Vec<u8> {
+    // TODO capacity
+    let mut k = vec![];
+    k.push(INDEX_ID_TO_PROPERTIES);
+    push_varint(&mut k, collection_id);
+    push_varint(&mut k, index_id);
+    k
 }
 
 fn encode_key_name_to_index_id(collection_id: u64, name: &str) -> Vec<u8> {
@@ -460,26 +514,6 @@ fn lsm_map_to_bson(ba: &[u8]) -> lsm::Result<bson::Document> {
 }
 
 impl MyConn {
-    fn get_next_id(&self, tag: u8) -> Result<u64> {
-        let mut k = Vec::with_capacity(1);
-        k.push(tag);
-        let k = k.into_boxed_slice();
-
-        let n = {
-            let mut csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
-            try!(csr.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
-            if csr.IsValid() {
-                let v = try!(csr.LiveValueRef().map_err(elmo::wrap_err));
-                let n = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
-                n
-            } else {
-                1
-            }
-        };
-
-        Ok(n)
-    }
-
     fn get_value_for_key_as_varint(&self, k: &[u8]) -> Result<Option<u64>> {
         // TODO this should probably take a cursor parameter, not create one
         let mut csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
@@ -608,6 +642,7 @@ impl MyConn {
 
         let mut key_preface = vec![];
         key_preface.push(INDEX_ENTRY);
+        push_varint(&mut key_preface, collection_id);
         push_varint(&mut key_preface, index_id);
 
         let cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
@@ -681,10 +716,24 @@ impl MyConn {
         Ok(rdr)
     }
 
-    // TODO this func could take an option collection_id and constrain easily
-    fn base_list_indexes(&self) -> Result<Vec<elmo::IndexInfo>> {
+    fn base_list_indexes(&self, collection_id: Option<u64>) -> Result<Vec<elmo::IndexInfo>> {
         let csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
-        let csr = lsm::PrefixCursor::new(csr, box [NAME_TO_INDEX_ID]);
+        let q = 
+            match collection_id {
+                Some(collection_id) => {
+                    // TODO capacity
+                    let mut k = vec![];
+                    k.push(NAME_TO_INDEX_ID);
+                    push_varint(&mut k, collection_id);
+                    k.into_boxed_slice()
+                },
+                None => {
+                    // TODO the vec! macro set capacity to match?
+                    let k = vec![NAME_TO_INDEX_ID];
+                    k.into_boxed_slice()
+                },
+            };
+        let csr = lsm::PrefixCursor::new(csr, q);
         let mut a = vec![];
 
         while csr.IsValid() {
@@ -700,7 +749,7 @@ impl MyConn {
             let v = try!(csr.LiveValueRef().map_err(elmo::wrap_err));
             let index_id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
 
-            let k = encode_key_index_id_to_properties(index_id);
+            let k = encode_key_index_id_to_properties(collection_id, index_id);
             let mut index_properties = try!(self.get_value_for_key_as_bson(&k)).unwrap_or(bson::Document::new());
             //let name = try!(index_properties.must_remove_string("n"));
             let spec = try!(index_properties.must_remove_document("s"));
@@ -732,7 +781,7 @@ impl MyConn {
             let v = try!(csr.LiveValueRef().map_err(elmo::wrap_err));
             let index_id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
 
-            let k = encode_key_index_id_to_properties(index_id);
+            let k = encode_key_index_id_to_properties(collection_id, index_id);
             let mut index_properties = try!(self.get_value_for_key_as_bson(&k)).unwrap_or(bson::Document::new());
             //let name = try!(index_properties.must_remove_string("n"));
             let spec = try!(index_properties.must_remove_document("s"));
@@ -805,22 +854,33 @@ impl<'a> MyWriter<'a> {
         self.pending.insert(k, v);
     }
 
-    fn use_next_collection_id(&mut self) -> u64 {
-        let n = self.next_collection_id;
-        self.next_collection_id += 1;
-        n
-    }
-
-    fn use_next_index_id(&mut self) -> u64 {
-        let n = self.next_index_id;
-        self.next_index_id += 1;
-        n
-    }
-
-    fn use_next_record_id(&mut self) -> u64 {
-        let n = self.next_record_id;
-        self.next_record_id += 1;
-        n
+    fn use_next_collection_id(&mut self) -> Result<u64> {
+        match self.max_collection_id {
+            Some(n) => {
+                let n = n + 1;
+                self.max_collection_id = Some(n);
+                Ok(n)
+            },
+            None => {
+                let n = {
+                    let mut csr = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+                    try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(box [COLLECTION_ID_BOUNDARY]), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
+                    if csr.IsValid() {
+                        let k = try!(csr.KeyRef().map_err(elmo::wrap_err));
+                        if try!(k.u8_at(0).map_err(elmo::wrap_err)) == COLLECTION_ID_TO_PROPERTIES {
+                            let collection_id = try!(decode_key_collection_id_to_properties(&k));
+                            1 + collection_id
+                        } else {
+                            1
+                        }
+                    } else {
+                        1
+                    }
+                };
+                self.max_collection_id = Some(n);
+                Ok(n)
+            },
+        }
     }
 
     fn get_collection_writer(&mut self, db: &str, coll: &str) -> Result<MyCollectionWriter> {
@@ -829,6 +889,7 @@ impl<'a> MyWriter<'a> {
         let c = MyCollectionWriter {
             indexes: indexes,
             collection_id: collection_id,
+            max_record_id: None,
         };
         Ok(c)
     }
@@ -838,7 +899,7 @@ impl<'a> MyWriter<'a> {
         match try!(self.myconn.get_value_for_key_as_varint(&k)) {
             Some(id) => Ok((false, id)),
             None => {
-                let collection_id = self.use_next_collection_id();
+                let collection_id = try!(self.use_next_collection_id());
                 self.pending.insert(k, lsm::Blob::Array(u64_to_boxed_varint(collection_id)));
 
                 // create mongo index for _id
@@ -846,11 +907,11 @@ impl<'a> MyWriter<'a> {
                     Some(&bson::Value::BBoolean(false)) => {
                     },
                     _ => {
-                        let index_id = self.use_next_index_id();
+                        let index_id = PRIMARY_INDEX_ID;
                         let k = encode_key_name_to_index_id(collection_id, "_id_");
                         self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(u64_to_boxed_varint(index_id)));
 
-                        let k = encode_key_index_id_to_properties(index_id);
+                        let k = encode_key_index_id_to_properties(collection_id, index_id);
                         let mut properties = bson::Document::new();
                         properties.set_str("n", "_id_");
                         let spec = bson::Document {pairs: vec![(String::from("_id"), bson::Value::BInt32(1))]};
@@ -899,6 +960,7 @@ impl<'a> MyWriter<'a> {
                 // TODO capacity
                 let mut index_entry = vec![];
                 index_entry.push(INDEX_ENTRY);
+                index_entry.push_all(ba_collection_id);
                 push_varint(&mut index_entry, ndx.index_id);
                 push_varint(&mut index_entry, k.len() as u64);
                 index_entry.push_all(&k);
@@ -944,13 +1006,13 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
     }
 
     fn insert(&mut self, db: &str, coll: &str, v: &bson::Document) -> Result<()> {
-        let cw = try!(self.get_collection_writer(db, coll));
+        let mut cw = try!(self.get_collection_writer(db, coll));
         // TODO capacity
         let mut k = vec![];
         k.push(RECORD);
         let ba_collection_id = u64_to_boxed_varint(cw.collection_id);
         k.push_all(&ba_collection_id);
-        let record_id = self.use_next_record_id();
+        let record_id = try!(cw.use_next_record_id(&self.myconn));
         let ba_record_id = u64_to_boxed_varint(record_id);
         k.push_all(&ba_record_id);
         self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(v.to_bson_array().into_boxed_slice()));
@@ -961,18 +1023,6 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
     }
 
     fn commit(mut self: Box<Self>) -> Result<()> {
-        if self.next_collection_id != self.orig_next_collection_id {
-            let t = self.next_collection_id;
-            self.pend_next_id(NEXT_COLLECTION_ID, t);
-        }
-        if self.next_index_id != self.orig_next_index_id {
-            let t = self.next_index_id;
-            self.pend_next_id(NEXT_INDEX_ID, t);
-        }
-        if self.next_record_id != self.orig_next_record_id {
-            let t = self.next_record_id;
-            self.pend_next_id(NEXT_RECORD_ID, t);
-        }
         if !self.pending.is_empty() {
             let pending = std::mem::replace(&mut self.pending, HashMap::new());
             let g = try!(self.myconn.conn.WriteSegment2(pending).map_err(elmo::wrap_err));
@@ -1063,7 +1113,7 @@ impl elmo::StorageBase for MyReader {
     }
 
     fn list_indexes(&self) -> Result<Vec<elmo::IndexInfo>> {
-        self.myconn.base_list_indexes()
+        self.myconn.base_list_indexes(None)
     }
 
 }
@@ -1107,7 +1157,7 @@ impl<'a> elmo::StorageBase for MyWriter<'a> {
     }
 
     fn list_indexes(&self) -> Result<Vec<elmo::IndexInfo>> {
-        self.myconn.base_list_indexes()
+        self.myconn.base_list_indexes(None)
     }
 
 }
@@ -1115,22 +1165,12 @@ impl<'a> elmo::StorageBase for MyWriter<'a> {
 impl elmo::StorageConnection for MyPublicConn {
     fn begin_write<'a>(&'a self) -> Result<Box<elmo::StorageWriter + 'a>> {
         let tx = try!(self.myconn.conn.GetWriteLock().map_err(elmo::wrap_err));
-        // TODO we should use one cursor/seek to get all three of these.
-        // configure their keys so that they will be all together.
-        // or maybe just put all three of them in the same record value.
-        let next_collection_id = try!(self.myconn.get_next_id(NEXT_COLLECTION_ID));
-        let next_index_id = try!(self.myconn.get_next_id(NEXT_INDEX_ID));
-        let next_record_id = try!(self.myconn.get_next_id(NEXT_RECORD_ID));
+
         let w = MyWriter {
             myconn: self.myconn.clone(),
             tx: tx,
             pending: HashMap::new(),
-            next_collection_id: next_collection_id,
-            next_index_id: next_index_id,
-            next_record_id: next_record_id,
-            orig_next_collection_id: next_collection_id,
-            orig_next_index_id: next_index_id,
-            orig_next_record_id: next_record_id,
+            max_collection_id: None,
         };
         Ok(box w)
     }

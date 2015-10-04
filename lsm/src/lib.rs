@@ -1617,6 +1617,7 @@ impl RangeCursor {
     pub fn First(&mut self) -> Result<()> {
         match self.min {
             Some(ref min) => {
+                // TODO this SeekRef call returns the cmp, right?  don't redo it?
                 try!(self.chain.SeekRef(&KeyRef::for_slice(&min.k), SeekOp::SEEK_GE));
                 let skip =
                     match min.cmp {
