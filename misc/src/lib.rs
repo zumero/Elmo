@@ -348,6 +348,28 @@ pub mod varint {
         else { 9 }
     }
 
+    pub fn first_byte_to_space_needed(a0: u8) -> usize {
+        if a0 <= 240 { 
+            1
+        } else if a0 <= 248 {
+            2
+        } else if a0 == 249 {
+            3
+        } else if a0 == 250 {
+            4
+        } else if a0 == 251 {
+            5
+        } else if a0 == 252 {
+            6
+        } else if a0 == 253 {
+            7
+        } else if a0 == 254 {
+            8
+        } else {
+            9
+        }
+    }
+
     // TODO stronger inline hint?
     #[inline]
     pub fn read(buf: &[u8], cur: &mut usize) -> u64 {

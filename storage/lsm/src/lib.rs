@@ -291,15 +291,15 @@ pub const NEXT_RECORD_ID: u8 = 3;
 ///     collid (varint)
 pub const NAME_TO_COLLECTION_ID: u8 = 10;
 
-// TODO maybe the options should just go with above
-// instead of in a separate record?
-
 /// key:
 ///     (tag)
 ///     collid (varint)
 /// value:
-///     options (bson)
-pub const COLLECTION_ID_TO_OPTIONS: u8 = 11;
+///     properties (bson):
+///         d: db name (str)
+///         c: coll name (str)
+///         o: options (document)
+pub const COLLECTION_ID_TO_PROPERTIES: u8 = 11;
 
 /// key:
 ///     (tag)
@@ -309,22 +309,15 @@ pub const COLLECTION_ID_TO_OPTIONS: u8 = 11;
 ///     indexid (varint)
 pub const NAME_TO_INDEX_ID: u8 = 20;
 
-// TODO maybe the spec/options should just go with above
-// instead of in a separate record?
-
 /// key:
 ///     (tag)
 ///     indexid (varint)
 /// value:
-///     spec (bson)
-pub const INDEX_ID_TO_SPEC: u8 = 21;
-
-/// key:
-///     (tag)
-///     indexid (varint)
-/// value:
-///     options (bson)
-pub const INDEX_ID_TO_OPTIONS: u8 = 22;
+///     properties (bson):
+///         n: name (str)
+///         s: spec (bson)
+///         o: options (bson)
+pub const INDEX_ID_TO_PROPERTIES: u8 = 21;
 
 /// key:
 ///     (tag)
@@ -385,6 +378,15 @@ fn decode_key_name_to_collection_id(k: &lsm::KeyRef) -> Result<(String, String)>
     Ok((db, coll))
 }
 
+fn decode_key_name_to_index_id(k: &lsm::KeyRef) -> Result<(u64, String)> {
+    let first_byte_of_collection_id = try!(k.u8_at(1).map_err(elmo::wrap_err));
+    let size_of_collection_id = misc::varint::first_byte_to_space_needed(first_byte_of_collection_id);
+    let collection_id = try!(k.map_range(1, 1 + size_of_collection_id, lsm_map_to_varint).map_err(elmo::wrap_err));
+    let begin_name = 1 + size_of_collection_id;
+    let name = try!(k.map_range(begin_name, k.len(), lsm_map_to_string).map_err(elmo::wrap_err));
+    Ok((collection_id, name))
+}
+
 fn push_varint(v: &mut Vec<u8>, n: u64) {
     let mut buf = [0; 9];
     let mut cur = 0;
@@ -402,16 +404,12 @@ fn encode_key_tag_and_varint(tag: u8, id: u64) -> Vec<u8> {
     k
 }
 
-fn encode_key_collection_id_to_options(id: u64) -> Vec<u8> {
-    encode_key_tag_and_varint(COLLECTION_ID_TO_OPTIONS, id)
+fn encode_key_collection_id_to_properties(id: u64) -> Vec<u8> {
+    encode_key_tag_and_varint(COLLECTION_ID_TO_PROPERTIES, id)
 }
 
-fn encode_key_index_id_to_spec(id: u64) -> Vec<u8> {
-    encode_key_tag_and_varint(INDEX_ID_TO_SPEC, id)
-}
-
-fn encode_key_index_id_to_options(id: u64) -> Vec<u8> {
-    encode_key_tag_and_varint(INDEX_ID_TO_OPTIONS, id)
+fn encode_key_index_id_to_properties(id: u64) -> Vec<u8> {
+    encode_key_tag_and_varint(INDEX_ID_TO_PROPERTIES, id)
 }
 
 fn encode_key_name_to_index_id(collection_id: u64, name: &str) -> Vec<u8> {
@@ -483,6 +481,7 @@ impl MyConn {
     }
 
     fn get_value_for_key_as_varint(&self, k: &[u8]) -> Result<Option<u64>> {
+        // TODO this should probably take a cursor parameter, not create one
         let mut csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
         try!(csr.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
         if csr.IsValid() {
@@ -495,6 +494,7 @@ impl MyConn {
     }
 
     fn get_value_for_key_as_bson(&self, k: &[u8]) -> Result<Option<bson::Document>> {
+        // TODO this should probably take a cursor parameter, not create one
         let mut csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
         try!(csr.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
         if csr.IsValid() {
@@ -681,10 +681,44 @@ impl MyConn {
         Ok(rdr)
     }
 
+    // TODO this func could take an option collection_id and constrain easily
     fn base_list_indexes(&self) -> Result<Vec<elmo::IndexInfo>> {
-        unimplemented!();
+        let csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        let csr = lsm::PrefixCursor::new(csr, box [NAME_TO_INDEX_ID]);
+        let mut a = vec![];
+
+        while csr.IsValid() {
+            let k = try!(csr.KeyRef().map_err(elmo::wrap_err));
+            let (collection_id, name) = try!(decode_key_name_to_index_id(&k));
+
+            let k = encode_key_collection_id_to_properties(collection_id);
+            let mut collection_properties = try!(self.get_value_for_key_as_bson(&k)).unwrap_or(bson::Document::new());
+            let db = try!(collection_properties.must_remove_string("d"));
+            let coll = try!(collection_properties.must_remove_string("c"));
+            //let options = try!(collection_properties.must_remove_document("o"));
+
+            let v = try!(csr.LiveValueRef().map_err(elmo::wrap_err));
+            let index_id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
+
+            let k = encode_key_index_id_to_properties(index_id);
+            let mut index_properties = try!(self.get_value_for_key_as_bson(&k)).unwrap_or(bson::Document::new());
+            //let name = try!(index_properties.must_remove_string("n"));
+            let spec = try!(index_properties.must_remove_document("s"));
+            let options = try!(index_properties.must_remove_document("o"));
+
+            let info = elmo::IndexInfo {
+                db: String::from(db),
+                coll: String::from(coll),
+                name: String::from(name),
+                spec: spec,
+                options: options,
+            };
+            a.push(info);
+        }
+        Ok(a)
     }
 
+    // TODO this function could be implemented in terms of the other one above
     fn list_indexes_for_collection(&self, collection_id: u64) -> Result<Vec<MyIndexPrep>> {
         let q = encode_key_tag_and_varint(NAME_TO_INDEX_ID, collection_id);
         let csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
@@ -698,12 +732,12 @@ impl MyConn {
             let v = try!(csr.LiveValueRef().map_err(elmo::wrap_err));
             let index_id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
 
-            let k = encode_key_index_id_to_spec(index_id);
-            let spec = try!(self.get_value_for_key_as_bson(&k)).unwrap_or(bson::Document::new());
+            let k = encode_key_index_id_to_properties(index_id);
+            let mut index_properties = try!(self.get_value_for_key_as_bson(&k)).unwrap_or(bson::Document::new());
+            //let name = try!(index_properties.must_remove_string("n"));
+            let spec = try!(index_properties.must_remove_document("s"));
+            let options = try!(index_properties.must_remove_document("o"));
 
-            let k = encode_key_index_id_to_options(index_id);
-            let options = try!(self.get_value_for_key_as_bson(&k)).unwrap_or(bson::Document::new());
-            
             let unique = 
                 match options.get("unique") {
                     Some(&bson::Value::BBoolean(b)) => b,
@@ -734,7 +768,7 @@ impl MyConn {
         let csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
         let mut csr = lsm::PrefixCursor::new(csr, box [NAME_TO_COLLECTION_ID]);
         let mut a = vec![];
-        // TODO might need to sort by the coll name
+        // TODO might need to sort by the coll name?  the sqlite version does.
         while csr.IsValid() {
             {
                 let k = try!(csr.KeyRef().map_err(elmo::wrap_err));
@@ -743,8 +777,11 @@ impl MyConn {
                 let v = try!(csr.LiveValueRef().map_err(elmo::wrap_err));
                 let collection_id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
 
-                let k = encode_key_collection_id_to_options(collection_id);
-                let options = try!(self.get_value_for_key_as_bson(&k)).unwrap_or(bson::Document::new());
+                let k = encode_key_collection_id_to_properties(collection_id);
+                let mut collection_properties = try!(self.get_value_for_key_as_bson(&k)).unwrap_or(bson::Document::new());
+                //let db = try!(collection_properties.must_remove_string("d"));
+                //let coll = try!(collection_properties.must_remove_string("c"));
+                let options = try!(collection_properties.must_remove_document("o"));
 
                 let info = elmo::CollectionInfo {
                     db: db,
@@ -804,10 +841,7 @@ impl<'a> MyWriter<'a> {
                 let collection_id = self.use_next_collection_id();
                 self.pending.insert(k, lsm::Blob::Array(u64_to_boxed_varint(collection_id)));
 
-                let k = encode_key_collection_id_to_options(collection_id);
-                self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(options.to_bson_array().into_boxed_slice()));
-
-                // now create mongo index for _id
+                // create mongo index for _id
                 match options.get("autoIndexId") {
                     Some(&bson::Value::BBoolean(false)) => {
                     },
@@ -816,15 +850,23 @@ impl<'a> MyWriter<'a> {
                         let k = encode_key_name_to_index_id(collection_id, "_id_");
                         self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(u64_to_boxed_varint(index_id)));
 
+                        let k = encode_key_index_id_to_properties(index_id);
+                        let mut properties = bson::Document::new();
+                        properties.set_str("n", "_id_");
                         let spec = bson::Document {pairs: vec![(String::from("_id"), bson::Value::BInt32(1))]};
-                        let k = encode_key_index_id_to_spec(index_id);
-                        self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(spec.to_bson_array().into_boxed_slice()));
-
                         let options = bson::Document {pairs: vec![(String::from("unique"), bson::Value::BBoolean(true))]};
-                        let k = encode_key_index_id_to_options(index_id);
-                        self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(spec.to_bson_array().into_boxed_slice()));
+                        properties.set_document("s", spec);
+                        properties.set_document("o", options);
+                        self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(properties.to_bson_array().into_boxed_slice()));
                     },
                 }
+
+                let k = encode_key_collection_id_to_properties(collection_id);
+                let mut properties = bson::Document::new();
+                properties.set_str("d", db);
+                properties.set_str("c", coll);
+                properties.set_document("o", options);
+                self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(properties.to_bson_array().into_boxed_slice()));
 
                 Ok((true, collection_id))
             },
