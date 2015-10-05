@@ -75,6 +75,8 @@ impl From<lsm::Error> for elmo::Error {
 }
 */
 
+#[derive(Clone)]
+// TODO Clone is part of temp hack, remove
 struct MyIndexPrep {
     index_id: u64,
     options: bson::Document,
@@ -83,8 +85,12 @@ struct MyIndexPrep {
     // TODO maybe keep the options we need here directly, sparse and unique
 }
 
+#[derive(Clone)]
+// TODO Clone is part of temp hack, remove
 struct MyCollectionWriter {
-    // TODO might want db and coll names here for caching
+    // db and coll are only here for caching
+    db: String,
+    coll: String,
     indexes: Vec<MyIndexPrep>,
     collection_id: u64,
 }
@@ -233,9 +239,9 @@ struct MyWriter<'a> {
     myconn: std::rc::Rc<MyConn>,
     tx: std::sync::MutexGuard<'a, lsm::WriteLock>,
     pending: HashMap<Box<[u8]>,lsm::Blob>,
-    // TODO cache the collection writer
     max_collection_id: Option<u64>,
     max_record_id: HashMap<u64, u64>,
+    cw: Option<MyCollectionWriter>,
 }
 
 struct MyConn {
@@ -708,7 +714,6 @@ impl MyConn {
 
     // TODO this could maybe return an iterator instead of a vec
     fn base_list_indexes(&self, collection_id: Option<u64>) -> Result<Vec<(u64, u64)>> {
-        println!("at: {}:{}", file!(), line!());
         let cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
         let q = 
             match collection_id {
@@ -925,14 +930,45 @@ impl<'a> MyWriter<'a> {
         }
     }
 
-    fn get_collection_writer(&mut self, db: &str, coll: &str) -> Result<MyCollectionWriter> {
+    fn make_collection_writer(&mut self, db: &str, coll: &str) -> Result<MyCollectionWriter> {
         let (_created, collection_id) = try!(self.base_create_collection(db, coll, bson::Document::new()));
         let indexes = try!(self.myconn.list_indexes_for_collection_writer(collection_id));
         let c = MyCollectionWriter {
+            db: String::from(db),
+            coll: String::from(coll),
             indexes: indexes,
             collection_id: collection_id,
         };
         Ok(c)
+    }
+
+    fn get_collection_writer(&mut self, db: &str, coll: &str) -> Result<MyCollectionWriter> {
+        let need_cw =
+            if self.cw.is_none() {
+                //println!("cw is none");
+                true
+            } else {
+                let cw = self.cw.as_ref().unwrap();
+                if cw.db != db || cw.coll != coll {
+                    true
+                } else {
+                    //println!("cw doesn't match");
+                    false
+                }
+            };
+        if need_cw {
+            let cw = try!(self.make_collection_writer(db, coll));
+            self.cw = Some(cw);
+        }
+        // TODO this is an awful approach here.  clone.  temporary workaround.
+        match self.cw {
+            Some(ref cw) => {
+                Ok(cw.clone())
+            },
+            None => {
+                unreachable!();
+            },
+        }
     }
 
     fn delete_by_prefix(&mut self, prefix: Box<[u8]>) -> Result<()> {
@@ -1247,6 +1283,30 @@ impl<'a> MyWriter<'a> {
         Ok(())
     }
 
+    fn merge(&self, level: u32) -> Result<bool> {
+        match try!(self.myconn.conn.merge(level, 4, Some(32)).map_err(elmo::wrap_err)) {
+            Some(seg) => {
+                //println!("{}: merged segment: {}", level, seg);
+                try!(self.tx.commitMerge(seg).map_err(elmo::wrap_err));
+                Ok(true)
+            },
+            None => {
+                //println!("{}: no merge needed", level);
+                Ok(false)
+            },
+        }
+    }
+
+    fn automerge(&self) -> Result<()> {
+        for i in 0 .. 100 {
+            let b = try!(self.merge(i));
+            if !b {
+                break;
+            }
+        }
+        Ok(())
+    }
+
 }
 
 impl<'a> elmo::StorageWriter for MyWriter<'a> {
@@ -1324,6 +1384,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
             let pending = std::mem::replace(&mut self.pending, HashMap::new());
             let g = try!(self.myconn.conn.WriteSegment2(pending).map_err(elmo::wrap_err));
             try!(self.tx.commitSegments(vec![g]).map_err(elmo::wrap_err));
+            try!(self.automerge());
         }
         Ok(())
     }
@@ -1469,6 +1530,7 @@ impl elmo::StorageConnection for MyPublicConn {
             pending: HashMap::new(),
             max_collection_id: None,
             max_record_id: HashMap::new(),
+            cw: None,
         };
         Ok(box w)
     }
@@ -1485,26 +1547,8 @@ fn base_connect(name: &str) -> lsm::Result<lsm::db> {
     lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS)
 }
 
-fn merge(db: &lsm::db, level: u32) -> lsm::Result<()> {
-    match try!(db.merge(level, 4, None)) {
-        Some(seg) => {
-            println!("{}: merged segment: {}", level, seg);
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitMerge(seg));
-        },
-        None => {
-            println!("{}: no merge needed", level);
-        },
-    }
-    Ok(())
-}
-
 pub fn connect(name: &str) -> Result<Box<elmo::StorageConnection>> {
     let conn = try!(base_connect(name).map_err(elmo::wrap_err));
-    try!(merge(&conn, 0).map_err(elmo::wrap_err));
-    try!(merge(&conn, 1).map_err(elmo::wrap_err));
-    try!(merge(&conn, 2).map_err(elmo::wrap_err));
-    try!(merge(&conn, 3).map_err(elmo::wrap_err));
     let c = MyConn {
         conn: conn,
     };
