@@ -708,6 +708,7 @@ impl MyConn {
 
     // TODO this could maybe return an iterator instead of a vec
     fn base_list_indexes(&self, collection_id: Option<u64>) -> Result<Vec<(u64, u64)>> {
+        println!("at: {}:{}", file!(), line!());
         let cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
         let q = 
             match collection_id {
@@ -1484,8 +1485,26 @@ fn base_connect(name: &str) -> lsm::Result<lsm::db> {
     lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS)
 }
 
+fn merge(db: &lsm::db, level: u32) -> lsm::Result<()> {
+    match try!(db.merge(level, 4, None)) {
+        Some(seg) => {
+            println!("{}: merged segment: {}", level, seg);
+            let lck = try!(db.GetWriteLock());
+            try!(lck.commitMerge(seg));
+        },
+        None => {
+            println!("{}: no merge needed", level);
+        },
+    }
+    Ok(())
+}
+
 pub fn connect(name: &str) -> Result<Box<elmo::StorageConnection>> {
     let conn = try!(base_connect(name).map_err(elmo::wrap_err));
+    try!(merge(&conn, 0).map_err(elmo::wrap_err));
+    try!(merge(&conn, 1).map_err(elmo::wrap_err));
+    try!(merge(&conn, 2).map_err(elmo::wrap_err));
+    try!(merge(&conn, 3).map_err(elmo::wrap_err));
     let c = MyConn {
         conn: conn,
     };
