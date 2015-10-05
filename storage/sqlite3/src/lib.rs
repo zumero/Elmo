@@ -840,6 +840,7 @@ impl MyWriter {
     fn base_clear_collection(&self, db: &str, coll: &str) -> Result<bool> {
         match try!(self.myconn.get_collection_options(db, coll)) {
             None => {
+                // TODO base_created_collection checks AGAIN to see if the collection exists
                 let created = try!(self.base_create_collection(db, coll, bson::Document::new()));
                 Ok(created)
             },

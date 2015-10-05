@@ -362,6 +362,7 @@ pub const INDEX_ENTRY: u8 = 40;
 /// key:
 ///     (tag)
 ///     collid (varint)
+///     indexid (varint)
 ///     recid (varint)
 ///     (complete index key)
 /// value:
@@ -947,11 +948,41 @@ impl<'a> MyWriter<'a> {
         Ok(())
     }
 
-    fn delete_by_prefix_tag_and_collection_id(&mut self, tag: u8, collection_id: u64) -> Result<()> {
+    fn delete_by_collection_id_prefix(&mut self, tag: u8, collection_id: u64) -> Result<()> {
         let mut k = vec![];
         k.push(tag);
         push_varint(&mut k, collection_id);
         self.delete_by_prefix(k.into_boxed_slice())
+    }
+
+    fn delete_by_index_id_prefix(&mut self, tag: u8, collection_id: u64, index_id: u64) -> Result<()> {
+        let mut k = vec![];
+        k.push(tag);
+        push_varint(&mut k, collection_id);
+        push_varint(&mut k, index_id);
+        self.delete_by_prefix(k.into_boxed_slice())
+    }
+
+    fn base_clear_collection(&mut self, db: &str, coll: &str) -> Result<bool> {
+        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+        let k = encode_key_name_to_collection_id(db, coll);
+        match try!(get_value_for_key_as_varint(&mut cursor, &k)) {
+            None => {
+                // TODO base_created_collection checks AGAIN to see if the collection exists
+                let (created, _) = try!(self.base_create_collection(db, coll, bson::Document::new()));
+                Ok(created)
+            },
+            Some(collection_id) => {
+                // all of the following tags are followed immediately by the
+                // collection_id, so we can delete by prefix:
+
+                try!(self.delete_by_collection_id_prefix(RECORD, collection_id));
+                try!(self.delete_by_collection_id_prefix(INDEX_ENTRY, collection_id));
+                try!(self.delete_by_collection_id_prefix(RECORD_ID_TO_INDEX_ENTRY, collection_id));
+
+                Ok(false)
+            },
+        }
     }
 
     fn base_drop_collection(&mut self, db: &str, coll: &str) -> Result<bool> {
@@ -965,14 +996,36 @@ impl<'a> MyWriter<'a> {
                 // all of the following tags are followed immediately by the
                 // collection_id, so we can delete by prefix:
 
-                try!(self.delete_by_prefix_tag_and_collection_id(COLLECTION_ID_TO_PROPERTIES, collection_id));
-                try!(self.delete_by_prefix_tag_and_collection_id(NAME_TO_INDEX_ID, collection_id));
-                try!(self.delete_by_prefix_tag_and_collection_id(INDEX_ID_TO_PROPERTIES, collection_id));
-                try!(self.delete_by_prefix_tag_and_collection_id(RECORD, collection_id));
-                try!(self.delete_by_prefix_tag_and_collection_id(INDEX_ENTRY, collection_id));
-                try!(self.delete_by_prefix_tag_and_collection_id(RECORD_ID_TO_INDEX_ENTRY, collection_id));
+                try!(self.delete_by_collection_id_prefix(COLLECTION_ID_TO_PROPERTIES, collection_id));
+                try!(self.delete_by_collection_id_prefix(NAME_TO_INDEX_ID, collection_id));
+                try!(self.delete_by_collection_id_prefix(INDEX_ID_TO_PROPERTIES, collection_id));
+                try!(self.delete_by_collection_id_prefix(RECORD, collection_id));
+                try!(self.delete_by_collection_id_prefix(INDEX_ENTRY, collection_id));
+                try!(self.delete_by_collection_id_prefix(RECORD_ID_TO_INDEX_ENTRY, collection_id));
 
                 Ok(true)
+            },
+        }
+    }
+
+    fn base_drop_index(&mut self, db: &str, coll: &str, name: &str) -> Result<bool> {
+        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+        match try!(get_value_for_key_as_varint(&mut cursor, &encode_key_name_to_collection_id(&db, &coll))) {
+            None => Ok(false),
+            Some(collection_id) => {
+                let k = encode_key_name_to_index_id(collection_id, name);
+                match try!(get_value_for_key_as_varint(&mut cursor, &k)) {
+                    None => Ok(false),
+                    Some(index_id) => {
+                        self.pending.insert(k.into_boxed_slice(), lsm::Blob::Tombstone);
+
+                        try!(self.delete_by_index_id_prefix(INDEX_ID_TO_PROPERTIES, collection_id, index_id));
+                        try!(self.delete_by_index_id_prefix(INDEX_ENTRY, collection_id, index_id));
+                        try!(self.delete_by_index_id_prefix(RECORD_ID_TO_INDEX_ENTRY, collection_id, index_id));
+
+                        Ok(true)
+                    },
+                }
             },
         }
     }
@@ -1166,7 +1219,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
     }
 
     fn drop_collection(&mut self, db: &str, coll: &str) -> Result<bool> {
-        unimplemented!();
+        self.base_drop_collection(db, coll)
     }
 
     fn create_indexes(&mut self, what: Vec<elmo::IndexInfo>) -> Result<Vec<bool>> {
@@ -1178,7 +1231,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
     }
 
     fn drop_index(&mut self, db: &str, coll: &str, name: &str) -> Result<bool> {
-        unimplemented!();
+        self.base_drop_index(db, coll, name)
     }
 
     fn drop_database(&mut self, db: &str) -> Result<bool> {
@@ -1186,7 +1239,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
     }
 
     fn clear_collection(&mut self, db: &str, coll: &str) -> Result<bool> {
-        unimplemented!();
+        self.base_clear_collection(db, coll)
     }
 
 }
