@@ -13,6 +13,7 @@
 /fsharp_lsm/packages/**
 Cargo.lock
 /lsm/target
+/diag_lsm/target
 /misc/target
 /lsm/tmp
 /bson/target
