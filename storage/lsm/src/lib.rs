@@ -90,47 +90,6 @@ struct MyCollectionWriter {
     // TODO might want db and coll names here for caching
     indexes: Vec<MyIndexPrep>,
     collection_id: u64,
-    max_record_id: Option<u64>,
-}
-
-impl MyCollectionWriter {
-    fn use_next_record_id(&mut self, myconn: &MyConn) -> Result<u64> {
-        match self.max_record_id {
-            Some(n) => {
-                let n = n + 1;
-                self.max_record_id = Some(n);
-                Ok(n)
-            },
-            None => {
-                let n = {
-                    let mut cursor = try!(myconn.conn.OpenCursor().map_err(elmo::wrap_err));
-                    // TODO capacity
-                    let mut k = vec![];
-                    k.push(RECORD);
-                    push_varint(&mut k, self.collection_id + 1);
-                    try!(cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
-                    if cursor.IsValid() {
-                        let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
-                        if try!(k.u8_at(0).map_err(elmo::wrap_err)) == RECORD {
-                            let (k_collection_id, record_id) = try!(decode_key_record(&k));
-                            if self.collection_id == k_collection_id {
-                                1 + record_id
-                            } else {
-                                1
-                            }
-                        } else {
-                            1
-                        }
-                    } else {
-                        1
-                    }
-                };
-                self.max_record_id = Some(n);
-                Ok(n)
-            },
-        }
-    }
-
 }
 
 struct MyCollectionReader {
@@ -279,6 +238,7 @@ struct MyWriter<'a> {
     pending: HashMap<Box<[u8]>,lsm::Blob>,
     // TODO cache the collection writer
     max_collection_id: Option<u64>,
+    max_record_id: HashMap<u64, u64>,
 }
 
 struct MyConn {
@@ -885,6 +845,43 @@ impl MyConn {
 }
 
 impl<'a> MyWriter<'a> {
+    fn use_next_record_id(&mut self, collection_id: u64) -> Result<u64> {
+        match self.max_record_id.entry(collection_id) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let n = e.get_mut();
+                *n = *n + 1;
+                Ok(*n)
+            },
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let n = {
+                    let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+                    // TODO capacity
+                    let mut k = vec![];
+                    k.push(RECORD);
+                    push_varint(&mut k, collection_id + 1);
+                    try!(cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
+                    if cursor.IsValid() {
+                        let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
+                        if try!(k.u8_at(0).map_err(elmo::wrap_err)) == RECORD {
+                            let (k_collection_id, record_id) = try!(decode_key_record(&k));
+                            if collection_id == k_collection_id {
+                                1 + record_id
+                            } else {
+                                1
+                            }
+                        } else {
+                            1
+                        }
+                    } else {
+                        1
+                    }
+                };
+                e.insert(n);
+                Ok(n)
+            },
+        }
+    }
+
     fn use_next_collection_id(&mut self, cursor: &mut lsm::LivingCursor) -> Result<u64> {
         match self.max_collection_id {
             Some(n) => {
@@ -919,7 +916,6 @@ impl<'a> MyWriter<'a> {
         let c = MyCollectionWriter {
             indexes: indexes,
             collection_id: collection_id,
-            max_record_id: None,
         };
         Ok(c)
     }
@@ -1225,7 +1221,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
             Some(id) => {
                 let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
                 // TODO maybe we should pass the cursor to get_collection_writer()
-                let mut cw = try!(self.get_collection_writer(db, coll));
+                let cw = try!(self.get_collection_writer(db, coll));
                 let record_id = try!(find_record(&mut cursor, cw.collection_id, &id));
 
                 // TODO capacity
@@ -1248,7 +1244,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
     fn delete(&mut self, db: &str, coll: &str, id: &bson::Value) -> Result<bool> {
         let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
         // TODO maybe we should pass the cursor to get_collection_writer()
-        let mut cw = try!(self.get_collection_writer(db, coll));
+        let cw = try!(self.get_collection_writer(db, coll));
         let record_id = try!(find_record(&mut cursor, cw.collection_id, &id));
 
         // TODO capacity
@@ -1272,13 +1268,13 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
     }
 
     fn insert(&mut self, db: &str, coll: &str, v: &bson::Document) -> Result<()> {
-        let mut cw = try!(self.get_collection_writer(db, coll));
+        let cw = try!(self.get_collection_writer(db, coll));
         // TODO capacity
         let mut k = vec![];
         k.push(RECORD);
         let ba_collection_id = u64_to_boxed_varint(cw.collection_id);
         k.push_all(&ba_collection_id);
-        let record_id = try!(cw.use_next_record_id(&self.myconn));
+        let record_id = try!(self.use_next_record_id(cw.collection_id));
         let ba_record_id = u64_to_boxed_varint(record_id);
         k.push_all(&ba_record_id);
         self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(v.to_bson_array().into_boxed_slice()));
@@ -1437,6 +1433,7 @@ impl elmo::StorageConnection for MyPublicConn {
             tx: tx,
             pending: HashMap::new(),
             max_collection_id: None,
+            max_record_id: HashMap::new(),
         };
         Ok(box w)
     }
