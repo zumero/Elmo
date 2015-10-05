@@ -985,6 +985,86 @@ impl<'a> MyWriter<'a> {
         }
     }
 
+    fn create_index(&mut self, info: elmo::IndexInfo) -> Result<bool> {
+        //println!("create_index: {:?}", info);
+        let (_created, collection_id) = try!(self.base_create_collection(&info.db, &info.coll, bson::Document::new()));
+        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+        let k = encode_key_name_to_index_id(collection_id, &info.name);
+        match try!(get_value_for_key_as_varint(&mut cursor, &k)) {
+            Some(index_id) => {
+                let k = encode_key_index_id_to_properties(collection_id, index_id);
+                let mut index_properties = try!(get_value_for_key_as_bson(&mut cursor, &k)).unwrap_or(bson::Document::new());
+                let name = try!(index_properties.must_remove_string("n"));
+                let spec = try!(index_properties.must_remove_document("s"));
+                let options = try!(index_properties.must_remove_document("o"));
+                if spec != info.spec {
+                    // note that we do not compare the options.
+                    // I think mongo does it this way too.
+                    Err(elmo::Error::Misc(String::from("index already exists with different keys")))
+                } else {
+                    Ok(false)
+                }
+            },
+            None => {
+                // TODO next index id for this collection
+                let index_id = 2;
+                self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(u64_to_boxed_varint(index_id)));
+
+                // now create entries for all the existing records
+
+                let unique = 
+                    match info.options.get("unique") {
+                        Some(&bson::Value::BBoolean(b)) => b,
+                        _ => false,
+                    };
+                let (normspec, weights) = try!(elmo::get_normalized_spec(&info.spec, &info.options));
+
+                let mut k = vec![];
+                k.push(RECORD);
+                push_varint(&mut k, collection_id);
+                let mut cursor = lsm::PrefixCursor::new(cursor, k.into_boxed_slice());
+                try!(cursor.First().map_err(elmo::wrap_err));
+                while cursor.IsValid() {
+                    {
+                        let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
+                        let (_, record_id) = try!(decode_key_record(&k));
+                        let ba_record_id = u64_to_boxed_varint(record_id);
+                        let v = try!(cursor.LiveValueRef().map_err(elmo::wrap_err));
+                        let v = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
+                        let entries = try!(elmo::get_index_entries(&v, &normspec, &weights, &info.options));
+                        let ba_collection_id = u64_to_boxed_varint(collection_id);
+                        let ba_index_id = u64_to_boxed_varint(index_id);
+                        for vals in entries {
+                            try!(self.add_index_entry(&ba_collection_id, &ba_index_id, &ba_record_id, vals, unique));
+                        }
+                    }
+
+                    try!(cursor.Next().map_err(elmo::wrap_err));
+                }
+
+                // now store the index id to properties
+
+                let k = encode_key_index_id_to_properties(collection_id, index_id);
+                let mut properties = bson::Document::new();
+                properties.set_string("n", info.name);
+                properties.set_document("s", info.spec);
+                properties.set_document("o", info.options);
+                self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(properties.to_bson_array().into_boxed_slice()));
+
+                Ok(true)
+            }
+        }
+    }
+
+    fn base_create_indexes(&mut self, what: Vec<elmo::IndexInfo>) -> Result<Vec<bool>> {
+        let mut v = Vec::new();
+        for info in what {
+            let b = try!(self.create_index(info));
+            v.push(b);
+        }
+        Ok(v)
+    }
+
     fn base_drop_collection(&mut self, db: &str, coll: &str) -> Result<bool> {
         let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
         let k = encode_key_name_to_collection_id(db, coll);
@@ -1006,6 +1086,17 @@ impl<'a> MyWriter<'a> {
                 Ok(true)
             },
         }
+    }
+
+    fn base_drop_database(&mut self, db_to_delete: &str) -> Result<bool> {
+        let mut b = false;
+        for (_, db, coll) in try!(self.myconn.base_list_collections()) {
+            if db == db_to_delete {
+                try!(self.base_drop_collection(&db, &coll));
+                b = true;
+            }
+        }
+        Ok(b)
     }
 
     fn base_drop_index(&mut self, db: &str, coll: &str, name: &str) -> Result<bool> {
@@ -1081,6 +1172,35 @@ impl<'a> MyWriter<'a> {
         Ok(())
     }
 
+    fn add_index_entry(&mut self, ba_collection_id: &Box<[u8]>, ba_index_id: &Box<[u8]>, ba_record_id: &Box<[u8]>, vals: Vec<(bson::Value, bool)>, unique: bool) -> Result<()> {
+        let vref = vals.iter().map(|&(ref v,neg)| (v,neg)).collect::<Vec<_>>();
+        let k = bson::Value::encode_multi_for_index(&vref, None);
+        // TODO capacity
+        let mut index_entry = vec![];
+        index_entry.push(INDEX_ENTRY);
+        index_entry.push_all(ba_collection_id);
+        index_entry.push_all(ba_index_id);
+        index_entry.push_all(&k);
+        if !unique {
+            index_entry.push_all(&ba_record_id);
+        }
+
+        // do the backward entry first, because the other one takes ownership
+        let mut backward_entry = vec![];
+        backward_entry.clear();
+        backward_entry.push(RECORD_ID_TO_INDEX_ENTRY);
+        backward_entry.push_all(ba_collection_id);
+        backward_entry.push_all(&ba_index_id);
+        backward_entry.push_all(ba_record_id);
+        backward_entry.push_all(&index_entry);
+        self.pending.insert(backward_entry.into_boxed_slice(), lsm::Blob::Array(box []));
+
+        // now the index entry itself, since ownership is transferred
+        self.pending.insert(index_entry.into_boxed_slice(), lsm::Blob::Array(ba_record_id.clone()));
+
+        Ok(())
+    }
+
     fn update_indexes_insert(&mut self, indexes: &Vec<MyIndexPrep>, ba_collection_id: &Box<[u8]>, ba_record_id: &Box<[u8]>, v: &bson::Document) -> Result<()> {
         for ndx in indexes {
             let entries = try!(elmo::get_index_entries(&v, &ndx.normspec, &ndx.weights, &ndx.options));
@@ -1093,35 +1213,7 @@ impl<'a> MyWriter<'a> {
             // TODO store this in the cache?
             let ba_index_id = u64_to_boxed_varint(ndx.index_id);
             for vals in entries {
-                let vref = vals.iter().map(|&(ref v,neg)| (v,neg)).collect::<Vec<_>>();
-                let k = bson::Value::encode_multi_for_index(&vref, None);
-                // TODO capacity
-                let mut index_entry = vec![];
-                index_entry.push(INDEX_ENTRY);
-                index_entry.push_all(ba_collection_id);
-                push_varint(&mut index_entry, ndx.index_id);
-                push_varint(&mut index_entry, k.len() as u64);
-                index_entry.push_all(&k);
-                if !unique {
-                    index_entry.push_all(&ba_record_id);
-                }
-
-                // TODO maybe the index_id shouldn't go in the backward entry.  
-                // would that make it easier to delete all entries for a given record_id?
-                // but harder to drop an index?
-
-                // do the backward entry first, because the other one takes ownership
-                let mut backward_entry = vec![];
-                backward_entry.clear();
-                backward_entry.push(RECORD_ID_TO_INDEX_ENTRY);
-                backward_entry.push_all(ba_collection_id);
-                backward_entry.push_all(&ba_index_id);
-                backward_entry.push_all(ba_record_id);
-                backward_entry.push_all(&index_entry);
-                self.pending.insert(backward_entry.into_boxed_slice(), lsm::Blob::Array(box []));
-
-                // now the index entry itself, since ownership is transferred
-                self.pending.insert(index_entry.into_boxed_slice(), lsm::Blob::Array(ba_record_id.clone()));
+                try!(self.add_index_entry(ba_collection_id, &ba_index_id, ba_record_id, vals, unique));
             }
         }
         Ok(())
@@ -1223,7 +1315,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
     }
 
     fn create_indexes(&mut self, what: Vec<elmo::IndexInfo>) -> Result<Vec<bool>> {
-        unimplemented!();
+        self.base_create_indexes(what)
     }
 
     fn rename_collection(&mut self, old_name: &str, new_name: &str, drop_target: bool) -> Result<bool> {
@@ -1235,7 +1327,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
     }
 
     fn drop_database(&mut self, db: &str) -> Result<bool> {
-        unimplemented!();
+        self.base_drop_database(db)
     }
 
     fn clear_collection(&mut self, db: &str, coll: &str) -> Result<bool> {
