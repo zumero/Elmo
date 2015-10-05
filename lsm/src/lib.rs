@@ -1266,7 +1266,7 @@ impl<'a> ICursor<'a> for MultiCursor {
                 // the current direction of the multicursor tells us
                 // something about the state of all the others.
 
-                if (self.dir == Direction::FORWARD) {
+                if self.dir == Direction::FORWARD {
                     // this is the happy case.  each cursor is at most
                     // one step away.
 
@@ -2910,7 +2910,7 @@ impl SegmentCursor {
            done: Box<Fn() -> ()>
           ) -> Result<SegmentCursor> {
 
-        // TODO consider not passsing in the path, and instead,
+        // TODO consider not passing in the path, and instead,
         // making the cursor call back to inner.OpenForReading...
         let mut f = try!(OpenOptions::new()
                 .read(true)
