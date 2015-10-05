@@ -289,6 +289,10 @@ struct MyPublicConn {
     myconn: std::rc::Rc<MyConn>,
 }
 
+// TODO should all these value encodings be switching around to have
+// the collid first, before the tag?  drop_collection gets trivial.
+// and the collection gets good locality of storage.
+
 // TODO should we have record ids?  or just have the _id of each record
 // be its actual key?  
 //
@@ -881,13 +885,6 @@ impl MyConn {
 }
 
 impl<'a> MyWriter<'a> {
-    fn pend_next_id(&mut self, tag: u8, val: u64) {
-        let k = box [tag];
-        let v = u64_to_boxed_varint(val);
-        let v = lsm::Blob::Array(v);
-        self.pending.insert(k, v);
-    }
-
     fn use_next_collection_id(&mut self, cursor: &mut lsm::LivingCursor) -> Result<u64> {
         match self.max_collection_id {
             Some(n) => {
