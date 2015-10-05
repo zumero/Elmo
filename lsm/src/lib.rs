@@ -69,6 +69,7 @@ pub enum Blob {
 #[derive(Debug)]
 pub enum Error {
     // TODO remove Misc
+    // TODO change Misc to be a String, like the others
     Misc(&'static str),
 
     // TODO more detail within CorruptFile
@@ -238,14 +239,14 @@ impl<'a> KeyRef<'a> {
                 if i < a.len() {
                     Ok(a[i])
                 } else {
-                    Err(Error::Misc("out of range"))
+                    Err(Error::Misc("u8_at: out of range 1"))
                 }
             },
             &KeyRef::Array(a) => {
                 if i < a.len() {
                     Ok(a[i])
                 } else {
-                    Err(Error::Misc("out of range"))
+                    Err(Error::Misc("u8_at: out of range 2"))
                 }
             },
             &KeyRef::Prefixed(front, back) => {
@@ -256,7 +257,7 @@ impl<'a> KeyRef<'a> {
                     if i < back.len() {
                         Ok(back[i])
                     } else {
-                        Err(Error::Misc("out of range"))
+                        Err(Error::Misc("u8_at: out of range 3"))
                     }
                 }
             },
@@ -313,33 +314,33 @@ impl<'a> KeyRef<'a> {
         }
         match self {
             &KeyRef::Array(a) => {
-                if end < a.len() {
+                if end <= a.len() {
                     let t = try!(func(&a[begin .. end]));
                     Ok(t)
                 } else {
-                    Err(Error::Misc("out of range"))
+                    Err(Error::Misc("map_range: out of range 1"))
                 }
             },
             &KeyRef::Overflowed(ref a) => {
-                if end < a.len() {
+                if end <= a.len() {
                     let t = try!(func(&a[begin .. end]));
                     Ok(t)
                 } else {
-                    Err(Error::Misc("out of range"))
+                    Err(Error::Misc("map_range: out of range 2"))
                 }
             },
             &KeyRef::Prefixed(front, back) => {
-                if end < front.len() {
+                if end <= front.len() {
                     let t = try!(func(&front[begin .. end]));
                     Ok(t)
                 } else if begin >= front.len() {
                     let begin = begin - front.len();
                     let end = end - front.len();
-                    if end < back.len() {
+                    if end <= back.len() {
                         let t = try!(func(&back[begin .. end]));
                         Ok(t)
                     } else {
-                        Err(Error::Misc("out of range"))
+                        Err(Error::Misc("map_range: out of range 3"))
                     }
                 } else {
                     // the range we want is split across the front and back.
@@ -347,12 +348,12 @@ impl<'a> KeyRef<'a> {
                     let mut a = Vec::with_capacity(end - begin);
                     a.push_all(&front[begin .. ]);
                     let end = end - front.len();
-                    if end < back.len() {
+                    if end <= back.len() {
                         a.push_all(&back[0 .. end]);
                         let t = try!(func(&a));
                         Ok(t)
                     } else {
-                        Err(Error::Misc("out of range"))
+                        Err(Error::Misc("map_range: out of range 4"))
                     }
                 }
             },

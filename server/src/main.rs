@@ -33,7 +33,7 @@ extern crate bson;
 
 extern crate elmo;
 
-extern crate elmo_sqlite3;
+extern crate elmo_lsm;
 
 use std::io::Read;
 
@@ -1540,7 +1540,7 @@ pub fn serve(factory: Box<elmo::ConnectionFactory>) {
 }
 
 pub fn main() {
-    let factory = elmo_sqlite3::MyFactory::new(String::from("elmodata.db"));
+    let factory = elmo_lsm::MyFactory::new(String::from("elmodata.lsm"));
     serve(box factory);
 }
 
