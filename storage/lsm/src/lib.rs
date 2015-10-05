@@ -513,6 +513,18 @@ fn lsm_map_to_bson(ba: &[u8]) -> lsm::Result<bson::Document> {
     r
 }
 
+fn find_record(cursor: &mut lsm::LivingCursor, collection_id: u64, id: &bson::Value) -> Result<u64> {
+    let mut k = vec![];
+    k.push(INDEX_ENTRY);
+    push_varint(&mut k, collection_id);
+    push_varint(&mut k, PRIMARY_INDEX_ID);
+    let ba = bson::Value::encode_one_for_index(id, false);
+    k.push_all(&ba);
+    match try!(get_value_for_key_as_varint(cursor, &k)) {
+        Some(record_id) => Ok(record_id),
+        None => return Err(elmo::Error::Misc(String::from("record not found"))),
+    }
+}
 fn get_value_for_key_as_varint(cursor: &mut lsm::LivingCursor, k: &[u8]) -> Result<Option<u64>> {
     try!(cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
     if cursor.IsValid() {
@@ -922,9 +934,10 @@ impl<'a> MyWriter<'a> {
 
     fn update_indexes_delete(&mut self, indexes: &Vec<MyIndexPrep>, ba_collection_id: &Box<[u8]>, ba_record_id: &Box<[u8]>) -> Result<()> {
         for ndx in indexes {
-            // TODO delete all index entries (and their back links) which involve this record_id
+            // TODO delete all index entries (and their back links) which involve this record_id.
             // this *could* be done by simply iterating over all the index entries,
             // unpacking each one, seeing if the record id matches, and remove it if so, etc.
+            // back links make it faster when the index is large.
         }
         Ok(())
     }
@@ -982,13 +995,52 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
         match v.get("_id") {
             None => Err(elmo::Error::Misc(String::from("cannot update without _id"))),
             Some(id) => {
-                unimplemented!();
+                let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+                // TODO maybe we should pass the cursor to get_collection_writer()
+                let mut cw = try!(self.get_collection_writer(db, coll));
+                let record_id = try!(find_record(&mut cursor, cw.collection_id, &id));
+
+                // TODO capacity
+                let mut k = vec![];
+                k.push(RECORD);
+                let ba_collection_id = u64_to_boxed_varint(cw.collection_id);
+                k.push_all(&ba_collection_id);
+                let ba_record_id = u64_to_boxed_varint(record_id);
+                k.push_all(&ba_record_id);
+                self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(v.to_bson_array().into_boxed_slice()));
+
+                try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id));
+                try!(self.update_indexes_insert(&cw.indexes, &ba_collection_id, &ba_record_id, v));
+
+                Ok(())
             },
         }
     }
 
-    fn delete(&mut self, db: &str, coll: &str, v: &bson::Value) -> Result<bool> {
-        unimplemented!();
+    fn delete(&mut self, db: &str, coll: &str, id: &bson::Value) -> Result<bool> {
+        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+        // TODO maybe we should pass the cursor to get_collection_writer()
+        let mut cw = try!(self.get_collection_writer(db, coll));
+        let record_id = try!(find_record(&mut cursor, cw.collection_id, &id));
+
+        // TODO capacity
+        let mut k = vec![];
+        k.push(RECORD);
+        let ba_collection_id = u64_to_boxed_varint(cw.collection_id);
+        k.push_all(&ba_collection_id);
+        let ba_record_id = u64_to_boxed_varint(record_id);
+        k.push_all(&ba_record_id);
+        self.pending.insert(k.into_boxed_slice(), lsm::Blob::Tombstone);
+
+        try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id));
+
+        // TODO ouch.  mongo wants us to return whether we deleted this or not,
+        // but this could be a blind write, which is much faster.
+        // for now, we lie and say true.
+
+        let deleted = true;
+
+        Ok(deleted)
     }
 
     fn insert(&mut self, db: &str, coll: &str, v: &bson::Document) -> Result<()> {

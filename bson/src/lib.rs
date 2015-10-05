@@ -2165,7 +2165,11 @@ impl Value {
         }
     }
 
+    // TODO dislike neg as a bool param
     pub fn encode_one_for_index(v: &Value, neg: bool) -> Vec<u8> {
+        // TODO
+        // I hate that this requires an alloc just so we can do neg
+        // as a second step.
         let mut a = Vec::new();
         v.encode_for_index_into(&mut a);
         if neg {

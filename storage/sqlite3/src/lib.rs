@@ -1012,27 +1012,26 @@ impl elmo::StorageWriter for MyWriter {
                 match try!(cw.find_rowid(&id).map_err(elmo::wrap_err)) {
                     None => Err(elmo::Error::Misc(String::from("update but does not exist"))),
                     Some(rowid) => {
-                                let ba = v.to_bson_array();
-                                cw.update.clear_bindings();
-                                try!(cw.update.bind_blob(1,&ba).map_err(elmo::wrap_err));
-                                try!(cw.update.bind_int64(2, rowid).map_err(elmo::wrap_err));
-                                try!(step_done(&mut cw.update));
-                                try!(verify_changes(&cw.update, 1));
-                                cw.update.reset();
-                                try!(Self::update_indexes_delete(&mut cw.indexes, rowid));
-                                try!(Self::update_indexes_insert(&mut cw.indexes, rowid, &v));
-                                Ok(())
-                            },
+                        let ba = v.to_bson_array();
+                        cw.update.clear_bindings();
+                        try!(cw.update.bind_blob(1,&ba).map_err(elmo::wrap_err));
+                        try!(cw.update.bind_int64(2, rowid).map_err(elmo::wrap_err));
+                        try!(step_done(&mut cw.update));
+                        try!(verify_changes(&cw.update, 1));
+                        cw.update.reset();
+                        try!(Self::update_indexes_delete(&mut cw.indexes, rowid));
+                        try!(Self::update_indexes_insert(&mut cw.indexes, rowid, &v));
+                        Ok(())
+                    },
                 }
             },
         }
     }
 
-    fn delete(&mut self, db: &str, coll: &str, v: &bson::Value) -> Result<bool> {
-        // TODO is v supposed to be the id?
+    fn delete(&mut self, db: &str, coll: &str, id: &bson::Value) -> Result<bool> {
         try!(self.prep_collection_writer(db, coll));
         let mut cw = self.cw.as_mut().unwrap();
-        match try!(cw.find_rowid(&v).map_err(elmo::wrap_err)) {
+        match try!(cw.find_rowid(&id).map_err(elmo::wrap_err)) {
             None => Ok(false),
             Some(rowid) => {
                 cw.delete.clear_bindings();
