@@ -17,10 +17,8 @@
 #![feature(box_syntax)]
 #![feature(associated_consts)]
 #![feature(vec_push_all)]
-#![feature(iter_arith)]
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 
 extern crate bson;
 
@@ -79,7 +77,6 @@ impl From<lsm::Error> for elmo::Error {
 
 struct MyIndexPrep {
     index_id: u64,
-    spec: bson::Document,
     options: bson::Document,
     normspec: Vec<(String,elmo::IndexType)>,
     weights: Option<HashMap<String,i32>>,
@@ -374,7 +371,7 @@ fn decode_key_name_to_collection_id(k: &lsm::KeyRef) -> Result<(String, String)>
     // k[0] must be NAME_TO_COLLECTION_ID
     let cur = 1;
     let (db, cur) = try!(decode_string_from_key(k, cur));
-    let (coll, cur) = try!(decode_string_from_key(k, cur));
+    let (coll, _) = try!(decode_string_from_key(k, cur));
     Ok((db, coll))
 }
 
@@ -382,7 +379,7 @@ fn decode_key_name_to_index_id(k: &lsm::KeyRef) -> Result<(u64, String)> {
     // k[0] must be NAME_TO_INDEX_ID
     let cur = 1;
     let (collection_id, cur) = try!(decode_varint_from_key(k, cur));
-    let (name, cur) = try!(decode_string_from_key(k, cur));
+    let (name, _) = try!(decode_string_from_key(k, cur));
     Ok((collection_id, name))
 }
 
@@ -390,15 +387,25 @@ fn decode_key_record(k: &lsm::KeyRef) -> Result<(u64, u64)> {
     // k[0] must be RECORD
     let cur = 1;
     let (collection_id, cur) = try!(decode_varint_from_key(k, cur));
-    let (record_id, cur) = try!(decode_varint_from_key(k, cur));
+    let (record_id, _) = try!(decode_varint_from_key(k, cur));
     Ok((collection_id, record_id))
 }
 
 fn decode_key_collection_id_to_properties(k: &lsm::KeyRef) -> Result<(u64)> {
     // k[0] must be COLLECTION_ID_TO_PROPERTIES
     let cur = 1;
-    let (collection_id, cur) = try!(decode_varint_from_key(k, cur));
+    let (collection_id, _) = try!(decode_varint_from_key(k, cur));
     Ok(collection_id)
+}
+
+fn decode_key_backlink(k: &lsm::KeyRef) -> Result<(u64, u64, u64, Box<[u8]>)> {
+    // k[0] must be RECORD_ID_TO_INDEX_ENTRY
+    let cur = 1;
+    let (collection_id, cur) = try!(decode_varint_from_key(k, cur));
+    let (index_id, cur) = try!(decode_varint_from_key(k, cur));
+    let (record_id, cur) = try!(decode_varint_from_key(k, cur));
+    let index_entry = try!(k.map_range(cur, k.len(), lsm_map_to_box).map_err(elmo::wrap_err));
+    Ok((collection_id, index_id, record_id, index_entry))
 }
 
 fn push_varint(v: &mut Vec<u8>, n: u64) {
@@ -460,6 +467,14 @@ fn lsm_map_to_varint(ba: &[u8]) -> lsm::Result<u64> {
     let n = misc::varint::read(ba, &mut cur);
     // TODO assert cur used up all of ba?
     Ok(n)
+}
+
+fn lsm_map_to_box(ba: &[u8]) -> lsm::Result<Box<[u8]>> {
+    // TODO capacity
+    let mut k = vec![];
+    k.push_all(ba);
+    let k = k.into_boxed_slice();
+    Ok(k)
 }
 
 fn u64_to_boxed_varint(n: u64) -> Box<[u8]> {
@@ -544,7 +559,7 @@ impl MyConn {
         }
     }
 
-    fn get_reader_text_index_scan(&self, myconn: std::rc::Rc<MyConn>, commit_on_drop: bool, ndx: &elmo::IndexInfo, eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<MyCollectionReader> {
+    fn get_reader_text_index_scan(&self, ndx: &elmo::IndexInfo, eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<MyCollectionReader> {
         unimplemented!();
     }
 
@@ -716,7 +731,7 @@ impl MyConn {
         while cursor.IsValid() {
             let (collection_id, index_id) = {
                 let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
-                let (collection_id, name) = try!(decode_key_name_to_index_id(&k));
+                let (collection_id, _name) = try!(decode_key_name_to_index_id(&k));
 
                 let v = try!(cursor.LiveValueRef().map_err(elmo::wrap_err));
                 let index_id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
@@ -766,13 +781,13 @@ impl MyConn {
         let mut cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
         let indexes = indexes.into_iter().map(
             |(_, index_id)| {
-                // TODO we might want to grab unique and sparse from options now, like:
                 let k = encode_key_index_id_to_properties(collection_id, index_id);
                 let mut index_properties = try!(get_value_for_key_as_bson(&mut cursor, &k)).unwrap_or(bson::Document::new());
                 //let name = try!(index_properties.must_remove_string("n"));
                 let spec = try!(index_properties.must_remove_document("s"));
                 let options = try!(index_properties.must_remove_document("o"));
 
+                // TODO we might want to grab unique and sparse from options now, like:
                 let unique = 
                     match options.get("unique") {
                         Some(&bson::Value::BBoolean(b)) => b,
@@ -787,7 +802,6 @@ impl MyConn {
                 let (normspec, weights) = try!(elmo::get_normalized_spec(&spec, &options));
                 let prep = MyIndexPrep {
                     index_id: index_id,
-                    spec: spec,
                     options: options,
                     normspec: normspec,
                     weights: weights,
@@ -922,7 +936,7 @@ impl<'a> MyWriter<'a> {
 
     fn delete_by_prefix(&mut self, prefix: Box<[u8]>) -> Result<()> {
         // TODO it would be nice if PrefixCursor did not consume its cursor?
-        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+        let cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
 
         // TODO it would be nice if lsm had a "graveyard" delete, a way to do a
         // blind delete by prefix.
@@ -987,9 +1001,9 @@ impl<'a> MyWriter<'a> {
             Some(index_id) => {
                 let k = encode_key_index_id_to_properties(collection_id, index_id);
                 let mut index_properties = try!(get_value_for_key_as_bson(&mut cursor, &k)).unwrap_or(bson::Document::new());
-                let name = try!(index_properties.must_remove_string("n"));
+                //let name = try!(index_properties.must_remove_string("n"));
                 let spec = try!(index_properties.must_remove_document("s"));
-                let options = try!(index_properties.must_remove_document("o"));
+                //let options = try!(index_properties.must_remove_document("o"));
                 if spec != info.spec {
                     // note that we do not compare the options.
                     // I think mongo does it this way too.
@@ -1157,10 +1171,31 @@ impl<'a> MyWriter<'a> {
 
     fn update_indexes_delete(&mut self, indexes: &Vec<MyIndexPrep>, ba_collection_id: &Box<[u8]>, ba_record_id: &Box<[u8]>) -> Result<()> {
         for ndx in indexes {
-            // TODO delete all index entries (and their back links) which involve this record_id.
+            // delete all index entries (and their back links) which involve this record_id.
             // this *could* be done by simply iterating over all the index entries,
             // unpacking each one, seeing if the record id matches, and remove it if so, etc.
-            // back links make it faster when the index is large.
+            // back links make it faster, especially when the index is large.
+
+            let mut backlink_prefix = vec![];
+            backlink_prefix.push(RECORD_ID_TO_INDEX_ENTRY);
+            backlink_prefix.push_all(ba_collection_id);
+            push_varint(&mut backlink_prefix, ndx.index_id);
+            backlink_prefix.push_all(ba_record_id);
+
+            let cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+            let mut cursor = lsm::PrefixCursor::new(cursor, backlink_prefix.into_boxed_slice());
+            try!(cursor.First().map_err(elmo::wrap_err));
+            while cursor.IsValid() {
+                {
+                    let k_backlink = try!(cursor.KeyRef().map_err(elmo::wrap_err));
+                    let (k_collection_id, k_index_id, k_record_id, k_index_entry) = try!(decode_key_backlink(&k_backlink));
+
+                    self.pending.insert(k_backlink.into_boxed_slice(), lsm::Blob::Tombstone);
+                    self.pending.insert(k_index_entry, lsm::Blob::Tombstone);
+                };
+
+                try!(cursor.Next().map_err(elmo::wrap_err));
+            }
         }
         Ok(())
     }
@@ -1179,14 +1214,13 @@ impl<'a> MyWriter<'a> {
         }
 
         // do the backward entry first, because the other one takes ownership
-        let mut backward_entry = vec![];
-        backward_entry.clear();
-        backward_entry.push(RECORD_ID_TO_INDEX_ENTRY);
-        backward_entry.push_all(ba_collection_id);
-        backward_entry.push_all(&ba_index_id);
-        backward_entry.push_all(ba_record_id);
-        backward_entry.push_all(&index_entry);
-        self.pending.insert(backward_entry.into_boxed_slice(), lsm::Blob::Array(box []));
+        let mut backlink = vec![];
+        backlink.push(RECORD_ID_TO_INDEX_ENTRY);
+        backlink.push_all(ba_collection_id);
+        backlink.push_all(&ba_index_id);
+        backlink.push_all(ba_record_id);
+        backlink.push_all(&index_entry);
+        self.pending.insert(backlink.into_boxed_slice(), lsm::Blob::Array(box []));
 
         // now the index entry itself, since ownership is transferred
         self.pending.insert(index_entry.into_boxed_slice(), lsm::Blob::Array(ba_record_id.clone()));
@@ -1361,7 +1395,7 @@ impl elmo::StorageBase for MyReader {
     }
 
     fn get_reader_text_index_scan(&self, ndx: &elmo::IndexInfo, eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
-        let rdr = try!(self.myconn.get_reader_text_index_scan(self.myconn.clone(), false, ndx, eq, terms));
+        let rdr = try!(self.myconn.get_reader_text_index_scan(ndx, eq, terms));
         Ok(box rdr)
     }
 
@@ -1387,7 +1421,7 @@ impl elmo::StorageReader for MyReader {
     }
 
     fn into_reader_text_index_scan(&self, ndx: &elmo::IndexInfo, eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
-        let rdr = try!(self.myconn.get_reader_text_index_scan(self.myconn.clone(), true, ndx, eq, terms));
+        let rdr = try!(self.myconn.get_reader_text_index_scan(ndx, eq, terms));
         Ok(box rdr)
     }
 
@@ -1405,7 +1439,7 @@ impl<'a> elmo::StorageBase for MyWriter<'a> {
     }
 
     fn get_reader_text_index_scan(&self, ndx: &elmo::IndexInfo, eq: elmo::QueryKey, terms: Vec<elmo::TextQueryTerm>) -> Result<Box<Iterator<Item=Result<elmo::Row>> + 'static>> {
-        let rdr = try!(self.myconn.get_reader_text_index_scan(self.myconn.clone(), false, ndx, eq, terms));
+        let rdr = try!(self.myconn.get_reader_text_index_scan(ndx, eq, terms));
         Ok(box rdr)
     }
 
