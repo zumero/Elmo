@@ -726,8 +726,9 @@ impl MyConn {
         Ok(rdr)
     }
 
-    fn base_list_indexes(&self, collection_id: Option<u64>) -> Result<Vec<(u64, elmo::IndexInfo)>> {
-        let cursor1 = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+    // TODO this could maybe return an iterator instead of a vec
+    fn base_list_indexes(&self, collection_id: Option<u64>) -> Result<Vec<(u64, u64)>> {
+        let cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
         let q = 
             match collection_id {
                 Some(collection_id) => {
@@ -743,63 +744,86 @@ impl MyConn {
                     k.into_boxed_slice()
                 },
             };
-        let mut cursor1 = lsm::PrefixCursor::new(cursor1, q);
+        let mut cursor = lsm::PrefixCursor::new(cursor, q);
         let mut a = vec![];
 
-        let mut cursor2 = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
-        try!(cursor1.First().map_err(elmo::wrap_err));
-        while cursor1.IsValid() {
-            let k = try!(cursor1.KeyRef().map_err(elmo::wrap_err));
-            let (collection_id, name) = try!(decode_key_name_to_index_id(&k));
+        try!(cursor.First().map_err(elmo::wrap_err));
+        while cursor.IsValid() {
+            let (collection_id, index_id) = {
+                let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
+                let (collection_id, name) = try!(decode_key_name_to_index_id(&k));
 
-            let k = encode_key_collection_id_to_properties(collection_id);
-            let mut collection_properties = try!(get_value_for_key_as_bson(&mut cursor2, &k)).unwrap_or(bson::Document::new());
-            let db = try!(collection_properties.must_remove_string("d"));
-            let coll = try!(collection_properties.must_remove_string("c"));
-            //let options = try!(collection_properties.must_remove_document("o"));
+                let v = try!(cursor.LiveValueRef().map_err(elmo::wrap_err));
+                let index_id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
 
-            let v = try!(cursor1.LiveValueRef().map_err(elmo::wrap_err));
-            let index_id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
-
-            let k = encode_key_index_id_to_properties(collection_id, index_id);
-            let mut index_properties = try!(get_value_for_key_as_bson(&mut cursor2, &k)).unwrap_or(bson::Document::new());
-            //let name = try!(index_properties.must_remove_string("n"));
-            let spec = try!(index_properties.must_remove_document("s"));
-            let options = try!(index_properties.must_remove_document("o"));
-
-            let info = elmo::IndexInfo {
-                db: String::from(db),
-                coll: String::from(coll),
-                name: String::from(name),
-                spec: spec,
-                options: options,
+                (collection_id, index_id)
             };
-            a.push((index_id, info));
+
+            a.push((collection_id, index_id));
+
+            try!(cursor.Next().map_err(elmo::wrap_err));
         }
         Ok(a)
     }
 
-    fn list_indexes_for_collection(&self, collection_id: u64) -> Result<Vec<MyIndexPrep>> {
-        let indexes = try!(self.base_list_indexes(Some(collection_id)));
+    fn base_list_index_infos(&self, collection_id: Option<u64>) -> Result<Vec<elmo::IndexInfo>> {
+        let indexes = try!(self.base_list_indexes(collection_id));
+        let mut cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
         let indexes = indexes.into_iter().map(
-            |(index_id, info)| {
+            |(collection_id, index_id)| {
+                let k = encode_key_collection_id_to_properties(collection_id);
+                let mut collection_properties = try!(get_value_for_key_as_bson(&mut cursor, &k)).unwrap_or(bson::Document::new());
+                let db = try!(collection_properties.must_remove_string("d"));
+                let coll = try!(collection_properties.must_remove_string("c"));
+                //let options = try!(collection_properties.must_remove_document("o"));
+
+                let k = encode_key_index_id_to_properties(collection_id, index_id);
+                let mut index_properties = try!(get_value_for_key_as_bson(&mut cursor, &k)).unwrap_or(bson::Document::new());
+                let name = try!(index_properties.must_remove_string("n"));
+                let spec = try!(index_properties.must_remove_document("s"));
+                let options = try!(index_properties.must_remove_document("o"));
+
+                let info = elmo::IndexInfo {
+                    db: String::from(db),
+                    coll: String::from(coll),
+                    name: String::from(name),
+                    spec: spec,
+                    options: options,
+                };
+                Ok(info)
+            }).collect::<Result<Vec<_>>>();
+        let indexes = try!(indexes);
+        Ok(indexes)
+    }
+
+    fn list_indexes_for_collection_writer(&self, collection_id: u64) -> Result<Vec<MyIndexPrep>> {
+        let indexes = try!(self.base_list_indexes(Some(collection_id)));
+        let mut cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        let indexes = indexes.into_iter().map(
+            |(_, index_id)| {
                 // TODO we might want to grab unique and sparse from options now, like:
+                let k = encode_key_index_id_to_properties(collection_id, index_id);
+                let mut index_properties = try!(get_value_for_key_as_bson(&mut cursor, &k)).unwrap_or(bson::Document::new());
+                //let name = try!(index_properties.must_remove_string("n"));
+                let spec = try!(index_properties.must_remove_document("s"));
+                let options = try!(index_properties.must_remove_document("o"));
+
                 let unique = 
-                    match info.options.get("unique") {
+                    match options.get("unique") {
                         Some(&bson::Value::BBoolean(b)) => b,
                         _ => false,
                     };
 
                 let sparse = 
-                    match info.options.get("sparse") {
+                    match options.get("sparse") {
                         Some(&bson::Value::BBoolean(b)) => b,
                         _ => false,
                     };
-                let (normspec, weights) = try!(elmo::get_normalized_spec(&info.spec, &info.options));
+                let (normspec, weights) = try!(elmo::get_normalized_spec(&spec, &options));
                 let prep = MyIndexPrep {
                     index_id: index_id,
-                    spec: info.spec,
-                    options: info.options,
+                    spec: spec,
+                    options: options,
                     normspec: normspec,
                     weights: weights,
                 };
@@ -809,23 +833,35 @@ impl MyConn {
         Ok(indexes)
     }
 
-    fn base_list_collections(&self) -> Result<Vec<elmo::CollectionInfo>> {
-        let cursor1 = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
-        let mut cursor1 = lsm::PrefixCursor::new(cursor1, box [NAME_TO_COLLECTION_ID]);
-        let mut cursor2 = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+    // TODO this could maybe return an iterator instead of a vec
+    fn base_list_collections(&self) -> Result<Vec<(u64, String, String)>> {
+        let cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        let mut cursor = lsm::PrefixCursor::new(cursor, box [NAME_TO_COLLECTION_ID]);
         let mut a = vec![];
         // TODO might need to sort by the coll name?  the sqlite version does.
-        try!(cursor1.First().map_err(elmo::wrap_err));
-        while cursor1.IsValid() {
+        try!(cursor.First().map_err(elmo::wrap_err));
+        while cursor.IsValid() {
             {
-                let k = try!(cursor1.KeyRef().map_err(elmo::wrap_err));
+                let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
                 let (db, coll) = try!(decode_key_name_to_collection_id(&k));
 
-                let v = try!(cursor1.LiveValueRef().map_err(elmo::wrap_err));
+                let v = try!(cursor.LiveValueRef().map_err(elmo::wrap_err));
                 let collection_id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
 
+                a.push((collection_id, db, coll));
+            }
+            try!(cursor.Next().map_err(elmo::wrap_err));
+        }
+        Ok(a)
+    }
+
+    fn base_list_collection_infos(&self) -> Result<Vec<elmo::CollectionInfo>> {
+        let collections = try!(self.base_list_collections());
+        let mut cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        let collections = collections.into_iter().map(
+            |(collection_id, db, coll)| {
                 let k = encode_key_collection_id_to_properties(collection_id);
-                let mut collection_properties = try!(get_value_for_key_as_bson(&mut cursor2, &k)).unwrap_or(bson::Document::new());
+                let mut collection_properties = try!(get_value_for_key_as_bson(&mut cursor, &k)).unwrap_or(bson::Document::new());
                 //let db = try!(collection_properties.must_remove_string("d"));
                 //let coll = try!(collection_properties.must_remove_string("c"));
                 let options = try!(collection_properties.must_remove_document("o"));
@@ -835,11 +871,10 @@ impl MyConn {
                     coll: coll,
                     options: options,
                 };
-                a.push(info);
-            }
-            try!(cursor1.Next().map_err(elmo::wrap_err));
-        }
-        Ok(a)
+                Ok(info)
+            }).collect::<Result<Vec<_>>>();
+        let collections = try!(collections);
+        Ok(collections)
     }
 
 }
@@ -882,13 +917,64 @@ impl<'a> MyWriter<'a> {
 
     fn get_collection_writer(&mut self, db: &str, coll: &str) -> Result<MyCollectionWriter> {
         let (_created, collection_id) = try!(self.base_create_collection(db, coll, bson::Document::new()));
-        let indexes = try!(self.myconn.list_indexes_for_collection(collection_id));
+        let indexes = try!(self.myconn.list_indexes_for_collection_writer(collection_id));
         let c = MyCollectionWriter {
             indexes: indexes,
             collection_id: collection_id,
             max_record_id: None,
         };
         Ok(c)
+    }
+
+    fn delete_by_prefix(&mut self, prefix: Box<[u8]>) -> Result<()> {
+        // TODO it would be nice if PrefixCursor did not consume its cursor?
+        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+
+        // TODO it would be nice if lsm had a "graveyard" delete, a way to do a
+        // blind delete by prefix.
+
+        let mut cursor = lsm::PrefixCursor::new(cursor, prefix);
+        try!(cursor.First().map_err(elmo::wrap_err));
+        while cursor.IsValid() {
+            {
+                let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
+                self.pending.insert(k.into_boxed_slice(), lsm::Blob::Tombstone);
+            }
+
+            try!(cursor.Next().map_err(elmo::wrap_err));
+        }
+
+        Ok(())
+    }
+
+    fn delete_by_prefix_tag_and_collection_id(&mut self, tag: u8, collection_id: u64) -> Result<()> {
+        let mut k = vec![];
+        k.push(tag);
+        push_varint(&mut k, collection_id);
+        self.delete_by_prefix(k.into_boxed_slice())
+    }
+
+    fn base_drop_collection(&mut self, db: &str, coll: &str) -> Result<bool> {
+        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+        let k = encode_key_name_to_collection_id(db, coll);
+        match try!(get_value_for_key_as_varint(&mut cursor, &k)) {
+            None => Ok(false),
+            Some(collection_id) => {
+                self.pending.insert(k, lsm::Blob::Tombstone);
+ 
+                // all of the following tags are followed immediately by the
+                // collection_id, so we can delete by prefix:
+
+                try!(self.delete_by_prefix_tag_and_collection_id(COLLECTION_ID_TO_PROPERTIES, collection_id));
+                try!(self.delete_by_prefix_tag_and_collection_id(NAME_TO_INDEX_ID, collection_id));
+                try!(self.delete_by_prefix_tag_and_collection_id(INDEX_ID_TO_PROPERTIES, collection_id));
+                try!(self.delete_by_prefix_tag_and_collection_id(RECORD, collection_id));
+                try!(self.delete_by_prefix_tag_and_collection_id(INDEX_ENTRY, collection_id));
+                try!(self.delete_by_prefix_tag_and_collection_id(RECORD_ID_TO_INDEX_ENTRY, collection_id));
+
+                Ok(true)
+            },
+        }
     }
 
     fn base_create_collection(&mut self, db: &str, coll: &str, options: bson::Document) -> Result<(bool, u64)> {
@@ -1147,13 +1233,11 @@ impl elmo::StorageBase for MyReader {
     }
 
     fn list_collections(&self) -> Result<Vec<elmo::CollectionInfo>> {
-        self.myconn.base_list_collections()
+        self.myconn.base_list_collection_infos()
     }
 
     fn list_indexes(&self) -> Result<Vec<elmo::IndexInfo>> {
-        let a = try!(self.myconn.base_list_indexes(None));
-        let a = a.into_iter().map(|(_,info)| info).collect::<Vec<_>>();
-        Ok(a)
+        self.myconn.base_list_index_infos(None)
     }
 
 }
@@ -1193,13 +1277,11 @@ impl<'a> elmo::StorageBase for MyWriter<'a> {
     }
 
     fn list_collections(&self) -> Result<Vec<elmo::CollectionInfo>> {
-        self.myconn.base_list_collections()
+        self.myconn.base_list_collection_infos()
     }
 
     fn list_indexes(&self) -> Result<Vec<elmo::IndexInfo>> {
-        let a = try!(self.myconn.base_list_indexes(None));
-        let a = a.into_iter().map(|(_,info)| info).collect::<Vec<_>>();
-        Ok(a)
+        self.myconn.base_list_index_infos(None)
     }
 
 }
