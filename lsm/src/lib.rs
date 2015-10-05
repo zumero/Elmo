@@ -744,8 +744,9 @@ pub const DEFAULT_SETTINGS : DbSettings =
         PagesPerBlock : 256,
     };
 
-#[derive(Clone)]
-struct SegmentInfo {
+#[derive(Debug,Clone)]
+// TODO might not want to leave this pub
+pub struct SegmentInfo {
     root : PageNum,
     age : u32,
     // TODO does this grow?  shouldn't it be a boxed array?
@@ -3956,6 +3957,10 @@ impl db {
     pub fn merge(&self, level: u32, min: usize, max: Option<usize>) -> Result<Option<SegmentNum>> {
         InnerPart::merge(&self.inner, level, min, max)
     }
+
+    pub fn list_segments(&self) -> Result<(Vec<SegmentNum>,HashMap<SegmentNum,SegmentInfo>)> {
+        InnerPart::list_segments(&self.inner)
+    }
 }
 
 // TODO this could be generic
@@ -4231,6 +4236,13 @@ impl InnerPart {
         let mc = MultiCursor::Create(clist);
         let lc = LivingCursor::Create(mc);
         Ok(lc)
+    }
+
+    fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<(Vec<SegmentNum>,HashMap<SegmentNum,SegmentInfo>)> {
+        let st = try!(inner.header.lock());
+        let a = st.header.currentState.clone();
+        let b = st.header.segments.clone();
+        Ok((a,b))
     }
 
     fn commitSegments(&self, 
