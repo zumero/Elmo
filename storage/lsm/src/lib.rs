@@ -716,7 +716,7 @@ impl MyConn {
         Ok(rdr)
     }
 
-    fn base_list_indexes(&self, collection_id: Option<u64>) -> Result<Vec<elmo::IndexInfo>> {
+    fn base_list_indexes(&self, collection_id: Option<u64>) -> Result<Vec<(u64, elmo::IndexInfo)>> {
         let csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
         let q = 
             match collection_id {
@@ -762,55 +762,39 @@ impl MyConn {
                 spec: spec,
                 options: options,
             };
-            a.push(info);
+            a.push((index_id, info));
         }
         Ok(a)
     }
 
-    // TODO this function could be implemented in terms of the other one above
     fn list_indexes_for_collection(&self, collection_id: u64) -> Result<Vec<MyIndexPrep>> {
-        let q = encode_key_tag_and_varint(NAME_TO_INDEX_ID, collection_id);
-        let csr = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
-        let csr = lsm::PrefixCursor::new(csr, q.into_boxed_slice());
-        let mut a = vec![];
+        let indexes = try!(self.base_list_indexes(Some(collection_id)));
+        let indexes = indexes.into_iter().map(
+            |(index_id, info)| {
+                // TODO we might want to grab unique and sparse from options now, like:
+                let unique = 
+                    match info.options.get("unique") {
+                        Some(&bson::Value::BBoolean(b)) => b,
+                        _ => false,
+                    };
 
-        while csr.IsValid() {
-            // let k = try!(csr.KeyRef().map_err(elmo::wrap_err));
-            // the name of the index is on the end of this key, but we don't need it
-
-            let v = try!(csr.LiveValueRef().map_err(elmo::wrap_err));
-            let index_id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
-
-            let k = encode_key_index_id_to_properties(collection_id, index_id);
-            let mut index_properties = try!(self.get_value_for_key_as_bson(&k)).unwrap_or(bson::Document::new());
-            //let name = try!(index_properties.must_remove_string("n"));
-            let spec = try!(index_properties.must_remove_document("s"));
-            let options = try!(index_properties.must_remove_document("o"));
-
-            let unique = 
-                match options.get("unique") {
-                    Some(&bson::Value::BBoolean(b)) => b,
-                    _ => false,
+                let sparse = 
+                    match info.options.get("sparse") {
+                        Some(&bson::Value::BBoolean(b)) => b,
+                        _ => false,
+                    };
+                let (normspec, weights) = try!(elmo::get_normalized_spec(&info.spec, &info.options));
+                let prep = MyIndexPrep {
+                    index_id: index_id,
+                    spec: info.spec,
+                    options: info.options,
+                    normspec: normspec,
+                    weights: weights,
                 };
-
-            let sparse = 
-                match options.get("sparse") {
-                    Some(&bson::Value::BBoolean(b)) => b,
-                    _ => false,
-                };
-
-            let (normspec, weights) = try!(elmo::get_normalized_spec(&spec, &options));
-            let info = MyIndexPrep {
-                index_id: index_id,
-                spec: spec,
-                options: options,
-                normspec: normspec,
-                weights: weights,
-            };
-
-            a.push(info);
-        }
-        Ok(a)
+                Ok(prep)
+            }).collect::<Result<Vec<_>>>();
+        let indexes = try!(indexes);
+        Ok(indexes)
     }
 
     fn base_list_collections(&self) -> Result<Vec<elmo::CollectionInfo>> {
@@ -1113,7 +1097,9 @@ impl elmo::StorageBase for MyReader {
     }
 
     fn list_indexes(&self) -> Result<Vec<elmo::IndexInfo>> {
-        self.myconn.base_list_indexes(None)
+        let a = try!(self.myconn.base_list_indexes(None));
+        let a = a.into_iter().map(|(_,info)| info).collect::<Vec<_>>();
+        Ok(a)
     }
 
 }
@@ -1157,7 +1143,9 @@ impl<'a> elmo::StorageBase for MyWriter<'a> {
     }
 
     fn list_indexes(&self) -> Result<Vec<elmo::IndexInfo>> {
-        self.myconn.base_list_indexes(None)
+        let a = try!(self.myconn.base_list_indexes(None));
+        let a = a.into_iter().map(|(_,info)| info).collect::<Vec<_>>();
+        Ok(a)
     }
 
 }
