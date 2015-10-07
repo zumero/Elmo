@@ -4411,6 +4411,17 @@ impl InnerPart {
         Ok(g)
     }
 
+    fn do_merge(inner: &std::sync::Arc<InnerPart>, segs: Vec<SegmentNum>, clist: Vec<SegmentCursor>) -> Result<SegmentNum> {
+        let mut mc = MultiCursor::Create(clist);
+        let mut fs = try!(inner.OpenForWriting());
+        try!(mc.First());
+        let (g,_) = try!(CreateFromSortedSequenceOfKeyValuePairs(&mut fs, &**inner, CursorIterator::new(mc)));
+        //printfn "merged %A to get %A" segs g
+        let mut mergeStuff = try!(inner.mergeStuff.lock());
+        mergeStuff.pendingMerges.insert(g, segs);
+        Ok(g)
+    }
+
     fn merge(inner: &std::sync::Arc<InnerPart>, level: u32, min: usize, max: Option<usize>) -> Result<Option<SegmentNum>> {
         let mrg = {
             let st = try!(inner.header.lock());
@@ -4474,19 +4485,12 @@ impl InnerPart {
             }
         };
 
-        // TODO if something goes wrong after this, the function will exit with
-        // an error but mergeStuff.merging will still contain the segments we are
-        // trying to merge, which will prevent them from EVER being merged.
-
         match mrg {
-            Some((segs,clist)) => {
-                let mut mc = MultiCursor::Create(clist);
-                let mut fs = try!(inner.OpenForWriting());
-                try!(mc.First());
-                let (g,_) = try!(CreateFromSortedSequenceOfKeyValuePairs(&mut fs, &**inner, CursorIterator::new(mc)));
-                //printfn "merged %A to get %A" segs g
-                let mut mergeStuff = try!(inner.mergeStuff.lock());
-                mergeStuff.pendingMerges.insert(g, segs);
+            Some((segs, clist)) => {
+                let g = try!(Self::do_merge(inner, segs, clist));
+                // TODO if something goes wrong here, the function will exit with
+                // an error but mergeStuff.merging will still contain the segments we are
+                // trying to merge, which will prevent them from EVER being merged.
                 Ok(Some(g))
             },
             None => {
