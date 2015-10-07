@@ -1251,6 +1251,18 @@ impl<'a> MyWriter<'a> {
             push_varint(&mut backlink_prefix, ndx.index_id);
             backlink_prefix.push_all(ba_record_id);
 
+            // TODO maybe store all the backlinks for a given record in a single
+            // value?  we could do a SeekRef EQ search instead?  and just one for
+            // all indexes for this record?  but delete of an index would get much
+            // harder.  and add an index would require a lot of extra work to
+            // rewrite all the backlinks, rather than just adding one for the new
+            // index.
+
+            // TODO
+            // maybe we shouldn't have backlinks?  maybe we should just take the record we
+            // are deleting, generate all the index entries from it, and then delete each
+            // one?
+
             let mut cursor = lsm::PrefixCursor::new(&mut self.cursor, backlink_prefix.into_boxed_slice());
             try!(cursor.First().map_err(elmo::wrap_err));
             while cursor.IsValid() {
