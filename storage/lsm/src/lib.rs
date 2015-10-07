@@ -101,18 +101,11 @@ struct MyCollectionReader {
     // TODO need counts here
 }
 
-// TODO LivingCursorBsonValueIterator
-// and PrefixCursorBsonValueIterator 
-// are basically identical.
-
-struct LivingCursorBsonValueIterator {
-    cursor: lsm::LivingCursor,
+struct RangeCursorBsonValueIterator {
+    cursor: lsm::RangeCursor,
 }
 
-// TODO suddenly having First and Next be different doesn't seem like
-// such a good idea.  in ICursor.  so different from Iterator.
-
-impl LivingCursorBsonValueIterator {
+impl RangeCursorBsonValueIterator {
     fn iter_next(&mut self) -> Result<Option<elmo::Row>> {
         if self.cursor.IsValid() {
             let row = {
@@ -134,56 +127,7 @@ impl LivingCursorBsonValueIterator {
     }
 }
 
-impl Iterator for LivingCursorBsonValueIterator {
-    type Item = Result<elmo::Row>;
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.iter_next() {
-            Err(e) => {
-                // TODO will this put us in situations where the iterator just
-                // returns errors forever?
-                return Some(Err(e));
-            },
-            Ok(v) => {
-                match v {
-                    None => {
-                        return None;
-                    },
-                    Some(v) => {
-                        return Some(Ok(v));
-                    }
-                }
-            },
-        }
-    }
-}
-
-struct PrefixCursorBsonValueIterator {
-    cursor: lsm::PrefixCursor,
-}
-
-impl PrefixCursorBsonValueIterator {
-    fn iter_next(&mut self) -> Result<Option<elmo::Row>> {
-        if self.cursor.IsValid() {
-            let row = {
-                let v = try!(self.cursor.LiveValueRef().map_err(elmo::wrap_err));
-                let v = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
-                let v = v.into_value();
-                let row = elmo::Row {
-                    doc: v,
-                    pos: None,
-                    score: None,
-                };
-                row
-            };
-            try!(self.cursor.Next().map_err(elmo::wrap_err));
-            Ok(Some(row))
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-impl Iterator for PrefixCursorBsonValueIterator {
+impl Iterator for RangeCursorBsonValueIterator {
     type Item = Result<elmo::Row>;
     fn next(&mut self) -> Option<Self::Item> {
         match self.iter_next() {
@@ -571,13 +515,24 @@ impl MyConn {
                 Ok(rdr)
             },
             Some(collection_id) => {
-                let mut k = vec![];
-                k.push(RECORD);
-                push_varint(&mut k, collection_id);
-                let mut cursor = lsm::PrefixCursor::new(cursor, k.into_boxed_slice());
+                // TODO vec capacity
+                let mut kmin = vec![];
+                kmin.push(RECORD);
+                push_varint(&mut kmin, collection_id);
+                let kmin = kmin.into_boxed_slice();
+                let min = lsm::Min::new(kmin, lsm::OpGt::GT);
+
+                // TODO vec capacity
+                let mut kmax = vec![];
+                kmax.push(RECORD);
+                push_varint(&mut kmax, collection_id + 1);
+                let kmax = kmax.into_boxed_slice();
+                let max = lsm::Max::new(kmax, lsm::OpLt::LT);
+
+                let mut cursor = lsm::RangeCursor::new(cursor, min, max);
                 try!(cursor.First().map_err(elmo::wrap_err));
                 let seq = 
-                    PrefixCursorBsonValueIterator {
+                    RangeCursorBsonValueIterator {
                         cursor: cursor,
                     };
                 let rdr = 
