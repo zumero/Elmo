@@ -69,8 +69,7 @@ pub enum Blob {
 #[derive(Debug)]
 pub enum Error {
     // TODO remove Misc
-    // TODO change Misc to be a String, like the others
-    Misc(&'static str),
+    Misc(String),
 
     // TODO more detail within CorruptFile
     CorruptFile(&'static str),
@@ -80,10 +79,9 @@ pub enum Error {
 
     CursorNotValid,
     InvalidPageNumber,
-    InvalidPageType,
+    InvalidPageType(u8),
     RootPageNotInSegmentBlockList,
     Poisoned,
-    Whatever(Box<std::error::Error>),
 }
 
 impl std::fmt::Display for Error {
@@ -91,14 +89,13 @@ impl std::fmt::Display for Error {
         match *self {
             Error::Io(ref err) => write!(f, "IO error: {}", err),
             Error::Utf8(ref err) => write!(f, "Utf8 error: {}", err),
-            Error::Misc(s) => write!(f, "Misc error: {}", s),
+            Error::Misc(ref s) => write!(f, "Misc error: {}", s),
             Error::CorruptFile(s) => write!(f, "Corrupt file: {}", s),
             Error::Poisoned => write!(f, "Poisoned"),
             Error::CursorNotValid => write!(f, "Cursor not valid"),
             Error::InvalidPageNumber => write!(f, "Invalid page number"),
-            Error::InvalidPageType => write!(f, "Invalid page type"),
+            Error::InvalidPageType(b) => write!(f, "Invalid page type: {}", b),
             Error::RootPageNotInSegmentBlockList => write!(f, "Root page not in segment block list"),
-            Error::Whatever(ref err) => write!(f, "Other error: {}", err),
         }
     }
 }
@@ -108,14 +105,13 @@ impl std::error::Error for Error {
         match *self {
             Error::Io(ref err) => std::error::Error::description(err),
             Error::Utf8(ref err) => std::error::Error::description(err),
-            Error::Misc(s) => s,
+            Error::Misc(ref s) => s.as_str(),
             Error::CorruptFile(s) => s,
             Error::Poisoned => "poisoned",
             Error::CursorNotValid => "cursor not valid",
             Error::InvalidPageNumber => "invalid page number",
-            Error::InvalidPageType => "invalid page type",
+            Error::InvalidPageType(b) => "invalid page type",
             Error::RootPageNotInSegmentBlockList => "Root page not in segment block list",
-            Error::Whatever(ref err) => std::error::Error::description(&**err),
         }
     }
 
@@ -123,7 +119,7 @@ impl std::error::Error for Error {
 }
 
 pub fn wrap_err<E: std::error::Error + 'static>(err: E) -> Error {
-    Error::Whatever(box err)
+    Error::Misc(format!("{}", err))
 }
 
 impl From<io::Error> for Error {
@@ -153,6 +149,7 @@ pub struct kvp {
     Value : Blob,
 }
 
+#[derive(Debug)]
 struct PendingSegment {
     blockList: Vec<PageBlock>,
     segnum: SegmentNum,
@@ -239,14 +236,14 @@ impl<'a> KeyRef<'a> {
                 if i < a.len() {
                     Ok(a[i])
                 } else {
-                    Err(Error::Misc("u8_at: out of range 1"))
+                    Err(Error::Misc(String::from("u8_at: out of range 1")))
                 }
             },
             &KeyRef::Array(a) => {
                 if i < a.len() {
                     Ok(a[i])
                 } else {
-                    Err(Error::Misc("u8_at: out of range 2"))
+                    Err(Error::Misc(String::from("u8_at: out of range 2")))
                 }
             },
             &KeyRef::Prefixed(front, back) => {
@@ -257,7 +254,7 @@ impl<'a> KeyRef<'a> {
                     if i < back.len() {
                         Ok(back[i])
                     } else {
-                        Err(Error::Misc("u8_at: out of range 3"))
+                        Err(Error::Misc(String::from("u8_at: out of range 3")))
                     }
                 }
             },
@@ -310,7 +307,7 @@ impl<'a> KeyRef<'a> {
     /// then an alloc+copy will be needed.
     pub fn map_range<T, F: Fn(&[u8]) -> Result<T>>(&self, begin: usize, end: usize, func: F) -> Result<T> {
         if end <= begin {
-            return Err(Error::Misc("illegal range"));
+            return Err(Error::Misc(String::from("illegal range")));
         }
         match self {
             &KeyRef::Array(a) => {
@@ -318,7 +315,7 @@ impl<'a> KeyRef<'a> {
                     let t = try!(func(&a[begin .. end]));
                     Ok(t)
                 } else {
-                    Err(Error::Misc("map_range: out of range 1"))
+                    Err(Error::Misc(String::from("map_range: out of range 1")))
                 }
             },
             &KeyRef::Overflowed(ref a) => {
@@ -326,7 +323,7 @@ impl<'a> KeyRef<'a> {
                     let t = try!(func(&a[begin .. end]));
                     Ok(t)
                 } else {
-                    Err(Error::Misc("map_range: out of range 2"))
+                    Err(Error::Misc(String::from("map_range: out of range 2")))
                 }
             },
             &KeyRef::Prefixed(front, back) => {
@@ -340,7 +337,7 @@ impl<'a> KeyRef<'a> {
                         let t = try!(func(&back[begin .. end]));
                         Ok(t)
                     } else {
-                        Err(Error::Misc("map_range: out of range 3"))
+                        Err(Error::Misc(String::from("map_range: out of range 3")))
                     }
                 } else {
                     // the range we want is split across the front and back.
@@ -353,7 +350,7 @@ impl<'a> KeyRef<'a> {
                         let t = try!(func(&a));
                         Ok(t)
                     } else {
-                        Err(Error::Misc("map_range: out of range 4"))
+                        Err(Error::Misc(String::from("map_range: out of range 4")))
                     }
                 }
             },
@@ -515,6 +512,22 @@ impl<'a> LiveValueRef<'a> {
         }
     }
 
+    // dangerous function if len() is big
+    pub fn into_boxed_slice(self) -> Result<Box<[u8]>> {
+        match self {
+            LiveValueRef::Array(a) => {
+                let mut v = Vec::with_capacity(a.len());
+                v.push_all(a);
+                Ok(v.into_boxed_slice())
+            },
+            LiveValueRef::Overflowed(len, mut strm) => {
+                let mut a = Vec::with_capacity(len);
+                try!(strm.read_to_end(&mut a));
+                Ok(a.into_boxed_slice())
+            },
+        }
+    }
+
     /// A LiveValueRef is conceptually just a bunch of bytes, but it can be represented in
     /// two different ways, depending on whether the value in the page was overflowed
     /// or not.  This function accepts a func which is to be applied to the value.
@@ -584,14 +597,18 @@ impl<'a> std::fmt::Debug for ValueRef<'a> {
     }
 }
 
+// TODO consider putting this into a module so we can keep firstPage and lastPage private and
+// expose methods to modify them so that we can assert when they become invalid.
+
 #[derive(Hash,PartialEq,Eq,Copy,Clone,Debug)]
-struct PageBlock {
+pub struct PageBlock {
     firstPage: PageNum,
     lastPage: PageNum,
 }
 
 impl PageBlock {
     fn new(first: PageNum, last: PageNum) -> PageBlock {
+        assert!(first <= last);
         PageBlock { firstPage: first, lastPage: last }
     }
 
@@ -745,14 +762,14 @@ pub const DEFAULT_SETTINGS : DbSettings =
     };
 
 #[derive(Debug,Clone)]
-// TODO might not want to leave this pub
+// TODO might not want to leave this stuff pub
 pub struct SegmentInfo {
-    root : PageNum,
-    age : u32,
+    pub root : PageNum,
+    pub age : u32,
     // TODO does this grow?  shouldn't it be a boxed array?
     // yes, but then derive clone complains.
     // ideally we could just stop cloning this struct.
-    blocks : Vec<PageBlock> 
+    pub blocks : Vec<PageBlock> 
 }
 
 pub mod utils {
@@ -1476,7 +1493,7 @@ impl LivingCursor {
         match try!(self.chain.ValueRef()) {
             ValueRef::Array(a) => Ok(LiveValueRef::Array(a)),
             ValueRef::Overflowed(len, r) => Ok(LiveValueRef::Overflowed(len, r)),
-            ValueRef::Tombstone => Err(Error::Misc("LiveValueRef tombstone TODO unreachable")),
+            ValueRef::Tombstone => Err(Error::Misc(String::from("LiveValueRef tombstone TODO unreachable"))),
         }
     }
 
@@ -1499,18 +1516,19 @@ impl LivingCursor {
     }
 }
 
-#[derive(PartialEq,Copy,Clone)]
+#[derive(PartialEq,Copy,Clone,Debug)]
 pub enum OpLt {
     LT,
     LTE,
 }
 
-#[derive(PartialEq,Copy,Clone)]
+#[derive(PartialEq,Copy,Clone,Debug)]
 pub enum OpGt {
     GT,
     GTE,
 }
 
+#[derive(Debug)]
 pub struct Min {
     k: Box<[u8]>,
     cmp: OpGt,
@@ -1537,6 +1555,7 @@ impl Min {
     }
 }
 
+#[derive(Debug)]
 pub struct Max {
     k: Box<[u8]>,
     cmp: OpLt,
@@ -1565,12 +1584,14 @@ impl Max {
 
 pub struct RangeCursor { 
     chain: LivingCursor,
-    min: Option<Min>,
-    max: Option<Max>,
+    min: Min,
+    max: Max,
 }
 
 impl RangeCursor {
-    pub fn new(ch: LivingCursor, min: Option<Min>, max: Option<Max>) -> RangeCursor {
+    pub fn new(ch: LivingCursor, min: Min, max: Max) -> RangeCursor {
+        //println!("RangeCursor min: {:?}", min);
+        //println!("RangeCursor max: {:?}", max);
         RangeCursor { 
             chain : ch,
             min: min,
@@ -1594,54 +1615,34 @@ impl RangeCursor {
         }
     }
 
-    fn is_min_in_bounds(&self, k: &KeyRef) -> bool {
-        match self.min {
-            Some(ref min) => min.is_in_bounds(k),
-            None => true,
-        }
-    }
-
-    fn is_max_in_bounds(&self, k: &KeyRef) -> bool {
-        match self.max {
-            Some(ref max) => max.is_in_bounds(k),
-            None => true,
-        }
-    }
-
     pub fn IsValid(&self) -> bool {
         self.chain.IsValid() 
             && {
                 let k = self.chain.KeyRef().unwrap();
-                self.is_min_in_bounds(&k) && self.is_max_in_bounds(&k)
+                //println!("bounds checking: {:?}", k);
+                self.min.is_in_bounds(&k) && self.max.is_in_bounds(&k)
             }
     }
 
     pub fn First(&mut self) -> Result<()> {
-        match self.min {
-            Some(ref min) => {
-                // TODO this SeekRef call returns the cmp, right?  don't redo it?
-                try!(self.chain.SeekRef(&KeyRef::for_slice(&min.k), SeekOp::SEEK_GE));
-                let skip =
-                    match min.cmp {
-                        OpGt::GT => {
-                            if self.chain.IsValid() {
-                                let k = try!(self.chain.KeyRef());
-                                k.compare_with(&min.k) == std::cmp::Ordering::Equal
-                            } else {
-                                false
-                            }
-                        },
-                        OpGt::GTE => {
-                            false
-                        },
-                    };
-                if skip {
-                    try!(self.chain.Next());
-                }
-            },
-            None => {
-                try!(self.chain.First());
-            },
+        // TODO this SeekRef call returns the cmp, right?  don't redo it?
+        try!(self.chain.SeekRef(&KeyRef::for_slice(&self.min.k), SeekOp::SEEK_GE));
+        let skip =
+            match self.min.cmp {
+                OpGt::GT => {
+                    if self.chain.IsValid() {
+                        let k = try!(self.chain.KeyRef());
+                        k.compare_with(&self.min.k) == std::cmp::Ordering::Equal
+                    } else {
+                        false
+                    }
+                },
+                OpGt::GTE => {
+                    false
+                },
+            };
+        if skip {
+            try!(self.chain.Next());
         }
         Ok(())
     }
@@ -1813,7 +1814,7 @@ impl PageType {
             1 => Ok(PageType::LEAF_NODE),
             2 => Ok(PageType::PARENT_NODE),
             3 => Ok(PageType::OVERFLOW_NODE),
-            _ => Err(Error::InvalidPageType),
+            _ => Err(Error::InvalidPageType(v)),
         }
     }
 }
@@ -1826,7 +1827,7 @@ mod ValueFlag {
 mod PageFlag {
     pub const FLAG_ROOT_NODE: u8 = 1;
     pub const FLAG_BOUNDARY_NODE: u8 = 2;
-    pub const FLAG_ENDS_ON_BOUNDARY: u8 = 3;
+    pub const FLAG_ENDS_ON_BOUNDARY: u8 = 4;
 }
 
 #[derive(Debug)]
@@ -1848,6 +1849,7 @@ struct ParentState {
 // this enum keeps track of what happened to a key as we
 // processed it.  either we determined that it will fit
 // inline or we wrote it as an overflow.
+#[derive(Debug)]
 enum KeyLocation {
     Inline,
     Overflowed(PageNum),
@@ -1857,11 +1859,12 @@ enum KeyLocation {
 // processed it.  it might have already been overflowed.  if
 // it's going to fit in the page, we still have the data
 // buffer.
+#[derive(Debug)]
 enum ValueLocation {
     Tombstone,
     // when this is a Buffer, this gets ownership of kvp.Value
     Buffer(Box<[u8]>),
-    Overflowed(usize,PageNum),
+    Overflowed(usize, PageNum),
 }
 
 struct LeafPair {
@@ -1889,32 +1892,33 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
     fn writeOverflow<SeekWrite>(startingBlock: PageBlock, 
                                 ba: &mut Read, 
                                 pageManager: &IPages, 
+                                token: &mut PendingSegment,
                                 fs: &mut SeekWrite
-                               ) -> Result<(usize,PageBlock)> where SeekWrite : Seek+Write {
+                               ) -> Result<(usize, PageBlock)> where SeekWrite : Seek+Write {
 
-        fn buildFirstPage(ba: &mut Read, pbFirstOverflow : &mut PageBuilder, pgsz: usize) -> Result<(usize,bool)> {
+        fn buildFirstPage(ba: &mut Read, pbFirstOverflow: &mut PageBuilder, pgsz: usize) -> Result<(usize, bool)> {
             pbFirstOverflow.Reset();
             pbFirstOverflow.PutByte(PageType::OVERFLOW_NODE.to_u8());
             pbFirstOverflow.PutByte(0u8); // starts 0, may be changed later
             let room = pgsz - (2 + SIZE_32);
             // something will be put in lastInt32 later
             let put = try!(pbFirstOverflow.PutStream2(ba, room));
-            Ok((put, put<room))
+            Ok((put, put < room))
         };
 
-        fn buildRegularPage(ba: &mut Read, pbOverflow : &mut PageBuilder, pgsz: usize) -> Result<(usize,bool)> {
+        fn buildRegularPage(ba: &mut Read, pbOverflow: &mut PageBuilder, pgsz: usize) -> Result<(usize, bool)> {
             pbOverflow.Reset();
             let room = pgsz;
             let put = try!(pbOverflow.PutStream2(ba, room));
-            Ok((put, put<room))
+            Ok((put, put < room))
         };
 
-        fn buildBoundaryPage(ba: &mut Read, pbOverflow : &mut PageBuilder, pgsz: usize) -> Result<(usize,bool)> {
+        fn buildBoundaryPage(ba: &mut Read, pbOverflow: &mut PageBuilder, pgsz: usize) -> Result<(usize, bool)> {
             pbOverflow.Reset();
             let room = pgsz - SIZE_32;
             // something will be put in lastInt32 before the page is written
             let put = try!(pbOverflow.PutStream2(ba, room));
-            Ok((put, put<room))
+            Ok((put, put < room))
         }
 
         fn writeRegularPages<SeekWrite>(max: PageNum, 
@@ -1923,19 +1927,19 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                                         fs: &mut SeekWrite, 
                                         ba: &mut Read, 
                                         pgsz: usize
-                                       ) -> Result<(PageNum,usize,bool)> where SeekWrite : Seek+Write {
+                                       ) -> Result<(PageNum, usize, bool)> where SeekWrite : Seek+Write {
             let mut i = 0;
             let mut sofar = sofar;
             loop {
                 if i < max {
                     let (put, finished) = try!(buildRegularPage(ba, pb, pgsz));
-                    if put==0 {
+                    if put == 0 {
                         return Ok((i, sofar, true));
                     } else {
                         sofar = sofar + put;
                         try!(pb.Write(fs));
                         if finished {
-                            return Ok((i+1, sofar, true));
+                            return Ok((i + 1, sofar, true));
                         } else {
                             i = i + 1;
                         }
@@ -1956,7 +1960,7 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                                     pbFirstOverflow: &mut PageBuilder,
                                     pageManager: &IPages,
                                     token: &mut PendingSegment
-                                   ) -> Result<(usize,PageBlock)> where SeekWrite : Seek+Write {
+                                   ) -> Result<(usize, PageBlock)> where SeekWrite : Seek+Write {
             // each trip through this loop will write out one
             // block, starting with the overflow first page,
             // followed by zero-or-more "regular" overflow pages,
@@ -1967,11 +1971,19 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
             // headerless, but it is four bytes smaller.
             let mut loop_sofar = param_sofar;
             let mut loop_firstBlk = param_firstBlk;
+            {
+                let curpage = (try!(fs.seek(SeekFrom::Current(0))) / (pgsz as u64) + 1) as PageNum;
+                assert!(param_firstBlk.firstPage == curpage);
+            }
             loop {
                 let sofar = loop_sofar;
                 let firstBlk = loop_firstBlk;
-                let (putFirst,finished) = try!(buildFirstPage (ba, pbFirstOverflow, pgsz));
-                if putFirst==0 { 
+                {
+                    let mut curpage = (try!(fs.seek(SeekFrom::Current(0))) / (pgsz as u64) + 1) as PageNum;
+                    assert!(firstBlk.firstPage == curpage);
+                }
+                let (putFirst, finished) = try!(buildFirstPage(ba, pbFirstOverflow, pgsz));
+                if putFirst == 0 { 
                     return Ok((sofar, firstBlk));
                 } else {
                     // note that we haven't written the first page yet.  we may have to fix
@@ -1998,8 +2010,10 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                             pbFirstOverflow.SetLastInt32(0); 
                             // offset to last used page in this block, which is this one
                             try!(pbFirstOverflow.Write(fs));
-                            return Ok((sofar, PageBlock::new(firstRegularPageNumber,firstBlk.lastPage)));
+                            return Ok((sofar, PageBlock::new(firstRegularPageNumber, firstBlk.lastPage)));
                         } else {
+                            // skip writing the first page for now
+
                             // we need to write more pages,
                             // until the end of the block,
                             // or the end of the stream, 
@@ -2011,11 +2025,11 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                             // NOT counting the boundary page, and the first page in the block
                             // has already been accounted for, so we're just talking about data pages.
                             let availableBeforeBoundary = 
-                                if firstBlk.lastPage > 0 
-                                    { (firstBlk.lastPage - firstRegularPageNumber) }
-                                else 
-                                    { PageNum::max_value() }
-                                ;
+                                if firstBlk.lastPage > 0 { 
+                                    firstBlk.lastPage - firstRegularPageNumber
+                                } else { 
+                                    PageNum::max_value() 
+                                };
 
                             let (numRegularPages, sofar, finished) = 
                                 try!(writeRegularPages(availableBeforeBoundary, sofar, pbOverflow, fs, ba, pgsz));
@@ -2028,15 +2042,16 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                                 // now reset to the next page in the block
                                 let blk = PageBlock::new(firstRegularPageNumber + numRegularPages, firstBlk.lastPage);
                                 try!(utils::SeekPage(fs, pgsz, blk.firstPage));
-                                return Ok((sofar,blk));
+                                return Ok((sofar, blk));
                             } else {
                                 // we need to write out a regular page except with a
                                 // boundary pointer in it.  and we need to set
                                 // FLAG_ENDS_ON_BOUNDARY on the first
                                 // overflow page in this block.
 
-                                let (putBoundary,finished) = try!(buildBoundaryPage (ba, pbOverflow, pgsz));
-                                if putBoundary==0 {
+                                let (putBoundary, finished) = try!(buildBoundaryPage(ba, pbOverflow, pgsz));
+                                if putBoundary == 0 {
+                                    // oops.  actually, we didn't need to touch the boundary page after all.
                                     // go back and fix the first page
                                     pbFirstOverflow.SetLastInt32(numRegularPages);
                                     try!(utils::SeekPage(fs, pgsz, firstBlk.firstPage));
@@ -2044,8 +2059,9 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
 
                                     // now reset to the next page in the block
                                     let blk = PageBlock::new(firstRegularPageNumber + numRegularPages, firstBlk.lastPage);
+                                    assert!(blk.firstPage == firstBlk.lastPage);
                                     try!(utils::SeekPage(fs, pgsz, firstBlk.lastPage));
-                                    return Ok((sofar,blk));
+                                    return Ok((sofar, blk));
                                 } else {
                                     // write the boundary page
                                     let sofar = sofar + putBoundary;
@@ -2055,7 +2071,7 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
 
                                     // go back and fix the first page
                                     pbFirstOverflow.SetPageFlag(PageFlag::FLAG_ENDS_ON_BOUNDARY);
-                                    pbFirstOverflow.SetLastInt32(numRegularPages + 1);
+                                    pbFirstOverflow.SetLastInt32(numRegularPages + 1); // TODO is this right?
                                     try!(utils::SeekPage(fs, pgsz, firstBlk.firstPage));
                                     try!(pbFirstOverflow.Write(fs));
 
@@ -2065,7 +2081,7 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                                         loop_sofar = sofar;
                                         loop_firstBlk = blk;
                                     } else {
-                                        return Ok((sofar,blk));
+                                        return Ok((sofar, blk));
                                     }
                                 }
                             }
@@ -2076,11 +2092,10 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
         }
 
         let pgsz = pageManager.PageSize();
-        let mut token = try!(pageManager.Begin());
         let mut pbFirstOverflow = PageBuilder::new(pgsz);
         let mut pbOverflow = PageBuilder::new(pgsz);
 
-        writeOneBlock(0, startingBlock, fs, ba, pgsz, &mut pbOverflow, &mut pbFirstOverflow, pageManager, &mut token)
+        writeOneBlock(0, startingBlock, fs, ba, pgsz, &mut pbOverflow, &mut pbFirstOverflow, pageManager, token)
     }
 
     fn writeLeaves<I,SeekWrite>(leavesBlk:PageBlock,
@@ -2129,12 +2144,12 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                     ValueLocation::Tombstone => {
                         pb.PutByte(ValueFlag::FLAG_TOMBSTONE);
                     },
-                    ValueLocation::Buffer (ref vbuf) => {
+                    ValueLocation::Buffer(ref vbuf) => {
                         pb.PutByte(0u8);
                         pb.PutVarint(vbuf.len() as u64);
                         pb.PutArray(&vbuf);
                     },
-                    ValueLocation::Overflowed (vlen,vpage) => {
+                    ValueLocation::Overflowed(vlen, vpage) => {
                         pb.PutByte(ValueFlag::FLAG_OVERFLOW);
                         pb.PutVarint(vlen as u64);
                         pb.PutInt32(vpage);
@@ -2168,18 +2183,23 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
             let thisPageNumber = st.blk.firstPage;
             let firstLeaf = if st.leaves.is_empty() { thisPageNumber } else { st.firstLeaf };
             let nextBlk = 
-                if isRootPage {
-                    PageBlock::new(thisPageNumber + 1, st.blk.lastPage)
-                } else if thisPageNumber == st.blk.lastPage {
-                    pb.SetPageFlag(PageFlag::FLAG_BOUNDARY_NODE);
-                    let newBlk = try!(pageManager.GetBlock(&mut *token));
-                    pb.SetLastInt32(newBlk.firstPage);
-                    newBlk
+                if thisPageNumber == st.blk.lastPage {
+                    if isRootPage {
+                        // TODO we do not need another block
+                        let newBlk = try!(pageManager.GetBlock(&mut *token));
+                        newBlk
+                    } else {
+                        pb.SetPageFlag(PageFlag::FLAG_BOUNDARY_NODE);
+                        let newBlk = try!(pageManager.GetBlock(&mut *token));
+                        pb.SetLastInt32(newBlk.firstPage);
+                        newBlk
+                    }
                 } else {
                     PageBlock::new(thisPageNumber + 1, st.blk.lastPage)
                 };
             try!(pb.Write(fs));
-            if nextBlk.firstPage != (thisPageNumber+1) {
+            if nextBlk.firstPage != (thisPageNumber + 1) {
+                // TODO don't do this seek if isRootPage
                 try!(utils::SeekPage(fs, pgsz, nextBlk.firstPage));
             }
             let pg = pgitem {page:thisPageNumber, key:last_key};
@@ -2270,7 +2290,7 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                     (st.blk, KeyLocation::Inline)
                 } else {
                     let vPage = st.blk.firstPage;
-                    let (_,newBlk) = try!(writeOverflow(st.blk, &mut &*k, pageManager, fs));
+                    let (_,newBlk) = try!(writeOverflow(st.blk, &mut &*k, pageManager, token, fs));
                     (newBlk, KeyLocation::Overflowed(vPage))
                 };
 
@@ -2314,8 +2334,8 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                                     },
                                     Blob::Stream(ref mut strm) => {
                                         let valuePage = blkAfterKey.firstPage;
-                                        let (len,newBlk) = try!(writeOverflow(blkAfterKey, &mut *strm, pageManager, fs));
-                                        (newBlk, ValueLocation::Overflowed(len,valuePage))
+                                        let (len,newBlk) = try!(writeOverflow(blkAfterKey, &mut *strm, pageManager, token, fs));
+                                        (newBlk, ValueLocation::Overflowed(len, valuePage))
                                     },
                                     Blob::Array(a) => {
                                         if a.is_empty() {
@@ -2324,8 +2344,8 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                                         } else {
                                             let valuePage = blkAfterKey.firstPage;
                                             let strm = a; // TODO need a Read for this
-                                            let (len,newBlk) = try!(writeOverflow(blkAfterKey, &mut &*strm, pageManager, fs));
-                                            (newBlk, ValueLocation::Overflowed(len,valuePage))
+                                            let (len,newBlk) = try!(writeOverflow(blkAfterKey, &mut &*strm, pageManager, token, fs));
+                                            (newBlk, ValueLocation::Overflowed(len, valuePage))
                                         }
                                     },
                                 }
@@ -2349,8 +2369,8 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                                             (blkAfterKey, ValueLocation::Buffer(va.into_boxed_slice()))
                                         } else {
                                             let valuePage = blkAfterKey.firstPage;
-                                            let (len,newBlk) = try!(writeOverflow(blkAfterKey, &mut (vbuf.chain(strm)), pageManager, fs));
-                                            (newBlk, ValueLocation::Overflowed (len,valuePage))
+                                            let (len,newBlk) = try!(writeOverflow(blkAfterKey, &mut (vbuf.chain(strm)), pageManager, token, fs));
+                                            (newBlk, ValueLocation::Overflowed (len, valuePage))
                                         }
                                     },
                                     Blob::Array(a) => {
@@ -2358,8 +2378,8 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                                             (blkAfterKey, ValueLocation::Buffer(a))
                                         } else {
                                             let valuePage = blkAfterKey.firstPage;
-                                            let (len,newBlk) = try!(writeOverflow(blkAfterKey, &mut &*a, pageManager, fs));
-                                            (newBlk, ValueLocation::Overflowed(len,valuePage))
+                                            let (len,newBlk) = try!(writeOverflow(blkAfterKey, &mut &*a, pageManager, token, fs));
+                                            (newBlk, ValueLocation::Overflowed(len, valuePage))
                                         }
                                     },
                                 }
@@ -2373,8 +2393,8 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                                 },
                                 Blob::Stream(ref mut strm) => {
                                     let valuePage = blkAfterKey.firstPage;
-                                    let (len,newBlk) = try!(writeOverflow(blkAfterKey, &mut *strm, pageManager, fs));
-                                    (newBlk, ValueLocation::Overflowed(len,valuePage))
+                                    let (len,newBlk) = try!(writeOverflow(blkAfterKey, &mut *strm, pageManager, token, fs));
+                                    (newBlk, ValueLocation::Overflowed(len, valuePage))
                                 },
                                 Blob::Array(a) => {
                                     if a.is_empty() {
@@ -2382,8 +2402,8 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                                         (blkAfterKey, ValueLocation::Buffer(a))
                                     } else {
                                         let valuePage = blkAfterKey.firstPage;
-                                        let (len,newBlk) = try!(writeOverflow(blkAfterKey, &mut &*a, pageManager, fs));
-                                        (newBlk, ValueLocation::Overflowed(len,valuePage))
+                                        let (len,newBlk) = try!(writeOverflow(blkAfterKey, &mut &*a, pageManager, token, fs));
+                                        (newBlk, ValueLocation::Overflowed(len, valuePage))
                                     }
                                 }
                             }
@@ -2542,7 +2562,13 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                     pb.SetPageFlag(PageFlag::FLAG_ROOT_NODE);
                     pb.SetSecondToLastInt32(firstLeaf);
                     pb.SetLastInt32(lastLeaf);
-                    PageBlock::new(thisPageNumber+1,st.blk.lastPage)
+                    if st.blk.firstPage == st.blk.lastPage {
+                        // TODO we do not need another block
+                        let newBlk = try!(pageManager.GetBlock(&mut *token));
+                        newBlk
+                    } else {
+                        PageBlock::new(thisPageNumber + 1, st.blk.lastPage)
+                    }
                 } else {
                     if st.blk.firstPage == st.blk.lastPage {
                         pb.SetPageFlag(PageFlag::FLAG_BOUNDARY_NODE);
@@ -2550,11 +2576,12 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                         pb.SetLastInt32(newBlk.firstPage);
                         newBlk
                     } else {
-                        PageBlock::new(thisPageNumber+1,st.blk.lastPage)
+                        PageBlock::new(thisPageNumber + 1,st.blk.lastPage)
                     }
                 };
             try!(pb.Write(fs));
             if nextBlk.firstPage != (thisPageNumber+1) {
+                // TODO don't do this seek if IsRootNode
                 try!(utils::SeekPage(fs, pgsz, nextBlk.firstPage));
             }
             st.sofar = 0;
@@ -2603,7 +2630,7 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                 st.sofar = st.sofar + neededForInline;
             } else {
                 let keyOverflowFirstPage = st.blk.firstPage;
-                let (_,newBlk) = try!(writeOverflow(st.blk, &mut &*pair.key, pageManager, fs));
+                let (_,newBlk) = try!(writeOverflow(st.blk, &mut &*pair.key, pageManager, token, fs));
                 st.sofar = st.sofar + neededForOverflow;
                 st.blk = newBlk;
                 // items.len() is the index that this pair is about to get, just below
@@ -2759,6 +2786,7 @@ impl myOverflowReadStream {
             self.boundaryPageNumber = self.currentPage;
             self.offsetToLastPageInThisBlock = 0;
             self.countRegularDataPagesInBlock = 0;
+            // TODO I think bytesOnThisPage might be wrong here
         } else {
             self.offsetToLastPageInThisBlock = self.GetLastInt32();
             if self.CheckPageFlag(PageFlag::FLAG_ENDS_ON_BOUNDARY) {
@@ -2942,7 +2970,7 @@ impl SegmentCursor {
         if ! try!(res.setCurrentPage(rootPage)) {
             // TODO fix this error.  or assert, because we previously verified
             // that the root page was in the block list we were given.
-            return Err(Error::Misc("failed to read root page"));
+            return Err(Error::Misc(String::from("failed to read root page")));
         }
         let pt = try!(res.pr.PageType());
         if pt == PageType::LEAF_NODE {
@@ -2954,6 +2982,8 @@ impl SegmentCursor {
             }
             res.firstLeaf = res.pr.GetSecondToLastInt32() as PageNum;
             res.lastLeaf = res.pr.GetLastInt32() as PageNum;
+            assert!(block_list_contains_page(&res.blocks, res.firstLeaf));
+            assert!(block_list_contains_page(&res.blocks, res.lastLeaf));
         } else {
             return Err(Error::CorruptFile("root page has invalid page type"));
         }
@@ -2970,18 +3000,13 @@ impl SegmentCursor {
 
     fn setCurrentPage(&mut self, pgnum: PageNum) -> Result<bool> {
         // TODO use self.blocks to make sure we are not straying out of bounds.
-
-        // TODO so I think this function actually should be Result<()>.
-        // it used to return Ok(false) in situations that I think should
-        // actually have been errors.  not 100% sure yet.  still trying
-        // to verify all the cases.
+        //assert!(block_list_contains_page(&self.blocks, pgnum));
 
         // TODO if currentPage = pgnum already...
         self.currentPage = pgnum;
         self.resetLeaf();
         if 0 == self.currentPage { 
             Err(Error::InvalidPageNumber)
-            //Ok(false)
         } else {
             // refuse to go to a page beyond the end of the stream
             // TODO is this the right place for this check?    
@@ -3589,6 +3614,7 @@ impl PendingSegment {
             // next page, because its page manager happened to give it a block
             // which immediately follows the one it had.
             self.blockList[len-1].lastPage = b.lastPage;
+            assert!(self.blockList[len-1].firstPage <= self.blockList[len-1].lastPage);
         } else {
             self.blockList.push(b);
         }
@@ -3597,12 +3623,20 @@ impl PendingSegment {
     fn End(mut self, lastPage: PageNum) -> (SegmentNum, Vec<PageBlock>, Option<PageBlock>) {
         let len = self.blockList.len();
         let leftovers = {
-            let givenLastPage = self.blockList[len-1].lastPage;
-            if lastPage < givenLastPage {
-                self.blockList[len-1].lastPage = lastPage;
-                Some (PageBlock::new(lastPage+1, givenLastPage))
+            if self.blockList[len-1].contains_page(lastPage) {
+                let givenLastPage = self.blockList[len-1].lastPage;
+                if lastPage < givenLastPage {
+                    self.blockList[len-1].lastPage = lastPage;
+                    assert!(self.blockList[len-1].firstPage <= self.blockList[len-1].lastPage);
+                    Some (PageBlock::new(lastPage+1, givenLastPage))
+                } else {
+                    None
+                }
             } else {
-                None
+                // this is one of those dorky cases where we they asked for a block
+                // and never used any of it.  TODO
+                let blk = self.blockList.pop().unwrap();
+                Some(blk)
             }
         };
         // consume self return blockList
@@ -3768,6 +3802,7 @@ fn invertBlockList(blocks: &Vec<PageBlock>) -> Vec<PageBlock> {
     for i in 0 .. len-1 {
         result[i].firstPage = result[i].lastPage+1;
         result[i].lastPage = result[i+1].firstPage-1;
+        assert!(result[i].firstPage <= result[i].lastPage);
     }
     result.remove(len-1);
     result
@@ -3961,6 +3996,14 @@ impl db {
     pub fn list_segments(&self) -> Result<(Vec<SegmentNum>,HashMap<SegmentNum,SegmentInfo>)> {
         InnerPart::list_segments(&self.inner)
     }
+
+    pub fn list_free_blocks(&self) -> Result<Vec<PageBlock>> {
+        InnerPart::list_free_blocks(&self.inner)
+    }
+
+    pub fn get_page(&self, pgnum: PageNum) -> Result<Box<[u8]>> {
+        InnerPart::get_page(&self.inner, pgnum)
+    }
 }
 
 // TODO this could be generic
@@ -3971,11 +4014,11 @@ fn slice_within(sub: &[SegmentNum], within: &[SegmentNum]) -> Result<usize> {
             if sub == &within[ndx_first .. ndx_first + count] {
                 Ok(ndx_first)
             } else {
-                Err(Error::Misc("not contiguous"))
+                Err(Error::Misc(String::from("not contiguous")))
             }
         },
         None => {
-            Err(Error::Misc("not contiguous"))
+            Err(Error::Misc(String::from("not contiguous")))
         },
     }
 }
@@ -4013,6 +4056,7 @@ impl InnerPart {
                     let blk2 = PageBlock::new(headBlk.firstPage,
                                               headBlk.firstPage+specificSizeInPages-1); 
                     space.freeBlocks[0].firstPage = space.freeBlocks[0].firstPage + specificSizeInPages;
+                    assert!(space.freeBlocks[0].firstPage <= space.freeBlocks[0].lastPage);
                     // TODO problem: the list is probably no longer sorted.  is this okay?
                     // is a re-sort of the list really worth it?
                     blk2
@@ -4201,7 +4245,7 @@ impl InnerPart {
                  g: SegmentNum
                 ) -> Result<SegmentCursor> {
         match st.header.segments.get(&g) {
-            None => Err(Error::Misc("getCursor: segment not found")),
+            None => Err(Error::Misc(String::from("getCursor: segment not found"))),
             Some(seg) => {
                 let rootPage = seg.root;
                 let mut cursors = try!(inner.cursors.lock());
@@ -4236,6 +4280,22 @@ impl InnerPart {
         let mc = MultiCursor::Create(clist);
         let lc = LivingCursor::Create(mc);
         Ok(lc)
+    }
+
+    fn get_page(inner: &std::sync::Arc<InnerPart>, pgnum: PageNum) -> Result<Box<[u8]>> {
+        let mut f = try!(OpenOptions::new()
+                .read(true)
+                .create(true)
+                .open(&inner.path));
+        let mut buf = vec![0; inner.pgsz].into_boxed_slice();
+        try!(utils::SeekPage(&mut f, inner.pgsz, pgnum));
+        try!(misc::io::read_fully(&mut f, &mut buf));
+        Ok(buf)
+    }
+
+    fn list_free_blocks(inner: &std::sync::Arc<InnerPart>) -> Result<Vec<PageBlock>> {
+        let space = try!(inner.space.lock());
+        Ok(space.freeBlocks.clone())
     }
 
     fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<(Vec<SegmentNum>,HashMap<SegmentNum,SegmentInfo>)> {
@@ -4278,7 +4338,7 @@ impl InnerPart {
                     newHeader.segments.insert(*g,info);
                 },
                 None => {
-                    return Err(Error::Misc("commitSegments: segment not found in segmentsInWaiting"));
+                    return Err(Error::Misc(String::from("commitSegments: segment not found in segmentsInWaiting")));
                 },
             }
         }
@@ -4415,6 +4475,11 @@ impl InnerPart {
                 None
             }
         };
+
+        // TODO if something goes wrong after this, the function will exit with
+        // an error but mergeStuff.merging will still contain the segments we are
+        // trying to merge, which will prevent them from EVER being merged.
+
         match mrg {
             Some((segs,clist)) => {
                 let mut mc = MultiCursor::Create(clist);
@@ -4451,7 +4516,7 @@ impl InnerPart {
         let old = {
             let maybe = mergeStuff.pendingMerges.get(&newSegNum);
             if maybe.is_none() {
-                return Err(Error::Misc("commitMerge: segment not found in pendingMerges"));
+                return Err(Error::Misc(String::from("commitMerge: segment not found in pendingMerges")));
             } else {
                 maybe.expect("just checked is_none").clone()
             }
@@ -4489,7 +4554,7 @@ impl InnerPart {
         let mut newSegmentInfo = {
             let maybe = waiting.segmentsInWaiting.get(&newSegNum);
             if maybe.is_none() {
-                return Err(Error::Misc("commitMerge: segment not found in segmentsInWaiting"));
+                return Err(Error::Misc(String::from("commitMerge: segment not found in segmentsInWaiting")));
             } else {
                 maybe.expect("seg not found").clone()
             }
@@ -4572,8 +4637,15 @@ impl IPages for InnerPart {
         Ok(blk)
     }
 
-    fn End(&self, ps:PendingSegment, lastPage: PageNum) -> Result<SegmentNum> {
+    fn End(&self, ps: PendingSegment, lastPage: PageNum) -> Result<SegmentNum> {
         let (g, blocks, leftovers) = ps.End(lastPage);
+        if !block_list_contains_page(&blocks, lastPage) {
+            //println!("RootPageNotInSegmentBlockList");
+            //println!("rootPage: {}", lastPage);
+            //println!("blocks: {:?}", blocks);
+            //println!("leftovers: {:?}", leftovers);
+            return Err(Error::RootPageNotInSegmentBlockList);
+        }
         let info = SegmentInfo {age: 0,blocks:blocks,root:lastPage};
         let mut waiting = try!(self.segmentsInWaiting.lock());
         let mut space = try!(self.space.lock());

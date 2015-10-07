@@ -13,6 +13,9 @@ path = "../bson"
 [dependencies.elmo]
 path = "../elmo"
 
+[dependencies.elmo_sqlite3]
+path = "../storage/sqlite3"
+
 [dependencies.elmo_lsm]
 path = "../storage/lsm"
 

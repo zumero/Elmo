@@ -618,9 +618,21 @@ impl MyConn {
         }
     }
 
-    fn base_list_indexes(&self) -> Result<Vec<elmo::IndexInfo>> {
+    fn base_list_indexes(&self, ns: Option<(&str, &str)>) -> Result<Vec<elmo::IndexInfo>> {
         // TODO DRY this string, above
-        let mut stmt = try!(self.conn.prepare("SELECT ndxName, spec, options, dbName, collName FROM \"indexes\"").map_err(elmo::wrap_err));
+        let mut stmt =
+            match ns {
+                None => {
+                    let stmt = try!(self.conn.prepare("SELECT ndxName, spec, options, dbName, collName FROM \"indexes\"").map_err(elmo::wrap_err));
+                    stmt
+                },
+                Some((db,coll)) => {
+                    let mut stmt = try!(self.conn.prepare("SELECT ndxName, spec, options, dbName, collName FROM \"indexes\" WHERE dbName=? AND collName=?").map_err(elmo::wrap_err));
+                    try!(stmt.bind_text(1, db).map_err(elmo::wrap_err));
+                    try!(stmt.bind_text(2, coll).map_err(elmo::wrap_err));
+                    stmt
+                },
+            };
         let mut v = Vec::new();
         loop {
             match try!(stmt.step().map_err(elmo::wrap_err)) {
@@ -704,10 +716,7 @@ impl MyWriter {
         let stmt_insert = try!(self.myconn.conn.prepare(&format!("INSERT INTO \"{}\" (bson) VALUES (?)", tbl)).map_err(elmo::wrap_err));
         let stmt_delete = try!(self.myconn.conn.prepare(&format!("DELETE FROM \"{}\" WHERE rowid=?", tbl)).map_err(elmo::wrap_err));
         let stmt_update = try!(self.myconn.conn.prepare(&format!("UPDATE \"{}\" SET bson=? WHERE rowid=?", tbl)).map_err(elmo::wrap_err));
-        let indexes = try!(self.myconn.base_list_indexes());
-        let indexes = indexes.into_iter().filter(
-            |ndx| ndx.db == db && ndx.coll == coll
-            ).collect::<Vec<_>>();
+        let indexes = try!(self.myconn.base_list_indexes(Some((db, coll))));
         let mut find_rowid = None;
         for info in &indexes {
             if info.name == "_id_" {
@@ -878,8 +887,7 @@ impl MyWriter {
             Some(_) => {
                 let old_tbl = get_table_name_for_collection(old_db, old_coll);
                 let new_tbl = get_table_name_for_collection(new_db, new_coll);
-                let indexes = try!(self.myconn.base_list_indexes());
-                let indexes = indexes.into_iter().filter(|info| info.db == old_db && info.coll == old_coll ).collect::<Vec<_>>();
+                let indexes = try!(self.myconn.base_list_indexes(Some((old_db, old_coll))));
 
                 let mut stmt = try!(self.myconn.conn.prepare("UPDATE \"collections\" SET dbName=?, collName=? WHERE dbName=? AND collName=?").map_err(elmo::wrap_err));
                 try!(stmt.bind_text(1, new_db).map_err(elmo::wrap_err));
@@ -982,11 +990,9 @@ impl MyWriter {
         match try!(self.myconn.get_collection_options(db, coll)) {
             None => Ok(false),
             Some(_) => {
-                let indexes = try!(self.myconn.base_list_indexes());
+                let indexes = try!(self.myconn.base_list_indexes(Some((db, coll))));
                 for info in indexes {
-                    if info.db == db && info.coll == coll {
-                        try!(self.base_drop_index(&info.db, &info.coll, &info.name));
-                    }
+                    try!(self.base_drop_index(&info.db, &info.coll, &info.name));
                 }
                 let mut stmt = try!(self.myconn.conn.prepare("DELETE FROM \"collections\" WHERE dbName=? AND collName=?").map_err(elmo::wrap_err));
                 try!(stmt.bind_text(1, db).map_err(elmo::wrap_err));
@@ -1183,8 +1189,8 @@ impl elmo::StorageBase for MyReader {
         self.myconn.base_list_collections()
     }
 
-    fn list_indexes(&self) -> Result<Vec<elmo::IndexInfo>> {
-        self.myconn.base_list_indexes()
+    fn list_indexes(&self, ns: Option<(&str, &str)>) -> Result<Vec<elmo::IndexInfo>> {
+        self.myconn.base_list_indexes(ns)
     }
 
 }
@@ -1228,8 +1234,8 @@ impl elmo::StorageBase for MyWriter {
         self.myconn.base_list_collections()
     }
 
-    fn list_indexes(&self) -> Result<Vec<elmo::IndexInfo>> {
-        self.myconn.base_list_indexes()
+    fn list_indexes(&self, ns: Option<(&str, &str)>) -> Result<Vec<elmo::IndexInfo>> {
+        self.myconn.base_list_indexes(ns)
     }
 
 }

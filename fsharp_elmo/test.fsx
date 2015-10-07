@@ -85,6 +85,7 @@ let all_tests = [
     "jstests/core/server9547.js"; // comment in test says that mongo SHOULD be giving the result we are giving
     "jstests/core/elemMatchProjection.js"; // jira server-1013, partial
     
+    (*
     "jstests/core/fts1.js"; // missing info from listIndexes for a text index
     "jstests/core/fts6.js"; // $or
     "jstests/core/fts_blog.js"; // stemming, write vs writing
@@ -104,6 +105,7 @@ let all_tests = [
     "jstests/core/fts_score_sort.js";
     "jstests/core/fts_spanish.js";
     "jstests/aggregation/bugs/server11675.js"; // $text fts?
+    *)
     "jstests/aggregation/bugs/server6125.js"; // sort.  see notes in code.  array sort?  or DBPointer?
     "jstests/aggregation/bugs/server6177.js"; // $project:{ 'x':{ $add:[ 1 ] }, 'x.b':1 } } should fail even when doc is {}, broke on fix of 6185
     "jstests/aggregation/bugs/server6192_server6193.js"; // explain
@@ -187,12 +189,14 @@ let all_tests = [
     "jstests/core/orh.js"; // disallow use of a sparse index on y for query {y:null}
     "jstests/core/null.js"; // disallow use of a sparse index on y for query {y:null}
     "jstests/core/minmax.js"; // min/max query modifier, 2 Compares
+    (*
     "jstests/core/fts2.js";
     "jstests/core/fts3.js";
     "jstests/core/fts4.js";
     "jstests/core/fts5.js";
     "jstests/core/fts_index2.js"; // wildcard
     "jstests/core/fts_partition1.js";
+    *)
     "jstests/aggregation/bugs/strcasecmp.js"; // "fails" because unicode support is more complete
     "jstests/aggregation/bugs/upperlower.js"; // "fails" because unicode support is more complete
     "jstests/core/updatej.js"; // update validation failure terminates the update without modifying subsequent

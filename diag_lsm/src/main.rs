@@ -18,11 +18,45 @@
 
 extern crate lsm;
 
+use lsm::ICursor;
+
+fn dump_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
+    let db = try!(lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let page = try!(db.get_page(pgnum));
+    println!("{:?}", page);
+    Ok(())
+}
+
 fn list_segments(name: &str) -> Result<(),lsm::Error> {
     let db = try!(lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let (segments, infos) = try!(db.list_segments());
-    println!("segments: {:?}", segments);
-    println!("infos: {:?}", infos);
+    for s in segments.iter() {
+        println!("{}: {:?}", s, infos[s]);
+    }
+    Ok(())
+}
+
+fn list_free_blocks(name: &str) -> Result<(),lsm::Error> {
+    let db = try!(lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let blocks = try!(db.list_free_blocks());
+    println!("{:?}", blocks);
+    Ok(())
+}
+
+fn list_keys(name: &str) -> Result<(),lsm::Error> {
+    let db = try!(lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let mut cursor = try!(db.OpenCursor());
+    try!(cursor.First());
+    while cursor.IsValid() {
+        {
+            let k = try!(cursor.KeyRef());
+            println!("k: {:?}", k);
+            let v = try!(cursor.LiveValueRef());
+            println!("v: {:?}", v);
+            let q = try!(v.into_boxed_slice());
+        }
+        try!(cursor.Next());
+    }
     Ok(())
 }
 
@@ -46,17 +80,17 @@ fn result_main() -> Result<(),lsm::Error> {
     let args: Vec<_> = std::env::args().collect();
     println!("args: {:?}", args);
     if args.len() < 2 {
-        return Err(lsm::Error::Misc("no command given"));
+        return Err(lsm::Error::Misc(String::from("no filename given")));
     }
-    let cmd = args[1].as_str();
     if args.len() < 3 {
-        return Err(lsm::Error::Misc("no filename given"));
+        return Err(lsm::Error::Misc(String::from("no command given")));
     }
-    let name = args[2].as_str();
+    let name = args[1].as_str();
+    let cmd = args[2].as_str();
     match cmd {
         "merge" => {
             if args.len() < 5 {
-                return Err(lsm::Error::Misc("too few args"));
+                return Err(lsm::Error::Misc(String::from("too few args")));
             }
             let level = args[3].parse::<u32>().unwrap();
             let min = args[4].parse::<usize>().unwrap();
@@ -67,11 +101,24 @@ fn result_main() -> Result<(),lsm::Error> {
                 merge(name, level, min, Some(max))
             }
         },
+        "dump_page" => {
+            if args.len() < 4 {
+                return Err(lsm::Error::Misc(String::from("too few args")));
+            }
+            let pgnum = args[3].parse::<u32>().unwrap();
+            dump_page(name, pgnum)
+        },
+        "list_keys" => {
+            list_keys(name)
+        },
         "list_segments" => {
             list_segments(name)
         },
+        "list_free_blocks" => {
+            list_free_blocks(name)
+        },
         _ => {
-            Err(lsm::Error::Misc("unknown command"))
+            Err(lsm::Error::Misc(String::from("unknown command")))
         },
     }
 }

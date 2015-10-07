@@ -33,7 +33,7 @@ extern crate bson;
 
 extern crate elmo;
 
-extern crate elmo_lsm;
+extern crate elmo_sqlite3;
 
 use std::io::Read;
 
@@ -610,7 +610,6 @@ impl<'b> Server<'b> {
 
         let was_update = update.is_some();
         let t = try!(self.conn.find_and_modify(db, &coll, filter, sort, remove, update, new, upsert));
-        //println!("result of find_and_modify: {:?}", t);
         let (found,err,changed,upserted,result) = t;
 
         let mut last_error_object = bson::Document::new();
@@ -1149,7 +1148,6 @@ impl<'b> Server<'b> {
                 self.remove_cursors_for_collection(&full_coll);
                 try!(conn2.clear_collection(db, &new_coll_name));
                 let results = try!(conn2.insert_seq(db, &new_coll_name, seq));
-                //println!("OUT results: {:?}", results);
                 let mut errors = Vec::new();
                 for i in 0 .. results.len() {
                     if results[i].is_err() {
@@ -1412,9 +1410,6 @@ impl<'b> Server<'b> {
             Some((ns, conn, mut seq)) => {
                 match Self::do_limit(&ns, &mut seq, req.number_to_return) {
                     Ok((docs, more)) => {
-                        //println!("GetMore: docs = {:?}", docs);
-                        //println!("GetMore: docs.len() = {:?}", docs.len());
-                        //println!("GetMore: more = {:?}", more);
                         if more {
                             // put the cursor back for next time
                             self.cursors.insert(req.cursor_id, (ns, conn, box seq));
@@ -1446,9 +1441,7 @@ impl<'b> Server<'b> {
 
     fn handle_one_message(&mut self, stream: &mut std::net::TcpStream) -> Result<bool> {
         fn send_reply(stream: &mut std::net::TcpStream, resp: Reply) -> Result<bool> {
-            //println!("resp: {:?}", resp);
             let ba = resp.encode();
-            //println!("ba: {:?}", ba);
             let wrote = try!(misc::io::write_fully(stream, &ba));
             if wrote != ba.len() {
                 return Err(Error::Misc(String::from("network write failed")));
@@ -1464,7 +1457,6 @@ impl<'b> Server<'b> {
                 Ok(false)
             },
             Some(ba) => {
-                //println!("{:?}", ba);
                 let msg = try!(parse_request(&ba));
                 //println!("request: {:?}", msg);
                 match msg {
@@ -1540,7 +1532,7 @@ pub fn serve(factory: Box<elmo::ConnectionFactory>) {
 }
 
 pub fn main() {
-    let factory = elmo_lsm::MyFactory::new(String::from("elmodata.lsm"));
+    let factory = elmo_sqlite3::MyFactory::new(String::from("elmodata.sqlite3"));
     serve(box factory);
 }
 

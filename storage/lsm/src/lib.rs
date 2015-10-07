@@ -109,18 +109,24 @@ struct LivingCursorBsonValueIterator {
     cursor: lsm::LivingCursor,
 }
 
+// TODO suddenly having First and Next be different doesn't seem like
+// such a good idea.  in ICursor.  so different from Iterator.
+
 impl LivingCursorBsonValueIterator {
     fn iter_next(&mut self) -> Result<Option<elmo::Row>> {
-        try!(self.cursor.Next().map_err(elmo::wrap_err));
         if self.cursor.IsValid() {
-            let v = try!(self.cursor.LiveValueRef().map_err(elmo::wrap_err));
-            let v = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
-            let v = v.into_value();
-            let row = elmo::Row {
-                doc: v,
-                pos: None,
-                score: None,
+            let row = {
+                let v = try!(self.cursor.LiveValueRef().map_err(elmo::wrap_err));
+                let v = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
+                let v = v.into_value();
+                let row = elmo::Row {
+                    doc: v,
+                    pos: None,
+                    score: None,
+                };
+                row
             };
+            try!(self.cursor.Next().map_err(elmo::wrap_err));
             Ok(Some(row))
         } else {
             Ok(None)
@@ -133,6 +139,8 @@ impl Iterator for LivingCursorBsonValueIterator {
     fn next(&mut self) -> Option<Self::Item> {
         match self.iter_next() {
             Err(e) => {
+                // TODO will this put us in situations where the iterator just
+                // returns errors forever?
                 return Some(Err(e));
             },
             Ok(v) => {
@@ -155,16 +163,19 @@ struct PrefixCursorBsonValueIterator {
 
 impl PrefixCursorBsonValueIterator {
     fn iter_next(&mut self) -> Result<Option<elmo::Row>> {
-        try!(self.cursor.Next().map_err(elmo::wrap_err));
         if self.cursor.IsValid() {
-            let v = try!(self.cursor.LiveValueRef().map_err(elmo::wrap_err));
-            let v = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
-            let v = v.into_value();
-            let row = elmo::Row {
-                doc: v,
-                pos: None,
-                score: None,
+            let row = {
+                let v = try!(self.cursor.LiveValueRef().map_err(elmo::wrap_err));
+                let v = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
+                let v = v.into_value();
+                let row = elmo::Row {
+                    doc: v,
+                    pos: None,
+                    score: None,
+                };
+                row
             };
+            try!(self.cursor.Next().map_err(elmo::wrap_err));
             Ok(Some(row))
         } else {
             Ok(None)
@@ -177,6 +188,8 @@ impl Iterator for PrefixCursorBsonValueIterator {
     fn next(&mut self) -> Option<Self::Item> {
         match self.iter_next() {
             Err(e) => {
+                // TODO will this put us in situations where the iterator just
+                // returns errors forever?
                 return Some(Err(e));
             },
             Ok(v) => {
@@ -199,10 +212,14 @@ struct RangeCursorVarintIterator {
 
 impl RangeCursorVarintIterator {
     fn iter_next(&mut self) -> Result<Option<u64>> {
-        try!(self.cursor.Next().map_err(elmo::wrap_err));
         if self.cursor.IsValid() {
-            let v = try!(self.cursor.LiveValueRef().map_err(elmo::wrap_err));
-            let v = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
+            let v = {
+                let v = try!(self.cursor.LiveValueRef().map_err(elmo::wrap_err));
+                //println!("got {:?}", v);
+                let v = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
+                v
+            };
+            try!(self.cursor.Next().map_err(elmo::wrap_err));
             Ok(Some(v))
         } else {
             Ok(None)
@@ -215,6 +232,8 @@ impl Iterator for RangeCursorVarintIterator {
     fn next(&mut self) -> Option<Self::Item> {
         match self.iter_next() {
             Err(e) => {
+                // TODO will this put us in situations where the iterator just
+                // returns errors forever?
                 return Some(Err(e));
             },
             Ok(v) => {
@@ -404,6 +423,14 @@ fn decode_key_collection_id_to_properties(k: &lsm::KeyRef) -> Result<(u64)> {
     Ok(collection_id)
 }
 
+fn decode_key_index_id_to_properties(k: &lsm::KeyRef) -> Result<(u64, u64)> {
+    // k[0] must be INDEX_ID_TO_PROPERTIES
+    let cur = 1;
+    let (collection_id, cur) = try!(decode_varint_from_key(k, cur));
+    let (index_id, _) = try!(decode_varint_from_key(k, cur));
+    Ok((collection_id, index_id))
+}
+
 fn decode_key_backlink(k: &lsm::KeyRef) -> Result<(u64, u64, u64, Box<[u8]>)> {
     // k[0] must be RECORD_ID_TO_INDEX_ENTRY
     let cur = 1;
@@ -499,17 +526,14 @@ fn lsm_map_to_bson(ba: &[u8]) -> lsm::Result<bson::Document> {
     r
 }
 
-fn find_record(cursor: &mut lsm::LivingCursor, collection_id: u64, id: &bson::Value) -> Result<u64> {
+fn find_record(cursor: &mut lsm::LivingCursor, collection_id: u64, id: &bson::Value) -> Result<Option<u64>> {
     let mut k = vec![];
     k.push(INDEX_ENTRY);
     push_varint(&mut k, collection_id);
     push_varint(&mut k, PRIMARY_INDEX_ID);
     let ba = bson::Value::encode_one_for_index(id, false);
     k.push_all(&ba);
-    match try!(get_value_for_key_as_varint(cursor, &k)) {
-        Some(record_id) => Ok(record_id),
-        None => return Err(elmo::Error::Misc(String::from("record not found"))),
-    }
+    get_value_for_key_as_varint(cursor, &k)
 }
 fn get_value_for_key_as_varint(cursor: &mut lsm::LivingCursor, k: &[u8]) -> Result<Option<u64>> {
     try!(cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
@@ -604,7 +628,7 @@ impl MyConn {
         fn f_twok(cursor: lsm::LivingCursor, kmin: Box<[u8]>, kmax: Box<[u8]>, min_cmp: lsm::OpGt, max_cmp: lsm::OpLt) -> lsm::RangeCursor {
             let min = lsm::Min::new(kmin, min_cmp);
             let max = lsm::Max::new(kmax, max_cmp);
-            let cursor = lsm::RangeCursor::new(cursor, Some(min), Some(max));
+            let cursor = lsm::RangeCursor::new(cursor, min, max);
             cursor
         }
 
@@ -623,7 +647,12 @@ impl MyConn {
             bson::Value::push_encode_multi_for_index(&mut kmin, &vals, None);
             let kmin = kmin.into_boxed_slice();
             let min = lsm::Min::new(kmin, min_cmp);
-            let cursor = lsm::RangeCursor::new(cursor, Some(min), None);
+
+            let kmax = add_one(&preface);
+            let kmax = kmax.into_boxed_slice();
+            let max = lsm::Max::new(kmax, lsm::OpLt::LT);
+
+            let cursor = lsm::RangeCursor::new(cursor, min, max);
             cursor
         }
 
@@ -632,7 +661,12 @@ impl MyConn {
             bson::Value::push_encode_multi_for_index(&mut kmax, &vals, None);
             let kmax = kmax.into_boxed_slice();
             let max = lsm::Max::new(kmax, max_cmp);
-            let cursor = lsm::RangeCursor::new(cursor, None, Some(max));
+
+            let kmin = preface.clone();
+            let kmin = kmin.into_boxed_slice();
+            let min = lsm::Min::new(kmin, lsm::OpGt::GT);
+
+            let cursor = lsm::RangeCursor::new(cursor, min, max);
             cursor
         }
 
@@ -713,20 +747,20 @@ impl MyConn {
     }
 
     // TODO this could maybe return an iterator instead of a vec
-    fn base_list_indexes(&self, collection_id: Option<u64>) -> Result<Vec<(u64, u64)>> {
+    fn base_list_indexes(&self, collection_id: Option<u64>) -> Result<Vec<(u64, u64, bson::Document)>> {
         let cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
         let q = 
             match collection_id {
                 Some(collection_id) => {
                     // TODO capacity
                     let mut k = vec![];
-                    k.push(NAME_TO_INDEX_ID);
+                    k.push(INDEX_ID_TO_PROPERTIES);
                     push_varint(&mut k, collection_id);
                     k.into_boxed_slice()
                 },
                 None => {
                     // TODO the vec! macro set capacity to match?
-                    let k = vec![NAME_TO_INDEX_ID];
+                    let k = vec![INDEX_ID_TO_PROPERTIES];
                     k.into_boxed_slice()
                 },
             };
@@ -735,36 +769,37 @@ impl MyConn {
 
         try!(cursor.First().map_err(elmo::wrap_err));
         while cursor.IsValid() {
-            let (collection_id, index_id) = {
+            let (collection_id, index_id, props) = {
                 let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
-                let (collection_id, _name) = try!(decode_key_name_to_index_id(&k));
+                let (collection_id, index_id) = try!(decode_key_index_id_to_properties(&k));
 
                 let v = try!(cursor.LiveValueRef().map_err(elmo::wrap_err));
-                let index_id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
+                let props = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
 
-                (collection_id, index_id)
+                (collection_id, index_id, props)
             };
 
-            a.push((collection_id, index_id));
+            a.push((collection_id, index_id, props));
 
             try!(cursor.Next().map_err(elmo::wrap_err));
         }
         Ok(a)
     }
 
-    fn base_list_index_infos(&self, collection_id: Option<u64>) -> Result<Vec<elmo::IndexInfo>> {
-        let indexes = try!(self.base_list_indexes(collection_id));
+    fn list_all_index_infos(&self) -> Result<Vec<elmo::IndexInfo>> {
+        let indexes = try!(self.base_list_indexes(None));
         let mut cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
         let indexes = indexes.into_iter().map(
-            |(collection_id, index_id)| {
+            |(collection_id, index_id, mut index_properties)| {
+                // TODO the extra lookup here is pretty expensive.
+                // maybe we should just store the db/coll names here too?
+
                 let k = encode_key_collection_id_to_properties(collection_id);
                 let mut collection_properties = try!(get_value_for_key_as_bson(&mut cursor, &k)).unwrap_or(bson::Document::new());
                 let db = try!(collection_properties.must_remove_string("d"));
                 let coll = try!(collection_properties.must_remove_string("c"));
                 //let options = try!(collection_properties.must_remove_document("o"));
 
-                let k = encode_key_index_id_to_properties(collection_id, index_id);
-                let mut index_properties = try!(get_value_for_key_as_bson(&mut cursor, &k)).unwrap_or(bson::Document::new());
                 let name = try!(index_properties.must_remove_string("n"));
                 let spec = try!(index_properties.must_remove_document("s"));
                 let options = try!(index_properties.must_remove_document("o"));
@@ -782,40 +817,34 @@ impl MyConn {
         Ok(indexes)
     }
 
-    fn list_indexes_for_collection_writer(&self, collection_id: u64) -> Result<Vec<MyIndexPrep>> {
-        let indexes = try!(self.base_list_indexes(Some(collection_id)));
+    fn list_index_infos_for_collection(&self, db: &str, coll: &str) -> Result<Vec<elmo::IndexInfo>> {
         let mut cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
-        let indexes = indexes.into_iter().map(
-            |(_, index_id)| {
-                let k = encode_key_index_id_to_properties(collection_id, index_id);
-                let mut index_properties = try!(get_value_for_key_as_bson(&mut cursor, &k)).unwrap_or(bson::Document::new());
-                //let name = try!(index_properties.must_remove_string("n"));
-                let spec = try!(index_properties.must_remove_document("s"));
-                let options = try!(index_properties.must_remove_document("o"));
+        let k = encode_key_name_to_collection_id(db, coll);
+        match try!(get_value_for_key_as_varint(&mut cursor, &k)) {
+            None => {
+                Ok(vec![])
+            },
+            Some(collection_id) => {
+                let indexes = try!(self.base_list_indexes(Some(collection_id)));
+                let indexes = indexes.into_iter().map(
+                    |(collection_id, index_id, mut index_properties)| {
+                        let name = try!(index_properties.must_remove_string("n"));
+                        let spec = try!(index_properties.must_remove_document("s"));
+                        let options = try!(index_properties.must_remove_document("o"));
 
-                // TODO we might want to grab unique and sparse from options now, like:
-                let unique = 
-                    match options.get("unique") {
-                        Some(&bson::Value::BBoolean(b)) => b,
-                        _ => false,
-                    };
-
-                let sparse = 
-                    match options.get("sparse") {
-                        Some(&bson::Value::BBoolean(b)) => b,
-                        _ => false,
-                    };
-                let (normspec, weights) = try!(elmo::get_normalized_spec(&spec, &options));
-                let prep = MyIndexPrep {
-                    index_id: index_id,
-                    options: options,
-                    normspec: normspec,
-                    weights: weights,
-                };
-                Ok(prep)
-            }).collect::<Result<Vec<_>>>();
-        let indexes = try!(indexes);
-        Ok(indexes)
+                        let info = elmo::IndexInfo {
+                            db: String::from(db),
+                            coll: String::from(coll),
+                            name: String::from(name),
+                            spec: spec,
+                            options: options,
+                        };
+                        Ok(info)
+                    }).collect::<Result<Vec<_>>>();
+                let indexes = try!(indexes);
+                Ok(indexes)
+            }
+        }
     }
 
     // TODO this could maybe return an iterator instead of a vec
@@ -930,9 +959,63 @@ impl<'a> MyWriter<'a> {
         }
     }
 
+    fn list_indexes_for_collection_writer(&self, collection_id: u64) -> Result<Vec<MyIndexPrep>> {
+        let indexes = try!(self.myconn.base_list_indexes(Some(collection_id)));
+        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+        let indexes = indexes.into_iter().map(
+            |(_, index_id, mut index_properties)| {
+                //let name = try!(index_properties.must_remove_string("n"));
+                let spec = try!(index_properties.must_remove_document("s"));
+                let options = try!(index_properties.must_remove_document("o"));
+
+                // TODO we might want to grab unique and sparse from options now, like:
+                let unique = 
+                    match options.get("unique") {
+                        Some(&bson::Value::BBoolean(b)) => b,
+                        _ => false,
+                    };
+
+                let sparse = 
+                    match options.get("sparse") {
+                        Some(&bson::Value::BBoolean(b)) => b,
+                        _ => false,
+                    };
+                let (normspec, weights) = try!(elmo::get_normalized_spec(&spec, &options));
+                let prep = MyIndexPrep {
+                    index_id: index_id,
+                    options: options,
+                    normspec: normspec,
+                    weights: weights,
+                };
+                Ok(prep)
+            }).collect::<Result<Vec<_>>>();
+        let indexes = try!(indexes);
+        Ok(indexes)
+    }
+
     fn make_collection_writer(&mut self, db: &str, coll: &str) -> Result<MyCollectionWriter> {
-        let (_created, collection_id) = try!(self.base_create_collection(db, coll, bson::Document::new()));
-        let indexes = try!(self.myconn.list_indexes_for_collection_writer(collection_id));
+        let (just_created, collection_id) = try!(self.base_create_collection(db, coll, bson::Document::new()));
+        let indexes = {
+            // TODO
+            // if the collection was just created, there will be no indexes found
+            // think of the following as a temporary hack.
+            // we currently have no way of including anything written during the
+            // current transaction in queries.
+            if just_created {
+                let spec = bson::Document {pairs: vec![(String::from("_id"), bson::Value::BInt32(1))]};
+                let options = bson::Document {pairs: vec![(String::from("unique"), bson::Value::BBoolean(true))]};
+                let (normspec, weights) = try!(elmo::get_normalized_spec(&spec, &options));
+                let prep = MyIndexPrep {
+                    index_id: PRIMARY_INDEX_ID,
+                    options: options,
+                    normspec: normspec,
+                    weights: weights,
+                };
+                vec![prep]
+            } else {
+                try!(self.list_indexes_for_collection_writer(collection_id))
+            }
+        };
         let c = MyCollectionWriter {
             db: String::from(db),
             coll: String::from(coll),
@@ -1219,6 +1302,9 @@ impl<'a> MyWriter<'a> {
             push_varint(&mut backlink_prefix, ndx.index_id);
             backlink_prefix.push_all(ba_record_id);
 
+            // TODO opening a cursor here is darn expensive.  we need PrefixCursor to know
+            // how to not own its subcursor.
+
             let cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
             let mut cursor = lsm::PrefixCursor::new(cursor, backlink_prefix.into_boxed_slice());
             try!(cursor.First().map_err(elmo::wrap_err));
@@ -1259,6 +1345,8 @@ impl<'a> MyWriter<'a> {
         backlink.push_all(&index_entry);
         self.pending.insert(backlink.into_boxed_slice(), lsm::Blob::Array(box []));
 
+        //println!("adding index entry: {:?}", index_entry);
+
         // now the index entry itself, since ownership is transferred
         self.pending.insert(index_entry.into_boxed_slice(), lsm::Blob::Array(ba_record_id.clone()));
 
@@ -1284,7 +1372,12 @@ impl<'a> MyWriter<'a> {
     }
 
     fn merge(&self, level: u32) -> Result<bool> {
-        match try!(self.myconn.conn.merge(level, 4, Some(32)).map_err(elmo::wrap_err)) {
+        let r = self.myconn.conn.merge(level, 4, Some(32)).map_err(elmo::wrap_err);
+        if r.is_err() {
+            println!("from merge: {:?}", r);
+        }
+        let r = try!(r);
+        match r {
             Some(seg) => {
                 //println!("{}: merged segment: {}", level, seg);
                 try!(self.tx.commitMerge(seg).map_err(elmo::wrap_err));
@@ -1292,6 +1385,17 @@ impl<'a> MyWriter<'a> {
             },
             None => {
                 //println!("{}: no merge needed", level);
+                {
+                    let (segments, infos) = try!(self.myconn.conn.list_segments().map_err(elmo::wrap_err));
+                    let count = segments.iter().filter(|s| infos[*s].age == level).count();
+                    if count > 4 {
+                        println!("    found {} segments in level {}", count, level);
+                        for s in segments.iter() {
+                            println!("{}: {:?}", s, infos[s]);
+                        }
+                        panic!();
+                    }
+                }
                 Ok(false)
             },
         }
@@ -1299,8 +1403,15 @@ impl<'a> MyWriter<'a> {
 
     fn automerge(&self) -> Result<()> {
         for i in 0 .. 100 {
-            let b = try!(self.merge(i));
-            if !b {
+            let mut at_least_once = false;
+            loop {
+                let merged = try!(self.merge(i));
+                if !merged {
+                    break;
+                }
+                at_least_once = true;
+            }
+            if !at_least_once {
                 break;
             }
         }
@@ -1317,21 +1428,26 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
                 let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
                 // TODO maybe we should pass the cursor to get_collection_writer()
                 let cw = try!(self.get_collection_writer(db, coll));
-                let record_id = try!(find_record(&mut cursor, cw.collection_id, &id));
+                match try!(find_record(&mut cursor, cw.collection_id, &id)) {
+                    None => {
+                        Err(elmo::Error::Misc(String::from("update but does not exist")))
+                    },
+                    Some(record_id) => {
+                        // TODO capacity
+                        let mut k = vec![];
+                        k.push(RECORD);
+                        let ba_collection_id = u64_to_boxed_varint(cw.collection_id);
+                        k.push_all(&ba_collection_id);
+                        let ba_record_id = u64_to_boxed_varint(record_id);
+                        k.push_all(&ba_record_id);
+                        self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(v.to_bson_array().into_boxed_slice()));
 
-                // TODO capacity
-                let mut k = vec![];
-                k.push(RECORD);
-                let ba_collection_id = u64_to_boxed_varint(cw.collection_id);
-                k.push_all(&ba_collection_id);
-                let ba_record_id = u64_to_boxed_varint(record_id);
-                k.push_all(&ba_record_id);
-                self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(v.to_bson_array().into_boxed_slice()));
+                        try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id));
+                        try!(self.update_indexes_insert(&cw.indexes, &ba_collection_id, &ba_record_id, v));
 
-                try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id));
-                try!(self.update_indexes_insert(&cw.indexes, &ba_collection_id, &ba_record_id, v));
-
-                Ok(())
+                        Ok(())
+                    },
+                }
             },
         }
     }
@@ -1340,26 +1456,25 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
         let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
         // TODO maybe we should pass the cursor to get_collection_writer()
         let cw = try!(self.get_collection_writer(db, coll));
-        let record_id = try!(find_record(&mut cursor, cw.collection_id, &id));
+        match try!(find_record(&mut cursor, cw.collection_id, &id)) {
+            Some(record_id) => {
+                // TODO capacity
+                let mut k = vec![];
+                k.push(RECORD);
+                let ba_collection_id = u64_to_boxed_varint(cw.collection_id);
+                k.push_all(&ba_collection_id);
+                let ba_record_id = u64_to_boxed_varint(record_id);
+                k.push_all(&ba_record_id);
+                self.pending.insert(k.into_boxed_slice(), lsm::Blob::Tombstone);
 
-        // TODO capacity
-        let mut k = vec![];
-        k.push(RECORD);
-        let ba_collection_id = u64_to_boxed_varint(cw.collection_id);
-        k.push_all(&ba_collection_id);
-        let ba_record_id = u64_to_boxed_varint(record_id);
-        k.push_all(&ba_record_id);
-        self.pending.insert(k.into_boxed_slice(), lsm::Blob::Tombstone);
+                try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id));
 
-        try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id));
-
-        // TODO ouch.  mongo wants us to return whether we deleted this or not,
-        // but this could be a blind write, which is much faster.
-        // for now, we lie and say true.
-
-        let deleted = true;
-
-        Ok(deleted)
+                Ok(true)
+            },
+            None => {
+                Ok(false)
+            },
+        }
     }
 
     fn insert(&mut self, db: &str, coll: &str, v: &bson::Document) -> Result<()> {
@@ -1470,8 +1585,15 @@ impl elmo::StorageBase for MyReader {
         self.myconn.base_list_collection_infos()
     }
 
-    fn list_indexes(&self) -> Result<Vec<elmo::IndexInfo>> {
-        self.myconn.base_list_index_infos(None)
+    fn list_indexes(&self, ns: Option<(&str, &str)>) -> Result<Vec<elmo::IndexInfo>> {
+        match ns {
+            Some((db, coll)) => {
+                self.myconn.list_index_infos_for_collection(db, coll)
+            },
+            None => {
+                self.myconn.list_all_index_infos()
+            },
+        }
     }
 
 }
@@ -1514,8 +1636,15 @@ impl<'a> elmo::StorageBase for MyWriter<'a> {
         self.myconn.base_list_collection_infos()
     }
 
-    fn list_indexes(&self) -> Result<Vec<elmo::IndexInfo>> {
-        self.myconn.base_list_index_infos(None)
+    fn list_indexes(&self, ns: Option<(&str, &str)>) -> Result<Vec<elmo::IndexInfo>> {
+        match ns {
+            Some((db, coll)) => {
+                self.myconn.list_index_infos_for_collection(db, coll)
+            },
+            None => {
+                self.myconn.list_all_index_infos()
+            },
+        }
     }
 
 }

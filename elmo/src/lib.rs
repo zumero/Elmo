@@ -878,7 +878,7 @@ pub trait StorageBase {
     // TODO maybe these two should return an iterator
     // TODO maybe these two should accept params to limit the rows returned
     fn list_collections(&self) -> Result<Vec<CollectionInfo>>;
-    fn list_indexes(&self) -> Result<Vec<IndexInfo>>;
+    fn list_indexes(&self, Option<(&str, &str)>) -> Result<Vec<IndexInfo>>;
 
     fn get_reader_collection_scan(&self, db: &str, coll: &str) -> Result<Box<Iterator<Item=Result<Row>> + 'static>>;
     // TODO QueryKey in text_index_scan should be an option
@@ -1918,9 +1918,7 @@ impl Connection {
 
     fn get_one_match(db: &str, coll: &str, w: &StorageWriter, m: &matcher::QueryDoc, orderby: Option<&bson::Value>) -> Result<Option<Row>> {
         // TODO dry
-        let indexes = try!(w.list_indexes()).into_iter().filter(
-            |ndx| ndx.db == db && ndx.coll == coll
-            ).collect::<Vec<_>>();
+        let indexes = try!(w.list_indexes(Some((db, coll))));
         //println!("indexes: {:?}", indexes);
         let plan = try!(Self::choose_index(&indexes, &m, None));
         //println!("plan: {:?}", plan);
@@ -2055,10 +2053,7 @@ impl Connection {
                         let (count_matches, count_modified) =
                             if multi {
                                 let reader = try!(rconn.conn.begin_read());
-                                // TODO DRY
-                                let indexes = try!(reader.list_indexes()).into_iter().filter(
-                                    |ndx| ndx.db == db && ndx.coll == coll
-                                    ).collect::<Vec<_>>();
+                                let indexes = try!(reader.list_indexes(Some((db, coll))));
                                 let plan = try!(Self::choose_index(&indexes, &m, None));
                                 let seq: Box<Iterator<Item=Result<Row>>> = try!(Self::into_collection_reader(reader, db, coll, plan));
                                 // TODO we shadow-let here because the type from seq_match_ref() doesn't match the original
@@ -2127,6 +2122,7 @@ impl Connection {
                         }
                         match try!(Self::get_one_match(db, coll, &*writer, &m, None)) {
                             Some(row) => {
+                                //println!("get_one_match found");
                                 let old_doc = try!(row.doc.into_document());
                                 let old_id = try!(old_doc.get("_id").ok_or(Error::Misc(String::from("_id not found in doc being updated")))).clone();
                                 let mut new_doc = u;
@@ -2155,6 +2151,7 @@ impl Connection {
                                 }
                             },
                             None => {
+                                //println!("get_one_match NOT");
                                 if upsert {
                                     let mut new_doc = u;
                                     try!(Self::build_simple_upsert(q_id, &mut new_doc));
@@ -2433,7 +2430,7 @@ impl Connection {
 
     pub fn list_indexes(&self) -> Result<Vec<IndexInfo>> {
         let reader = try!(self.conn.begin_read());
-        let v = try!(reader.list_indexes());
+        let v = try!(reader.list_indexes(None));
         Ok(v)
     }
 
@@ -2457,10 +2454,7 @@ impl Connection {
 
     pub fn delete_indexes(&self, db: &str, coll: &str, index: &bson::Value) -> Result<(usize, usize)> {
         let mut writer = try!(self.conn.begin_write());
-        // TODO DRY
-        let indexes = try!(writer.list_indexes()).into_iter().filter(
-            |ndx| ndx.db == db && ndx.coll == coll
-            ).collect::<Vec<_>>();
+        let indexes = try!(writer.list_indexes(Some((db, coll))));
         let count_before = indexes.len();
         let indexes = 
             if index.is_string() && try!(index.as_str()) == "*" {
@@ -2541,9 +2535,7 @@ impl Connection {
                     let q = try!(del.must_remove_document("q"));
                     let limit = del.get("limit");
                     let m = try!(matcher::parse_query(q));
-                    let indexes = try!(writer.list_indexes()).into_iter().filter(
-                        |ndx| ndx.db == db && ndx.coll == coll
-                        ).collect::<Vec<_>>();
+                    let indexes = try!(writer.list_indexes(Some((db, coll))));
                     //println!("indexes: {:?}", indexes);
                     let mut seq = {
                         let plan = try!(Self::choose_index(&indexes, &m, None));
@@ -4961,10 +4953,7 @@ looking EXACTLY like a plain objectid entry.
 
     pub fn distinct(&self, db: &str, coll: &str, key: &str, query: bson::Document) -> Result<bson::Array> {
         let reader = try!(self.conn.begin_read());
-        // TODO dry
-        let indexes = try!(reader.list_indexes()).into_iter().filter(
-            |ndx| ndx.db == db && ndx.coll == coll
-            ).collect::<Vec<_>>();
+        let indexes = try!(reader.list_indexes(Some((db, coll))));
         //println!("indexes: {:?}", indexes);
         let m = try!(matcher::parse_query(query));
         let plan = try!(Self::choose_index(&indexes, &m, None));
@@ -5008,10 +4997,7 @@ looking EXACTLY like a plain objectid entry.
         -> Result<Box<Iterator<Item=Result<Row>> + 'static>>
     {
         let reader = try!(self.conn.begin_read());
-        // TODO DRY
-        let indexes = try!(reader.list_indexes()).into_iter().filter(
-            |ndx| ndx.db == db && ndx.coll == coll
-            ).collect::<Vec<_>>();
+        let indexes = try!(reader.list_indexes(Some((db, coll))));
         // TODO maybe we should get normalized index specs for all the indexes now.
         let m = try!(matcher::parse_query(query));
         fn is_hint_natural(v: &bson::Value) -> bool {
