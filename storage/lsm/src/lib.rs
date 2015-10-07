@@ -1006,11 +1006,11 @@ impl<'a> MyWriter<'a> {
         }
     }
 
-    fn delete_by_prefix(&mut self, cursor: &mut lsm::LivingCursor, prefix: Box<[u8]>) -> Result<()> {
+    fn delete_by_prefix(&mut self, prefix: Box<[u8]>) -> Result<()> {
         // TODO it would be nice if lsm had a "graveyard" delete, a way to do a
         // blind delete by prefix.
 
-        let mut cursor = lsm::PrefixCursor::new(cursor, prefix);
+        let mut cursor = lsm::PrefixCursor::new(&mut self.cursor, prefix);
         try!(cursor.First().map_err(elmo::wrap_err));
         while cursor.IsValid() {
             {
@@ -1024,19 +1024,19 @@ impl<'a> MyWriter<'a> {
         Ok(())
     }
 
-    fn delete_by_collection_id_prefix(&mut self, cursor: &mut lsm::LivingCursor, tag: u8, collection_id: u64) -> Result<()> {
+    fn delete_by_collection_id_prefix(&mut self, tag: u8, collection_id: u64) -> Result<()> {
         let mut k = vec![];
         k.push(tag);
         push_varint(&mut k, collection_id);
-        self.delete_by_prefix(cursor, k.into_boxed_slice())
+        self.delete_by_prefix(k.into_boxed_slice())
     }
 
-    fn delete_by_index_id_prefix(&mut self, cursor: &mut lsm::LivingCursor, tag: u8, collection_id: u64, index_id: u64) -> Result<()> {
+    fn delete_by_index_id_prefix(&mut self, tag: u8, collection_id: u64, index_id: u64) -> Result<()> {
         let mut k = vec![];
         k.push(tag);
         push_varint(&mut k, collection_id);
         push_varint(&mut k, index_id);
-        self.delete_by_prefix(cursor, k.into_boxed_slice())
+        self.delete_by_prefix(k.into_boxed_slice())
     }
 
     fn base_clear_collection(&mut self, db: &str, coll: &str) -> Result<bool> {
@@ -1052,9 +1052,9 @@ impl<'a> MyWriter<'a> {
                 // all of the following tags are followed immediately by the
                 // collection_id, so we can delete by prefix:
 
-                try!(self.delete_by_collection_id_prefix(&mut cursor, RECORD, collection_id));
-                try!(self.delete_by_collection_id_prefix(&mut cursor, INDEX_ENTRY, collection_id));
-                try!(self.delete_by_collection_id_prefix(&mut cursor, RECORD_ID_TO_INDEX_ENTRY, collection_id));
+                try!(self.delete_by_collection_id_prefix(RECORD, collection_id));
+                try!(self.delete_by_collection_id_prefix(INDEX_ENTRY, collection_id));
+                try!(self.delete_by_collection_id_prefix(RECORD_ID_TO_INDEX_ENTRY, collection_id));
 
                 Ok(false)
             },
@@ -1142,6 +1142,7 @@ impl<'a> MyWriter<'a> {
     }
 
     fn base_drop_collection(&mut self, db: &str, coll: &str) -> Result<bool> {
+        // TODO shouldn't this use self.cursor?
         let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
         let k = encode_key_name_to_collection_id(db, coll);
         match try!(get_value_for_key_as_varint(&mut cursor, &k)) {
@@ -1152,15 +1153,63 @@ impl<'a> MyWriter<'a> {
                 // all of the following tags are followed immediately by the
                 // collection_id, so we can delete by prefix:
 
-                try!(self.delete_by_collection_id_prefix(&mut cursor, COLLECTION_ID_TO_PROPERTIES, collection_id));
-                try!(self.delete_by_collection_id_prefix(&mut cursor, NAME_TO_INDEX_ID, collection_id));
-                try!(self.delete_by_collection_id_prefix(&mut cursor, INDEX_ID_TO_PROPERTIES, collection_id));
-                try!(self.delete_by_collection_id_prefix(&mut cursor, RECORD, collection_id));
-                try!(self.delete_by_collection_id_prefix(&mut cursor, INDEX_ENTRY, collection_id));
-                try!(self.delete_by_collection_id_prefix(&mut cursor, RECORD_ID_TO_INDEX_ENTRY, collection_id));
+                try!(self.delete_by_collection_id_prefix(COLLECTION_ID_TO_PROPERTIES, collection_id));
+                try!(self.delete_by_collection_id_prefix(NAME_TO_INDEX_ID, collection_id));
+                try!(self.delete_by_collection_id_prefix(INDEX_ID_TO_PROPERTIES, collection_id));
+                try!(self.delete_by_collection_id_prefix(RECORD, collection_id));
+                try!(self.delete_by_collection_id_prefix(INDEX_ENTRY, collection_id));
+                try!(self.delete_by_collection_id_prefix(RECORD_ID_TO_INDEX_ENTRY, collection_id));
 
                 Ok(true)
             },
+        }
+    }
+
+    fn base_rename_collection(&mut self, old_name: &str, new_name: &str, drop_target: bool) -> Result<(bool, u64)> {
+        let (old_db, old_coll) = try!(bson::split_name(old_name));
+        let (new_db, new_coll) = try!(bson::split_name(new_name));
+
+        // jstests/core/rename8.js seems to think that renaming to/from a system collection is illegal unless
+        // that collection is system.users, which is "whitelisted".  for now, we emulate this behavior, even
+        // though system.users isn't supported.
+        if old_coll != "system.users" && old_coll.starts_with("system.") {
+            return Err(elmo::Error::Misc(String::from("renameCollection with a system collection not allowed.")))
+        }
+        if new_coll != "system.users" && new_coll.starts_with("system.") {
+            return Err(elmo::Error::Misc(String::from("renameCollection with a system collection not allowed.")))
+        }
+
+        if drop_target {
+            let _deleted = try!(self.base_drop_collection(new_db, new_coll));
+        }
+
+        let k = encode_key_name_to_collection_id(old_db, old_coll);
+        match try!(get_value_for_key_as_varint(&mut self.cursor, &k)) {
+            None => {
+                let created = try!(self.base_create_collection(new_db, new_coll, bson::Document::new()));
+                Ok(created)
+            },
+            Some(collection_id) => {
+                self.pending.insert(k, lsm::Blob::Tombstone);
+
+                let k = encode_key_name_to_collection_id(old_db, old_coll);
+                self.pending.insert(k, lsm::Blob::Array(u64_to_boxed_varint(collection_id)));
+
+                let k = encode_key_collection_id_to_properties(collection_id);
+                match try!(get_value_for_key_as_bson(&mut self.cursor, &k)) {
+                    Some(mut collection_properties) => {
+                        collection_properties.set_str("d", new_db);
+                        collection_properties.set_str("c", new_coll);
+                        // TODO assert that "o" (options) is already there
+                        // collection_properties.set_document("o", options);
+                        self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(collection_properties.to_bson_array().into_boxed_slice()));
+                    },
+                    None => {
+                        // TODO this should not be possible
+                    },
+                }
+                Ok((false, collection_id))
+            }
         }
     }
 
@@ -1187,9 +1236,9 @@ impl<'a> MyWriter<'a> {
                     Some(index_id) => {
                         self.pending.insert(k.into_boxed_slice(), lsm::Blob::Tombstone);
 
-                        try!(self.delete_by_index_id_prefix(&mut cursor, INDEX_ID_TO_PROPERTIES, collection_id, index_id));
-                        try!(self.delete_by_index_id_prefix(&mut cursor, INDEX_ENTRY, collection_id, index_id));
-                        try!(self.delete_by_index_id_prefix(&mut cursor, RECORD_ID_TO_INDEX_ENTRY, collection_id, index_id));
+                        try!(self.delete_by_index_id_prefix(INDEX_ID_TO_PROPERTIES, collection_id, index_id));
+                        try!(self.delete_by_index_id_prefix(INDEX_ENTRY, collection_id, index_id));
+                        try!(self.delete_by_index_id_prefix(RECORD_ID_TO_INDEX_ENTRY, collection_id, index_id));
 
                         Ok(true)
                     },
@@ -1469,7 +1518,8 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
     }
 
     fn rename_collection(&mut self, old_name: &str, new_name: &str, drop_target: bool) -> Result<bool> {
-        unimplemented!();
+        let (created, _collection_id) = try!(self.base_rename_collection(old_name, new_name, drop_target));
+        Ok(created)
     }
 
     fn drop_index(&mut self, db: &str, coll: &str, name: &str) -> Result<bool> {
