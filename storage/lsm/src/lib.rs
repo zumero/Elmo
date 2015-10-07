@@ -205,6 +205,7 @@ struct MyWriter<'a> {
     max_collection_id: Option<u64>,
     max_record_id: HashMap<u64, u64>,
     cw: Option<MyCollectionWriter>,
+    cursor: lsm::LivingCursor,
 }
 
 struct MyConn {
@@ -856,14 +857,13 @@ impl<'a> MyWriter<'a> {
             },
             std::collections::hash_map::Entry::Vacant(e) => {
                 let n = {
-                    let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
                     // TODO capacity
                     let mut k = vec![];
                     k.push(RECORD);
                     push_varint(&mut k, collection_id + 1);
-                    try!(cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
-                    if cursor.IsValid() {
-                        let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
+                    try!(self.cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
+                    if self.cursor.IsValid() {
+                        let k = try!(self.cursor.KeyRef().map_err(elmo::wrap_err));
                         if try!(k.u8_at(0).map_err(elmo::wrap_err)) == RECORD {
                             let (k_collection_id, record_id) = try!(decode_key_record(&k));
                             if collection_id == k_collection_id {
@@ -884,7 +884,7 @@ impl<'a> MyWriter<'a> {
         }
     }
 
-    fn use_next_collection_id(&mut self, cursor: &mut lsm::LivingCursor) -> Result<u64> {
+    fn use_next_collection_id(&mut self) -> Result<u64> {
         match self.max_collection_id {
             Some(n) => {
                 let n = n + 1;
@@ -893,9 +893,9 @@ impl<'a> MyWriter<'a> {
             },
             None => {
                 let n = {
-                    try!(cursor.SeekRef(&lsm::KeyRef::from_boxed_slice(box [COLLECTION_ID_BOUNDARY]), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
-                    if cursor.IsValid() {
-                        let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
+                    try!(self.cursor.SeekRef(&lsm::KeyRef::from_boxed_slice(box [COLLECTION_ID_BOUNDARY]), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
+                    if self.cursor.IsValid() {
+                        let k = try!(self.cursor.KeyRef().map_err(elmo::wrap_err));
                         if try!(k.u8_at(0).map_err(elmo::wrap_err)) == COLLECTION_ID_TO_PROPERTIES {
                             let collection_id = try!(decode_key_collection_id_to_properties(&k));
                             1 + collection_id
@@ -912,9 +912,8 @@ impl<'a> MyWriter<'a> {
         }
     }
 
-    fn list_indexes_for_collection_writer(&self, collection_id: u64) -> Result<Vec<MyIndexPrep>> {
-        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
-        let indexes = try!(self.myconn.base_list_indexes(&mut cursor, Some(collection_id)));
+    fn list_indexes_for_collection_writer(&mut self, collection_id: u64) -> Result<Vec<MyIndexPrep>> {
+        let indexes = try!(self.myconn.base_list_indexes(&mut self.cursor, Some(collection_id)));
         let indexes = indexes.into_iter().map(
             |(_, index_id, mut index_properties)| {
                 //let name = try!(index_properties.must_remove_string("n"));
@@ -1200,12 +1199,11 @@ impl<'a> MyWriter<'a> {
     }
 
     fn base_create_collection(&mut self, db: &str, coll: &str, options: bson::Document) -> Result<(bool, u64)> {
-        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
         let k = encode_key_name_to_collection_id(db, coll);
-        match try!(get_value_for_key_as_varint(&mut cursor, &k)) {
+        match try!(get_value_for_key_as_varint(&mut self.cursor, &k)) {
             Some(id) => Ok((false, id)),
             None => {
-                let collection_id = try!(self.use_next_collection_id(&mut cursor));
+                let collection_id = try!(self.use_next_collection_id());
                 self.pending.insert(k, lsm::Blob::Array(u64_to_boxed_varint(collection_id)));
 
                 // create mongo index for _id
@@ -1240,7 +1238,7 @@ impl<'a> MyWriter<'a> {
         }
     }
 
-    fn update_indexes_delete(&mut self, cursor: &mut lsm::LivingCursor, indexes: &Vec<MyIndexPrep>, ba_collection_id: &Box<[u8]>, ba_record_id: &Box<[u8]>) -> Result<()> {
+    fn update_indexes_delete(&mut self, indexes: &Vec<MyIndexPrep>, ba_collection_id: &Box<[u8]>, ba_record_id: &Box<[u8]>) -> Result<()> {
         for ndx in indexes {
             // delete all index entries (and their back links) which involve this record_id.
             // this *could* be done by simply iterating over all the index entries,
@@ -1253,10 +1251,7 @@ impl<'a> MyWriter<'a> {
             push_varint(&mut backlink_prefix, ndx.index_id);
             backlink_prefix.push_all(ba_record_id);
 
-            // TODO opening a cursor here is darn expensive.  we need PrefixCursor to know
-            // how to not own its subcursor.
-
-            let mut cursor = lsm::PrefixCursor::new(cursor, backlink_prefix.into_boxed_slice());
+            let mut cursor = lsm::PrefixCursor::new(&mut self.cursor, backlink_prefix.into_boxed_slice());
             try!(cursor.First().map_err(elmo::wrap_err));
             while cursor.IsValid() {
                 {
@@ -1375,10 +1370,8 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
         match v.get("_id") {
             None => Err(elmo::Error::Misc(String::from("cannot update without _id"))),
             Some(id) => {
-                let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
-                // TODO maybe we should pass the cursor to get_collection_writer()
                 let cw = try!(self.get_collection_writer(db, coll));
-                match try!(find_record(&mut cursor, cw.collection_id, &id)) {
+                match try!(find_record(&mut self.cursor, cw.collection_id, &id)) {
                     None => {
                         Err(elmo::Error::Misc(String::from("update but does not exist")))
                     },
@@ -1392,7 +1385,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
                         k.push_all(&ba_record_id);
                         self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(v.to_bson_array().into_boxed_slice()));
 
-                        try!(self.update_indexes_delete(&mut cursor, &cw.indexes, &ba_collection_id, &ba_record_id));
+                        try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id));
                         try!(self.update_indexes_insert(&cw.indexes, &ba_collection_id, &ba_record_id, v));
 
                         Ok(())
@@ -1403,10 +1396,8 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
     }
 
     fn delete(&mut self, db: &str, coll: &str, id: &bson::Value) -> Result<bool> {
-        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
-        // TODO maybe we should pass the cursor to get_collection_writer()
         let cw = try!(self.get_collection_writer(db, coll));
-        match try!(find_record(&mut cursor, cw.collection_id, &id)) {
+        match try!(find_record(&mut self.cursor, cw.collection_id, &id)) {
             Some(record_id) => {
                 // TODO capacity
                 let mut k = vec![];
@@ -1417,7 +1408,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
                 k.push_all(&ba_record_id);
                 self.pending.insert(k.into_boxed_slice(), lsm::Blob::Tombstone);
 
-                try!(self.update_indexes_delete(&mut cursor, &cw.indexes, &ba_collection_id, &ba_record_id));
+                try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id));
 
                 Ok(true)
             },
@@ -1602,6 +1593,7 @@ impl<'a> elmo::StorageBase for MyWriter<'a> {
 impl elmo::StorageConnection for MyPublicConn {
     fn begin_write<'a>(&'a self) -> Result<Box<elmo::StorageWriter + 'a>> {
         let tx = try!(self.myconn.conn.GetWriteLock().map_err(elmo::wrap_err));
+        let cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
 
         let w = MyWriter {
             myconn: self.myconn.clone(),
@@ -1610,6 +1602,7 @@ impl elmo::StorageConnection for MyPublicConn {
             max_collection_id: None,
             max_record_id: HashMap::new(),
             cw: None,
+            cursor: cursor,
         };
         Ok(box w)
     }
