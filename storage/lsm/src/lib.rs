@@ -702,8 +702,7 @@ impl MyConn {
     }
 
     // TODO this could maybe return an iterator instead of a vec
-    fn base_list_indexes(&self, collection_id: Option<u64>) -> Result<Vec<(u64, u64, bson::Document)>> {
-        let cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+    fn base_list_indexes(&self, cursor: &mut lsm::LivingCursor, collection_id: Option<u64>) -> Result<Vec<(u64, u64, bson::Document)>> {
         let q = 
             match collection_id {
                 Some(collection_id) => {
@@ -742,8 +741,8 @@ impl MyConn {
     }
 
     fn list_all_index_infos(&self) -> Result<Vec<elmo::IndexInfo>> {
-        let indexes = try!(self.base_list_indexes(None));
         let mut cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        let indexes = try!(self.base_list_indexes(&mut cursor, None));
         let indexes = indexes.into_iter().map(
             |(collection_id, index_id, mut index_properties)| {
                 // TODO the extra lookup here is pretty expensive.
@@ -780,7 +779,7 @@ impl MyConn {
                 Ok(vec![])
             },
             Some(collection_id) => {
-                let indexes = try!(self.base_list_indexes(Some(collection_id)));
+                let indexes = try!(self.base_list_indexes(&mut cursor, Some(collection_id)));
                 let indexes = indexes.into_iter().map(
                     |(collection_id, index_id, mut index_properties)| {
                         let name = try!(index_properties.must_remove_string("n"));
@@ -803,8 +802,7 @@ impl MyConn {
     }
 
     // TODO this could maybe return an iterator instead of a vec
-    fn base_list_collections(&self) -> Result<Vec<(u64, String, String)>> {
-        let cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+    fn base_list_collections(&self, cursor: &mut lsm::LivingCursor) -> Result<Vec<(u64, String, String)>> {
         let mut cursor = lsm::PrefixCursor::new(cursor, box [NAME_TO_COLLECTION_ID]);
         let mut a = vec![];
         // TODO might need to sort by the coll name?  the sqlite version does.
@@ -825,8 +823,8 @@ impl MyConn {
     }
 
     fn base_list_collection_infos(&self) -> Result<Vec<elmo::CollectionInfo>> {
-        let collections = try!(self.base_list_collections());
         let mut cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        let collections = try!(self.base_list_collections(&mut cursor));
         let collections = collections.into_iter().map(
             |(collection_id, db, coll)| {
                 let k = encode_key_collection_id_to_properties(collection_id);
@@ -915,8 +913,8 @@ impl<'a> MyWriter<'a> {
     }
 
     fn list_indexes_for_collection_writer(&self, collection_id: u64) -> Result<Vec<MyIndexPrep>> {
-        let indexes = try!(self.myconn.base_list_indexes(Some(collection_id)));
         let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+        let indexes = try!(self.myconn.base_list_indexes(&mut cursor, Some(collection_id)));
         let indexes = indexes.into_iter().map(
             |(_, index_id, mut index_properties)| {
                 //let name = try!(index_properties.must_remove_string("n"));
@@ -1009,10 +1007,7 @@ impl<'a> MyWriter<'a> {
         }
     }
 
-    fn delete_by_prefix(&mut self, prefix: Box<[u8]>) -> Result<()> {
-        // TODO it would be nice if PrefixCursor did not consume its cursor?
-        let cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
-
+    fn delete_by_prefix(&mut self, cursor: &mut lsm::LivingCursor, prefix: Box<[u8]>) -> Result<()> {
         // TODO it would be nice if lsm had a "graveyard" delete, a way to do a
         // blind delete by prefix.
 
@@ -1030,19 +1025,19 @@ impl<'a> MyWriter<'a> {
         Ok(())
     }
 
-    fn delete_by_collection_id_prefix(&mut self, tag: u8, collection_id: u64) -> Result<()> {
+    fn delete_by_collection_id_prefix(&mut self, cursor: &mut lsm::LivingCursor, tag: u8, collection_id: u64) -> Result<()> {
         let mut k = vec![];
         k.push(tag);
         push_varint(&mut k, collection_id);
-        self.delete_by_prefix(k.into_boxed_slice())
+        self.delete_by_prefix(cursor, k.into_boxed_slice())
     }
 
-    fn delete_by_index_id_prefix(&mut self, tag: u8, collection_id: u64, index_id: u64) -> Result<()> {
+    fn delete_by_index_id_prefix(&mut self, cursor: &mut lsm::LivingCursor, tag: u8, collection_id: u64, index_id: u64) -> Result<()> {
         let mut k = vec![];
         k.push(tag);
         push_varint(&mut k, collection_id);
         push_varint(&mut k, index_id);
-        self.delete_by_prefix(k.into_boxed_slice())
+        self.delete_by_prefix(cursor, k.into_boxed_slice())
     }
 
     fn base_clear_collection(&mut self, db: &str, coll: &str) -> Result<bool> {
@@ -1058,9 +1053,9 @@ impl<'a> MyWriter<'a> {
                 // all of the following tags are followed immediately by the
                 // collection_id, so we can delete by prefix:
 
-                try!(self.delete_by_collection_id_prefix(RECORD, collection_id));
-                try!(self.delete_by_collection_id_prefix(INDEX_ENTRY, collection_id));
-                try!(self.delete_by_collection_id_prefix(RECORD_ID_TO_INDEX_ENTRY, collection_id));
+                try!(self.delete_by_collection_id_prefix(&mut cursor, RECORD, collection_id));
+                try!(self.delete_by_collection_id_prefix(&mut cursor, INDEX_ENTRY, collection_id));
+                try!(self.delete_by_collection_id_prefix(&mut cursor, RECORD_ID_TO_INDEX_ENTRY, collection_id));
 
                 Ok(false)
             },
@@ -1104,7 +1099,7 @@ impl<'a> MyWriter<'a> {
                 let mut k = vec![];
                 k.push(RECORD);
                 push_varint(&mut k, collection_id);
-                let mut cursor = lsm::PrefixCursor::new(cursor, k.into_boxed_slice());
+                let mut cursor = lsm::PrefixCursor::new(&mut cursor, k.into_boxed_slice());
                 try!(cursor.First().map_err(elmo::wrap_err));
                 while cursor.IsValid() {
                     {
@@ -1158,12 +1153,12 @@ impl<'a> MyWriter<'a> {
                 // all of the following tags are followed immediately by the
                 // collection_id, so we can delete by prefix:
 
-                try!(self.delete_by_collection_id_prefix(COLLECTION_ID_TO_PROPERTIES, collection_id));
-                try!(self.delete_by_collection_id_prefix(NAME_TO_INDEX_ID, collection_id));
-                try!(self.delete_by_collection_id_prefix(INDEX_ID_TO_PROPERTIES, collection_id));
-                try!(self.delete_by_collection_id_prefix(RECORD, collection_id));
-                try!(self.delete_by_collection_id_prefix(INDEX_ENTRY, collection_id));
-                try!(self.delete_by_collection_id_prefix(RECORD_ID_TO_INDEX_ENTRY, collection_id));
+                try!(self.delete_by_collection_id_prefix(&mut cursor, COLLECTION_ID_TO_PROPERTIES, collection_id));
+                try!(self.delete_by_collection_id_prefix(&mut cursor, NAME_TO_INDEX_ID, collection_id));
+                try!(self.delete_by_collection_id_prefix(&mut cursor, INDEX_ID_TO_PROPERTIES, collection_id));
+                try!(self.delete_by_collection_id_prefix(&mut cursor, RECORD, collection_id));
+                try!(self.delete_by_collection_id_prefix(&mut cursor, INDEX_ENTRY, collection_id));
+                try!(self.delete_by_collection_id_prefix(&mut cursor, RECORD_ID_TO_INDEX_ENTRY, collection_id));
 
                 Ok(true)
             },
@@ -1171,8 +1166,9 @@ impl<'a> MyWriter<'a> {
     }
 
     fn base_drop_database(&mut self, db_to_delete: &str) -> Result<bool> {
+        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
         let mut b = false;
-        for (_, db, coll) in try!(self.myconn.base_list_collections()) {
+        for (_, db, coll) in try!(self.myconn.base_list_collections(&mut cursor)) {
             if db == db_to_delete {
                 try!(self.base_drop_collection(&db, &coll));
                 b = true;
@@ -1192,9 +1188,9 @@ impl<'a> MyWriter<'a> {
                     Some(index_id) => {
                         self.pending.insert(k.into_boxed_slice(), lsm::Blob::Tombstone);
 
-                        try!(self.delete_by_index_id_prefix(INDEX_ID_TO_PROPERTIES, collection_id, index_id));
-                        try!(self.delete_by_index_id_prefix(INDEX_ENTRY, collection_id, index_id));
-                        try!(self.delete_by_index_id_prefix(RECORD_ID_TO_INDEX_ENTRY, collection_id, index_id));
+                        try!(self.delete_by_index_id_prefix(&mut cursor, INDEX_ID_TO_PROPERTIES, collection_id, index_id));
+                        try!(self.delete_by_index_id_prefix(&mut cursor, INDEX_ENTRY, collection_id, index_id));
+                        try!(self.delete_by_index_id_prefix(&mut cursor, RECORD_ID_TO_INDEX_ENTRY, collection_id, index_id));
 
                         Ok(true)
                     },
@@ -1244,7 +1240,7 @@ impl<'a> MyWriter<'a> {
         }
     }
 
-    fn update_indexes_delete(&mut self, indexes: &Vec<MyIndexPrep>, ba_collection_id: &Box<[u8]>, ba_record_id: &Box<[u8]>) -> Result<()> {
+    fn update_indexes_delete(&mut self, cursor: &mut lsm::LivingCursor, indexes: &Vec<MyIndexPrep>, ba_collection_id: &Box<[u8]>, ba_record_id: &Box<[u8]>) -> Result<()> {
         for ndx in indexes {
             // delete all index entries (and their back links) which involve this record_id.
             // this *could* be done by simply iterating over all the index entries,
@@ -1260,7 +1256,6 @@ impl<'a> MyWriter<'a> {
             // TODO opening a cursor here is darn expensive.  we need PrefixCursor to know
             // how to not own its subcursor.
 
-            let cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
             let mut cursor = lsm::PrefixCursor::new(cursor, backlink_prefix.into_boxed_slice());
             try!(cursor.First().map_err(elmo::wrap_err));
             while cursor.IsValid() {
@@ -1397,7 +1392,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
                         k.push_all(&ba_record_id);
                         self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(v.to_bson_array().into_boxed_slice()));
 
-                        try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id));
+                        try!(self.update_indexes_delete(&mut cursor, &cw.indexes, &ba_collection_id, &ba_record_id));
                         try!(self.update_indexes_insert(&cw.indexes, &ba_collection_id, &ba_record_id, v));
 
                         Ok(())
@@ -1422,7 +1417,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
                 k.push_all(&ba_record_id);
                 self.pending.insert(k.into_boxed_slice(), lsm::Blob::Tombstone);
 
-                try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id));
+                try!(self.update_indexes_delete(&mut cursor, &cw.indexes, &ba_collection_id, &ba_record_id));
 
                 Ok(true)
             },

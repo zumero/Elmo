@@ -1658,23 +1658,20 @@ impl RangeCursor {
     // TODO this one could support Last/Prev I suppose
 }
 
-pub struct PrefixCursor { 
-    chain : LivingCursor,
+pub struct PrefixCursor<'c> { 
+    chain : &'c mut LivingCursor,
     prefix: Box<[u8]>,
 }
 
-// PrefixCursor could be implemented in terms of RangeCursor,
-// but I'm not sure it would actually be less code, and it would probably be
-// slower.
-
-impl PrefixCursor {
-    pub fn new(ch: LivingCursor, prefix: Box<[u8]>) -> PrefixCursor {
+impl<'c> PrefixCursor<'c> {
+    pub fn new(ch: &'c mut LivingCursor, prefix: Box<[u8]>) -> PrefixCursor<'c> {
         PrefixCursor { 
             chain : ch,
             prefix: prefix,
         }
     }
 
+    // TODO lifetimes below should be 'c ?
     pub fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
         if self.IsValid() {
             self.chain.KeyRef()
@@ -1683,6 +1680,7 @@ impl PrefixCursor {
         }
     }
 
+    // TODO lifetimes below should be 'c ?
     pub fn LiveValueRef<'a>(&'a self) -> Result<LiveValueRef<'a>> {
         if self.IsValid() {
             self.chain.LiveValueRef()
