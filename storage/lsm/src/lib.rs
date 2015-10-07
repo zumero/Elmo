@@ -1040,9 +1040,8 @@ impl<'a> MyWriter<'a> {
     }
 
     fn base_clear_collection(&mut self, db: &str, coll: &str) -> Result<bool> {
-        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
         let k = encode_key_name_to_collection_id(db, coll);
-        match try!(get_value_for_key_as_varint(&mut cursor, &k)) {
+        match try!(get_value_for_key_as_varint(&mut self.cursor, &k)) {
             None => {
                 // TODO base_created_collection checks AGAIN to see if the collection exists
                 let (created, _) = try!(self.base_create_collection(db, coll, bson::Document::new()));
@@ -1064,12 +1063,11 @@ impl<'a> MyWriter<'a> {
     fn create_index(&mut self, info: elmo::IndexInfo) -> Result<bool> {
         //println!("create_index: {:?}", info);
         let (_created, collection_id) = try!(self.base_create_collection(&info.db, &info.coll, bson::Document::new()));
-        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
         let k = encode_key_name_to_index_id(collection_id, &info.name);
-        match try!(get_value_for_key_as_varint(&mut cursor, &k)) {
+        match try!(get_value_for_key_as_varint(&mut self.cursor, &k)) {
             Some(index_id) => {
                 let k = encode_key_index_id_to_properties(collection_id, index_id);
-                let mut index_properties = try!(get_value_for_key_as_bson(&mut cursor, &k)).unwrap_or(bson::Document::new());
+                let mut index_properties = try!(get_value_for_key_as_bson(&mut self.cursor, &k)).unwrap_or(bson::Document::new());
                 //let name = try!(index_properties.must_remove_string("n"));
                 let spec = try!(index_properties.must_remove_document("s"));
                 //let options = try!(index_properties.must_remove_document("o"));
@@ -1098,7 +1096,7 @@ impl<'a> MyWriter<'a> {
                 let mut k = vec![];
                 k.push(RECORD);
                 push_varint(&mut k, collection_id);
-                let mut cursor = lsm::PrefixCursor::new(&mut cursor, k.into_boxed_slice());
+                let mut cursor = lsm::PrefixCursor::new(&mut self.cursor, k.into_boxed_slice());
                 try!(cursor.First().map_err(elmo::wrap_err));
                 while cursor.IsValid() {
                     {
@@ -1111,7 +1109,9 @@ impl<'a> MyWriter<'a> {
                         let ba_collection_id = u64_to_boxed_varint(collection_id);
                         let ba_index_id = u64_to_boxed_varint(index_id);
                         for vals in entries {
-                            try!(self.add_index_entry(&ba_collection_id, &ba_index_id, &ba_record_id, vals, unique));
+                            let (index_entry, backlink) = try!(Self::make_index_entry_pair(&ba_collection_id, &ba_index_id, &ba_record_id, vals, unique));
+                            self.pending.insert(index_entry, lsm::Blob::Array(ba_record_id.clone()));
+                            self.pending.insert(backlink, lsm::Blob::Array(box []));
                         }
                     }
 
@@ -1142,10 +1142,8 @@ impl<'a> MyWriter<'a> {
     }
 
     fn base_drop_collection(&mut self, db: &str, coll: &str) -> Result<bool> {
-        // TODO shouldn't this use self.cursor?
-        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
         let k = encode_key_name_to_collection_id(db, coll);
-        match try!(get_value_for_key_as_varint(&mut cursor, &k)) {
+        match try!(get_value_for_key_as_varint(&mut self.cursor, &k)) {
             None => Ok(false),
             Some(collection_id) => {
                 self.pending.insert(k, lsm::Blob::Tombstone);
@@ -1214,9 +1212,8 @@ impl<'a> MyWriter<'a> {
     }
 
     fn base_drop_database(&mut self, db_to_delete: &str) -> Result<bool> {
-        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
         let mut b = false;
-        for (_, db, coll) in try!(self.myconn.base_list_collections(&mut cursor)) {
+        for (_, db, coll) in try!(self.myconn.base_list_collections(&mut self.cursor)) {
             if db == db_to_delete {
                 try!(self.base_drop_collection(&db, &coll));
                 b = true;
@@ -1226,12 +1223,11 @@ impl<'a> MyWriter<'a> {
     }
 
     fn base_drop_index(&mut self, db: &str, coll: &str, name: &str) -> Result<bool> {
-        let mut cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
-        match try!(get_value_for_key_as_varint(&mut cursor, &encode_key_name_to_collection_id(&db, &coll))) {
+        match try!(get_value_for_key_as_varint(&mut self.cursor, &encode_key_name_to_collection_id(&db, &coll))) {
             None => Ok(false),
             Some(collection_id) => {
                 let k = encode_key_name_to_index_id(collection_id, name);
-                match try!(get_value_for_key_as_varint(&mut cursor, &k)) {
+                match try!(get_value_for_key_as_varint(&mut self.cursor, &k)) {
                     None => Ok(false),
                     Some(index_id) => {
                         self.pending.insert(k.into_boxed_slice(), lsm::Blob::Tombstone);
@@ -1329,7 +1325,7 @@ impl<'a> MyWriter<'a> {
         Ok(())
     }
 
-    fn add_index_entry(&mut self, ba_collection_id: &Box<[u8]>, ba_index_id: &Box<[u8]>, ba_record_id: &Box<[u8]>, vals: Vec<(bson::Value, bool)>, unique: bool) -> Result<()> {
+    fn make_index_entry_pair(ba_collection_id: &Box<[u8]>, ba_index_id: &Box<[u8]>, ba_record_id: &Box<[u8]>, vals: Vec<(bson::Value, bool)>, unique: bool) -> Result<(Box<[u8]>, Box<[u8]>)> {
         let vref = vals.iter().map(|&(ref v,neg)| (v,neg)).collect::<Vec<_>>();
         let k = bson::Value::encode_multi_for_index(&vref, None);
         // TODO capacity
@@ -1349,14 +1345,8 @@ impl<'a> MyWriter<'a> {
         backlink.push_all(&ba_index_id);
         backlink.push_all(ba_record_id);
         backlink.push_all(&index_entry);
-        self.pending.insert(backlink.into_boxed_slice(), lsm::Blob::Array(box []));
 
-        //println!("adding index entry: {:?}", index_entry);
-
-        // now the index entry itself, since ownership is transferred
-        self.pending.insert(index_entry.into_boxed_slice(), lsm::Blob::Array(ba_record_id.clone()));
-
-        Ok(())
+        Ok((index_entry.into_boxed_slice(), backlink.into_boxed_slice()))
     }
 
     fn update_indexes_insert(&mut self, indexes: &Vec<MyIndexPrep>, ba_collection_id: &Box<[u8]>, ba_record_id: &Box<[u8]>, v: &bson::Document) -> Result<()> {
@@ -1371,7 +1361,9 @@ impl<'a> MyWriter<'a> {
             // TODO store this in the cache?
             let ba_index_id = u64_to_boxed_varint(ndx.index_id);
             for vals in entries {
-                try!(self.add_index_entry(ba_collection_id, &ba_index_id, ba_record_id, vals, unique));
+                let (index_entry, backlink) = try!(Self::make_index_entry_pair(ba_collection_id, &ba_index_id, ba_record_id, vals, unique));
+                self.pending.insert(index_entry, lsm::Blob::Array(ba_record_id.clone()));
+                self.pending.insert(backlink, lsm::Blob::Array(box []));
             }
         }
         Ok(())
