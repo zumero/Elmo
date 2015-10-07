@@ -60,9 +60,9 @@ fn list_keys(name: &str) -> Result<(),lsm::Error> {
     Ok(())
 }
 
-fn merge(name: &str, level: u32, min: usize, max: Option<usize>) -> Result<(),lsm::Error> {
+fn merge(name: &str, min_level: u32, max_level: u32, min_segs: usize, max_segs: usize) -> Result<(),lsm::Error> {
     let db = try!(lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS));
-    match try!(db.merge(level, min, max)) {
+    match try!(db.merge(min_level, max_level, min_segs, max_segs)) {
         Some(seg) => {
             println!("merged segment: {}", seg);
             let lck = try!(db.GetWriteLock());
@@ -89,17 +89,14 @@ fn result_main() -> Result<(),lsm::Error> {
     let cmd = args[2].as_str();
     match cmd {
         "merge" => {
-            if args.len() < 5 {
+            if args.len() < 7 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
-            let level = args[3].parse::<u32>().unwrap();
-            let min = args[4].parse::<usize>().unwrap();
-            if args.len() == 5 {
-                merge(name, level, min, None)
-            } else {
-                let max = args[5].parse::<usize>().unwrap();
-                merge(name, level, min, Some(max))
-            }
+            let min_level = args[3].parse::<u32>().unwrap();
+            let max_level = args[4].parse::<u32>().unwrap();
+            let min_segs = args[5].parse::<usize>().unwrap();
+            let max_segs = args[6].parse::<usize>().unwrap();
+            merge(name, min_level, max_level, min_segs, max_segs)
         },
         "dump_page" => {
             if args.len() < 4 {

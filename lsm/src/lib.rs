@@ -1443,7 +1443,7 @@ impl<'a> ICursor<'a> for MultiCursor {
         }
     }
 
-    fn SeekRef(&mut self, k: &KeyRef, sop:SeekOp) -> Result<SeekResult> {
+    fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
         self.cur = None;
         self.dir = Direction::WANDERING;
         for j in 0 .. self.subcursors.len() {
@@ -3840,12 +3840,12 @@ struct Space {
 }
 
 struct SafeSegmentsInWaiting {
-    segmentsInWaiting: HashMap<SegmentNum,SegmentInfo>,
+    segmentsInWaiting: HashMap<SegmentNum, SegmentInfo>,
 }
 
 struct SafeMergeStuff {
     merging: HashSet<SegmentNum>,
-    pendingMerges: HashMap<SegmentNum,Vec<SegmentNum>>,
+    pendingMerges: HashMap<SegmentNum, Vec<SegmentNum>>,
 }
 
 struct SafeHeader {
@@ -3855,8 +3855,8 @@ struct SafeHeader {
 
 struct SafeCursors {
     nextCursorNum: u64,
-    cursors: HashMap<u64,SegmentNum>,
-    zombies: HashMap<SegmentNum,SegmentInfo>,
+    cursors: HashMap<u64, SegmentNum>,
+    zombies: HashMap<SegmentNum, SegmentInfo>,
 }
 
 struct InnerPart {
@@ -3987,8 +3987,8 @@ impl db {
         self.inner.WriteSegment2(pairs)
     }
 
-    pub fn merge(&self, level: u32, min: usize, max: Option<usize>) -> Result<Option<SegmentNum>> {
-        InnerPart::merge(&self.inner, level, min, max)
+    pub fn merge(&self, min_level: u32, max_level: u32, min_segs: usize, max_segs: usize) -> Result<Option<SegmentNum>> {
+        InnerPart::merge(&self.inner, min_level, max_level, min_segs, max_segs)
     }
 
     pub fn list_segments(&self) -> Result<(Vec<SegmentNum>,HashMap<SegmentNum,SegmentInfo>)> {
@@ -4422,7 +4422,9 @@ impl InnerPart {
         Ok(g)
     }
 
-    fn merge(inner: &std::sync::Arc<InnerPart>, level: u32, min: usize, max: Option<usize>) -> Result<Option<SegmentNum>> {
+    fn merge(inner: &std::sync::Arc<InnerPart>, min_level: u32, max_level: u32, min_segs: usize, max_segs: usize) -> Result<Option<SegmentNum>> {
+        assert!(min_level <= max_level);
+        assert!(min_segs <= max_segs);
         let mrg = {
             let st = try!(inner.header.lock());
 
@@ -4435,7 +4437,7 @@ impl InnerPart {
 
             let age_group = st.header.currentState.iter().filter(|g| {
                 let info = st.header.segments.get(&g).unwrap();
-                info.age == level
+                info.age >= min_level && info.age <= max_level
             }).map(|g| *g).collect::<Vec<SegmentNum>>();
 
             //println!("age_group: {:?}", age_group);
@@ -4464,13 +4466,8 @@ impl InnerPart {
                 }
             }
 
-            if segs.len() >= min {
-                match max {
-                    Some(max) => {
-                        segs.truncate(max);
-                    },
-                    None => (),
-                }
+            if segs.len() >= min_segs {
+                segs.truncate(max_segs);
                 segs.reverse();
                 let mut clist = Vec::with_capacity(segs.len());
                 for g in segs.iter() {
@@ -4479,7 +4476,7 @@ impl InnerPart {
                 for g in segs.iter() {
                     mergeStuff.merging.insert(*g);
                 }
-                Some((segs,clist))
+                Some((segs, clist))
             } else {
                 None
             }
@@ -4562,12 +4559,25 @@ impl InnerPart {
             }
         };
 
-        // and fix its age to be one higher than the maximum age of the
-        // segments it replaced.
+        // and fix its age.
 
         let age_of_new_segment = {
             let ages: Vec<u32> = segmentsBeingReplaced.values().map(|info| info.age).collect();
-            1 + ages.iter().max().expect("this cannot be empty")
+            let min_age = *ages.iter().min().expect("this cannot be empty");
+            let max_age = *ages.iter().max().expect("this cannot be empty");
+            if min_age == max_age {
+                // if the ages of the merged segments were all the same,
+                // the new one gets 1 plus that age.  it is simply getting
+                // promoted to the next level.
+                1 + max_age
+            } else {
+                // if the merge included a range of ages, the new segment
+                // gets the same age as the max age of the group, so we
+                // don't end up with ages growing forever.
+                // TODO do we want the caller to be allowed to say they
+                // want 1 added (to promote to the next level) ?
+                max_age
+            }
         };
         newSegmentInfo.age = age_of_new_segment;
 

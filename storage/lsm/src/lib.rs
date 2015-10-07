@@ -1316,8 +1316,8 @@ impl<'a> MyWriter<'a> {
         Ok(())
     }
 
-    fn merge(&self, level: u32) -> Result<bool> {
-        let r = self.myconn.conn.merge(level, 4, Some(32)).map_err(elmo::wrap_err);
+    fn merge(&self, min_level: u32, max_level: u32, min_segs: usize, max_segs: usize) -> Result<bool> {
+        let r = self.myconn.conn.merge(min_level, max_level, min_segs, max_segs).map_err(elmo::wrap_err);
         if r.is_err() {
             println!("from merge: {:?}", r);
         }
@@ -1330,36 +1330,29 @@ impl<'a> MyWriter<'a> {
             },
             None => {
                 //println!("{}: no merge needed", level);
-                {
-                    let (segments, infos) = try!(self.myconn.conn.list_segments().map_err(elmo::wrap_err));
-                    let count = segments.iter().filter(|s| infos[*s].age == level).count();
-                    if count > 4 {
-                        println!("    found {} segments in level {}", count, level);
-                        for s in segments.iter() {
-                            println!("{}: {:?}", s, infos[s]);
-                        }
-                        panic!();
-                    }
-                }
                 Ok(false)
             },
         }
     }
 
     fn automerge(&self) -> Result<()> {
-        for i in 0 .. 100 {
-            let mut at_least_once = false;
+        let mut count_merges = 0;
+        for i in 0 .. 16 {
+            let mut at_least_once_in_this_level = false;
             loop {
-                let merged = try!(self.merge(i));
+                let merged = try!(self.merge(i, i, 4, 8));
                 if !merged {
                     break;
                 }
-                at_least_once = true;
+                count_merges = count_merges + 1;
+                at_least_once_in_this_level = true;
             }
-            if !at_least_once {
+            if !at_least_once_in_this_level {
                 break;
             }
         }
+        // TODO consider something like:
+        //try!(self.merge(0, 40, 8, 16));
         Ok(())
     }
 
