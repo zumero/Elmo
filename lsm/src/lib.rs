@@ -3297,43 +3297,6 @@ impl SegmentCursor {
         }
     }
 
-    fn readParentPage(&mut self) -> Result<(Vec<PageNum>, Vec<KeyRef>)> {
-        let mut cur = 0;
-        let pt = try!(PageType::from_u8(self.pr.GetByte(&mut cur)));
-        if  pt != PageType::PARENT_NODE {
-            return Err(Error::CorruptFile("parent page has invalid page type"));
-        }
-        cur = cur + 1; // page flags
-        let count = self.pr.GetInt16(&mut cur);
-        let mut ptrs = Vec::with_capacity((count + 1) as usize);
-        let mut keys = Vec::with_capacity(count as usize);
-        for _ in 0 .. count {
-            let kflag = self.pr.GetByte(&mut cur);
-            let klen = self.pr.GetVarint(&mut cur) as usize;
-            let k =
-                if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
-                    let k = KeyRef::Array(self.pr.get_slice(cur, klen));
-                    cur = cur + klen;
-                    k
-                } else {
-                    let firstPage = self.pr.GetInt32(&mut cur) as PageNum;
-                    // TODO move the following line outside the loop?
-                    let pgsz = self.pr.PageSize();
-                    let mut ostrm = try!(myOverflowReadStream::new(&self.path, pgsz, firstPage, klen));
-                    let mut x_k = Vec::with_capacity(klen);
-                    try!(ostrm.read_to_end(&mut x_k));
-                    let x_k = x_k.into_boxed_slice();
-                    let k = KeyRef::Overflowed(x_k);
-                    k
-                };
-            keys.push(k);
-        }
-        for _ in 0 .. count+1 {
-            ptrs.push(self.pr.GetVarint(&mut cur) as PageNum);
-        }
-        Ok((ptrs,keys))
-    }
-
     fn get_next_from_parent_page(&mut self, kq: &KeyRef) -> Result<PageNum> {
         let mut cur = 0;
         let pt = try!(PageType::from_u8(self.pr.GetByte(&mut cur)));
@@ -3508,22 +3471,7 @@ impl SegmentCursor {
                     Ok(SeekResult::Unequal)
                 }
             } else if PageType::PARENT_NODE == pt {
-/*
-                let next = {
-                    let (ptrs, keys) = try!(self.readParentPage());
-                    println!("k: {:?}", k);
-                    println!("keys: {:?}", keys);
-                    println!("ptrs: {:?}", ptrs);
-                    match Self::searchInParentPage(k, &ptrs, &keys) {
-                        Some(found) => found,
-                        None => ptrs[ptrs.len() - 1],
-                    }
-                };
-                println!("next: {}", next);
-*/
                 let next = try!(self.get_next_from_parent_page(k));
-                //assert!(next == new_next);
-                //println!("new_next: {}", new_next);
                 self.search(next, k, sop)
             } else {
                 unreachable!();
@@ -3531,17 +3479,6 @@ impl SegmentCursor {
         } else {
             Ok(SeekResult::Invalid)
         }
-    }
-
-    fn searchInParentPage(k: &KeyRef, ptrs: &Vec<PageNum>, keys: &Vec<KeyRef>) -> Option<PageNum> {
-        // TODO linear search?  really?
-        for i in 0 .. keys.len() {
-            let cmp = KeyRef::cmp(k, &keys[i]);
-            if cmp != Ordering::Greater {
-                return Some(ptrs[i])
-            }
-        }
-        None
     }
 
 }
