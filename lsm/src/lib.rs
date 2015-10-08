@@ -1049,7 +1049,7 @@ enum Direction {
 
 struct MultiCursor { 
     subcursors: Box<[SegmentCursor]>, 
-    sorted: Box<[(usize,Option<Ordering>)]>,
+    sorted: Box<[(usize, Option<Ordering>)]>,
     cur: Option<usize>, 
     dir: Direction,
 }
@@ -1300,7 +1300,7 @@ impl<'a> ICursor<'a> for MultiCursor {
 
                     for i in 1 .. self.sorted.len() {
                         //println!("sorted[{}] : {:?}", i, self.sorted[i]);
-                        let (n,c) = self.sorted[i];
+                        let (n, c) = self.sorted[i];
                         match c {
                             None => {
                                 break;
@@ -2277,9 +2277,25 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
             blk:leavesBlk,
             };
 
+        //let mut prev_key: Option<Box<[u8]>> = None;
         for result_pair in source {
             let mut pair = try!(result_pair);
             let k = pair.Key;
+            /*
+            match prev_key {
+                None => {
+                },
+                Some(prev_key) => {
+                    let c = k.cmp(&prev_key);
+                    if c != Ordering::Greater {
+                        println!("prev_key: {:?}", prev_key);
+                        println!("k: {:?}", k);
+                        panic!("unsorted keys");
+                    }
+                },
+            }
+            prev_key = Some(k.clone());
+            */
 
             // TODO is it possible for this to conclude that the key must be overflowed
             // when it would actually fit because of prefixing?
@@ -2913,7 +2929,7 @@ fn readOverflow(path: &str, pgsz: usize, firstPage: PageNum, buf: &mut [u8]) -> 
     Ok(res)
 }
 
-struct SegmentCursor {
+pub struct SegmentCursor {
     path: String,
     done: Box<Fn() -> ()>,
     blocks: Vec<PageBlock>, // TODO will be needed later for stray checking
@@ -2966,7 +2982,7 @@ impl SegmentCursor {
             firstLeaf: 0, // temporary
             lastLeaf: 0, // temporary
         };
-        if ! try!(res.setCurrentPage(rootPage)) {
+        if !try!(res.setCurrentPage(rootPage)) {
             // TODO fix this error.  or assert, because we previously verified
             // that the root page was in the block list we were given.
             return Err(Error::Misc(String::from("failed to read root page")));
@@ -2998,6 +3014,8 @@ impl SegmentCursor {
     }
 
     fn setCurrentPage(&mut self, pgnum: PageNum) -> Result<bool> {
+        // TODO this function is silly.  it never returns false.
+
         // TODO use self.blocks to make sure we are not straying out of bounds.
         //assert!(block_list_contains_page(&self.blocks, pgnum));
 
@@ -3332,6 +3350,8 @@ impl SegmentCursor {
             // no more leaves.
             Ok(false)
         } else {
+            assert!(pt == PageType::OVERFLOW_NODE);
+
             let lastInt32 = self.pr.GetLastInt32() as PageNum;
             //
             // an overflow page has a value in its LastInt32 which
@@ -3549,15 +3569,24 @@ impl<'a> ICursor<'a> for SegmentCursor {
     }
 
     fn Next(&mut self) -> Result<()> {
-        if ! self.nextInLeaf() {
+        if !self.nextInLeaf() {
             let nextPage =
-                if self.pr.CheckPageFlag(PageFlag::FLAG_BOUNDARY_NODE) { self.pr.GetLastInt32() as PageNum }
-                else if try!(self.pr.PageType()) == PageType::LEAF_NODE {
-                    if self.currentPage == self.rootPage { 0 }
-                    else { self.currentPage + 1 }
-                } else { 0 }
-            ;
-            if try!(self.setCurrentPage(nextPage)) && try!(self.searchForwardForLeaf()) {
+                if self.pr.CheckPageFlag(PageFlag::FLAG_BOUNDARY_NODE) { 
+                    self.pr.GetLastInt32() as PageNum 
+                } else if try!(self.pr.PageType()) == PageType::LEAF_NODE {
+                    if self.currentPage == self.rootPage { 
+                        0 
+                    } else { 
+                        self.currentPage + 1 
+                    }
+                } else { 
+                    0 
+                };
+            if 0 == nextPage {
+                self.resetLeaf();
+            } else if !block_list_contains_page(&self.blocks, nextPage) {
+                self.resetLeaf();
+            } else if try!(self.setCurrentPage(nextPage)) && try!(self.searchForwardForLeaf()) {
                 try!(self.readLeaf());
                 self.currentKey = Some(0);
             }
@@ -3566,7 +3595,7 @@ impl<'a> ICursor<'a> for SegmentCursor {
     }
 
     fn Prev(&mut self) -> Result<()> {
-        if ! self.prevInLeaf() {
+        if !self.prevInLeaf() {
             let previousLeaf = self.previousLeaf;
             if 0 == previousLeaf {
                 self.resetLeaf();
@@ -3973,6 +4002,10 @@ impl db {
         InnerPart::OpenCursor(&self.inner)
     }
 
+    pub fn OpenSegmentCursor(&self, n: SegmentNum) -> Result<SegmentCursor> {
+        InnerPart::OpenSegmentCursor(&self.inner, n)
+    }
+
     pub fn WriteSegmentFromSortedSequence<I>(&self, source: I) -> Result<SegmentNum> where I:Iterator<Item=Result<kvp>> {
         self.inner.WriteSegmentFromSortedSequence(source)
     }
@@ -4261,6 +4294,12 @@ impl InnerPart {
                 Ok(csr)
             }
         }
+    }
+
+    fn OpenSegmentCursor(inner: &std::sync::Arc<InnerPart>, g: SegmentNum) -> Result<SegmentCursor> {
+        let st = try!(inner.header.lock());
+        let cursor = try!(Self::getCursor(inner, &*st, g));
+        Ok(cursor)
     }
 
     // TODO we also need a way to open a cursor on segments in waiting

@@ -52,8 +52,25 @@ fn list_keys(name: &str) -> Result<(),lsm::Error> {
             let k = try!(cursor.KeyRef());
             println!("k: {:?}", k);
             let v = try!(cursor.LiveValueRef());
-            println!("v: {:?}", v);
-            let q = try!(v.into_boxed_slice());
+            //println!("v: {:?}", v);
+            //let q = try!(v.into_boxed_slice());
+        }
+        try!(cursor.Next());
+    }
+    Ok(())
+}
+
+fn dump_segment(name: &str, segnum: u64) -> Result<(),lsm::Error> {
+    let db = try!(lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let mut cursor = try!(db.OpenSegmentCursor(segnum));
+    try!(cursor.First());
+    while cursor.IsValid() {
+        {
+            let k = try!(cursor.KeyRef());
+            println!("k: {:?}", k);
+            //let v = try!(cursor.LiveValueRef());
+            //println!("v: {:?}", v);
+            //let q = try!(v.into_boxed_slice());
         }
         try!(cursor.Next());
     }
@@ -113,6 +130,13 @@ fn result_main() -> Result<(),lsm::Error> {
         },
         "list_free_blocks" => {
             list_free_blocks(name)
+        },
+        "dump_segment" => {
+            if args.len() < 4 {
+                return Err(lsm::Error::Misc(String::from("too few args")));
+            }
+            let segnum = args[3].parse::<u64>().unwrap();
+            dump_segment(name, segnum)
         },
         _ => {
             Err(lsm::Error::Misc(String::from("unknown command")))
