@@ -1234,14 +1234,25 @@ impl<'a> MyWriter<'a> {
         // that collection is system.users, which is "whitelisted".  for now, we emulate this behavior, even
         // though system.users isn't supported.
         if old_coll != "system.users" && old_coll.starts_with("system.") {
-            return Err(elmo::Error::Misc(String::from("renameCollection with a system collection not allowed.")))
+            return Err(elmo::Error::Misc(String::from("renameCollection with a system collection not allowed.")));
         }
         if new_coll != "system.users" && new_coll.starts_with("system.") {
-            return Err(elmo::Error::Misc(String::from("renameCollection with a system collection not allowed.")))
+            return Err(elmo::Error::Misc(String::from("renameCollection with a system collection not allowed.")));
         }
 
         if drop_target {
             let _deleted = try!(self.base_drop_collection(new_db, new_coll));
+        } else {
+            let k = encode_key_name_to_collection_id(new_db, new_coll);
+            match try!(get_value_for_key_as_varint(&mut self.cursor, &k)) {
+                None => {
+                    // fine
+                },
+                Some(collection_id) => {
+                    // error
+                    return Err(elmo::Error::Misc(String::from("renameCollection to something that already exists")));
+                },
+            }
         }
 
         let k = encode_key_name_to_collection_id(old_db, old_coll);
