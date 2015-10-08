@@ -3334,6 +3334,65 @@ impl SegmentCursor {
         Ok((ptrs,keys))
     }
 
+    fn get_next_from_parent_page(&mut self, kq: &KeyRef) -> Result<PageNum> {
+        let mut cur = 0;
+        let pt = try!(PageType::from_u8(self.pr.GetByte(&mut cur)));
+        if  pt != PageType::PARENT_NODE {
+            return Err(Error::CorruptFile("parent page has invalid page type"));
+        }
+        cur = cur + 1; // page flags
+        let count = self.pr.GetInt16(&mut cur);
+        let mut found = None;
+        for i in 0 .. count {
+            let kflag = self.pr.GetByte(&mut cur);
+            let klen = self.pr.GetVarint(&mut cur) as usize;
+            let k =
+                if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
+                    let k = KeyRef::Array(self.pr.get_slice(cur, klen));
+                    cur = cur + klen;
+                    k
+                } else {
+                    let firstPage = self.pr.GetInt32(&mut cur) as PageNum;
+                    // TODO move the following line outside the loop?
+                    let pgsz = self.pr.PageSize();
+                    let mut ostrm = try!(myOverflowReadStream::new(&self.path, pgsz, firstPage, klen));
+                    let mut x_k = Vec::with_capacity(klen);
+                    try!(ostrm.read_to_end(&mut x_k));
+                    let x_k = x_k.into_boxed_slice();
+                    let k = KeyRef::Overflowed(x_k);
+                    k
+                };
+            let cmp = KeyRef::cmp(kq, &k);
+            if cmp != Ordering::Greater {
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            None => {
+            },
+            Some(found) => {
+                for i in found+1 .. count {
+                    let kflag = self.pr.GetByte(&mut cur);
+                    let klen = self.pr.GetVarint(&mut cur) as usize;
+                    if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
+                        cur = cur + klen;
+                    } else {
+                        cur = cur + 4;
+                    };
+                }
+            },
+        }
+        let found = found.unwrap_or(count);
+        for _ in 0 .. found {
+            let b = self.pr.GetByte(&mut cur);
+            let len = misc::varint::first_byte_to_len(b);
+            cur = cur + len - 1;
+        }
+        let pg = self.pr.GetVarint(&mut cur) as PageNum;
+        Ok(pg)
+    }
+
     // this is used when moving forward through the leaf pages.
     // we need to skip any overflows.  when moving backward,
     // this is not necessary, because each leaf has a pointer to
@@ -3449,13 +3508,22 @@ impl SegmentCursor {
                     Ok(SeekResult::Unequal)
                 }
             } else if PageType::PARENT_NODE == pt {
+/*
                 let next = {
                     let (ptrs, keys) = try!(self.readParentPage());
+                    println!("k: {:?}", k);
+                    println!("keys: {:?}", keys);
+                    println!("ptrs: {:?}", ptrs);
                     match Self::searchInParentPage(k, &ptrs, &keys) {
                         Some(found) => found,
                         None => ptrs[ptrs.len() - 1],
                     }
                 };
+                println!("next: {}", next);
+*/
+                let next = try!(self.get_next_from_parent_page(k));
+                //assert!(next == new_next);
+                //println!("new_next: {}", new_next);
                 self.search(next, k, sop)
             } else {
                 unreachable!();
