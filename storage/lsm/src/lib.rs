@@ -658,7 +658,13 @@ impl MyConn {
                 cursor: cursor,
             };
 
-        // TODO DISTINCT problem here? we don't want this producing the same record twice
+        let seq = {
+            // DISTINCT. we don't want this producing the same record twice.
+            let mut q = try!(seq.collect::<Result<Vec<_>>>());
+            q.sort();
+            q.dedup();
+            q.into_iter().map(|x| Ok(x))
+        };
 
         // the iterator above yields record ids.
         // now we need something that, for each record id yielded by an
