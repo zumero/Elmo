@@ -563,15 +563,22 @@ impl MyConn {
                 Some(id) => id,
                 None => return Err(elmo::Error::Misc(String::from("index does not exist"))),
             };
+        let has_recid = {
+            let unique = 
+                match ndx.options.get("unique") {
+                    Some(&bson::Value::BBoolean(b)) => b,
+                    _ => false,
+                };
+            !unique
+        };
 
-        fn add_one(ba: &Vec<u8>) -> Vec<u8> {
-            let mut a = ba.clone();
+        fn add_one(a: &mut Vec<u8>) {
             let mut i = a.len() - 1;
             loop {
                 if a[i] == 255 {
                     a[i] = 0;
                     if i == 0 {
-                        panic!("TODO handle case where add_one to binary array overflows the first byte");
+                        panic!("TODO handle case where add_one to binary array overflows the first byte?");
                     } else {
                         i = i - 1;
                     }
@@ -580,52 +587,58 @@ impl MyConn {
                     break;
                 }
             }
-            a
         }
 
-        fn f_twok(cursor: lsm::LivingCursor, kmin: Box<[u8]>, kmax: Box<[u8]>, min_cmp: lsm::OpGt, max_cmp: lsm::OpLt) -> lsm::RangeCursor {
+        fn f_twok(cursor: lsm::LivingCursor, kmin: Vec<u8>, kmax: Vec<u8>, min_cmp: lsm::OpGt, max_cmp: lsm::OpLt) -> lsm::RangeCursor {
+            let kmin = kmin.into_boxed_slice();
+            let kmax = kmax.into_boxed_slice();
             let min = lsm::Min::new(kmin, min_cmp);
             let max = lsm::Max::new(kmax, max_cmp);
             let cursor = lsm::RangeCursor::new(cursor, min, max);
             cursor
         }
 
-        fn f_two(preface: Vec<u8>, cursor: lsm::LivingCursor, eqvals: elmo::QueryKey, minvals: elmo::QueryKey, maxvals: elmo::QueryKey, min_cmp: lsm::OpGt, max_cmp: lsm::OpLt) -> lsm::RangeCursor {
+        fn f_two(has_recid: bool, preface: Vec<u8>, cursor: lsm::LivingCursor, eqvals: elmo::QueryKey, minvals: elmo::QueryKey, maxvals: elmo::QueryKey, min_cmp: lsm::OpGt, max_cmp: lsm::OpLt) -> lsm::RangeCursor {
             let mut kmin = preface.clone();
             bson::Value::push_encode_multi_for_index(&mut kmin, &eqvals, Some(&minvals));
+            if has_recid && min_cmp == lsm::OpGt::GT {
+                add_one(&mut kmin);
+            }
+
             let mut kmax = preface;
             bson::Value::push_encode_multi_for_index(&mut kmax, &eqvals, Some(&maxvals));
-            let kmin = kmin.into_boxed_slice();
-            let kmax = kmax.into_boxed_slice();
+            if has_recid && max_cmp == lsm::OpLt::LTE {
+                add_one(&mut kmax);
+            }
+
             f_twok(cursor, kmin, kmax, min_cmp, max_cmp)
         }
 
-        fn f_gt(preface: Vec<u8>, cursor: lsm::LivingCursor, vals: elmo::QueryKey, min_cmp: lsm::OpGt) -> lsm::RangeCursor {
+        fn f_gt(has_recid: bool, preface: Vec<u8>, cursor: lsm::LivingCursor, vals: elmo::QueryKey, min_cmp: lsm::OpGt) -> lsm::RangeCursor {
             let mut kmin = preface.clone();
             bson::Value::push_encode_multi_for_index(&mut kmin, &vals, None);
-            let kmin = kmin.into_boxed_slice();
-            let min = lsm::Min::new(kmin, min_cmp);
+            if has_recid && min_cmp == lsm::OpGt::GT {
+                add_one(&mut kmin);
+            }
 
-            let kmax = add_one(&preface);
-            let kmax = kmax.into_boxed_slice();
-            let max = lsm::Max::new(kmax, lsm::OpLt::LT);
+            let mut kmax = preface.clone();
+            add_one(&mut kmax);
+            let max_cmp = lsm::OpLt::LT;
 
-            let cursor = lsm::RangeCursor::new(cursor, min, max);
-            cursor
+            f_twok(cursor, kmin, kmax, min_cmp, max_cmp)
         }
 
-        fn f_lt(preface: Vec<u8>, cursor: lsm::LivingCursor, vals: elmo::QueryKey, max_cmp: lsm::OpLt) -> lsm::RangeCursor {
+        fn f_lt(has_recid: bool, preface: Vec<u8>, cursor: lsm::LivingCursor, vals: elmo::QueryKey, max_cmp: lsm::OpLt) -> lsm::RangeCursor {
             let mut kmax = preface.clone();
             bson::Value::push_encode_multi_for_index(&mut kmax, &vals, None);
-            let kmax = kmax.into_boxed_slice();
-            let max = lsm::Max::new(kmax, max_cmp);
+            if has_recid && max_cmp == lsm::OpLt::LTE {
+                add_one(&mut kmax);
+            }
 
             let kmin = preface.clone();
-            let kmin = kmin.into_boxed_slice();
-            let min = lsm::Min::new(kmin, lsm::OpGt::GT);
+            let min_cmp = lsm::OpGt::GT;
 
-            let cursor = lsm::RangeCursor::new(cursor, min, max);
-            cursor
+            f_twok(cursor, kmin, kmax, min_cmp, max_cmp)
         }
 
         let mut key_preface = vec![];
@@ -635,20 +648,21 @@ impl MyConn {
 
         let mut cursor =
             match bounds {
-                elmo::QueryBounds::GT(vals) => f_gt(key_preface, cursor, vals, lsm::OpGt::GT),
-                elmo::QueryBounds::GTE(vals) => f_gt(key_preface, cursor, vals, lsm::OpGt::GTE),
-                elmo::QueryBounds::LT(vals) => f_lt(key_preface, cursor, vals, lsm::OpLt::LT),
-                elmo::QueryBounds::LTE(vals) => f_lt(key_preface, cursor, vals, lsm::OpLt::LTE),
-                elmo::QueryBounds::GT_LT(eqvals, minvals, maxvals) => f_two(key_preface, cursor, eqvals, minvals, maxvals, lsm::OpGt::GT, lsm::OpLt::LT),
-                elmo::QueryBounds::GTE_LT(eqvals, minvals, maxvals) => f_two(key_preface, cursor, eqvals, minvals, maxvals, lsm::OpGt::GTE, lsm::OpLt::LT),
-                elmo::QueryBounds::GT_LTE(eqvals, minvals, maxvals) => f_two(key_preface, cursor, eqvals, minvals, maxvals, lsm::OpGt::GT, lsm::OpLt::LTE),
-                elmo::QueryBounds::GTE_LTE(eqvals, minvals, maxvals) => f_two(key_preface, cursor, eqvals, minvals, maxvals, lsm::OpGt::GTE, lsm::OpLt::LTE),
+                elmo::QueryBounds::GT(vals) => f_gt(has_recid, key_preface, cursor, vals, lsm::OpGt::GT),
+                elmo::QueryBounds::GTE(vals) => f_gt(has_recid, key_preface, cursor, vals, lsm::OpGt::GTE),
+                elmo::QueryBounds::LT(vals) => f_lt(has_recid, key_preface, cursor, vals, lsm::OpLt::LT),
+                elmo::QueryBounds::LTE(vals) => f_lt(has_recid, key_preface, cursor, vals, lsm::OpLt::LTE),
+                elmo::QueryBounds::GT_LT(eqvals, minvals, maxvals) => f_two(has_recid, key_preface, cursor, eqvals, minvals, maxvals, lsm::OpGt::GT, lsm::OpLt::LT),
+                elmo::QueryBounds::GTE_LT(eqvals, minvals, maxvals) => f_two(has_recid, key_preface, cursor, eqvals, minvals, maxvals, lsm::OpGt::GTE, lsm::OpLt::LT),
+                elmo::QueryBounds::GT_LTE(eqvals, minvals, maxvals) => f_two(has_recid, key_preface, cursor, eqvals, minvals, maxvals, lsm::OpGt::GT, lsm::OpLt::LTE),
+                elmo::QueryBounds::GTE_LTE(eqvals, minvals, maxvals) => f_two(has_recid, key_preface, cursor, eqvals, minvals, maxvals, lsm::OpGt::GTE, lsm::OpLt::LTE),
                 elmo::QueryBounds::EQ(vals) => {
                     let mut kmin = key_preface.clone();
                     bson::Value::push_encode_multi_for_index(&mut kmin, &vals, None);
-                    let kmax = add_one(&kmin);
-                    let kmin = kmin.into_boxed_slice();
-                    let kmax = kmax.into_boxed_slice();
+
+                    let mut kmax = kmin.clone();
+                    add_one(&mut kmax);
+
                     f_twok(cursor, kmin, kmax, lsm::OpGt::GTE, lsm::OpLt::LT)
                 },
             };
