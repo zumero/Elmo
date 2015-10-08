@@ -19,6 +19,7 @@
 #![feature(vec_push_all)]
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 extern crate bson;
 
@@ -661,9 +662,15 @@ impl MyConn {
         let seq = {
             // DISTINCT. we don't want this producing the same record twice.
             let mut q = try!(seq.collect::<Result<Vec<_>>>());
-            q.sort();
-            q.dedup();
-            q.into_iter().map(|x| Ok(x))
+            let mut seen = HashSet::new();
+            let mut a = vec![];
+            for x in q {
+                if !seen.contains(&x) {
+                    a.push(x);
+                    seen.insert(x);
+                }
+            }
+            a.into_iter().map(|x| Ok(x))
         };
 
         // the iterator above yields record ids.
