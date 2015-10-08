@@ -3446,7 +3446,7 @@ impl SegmentCursor {
             } else if PageType::PARENT_NODE == pt {
                 let next = {
                     let (ptrs, keys) = try!(self.readParentPage());
-                    match Self::searchInParentPage(k, &ptrs, &keys, 0) {
+                    match Self::searchInParentPage(k, &ptrs, &keys) {
                         Some(found) => found,
                         None => ptrs[ptrs.len() - 1],
                     }
@@ -3460,19 +3460,15 @@ impl SegmentCursor {
         }
     }
 
-    fn searchInParentPage(k: &KeyRef, ptrs: &Vec<PageNum>, keys: &Vec<KeyRef>, i: usize) -> Option<PageNum> {
+    fn searchInParentPage(k: &KeyRef, ptrs: &Vec<PageNum>, keys: &Vec<KeyRef>) -> Option<PageNum> {
         // TODO linear search?  really?
-        // TODO also, this doesn't need to be recursive
-        if i < keys.len() {
+        for i in 0 .. keys.len() {
             let cmp = KeyRef::cmp(k, &keys[i]);
-            if cmp==Ordering::Greater {
-                Self::searchInParentPage(k, ptrs, keys, i+1)
-            } else {
-                Some(ptrs[i])
+            if cmp != Ordering::Greater {
+                return Some(ptrs[i])
             }
-        } else {
-            None
         }
+        None
     }
 
 }
