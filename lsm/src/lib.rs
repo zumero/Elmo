@@ -1626,24 +1626,13 @@ impl RangeCursor {
     }
 
     pub fn First(&mut self) -> Result<()> {
-        // TODO this SeekRef call returns the cmp, right?  don't redo it?
-        try!(self.chain.SeekRef(&KeyRef::for_slice(&self.min.k), SeekOp::SEEK_GE));
-        let skip =
-            match self.min.cmp {
-                OpGt::GT => {
-                    if self.chain.IsValid() {
-                        let k = try!(self.chain.KeyRef());
-                        k.compare_with(&self.min.k) == std::cmp::Ordering::Equal
-                    } else {
-                        false
-                    }
-                },
-                OpGt::GTE => {
-                    false
-                },
-            };
-        if skip {
-            try!(self.chain.Next());
+        let sr = try!(self.chain.SeekRef(&KeyRef::for_slice(&self.min.k), SeekOp::SEEK_GE));
+        match (sr, self.min.cmp) {
+            (SeekResult::Equal, OpGt::GT) => {
+                try!(self.chain.Next());
+            },
+            _ => {
+            },
         }
         Ok(())
     }
