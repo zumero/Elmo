@@ -2533,13 +2533,8 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
             pb.PutByte(PageType::PARENT_NODE.to_u8());
             pb.PutByte(0u8);
             pb.PutInt16(items.len() as u16);
-            // store all the ptrs, n+1 of them
-            for x in items.iter() {
-                pb.PutVarint(x.page as u64);
-            }
-            pb.PutVarint(lastPtr as u64);
             // store all the keys, n of them
-            for (i,x) in items.drain(..).enumerate() {
+            for (i,x) in items.iter().enumerate() {
                 match overflows.get(&i) {
                     Some(pg) => {
                         pb.PutByte(ValueFlag::FLAG_OVERFLOW);
@@ -2553,6 +2548,11 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                     },
                 }
             }
+            // store all the ptrs, n+1 of them
+            for x in items.drain(..) {
+                pb.PutVarint(x.page as u64);
+            }
+            pb.PutVarint(lastPtr as u64);
         }
 
         fn writeParentPage<SeekWrite>(st: &mut ParentState, 
@@ -3307,24 +3307,29 @@ impl SegmentCursor {
         let count = self.pr.GetInt16(&mut cur);
         let mut ptrs = Vec::with_capacity((count + 1) as usize);
         let mut keys = Vec::with_capacity(count as usize);
-        for _ in 0 .. count+1 {
-            ptrs.push(self.pr.GetVarint(&mut cur) as PageNum);
-        }
         for _ in 0 .. count {
             let kflag = self.pr.GetByte(&mut cur);
             let klen = self.pr.GetVarint(&mut cur) as usize;
-            if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
-                keys.push(KeyRef::Array(self.pr.get_slice(cur, klen)));
-                cur = cur + klen;
-            } else {
-                let firstPage = self.pr.GetInt32(&mut cur) as PageNum;
-                let pgsz = self.pr.PageSize();
-                let mut ostrm = try!(myOverflowReadStream::new(&self.path, pgsz, firstPage, klen));
-                let mut x_k = Vec::with_capacity(klen);
-                try!(ostrm.read_to_end(&mut x_k));
-                let x_k = x_k.into_boxed_slice();
-                keys.push(KeyRef::Overflowed(x_k));
-            }
+            let k =
+                if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
+                    let k = KeyRef::Array(self.pr.get_slice(cur, klen));
+                    cur = cur + klen;
+                    k
+                } else {
+                    let firstPage = self.pr.GetInt32(&mut cur) as PageNum;
+                    // TODO move the following line outside the loop?
+                    let pgsz = self.pr.PageSize();
+                    let mut ostrm = try!(myOverflowReadStream::new(&self.path, pgsz, firstPage, klen));
+                    let mut x_k = Vec::with_capacity(klen);
+                    try!(ostrm.read_to_end(&mut x_k));
+                    let x_k = x_k.into_boxed_slice();
+                    let k = KeyRef::Overflowed(x_k);
+                    k
+                };
+            keys.push(k);
+        }
+        for _ in 0 .. count+1 {
+            ptrs.push(self.pr.GetVarint(&mut cur) as PageNum);
         }
         Ok((ptrs,keys))
     }
