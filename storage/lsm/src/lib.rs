@@ -204,6 +204,7 @@ struct MyWriter<'a> {
     pending: HashMap<Box<[u8]>,lsm::Blob>,
     max_collection_id: Option<u64>,
     max_record_id: HashMap<u64, u64>,
+    max_index_id: HashMap<u64, u64>,
     cw: Option<MyCollectionWriter>,
     cursor: lsm::LivingCursor,
 }
@@ -848,6 +849,42 @@ impl MyConn {
 }
 
 impl<'a> MyWriter<'a> {
+    fn use_next_index_id(&mut self, collection_id: u64) -> Result<u64> {
+        match self.max_index_id.entry(collection_id) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let n = e.get_mut();
+                *n = *n + 1;
+                Ok(*n)
+            },
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let n = {
+                    // TODO capacity
+                    let mut k = vec![];
+                    k.push(INDEX_ID_TO_PROPERTIES);
+                    push_varint(&mut k, collection_id + 1);
+                    try!(self.cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
+                    if self.cursor.IsValid() {
+                        let k = try!(self.cursor.KeyRef().map_err(elmo::wrap_err));
+                        if try!(k.u8_at(0).map_err(elmo::wrap_err)) == INDEX_ID_TO_PROPERTIES {
+                            let (k_collection_id, index_id) = try!(decode_key_index_id_to_properties(&k));
+                            if collection_id == k_collection_id {
+                                1 + index_id
+                            } else {
+                                1 + PRIMARY_INDEX_ID
+                            }
+                        } else {
+                            1 + PRIMARY_INDEX_ID
+                        }
+                    } else {
+                        1 + PRIMARY_INDEX_ID
+                    }
+                };
+                e.insert(n);
+                Ok(n)
+            },
+        }
+    }
+
     fn use_next_record_id(&mut self, collection_id: u64) -> Result<u64> {
         match self.max_record_id.entry(collection_id) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
@@ -1080,8 +1117,7 @@ impl<'a> MyWriter<'a> {
                 }
             },
             None => {
-                // TODO next index id for this collection
-                let index_id = 2;
+                let index_id = try!(self.use_next_index_id(collection_id));
                 self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(u64_to_boxed_varint(index_id)));
 
                 // now create entries for all the existing records
@@ -1190,7 +1226,7 @@ impl<'a> MyWriter<'a> {
             Some(collection_id) => {
                 self.pending.insert(k, lsm::Blob::Tombstone);
 
-                let k = encode_key_name_to_collection_id(old_db, old_coll);
+                let k = encode_key_name_to_collection_id(new_db, new_coll);
                 self.pending.insert(k, lsm::Blob::Array(u64_to_boxed_varint(collection_id)));
 
                 let k = encode_key_collection_id_to_properties(collection_id);
@@ -1648,6 +1684,7 @@ impl elmo::StorageConnection for MyPublicConn {
             pending: HashMap::new(),
             max_collection_id: None,
             max_record_id: HashMap::new(),
+            max_index_id: HashMap::new(),
             cw: None,
             cursor: cursor,
         };
