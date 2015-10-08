@@ -542,6 +542,7 @@ impl<'a> LiveValueRef<'a> {
             LiveValueRef::Overflowed(len, mut strm) => {
                 let mut a = Vec::with_capacity(len);
                 try!(strm.read_to_end(&mut a));
+                assert!(len == a.len());
                 let t = try!(func(&a));
                 Ok(t)
             },
@@ -2075,7 +2076,7 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
 
                                     // now reset to the first page in the next block
                                     try!(utils::SeekPage(fs, pgsz, blk.firstPage));
-                                    if finished {
+                                    if !finished {
                                         loop_sofar = sofar;
                                         loop_firstBlk = blk;
                                     } else {
