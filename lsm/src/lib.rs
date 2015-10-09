@@ -647,103 +647,17 @@ pub enum SeekOp {
     SEEK_GE = 2,
 }
 
-// TODO it's dreadful to have three copies of this iterator
-// simply because we can't figure out how to put an ICursor
-// into the struct because of its lifetime param.
-
-struct MultiCursorIterator {
-    csr: MultiCursor
+struct CursorIterator {
+    csr: Box<ICursor>,
 }
 
-impl MultiCursorIterator {
-    fn new(it: MultiCursor) -> MultiCursorIterator {
-        MultiCursorIterator { csr: it }
+impl CursorIterator {
+    fn new(it: Box<ICursor>) -> CursorIterator {
+        CursorIterator { csr: it }
     }
 }
 
-impl Iterator for MultiCursorIterator {
-    type Item = Result<kvp>;
-    fn next(&mut self) -> Option<Result<kvp>> {
-        if self.csr.IsValid() {
-            let k = {
-                let k = self.csr.KeyRef();
-                if k.is_err() {
-                    return Some(Err(k.err().unwrap()));
-                }
-                let k = k.unwrap().into_boxed_slice();
-                k
-            };
-            let v = {
-                let v = self.csr.ValueRef();
-                if v.is_err() {
-                    return Some(Err(v.err().unwrap()));
-                }
-                let v = v.unwrap().into_blob();
-                v
-            };
-            let r = self.csr.Next();
-            if r.is_err() {
-                return Some(Err(r.err().unwrap()));
-            }
-            Some(Ok(kvp{Key:k, Value:v}))
-        } else {
-            return None;
-        }
-    }
-}
-
-struct LivingCursorIterator {
-    csr: LivingCursor
-}
-
-impl LivingCursorIterator {
-    fn new(it: LivingCursor) -> LivingCursorIterator {
-        LivingCursorIterator { csr: it }
-    }
-}
-
-impl Iterator for LivingCursorIterator {
-    type Item = Result<kvp>;
-    fn next(&mut self) -> Option<Result<kvp>> {
-        if self.csr.IsValid() {
-            let k = {
-                let k = self.csr.KeyRef();
-                if k.is_err() {
-                    return Some(Err(k.err().unwrap()));
-                }
-                let k = k.unwrap().into_boxed_slice();
-                k
-            };
-            let v = {
-                let v = self.csr.ValueRef();
-                if v.is_err() {
-                    return Some(Err(v.err().unwrap()));
-                }
-                let v = v.unwrap().into_blob();
-                v
-            };
-            let r = self.csr.Next();
-            if r.is_err() {
-                return Some(Err(r.err().unwrap()));
-            }
-            Some(Ok(kvp{Key:k, Value:v}))
-        } else {
-            return None;
-        }
-    }
-}
-
-struct FilterTombstonesCursorIterator {
-    csr: FilterTombstonesCursor
-}
-
-impl FilterTombstonesCursorIterator {
-    fn new(it: FilterTombstonesCursor) -> FilterTombstonesCursorIterator {
-        FilterTombstonesCursorIterator { csr: it }
-    }
-}
-
-impl Iterator for FilterTombstonesCursorIterator {
+impl Iterator for CursorIterator {
     type Item = Result<kvp>;
     fn next(&mut self) -> Option<Result<kvp>> {
         if self.csr.IsValid() {
@@ -4657,7 +4571,8 @@ impl InnerPart {
         Ok(g)
     }
 
-    fn do_merge<I>(inner: &std::sync::Arc<InnerPart>, segs: Vec<SegmentNum>, source: I) -> Result<SegmentNum> where I: Iterator<Item=Result<kvp>> {
+    fn do_merge(inner: &std::sync::Arc<InnerPart>, segs: Vec<SegmentNum>, cursor: Box<ICursor>) -> Result<SegmentNum> {
+        let source = CursorIterator::new(cursor);
         let mut fs = try!(inner.OpenForWriting());
         let (g,_) = try!(CreateFromSortedSequenceOfKeyValuePairs(&mut fs, &**inner, source));
         //printfn "merged %A to get %A" segs g
@@ -4736,7 +4651,7 @@ impl InnerPart {
                 let pos_last_seg = st.header.currentState.iter().position(|s| *s == last_seg_being_merged).expect("gotta be there");
                 let count_segments_behind = st.header.currentState.len() - 1 - pos_last_seg;
 
-                let it: Box<Iterator<Item=Result<kvp>>> = 
+                let cursor: Box<ICursor> =
                     if count_segments_behind == 0 {
                         // we are merging the last segments in the current state.
                         // there is nothing behind.
@@ -4745,8 +4660,8 @@ impl InnerPart {
                         let mut cursor = LivingCursor::Create(cursor);
                         try!(cursor.First());
                         // TODO check IsValid here?  to avoid trying to write a segment with no keys.
-                        box LivingCursorIterator::new(cursor)
-                    } else if count_segments_behind < 4 {
+                        box cursor
+                    } else if count_segments_behind <= 4 {
                         // there are segments behind the ones we are merging.
                         // we can only filter a tombstones if its key is not present behind.
 
@@ -4769,22 +4684,25 @@ impl InnerPart {
                         let mut cursor = FilterTombstonesCursor::Create(cursor, behind);
                         try!(cursor.First());
                         // TODO check IsValid here?  to avoid trying to write a segment with no keys.
-                        box FilterTombstonesCursorIterator::new(cursor)
+                        box cursor
                     } else {
                         let mut cursor = cursor;
                         try!(cursor.First());
-                        box MultiCursorIterator::new(cursor)
+                        box cursor
                     };
 
-                Some((segs, it))
+                Some((segs, cursor))
             } else {
                 None
             }
         };
 
         match mrg {
-            Some((segs, source)) => {
-                let g = try!(Self::do_merge(inner, segs, source));
+            Some((segs, cursor)) => {
+                // note that cursor.First() should have already been called
+
+                // TODO check IsValid here?  to avoid trying to write a segment with no keys.
+                let g = try!(Self::do_merge(inner, segs, cursor));
                 // TODO if something goes wrong here, the function will exit with
                 // an error but mergeStuff.merging will still contain the segments we are
                 // trying to merge, which will prevent them from EVER being merged.
