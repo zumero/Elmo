@@ -211,6 +211,27 @@ pub enum KeyRef<'a> {
     Array(&'a [u8]),
 }
 
+// TODO hmmm.  maybe we should implement PartialEq for KeyRef as well.
+
+impl<'a> std::hash::Hash for KeyRef<'a> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match *self {
+            KeyRef::Overflowed(ref a) => {
+                state.write(a);
+            },
+            KeyRef::Prefixed(front, back) => {
+                // TODO is this identical to if it were one slice?
+                state.write(front);
+                state.write(back);
+            },
+            KeyRef::Array(a) => {
+                state.write(a);
+            },
+        }
+    }
+}
+
+
 impl<'a> std::fmt::Debug for KeyRef<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         match *self {
