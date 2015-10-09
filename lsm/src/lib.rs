@@ -782,7 +782,7 @@ pub enum SeekResult {
 }
 
 impl SeekResult {
-    fn from_cursor<'a, T: ICursor<'a>>(csr: &T, k: &KeyRef) -> Result<SeekResult> {
+    fn from_cursor<T: ICursor>(csr: &T, k: &KeyRef) -> Result<SeekResult> {
         if csr.IsValid() {
             if Ordering::Equal == try!(csr.KeyCompare(k)) {
                 Ok(SeekResult::Equal)
@@ -811,7 +811,7 @@ impl SeekResult {
     }
 }
 
-pub trait ICursor<'a> {
+pub trait ICursor {
     fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult>;
     fn First(&mut self) -> Result<()>;
     fn Last(&mut self) -> Result<()>;
@@ -820,9 +820,8 @@ pub trait ICursor<'a> {
 
     fn IsValid(&self) -> bool;
 
-    // TODO could these lifetimes be declared on the funcs instead of on the ICursor trait?
-    fn KeyRef(&'a self) -> Result<KeyRef<'a>>;
-    fn ValueRef(&'a self) -> Result<ValueRef<'a>>;
+    fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>>;
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>>;
 
     // TODO maybe rm ValueLength.  but LivingCursor uses it as a fast
     // way to detect whether a value is a tombstone or not.
@@ -1296,7 +1295,7 @@ impl MultiCursor {
 
 }
 
-impl<'a> ICursor<'a> for MultiCursor {
+impl ICursor for MultiCursor {
     fn IsValid(&self) -> bool {
         match self.cur {
             Some(i) => self.subcursors[i].IsValid(),
@@ -1320,14 +1319,14 @@ impl<'a> ICursor<'a> for MultiCursor {
         Ok(())
     }
 
-    fn KeyRef(&'a self) -> Result<KeyRef<'a>> {
+    fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
         match self.cur {
             None => Err(Error::CursorNotValid),
             Some(icur) => self.subcursors[icur].KeyRef(),
         }
     }
 
-    fn ValueRef(&'a self) -> Result<ValueRef<'a>> {
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
         match self.cur {
             None => Err(Error::CursorNotValid),
             Some(icur) => self.subcursors[icur].ValueRef(),
@@ -1650,7 +1649,7 @@ impl FilterTombstonesCursor {
     }
 }
 
-impl<'a> ICursor<'a> for FilterTombstonesCursor {
+impl ICursor for FilterTombstonesCursor {
     fn First(&mut self) -> Result<()> {
         try!(self.chain.First());
         try!(self.skipTombstonesForward());
@@ -1663,11 +1662,11 @@ impl<'a> ICursor<'a> for FilterTombstonesCursor {
         Ok(())
     }
 
-    fn KeyRef(&'a self) -> Result<KeyRef<'a>> {
+    fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
         self.chain.KeyRef()
     }
 
-    fn ValueRef(&'a self) -> Result<ValueRef<'a>> {
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
         self.chain.ValueRef()
     }
 
@@ -1902,7 +1901,7 @@ impl<'c> PrefixCursor<'c> {
 
 }
 
-impl<'a> ICursor<'a> for LivingCursor {
+impl ICursor for LivingCursor {
     fn First(&mut self) -> Result<()> {
         try!(self.chain.First());
         try!(self.skipTombstonesForward());
@@ -1915,11 +1914,11 @@ impl<'a> ICursor<'a> for LivingCursor {
         Ok(())
     }
 
-    fn KeyRef(&'a self) -> Result<KeyRef<'a>> {
+    fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
         self.chain.KeyRef()
     }
 
-    fn ValueRef(&'a self) -> Result<ValueRef<'a>> {
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
         self.chain.ValueRef()
     }
 
@@ -3690,7 +3689,7 @@ impl Drop for SegmentCursor {
     }
 }
 
-impl<'a> ICursor<'a> for SegmentCursor {
+impl ICursor for SegmentCursor {
     fn IsValid(&self) -> bool {
         self.leafIsValid()
     }
@@ -3700,14 +3699,14 @@ impl<'a> ICursor<'a> for SegmentCursor {
         self.search(rootPage, k, sop)
     }
 
-    fn KeyRef(&'a self) -> Result<KeyRef<'a>> {
+    fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
         match self.currentKey {
             None => Err(Error::CursorNotValid),
             Some(currentKey) => self.keyInLeaf2(currentKey),
         }
     }
 
-    fn ValueRef(&'a self) -> Result<ValueRef<'a>> {
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
         match self.currentKey {
             None => Err(Error::CursorNotValid),
             Some(currentKey) => {
