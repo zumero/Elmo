@@ -68,8 +68,8 @@ fn dump_segment(name: &str, segnum: u64) -> Result<(),lsm::Error> {
         {
             let k = try!(cursor.KeyRef());
             println!("k: {:?}", k);
-            //let v = try!(cursor.LiveValueRef());
-            //println!("v: {:?}", v);
+            let v = try!(cursor.ValueRef());
+            println!("v: {:?}", v);
             //let q = try!(v.into_boxed_slice());
         }
         try!(cursor.Next());

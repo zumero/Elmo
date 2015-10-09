@@ -647,17 +647,21 @@ pub enum SeekOp {
     SEEK_GE = 2,
 }
 
-struct CursorIterator {
+// TODO it's dreadful to have three copies of this iterator
+// simply because we can't figure out how to put an ICursor
+// into the struct because of its lifetime param.
+
+struct MultiCursorIterator {
     csr: MultiCursor
 }
 
-impl CursorIterator {
-    fn new(it: MultiCursor) -> CursorIterator {
-        CursorIterator { csr: it }
+impl MultiCursorIterator {
+    fn new(it: MultiCursor) -> MultiCursorIterator {
+        MultiCursorIterator { csr: it }
     }
 }
 
-impl Iterator for CursorIterator {
+impl Iterator for MultiCursorIterator {
     type Item = Result<kvp>;
     fn next(&mut self) -> Option<Result<kvp>> {
         if self.csr.IsValid() {
@@ -688,7 +692,89 @@ impl Iterator for CursorIterator {
     }
 }
 
-#[derive(Copy,Clone,Debug)]
+struct LivingCursorIterator {
+    csr: LivingCursor
+}
+
+impl LivingCursorIterator {
+    fn new(it: LivingCursor) -> LivingCursorIterator {
+        LivingCursorIterator { csr: it }
+    }
+}
+
+impl Iterator for LivingCursorIterator {
+    type Item = Result<kvp>;
+    fn next(&mut self) -> Option<Result<kvp>> {
+        if self.csr.IsValid() {
+            let k = {
+                let k = self.csr.KeyRef();
+                if k.is_err() {
+                    return Some(Err(k.err().unwrap()));
+                }
+                let k = k.unwrap().into_boxed_slice();
+                k
+            };
+            let v = {
+                let v = self.csr.ValueRef();
+                if v.is_err() {
+                    return Some(Err(v.err().unwrap()));
+                }
+                let v = v.unwrap().into_blob();
+                v
+            };
+            let r = self.csr.Next();
+            if r.is_err() {
+                return Some(Err(r.err().unwrap()));
+            }
+            Some(Ok(kvp{Key:k, Value:v}))
+        } else {
+            return None;
+        }
+    }
+}
+
+struct FilterTombstonesCursorIterator {
+    csr: FilterTombstonesCursor
+}
+
+impl FilterTombstonesCursorIterator {
+    fn new(it: FilterTombstonesCursor) -> FilterTombstonesCursorIterator {
+        FilterTombstonesCursorIterator { csr: it }
+    }
+}
+
+impl Iterator for FilterTombstonesCursorIterator {
+    type Item = Result<kvp>;
+    fn next(&mut self) -> Option<Result<kvp>> {
+        if self.csr.IsValid() {
+            let k = {
+                let k = self.csr.KeyRef();
+                if k.is_err() {
+                    return Some(Err(k.err().unwrap()));
+                }
+                let k = k.unwrap().into_boxed_slice();
+                k
+            };
+            let v = {
+                let v = self.csr.ValueRef();
+                if v.is_err() {
+                    return Some(Err(v.err().unwrap()));
+                }
+                let v = v.unwrap().into_blob();
+                v
+            };
+            let r = self.csr.Next();
+            if r.is_err() {
+                return Some(Err(r.err().unwrap()));
+            }
+            Some(Ok(kvp{Key:k, Value:v}))
+        } else {
+            return None;
+        }
+    }
+}
+
+#[derive(Copy,Clone,Debug,PartialEq)]
 pub enum SeekResult {
     Invalid,
     Unequal,
@@ -734,6 +820,7 @@ pub trait ICursor<'a> {
 
     fn IsValid(&self) -> bool;
 
+    // TODO could these lifetimes be declared on the funcs instead of on the ICursor trait?
     fn KeyRef(&'a self) -> Result<KeyRef<'a>>;
     fn ValueRef(&'a self) -> Result<ValueRef<'a>>;
 
@@ -1518,6 +1605,121 @@ impl LivingCursor {
     }
 }
 
+pub struct FilterTombstonesCursor { 
+    chain: MultiCursor,
+    behind: MultiCursor,
+}
+
+impl FilterTombstonesCursor {
+    fn can_skip(&mut self) -> Result<bool> {
+        if self.chain.IsValid() && try!(self.chain.ValueLength()).is_none() {
+            let k = try!(self.chain.KeyRef());
+            // TODO would it be faster to just keep behind moving Next() along with chain?
+
+            // TODO optimize cases where we already know that the key is not present in
+            // behind because, for example, we hit the max key in behind already.
+
+            // TODO this would be a useful place for a bloom filter
+
+            let found = SeekResult::Equal == try!(self.behind.SeekRef(&k, SeekOp::SEEK_EQ));
+            Ok(!found)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn skipTombstonesForward(&mut self) -> Result<()> {
+        while try!(self.can_skip()) {
+            try!(self.chain.Next());
+        }
+        Ok(())
+    }
+
+    fn skipTombstonesBackward(&mut self) -> Result<()> {
+        while try!(self.can_skip()) {
+            try!(self.chain.Prev());
+        }
+        Ok(())
+    }
+
+    fn Create(ch: MultiCursor, behind: MultiCursor) -> FilterTombstonesCursor {
+        FilterTombstonesCursor { 
+            chain: ch,
+            behind: behind,
+        }
+    }
+}
+
+impl<'a> ICursor<'a> for FilterTombstonesCursor {
+    fn First(&mut self) -> Result<()> {
+        try!(self.chain.First());
+        try!(self.skipTombstonesForward());
+        Ok(())
+    }
+
+    fn Last(&mut self) -> Result<()> {
+        try!(self.chain.Last());
+        try!(self.skipTombstonesBackward());
+        Ok(())
+    }
+
+    fn KeyRef(&'a self) -> Result<KeyRef<'a>> {
+        self.chain.KeyRef()
+    }
+
+    fn ValueRef(&'a self) -> Result<ValueRef<'a>> {
+        self.chain.ValueRef()
+    }
+
+    fn ValueLength(&self) -> Result<Option<usize>> {
+        self.chain.ValueLength()
+    }
+
+    fn IsValid(&self) -> bool {
+        self.chain.IsValid() 
+    }
+
+    fn KeyCompare(&self, k: &KeyRef) -> Result<Ordering> {
+        self.chain.KeyCompare(k)
+    }
+
+    fn Next(&mut self) -> Result<()> {
+        try!(self.chain.Next());
+        try!(self.skipTombstonesForward());
+        Ok(())
+    }
+
+    fn Prev(&mut self) -> Result<()> {
+        try!(self.chain.Prev());
+        try!(self.skipTombstonesBackward());
+        Ok(())
+    }
+
+    fn SeekRef(&mut self, k: &KeyRef, sop:SeekOp) -> Result<SeekResult> {
+        let sr = try!(self.chain.SeekRef(k, sop));
+        match sop {
+            SeekOp::SEEK_GE => {
+                if sr.is_valid() && self.chain.ValueLength().unwrap().is_none() {
+                    try!(self.skipTombstonesForward());
+                    SeekResult::from_cursor(&self.chain, k)
+                } else {
+                    Ok(sr)
+                }
+            },
+            SeekOp::SEEK_LE => {
+                if sr.is_valid() && self.chain.ValueLength().unwrap().is_none() {
+                    try!(self.skipTombstonesBackward());
+                    SeekResult::from_cursor(&self.chain, k)
+                } else {
+                    Ok(sr)
+                }
+            },
+            SeekOp::SEEK_EQ => Ok(sr),
+        }
+    }
+
+}
+
 #[derive(PartialEq,Copy,Clone,Debug)]
 pub enum OpLt {
     LT,
@@ -1873,10 +2075,10 @@ struct LeafState {
     blk : PageBlock,
 }
 
-fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite, 
+fn CreateFromSortedSequenceOfKeyValuePairs<I, SeekWrite>(fs: &mut SeekWrite, 
                                                             pageManager: &IPages, 
                                                             source: I,
-                                                           ) -> Result<(SegmentNum,PageNum)> where I:Iterator<Item=Result<kvp>>, SeekWrite : Seek+Write {
+                                                           ) -> Result<(SegmentNum,PageNum)> where I: Iterator<Item=Result<kvp>>, SeekWrite: Seek+Write {
 
     fn writeOverflow<SeekWrite>(startingBlock: PageBlock, 
                                 ba: &mut Read, 
@@ -2670,7 +2872,10 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
     // keep writing until we have written a level which has only one node,
     // which is the root node.
 
-    let lastLeaf = leaves[leaves.len()-1].page;
+    // TODO deal with the case where there were no leaves?  what if
+    // a merge with a filtering cursor ends up filtering everything?
+
+    let lastLeaf = leaves[leaves.len() - 1].page;
 
     let rootPage = {
         let mut blk = blkAfterLeaves;
@@ -2695,7 +2900,7 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
     */
 
     let g = try!(pageManager.End(token, rootPage));
-    Ok((g,rootPage))
+    Ok((g, rootPage))
 }
 
 struct myOverflowReadStream {
@@ -4453,11 +4658,9 @@ impl InnerPart {
         Ok(g)
     }
 
-    fn do_merge(inner: &std::sync::Arc<InnerPart>, segs: Vec<SegmentNum>, clist: Vec<SegmentCursor>) -> Result<SegmentNum> {
-        let mut mc = MultiCursor::Create(clist);
+    fn do_merge<I>(inner: &std::sync::Arc<InnerPart>, segs: Vec<SegmentNum>, source: I) -> Result<SegmentNum> where I: Iterator<Item=Result<kvp>> {
         let mut fs = try!(inner.OpenForWriting());
-        try!(mc.First());
-        let (g,_) = try!(CreateFromSortedSequenceOfKeyValuePairs(&mut fs, &**inner, CursorIterator::new(mc)));
+        let (g,_) = try!(CreateFromSortedSequenceOfKeyValuePairs(&mut fs, &**inner, source));
         //printfn "merged %A to get %A" segs g
         let mut mergeStuff = try!(inner.mergeStuff.lock());
         mergeStuff.pendingMerges.insert(g, segs);
@@ -4510,23 +4713,79 @@ impl InnerPart {
 
             if segs.len() >= min_segs {
                 segs.truncate(max_segs);
+
+                // right now the segs list is in reverse order because we searched with a
+                // reverse iterator just above.  reverse it again to make it right.
                 segs.reverse();
-                let mut clist = Vec::with_capacity(segs.len());
-                for g in segs.iter() {
-                    clist.push(try!(Self::getCursor(inner, &st, *g)));
-                }
-                for g in segs.iter() {
-                    mergeStuff.merging.insert(*g);
-                }
-                Some((segs, clist))
+
+                let cursor = {
+                    let mut clist = Vec::with_capacity(segs.len());
+                    for g in segs.iter() {
+                        let cursor = try!(Self::getCursor(inner, &st, *g));
+                        clist.push(cursor);
+                    }
+
+                    for g in segs.iter() {
+                        mergeStuff.merging.insert(*g);
+                    }
+
+                    let mc = MultiCursor::Create(clist);
+                    mc
+                };
+
+                let last_seg_being_merged = segs[segs.len() - 1];
+                let pos_last_seg = st.header.currentState.iter().position(|s| *s == last_seg_being_merged).expect("gotta be there");
+                let count_segments_behind = st.header.currentState.len() - 1 - pos_last_seg;
+
+                let it: Box<Iterator<Item=Result<kvp>>> = 
+                    if count_segments_behind == 0 {
+                        // we are merging the last segments in the current state.
+                        // there is nothing behind.
+                        // so all tombstones can be filtered.
+                        // so we just wrap in a LivingCursor.
+                        let mut cursor = LivingCursor::Create(cursor);
+                        try!(cursor.First());
+                        // TODO check IsValid here?  to avoid trying to write a segment with no keys.
+                        box LivingCursorIterator::new(cursor)
+                    } else if count_segments_behind < 4 {
+                        // there are segments behind the ones we are merging.
+                        // we can only filter a tombstones if its key is not present behind.
+
+                        // TODO getting all these cursors can be really expensive.
+
+                        // TODO if we knew there were no tombstones in the segments to be merged,
+                        // we would not bother with this.
+
+                        // TODO if there are a LOT of segments behind, this will fail because
+                        // of opening too many files.
+
+                        // TODO capacity
+                        let mut behind = vec![];
+                        for i in pos_last_seg .. st.header.currentState.len() {
+                            let s = st.header.currentState[i];
+                            let cursor = try!(Self::getCursor(inner, &st, s));
+                            behind.push(cursor);
+                        }
+                        let behind = MultiCursor::Create(behind);
+                        let mut cursor = FilterTombstonesCursor::Create(cursor, behind);
+                        try!(cursor.First());
+                        // TODO check IsValid here?  to avoid trying to write a segment with no keys.
+                        box FilterTombstonesCursorIterator::new(cursor)
+                    } else {
+                        let mut cursor = cursor;
+                        try!(cursor.First());
+                        box MultiCursorIterator::new(cursor)
+                    };
+
+                Some((segs, it))
             } else {
                 None
             }
         };
 
         match mrg {
-            Some((segs, clist)) => {
-                let g = try!(Self::do_merge(inner, segs, clist));
+            Some((segs, source)) => {
+                let g = try!(Self::do_merge(inner, segs, source));
                 // TODO if something goes wrong here, the function will exit with
                 // an error but mergeStuff.merging will still contain the segments we are
                 // trying to merge, which will prevent them from EVER being merged.
