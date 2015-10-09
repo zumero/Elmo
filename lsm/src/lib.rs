@@ -785,6 +785,7 @@ pub mod utils {
 
     pub fn SeekPage(strm: &mut Seek, pgsz: usize, pageNumber: PageNum) -> Result<u64> {
         if 0==pageNumber { 
+            // TODO should this panic?
             return Err(Error::InvalidPageNumber);
         }
         let pos = ((pageNumber as u64) - 1) * (pgsz as u64);
@@ -2186,8 +2187,7 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                     PageBlock::new(thisPageNumber + 1, st.blk.lastPage)
                 };
             try!(pb.Write(fs));
-            if nextBlk.firstPage != (thisPageNumber + 1) {
-                // TODO don't do this seek if isRootPage
+            if nextBlk.firstPage != (thisPageNumber + 1) && !isRootPage {
                 try!(utils::SeekPage(fs, pgsz, nextBlk.firstPage));
             }
             let pg = pgitem {page:thisPageNumber, key:last_key};
@@ -2584,8 +2584,7 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
                     }
                 };
             try!(pb.Write(fs));
-            if nextBlk.firstPage != (thisPageNumber+1) {
-                // TODO don't do this seek if IsRootNode
+            if nextBlk.firstPage != (thisPageNumber+1) && !isRootNode {
                 try!(utils::SeekPage(fs, pgsz, nextBlk.firstPage));
             }
             st.sofar = 0;
@@ -2676,17 +2675,24 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I,SeekWrite>(fs: &mut SeekWrite,
     let rootPage = {
         let mut blk = blkAfterLeaves;
         let mut children = leaves;
-        loop {
+        while children.len() > 1 {
             let (newBlk, newChildren) = try!(writeParentNodes(blk, &mut children, pgsz, fs, pageManager, &mut token, lastLeaf, firstLeaf, &mut pb));
             assert!(children.is_empty());
             blk = newBlk;
             children = newChildren;
-            if children.len()==1 {
-                break;
-            }
         }
         children[0].page
     };
+
+    /*
+    {
+        let mut pr = PageBuffer::new(pgsz);
+        try!(utils::SeekPage(fs, pgsz, rootPage));
+        try!(pr.Read(fs));
+        let pt = try!(pr.PageType());
+        assert!(pt == PageType::LEAF_NODE || pt == PageType::PARENT_NODE);
+    }
+    */
 
     let g = try!(pageManager.End(token, rootPage));
     Ok((g,rootPage))
@@ -3023,7 +3029,6 @@ impl SegmentCursor {
                 Ok(true)
             } else {
                 Err(Error::InvalidPageNumber)
-                //Ok(false)
             }
         }
     }
@@ -3437,7 +3442,9 @@ impl SegmentCursor {
                                 if self.pr.CheckPageFlag(PageFlag::FLAG_BOUNDARY_NODE) { self.pr.GetLastInt32() as PageNum }
                                 else if self.currentPage == self.rootPage { 0 }
                                 else { self.currentPage + 1 };
-                            if try!(self.setCurrentPage(nextPage)) && try!(self.searchForwardForLeaf()) {
+                        if 0 == nextPage {
+                                self.resetLeaf();
+                        } else if try!(self.setCurrentPage(nextPage)) && try!(self.searchForwardForLeaf()) {
                                 try!(self.readLeaf());
                                 self.currentKey = Some(0);
                             }

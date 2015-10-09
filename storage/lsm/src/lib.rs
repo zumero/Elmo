@@ -292,16 +292,6 @@ pub const RECORD: u8 = 30;
 ///     recid (varint) (present only when index option unique?)
 pub const INDEX_ENTRY: u8 = 40;
 
-/// key:
-///     (tag)
-///     collid (varint)
-///     indexid (varint)
-///     recid (varint)
-///     (complete index key)
-/// value:
-///    (none)
-pub const RECORD_ID_TO_INDEX_ENTRY: u8 = 41;
-
 fn encode_key_name_to_collection_id(db: &str, coll: &str) -> Box<[u8]> {
     // TODO capacity
     let mut k = vec![];
@@ -376,16 +366,6 @@ fn decode_key_index_id_to_properties(k: &lsm::KeyRef) -> Result<(u64, u64)> {
     let (collection_id, cur) = try!(decode_varint_from_key(k, cur));
     let (index_id, _) = try!(decode_varint_from_key(k, cur));
     Ok((collection_id, index_id))
-}
-
-fn decode_key_backlink(k: &lsm::KeyRef) -> Result<(u64, u64, u64, Box<[u8]>)> {
-    // k[0] must be RECORD_ID_TO_INDEX_ENTRY
-    let cur = 1;
-    let (collection_id, cur) = try!(decode_varint_from_key(k, cur));
-    let (index_id, cur) = try!(decode_varint_from_key(k, cur));
-    let (record_id, cur) = try!(decode_varint_from_key(k, cur));
-    let index_entry = try!(k.map_range(cur, k.len(), lsm_map_to_box).map_err(elmo::wrap_err));
-    Ok((collection_id, index_id, record_id, index_entry))
 }
 
 fn push_varint(v: &mut Vec<u8>, n: u64) {
@@ -1117,7 +1097,6 @@ impl<'a> MyWriter<'a> {
 
                 try!(self.delete_by_collection_id_prefix(RECORD, collection_id));
                 try!(self.delete_by_collection_id_prefix(INDEX_ENTRY, collection_id));
-                try!(self.delete_by_collection_id_prefix(RECORD_ID_TO_INDEX_ENTRY, collection_id));
 
                 Ok(false)
             },
@@ -1172,9 +1151,8 @@ impl<'a> MyWriter<'a> {
                         let ba_collection_id = u64_to_boxed_varint(collection_id);
                         let ba_index_id = u64_to_boxed_varint(index_id);
                         for vals in entries {
-                            let (index_entry, backlink) = try!(Self::make_index_entry_pair(&ba_collection_id, &ba_index_id, &ba_record_id, vals, unique));
+                            let index_entry = try!(Self::make_index_entry(&ba_collection_id, &ba_index_id, &ba_record_id, vals, unique));
                             self.pending.insert(index_entry, lsm::Blob::Array(ba_record_id.clone()));
-                            self.pending.insert(backlink, lsm::Blob::Array(box []));
                         }
                     }
 
@@ -1219,7 +1197,6 @@ impl<'a> MyWriter<'a> {
                 try!(self.delete_by_collection_id_prefix(INDEX_ID_TO_PROPERTIES, collection_id));
                 try!(self.delete_by_collection_id_prefix(RECORD, collection_id));
                 try!(self.delete_by_collection_id_prefix(INDEX_ENTRY, collection_id));
-                try!(self.delete_by_collection_id_prefix(RECORD_ID_TO_INDEX_ENTRY, collection_id));
 
                 Ok(true)
             },
@@ -1308,7 +1285,6 @@ impl<'a> MyWriter<'a> {
 
                         try!(self.delete_by_index_id_prefix(INDEX_ID_TO_PROPERTIES, collection_id, index_id));
                         try!(self.delete_by_index_id_prefix(INDEX_ENTRY, collection_id, index_id));
-                        try!(self.delete_by_index_id_prefix(RECORD_ID_TO_INDEX_ENTRY, collection_id, index_id));
 
                         Ok(true)
                     },
@@ -1357,49 +1333,7 @@ impl<'a> MyWriter<'a> {
         }
     }
 
-    fn update_indexes_delete(&mut self, indexes: &Vec<MyIndexPrep>, ba_collection_id: &Box<[u8]>, ba_record_id: &Box<[u8]>) -> Result<()> {
-        for ndx in indexes {
-            // delete all index entries (and their back links) which involve this record_id.
-            // this *could* be done by simply iterating over all the index entries,
-            // unpacking each one, seeing if the record id matches, and remove it if so, etc.
-            // back links make it faster, especially when the index is large.
-
-            let mut backlink_prefix = vec![];
-            backlink_prefix.push(RECORD_ID_TO_INDEX_ENTRY);
-            backlink_prefix.push_all(ba_collection_id);
-            push_varint(&mut backlink_prefix, ndx.index_id);
-            backlink_prefix.push_all(ba_record_id);
-
-            // TODO maybe store all the backlinks for a given record in a single
-            // value?  we could do a SeekRef EQ search instead?  and just one for
-            // all indexes for this record?  but delete of an index would get much
-            // harder.  and add an index would require a lot of extra work to
-            // rewrite all the backlinks, rather than just adding one for the new
-            // index.
-
-            // TODO
-            // maybe we shouldn't have backlinks?  maybe we should just take the record we
-            // are deleting, generate all the index entries from it, and then delete each
-            // one?
-
-            let mut cursor = lsm::PrefixCursor::new(&mut self.cursor, backlink_prefix.into_boxed_slice());
-            try!(cursor.First().map_err(elmo::wrap_err));
-            while cursor.IsValid() {
-                {
-                    let k_backlink = try!(cursor.KeyRef().map_err(elmo::wrap_err));
-                    let (k_collection_id, k_index_id, k_record_id, k_index_entry) = try!(decode_key_backlink(&k_backlink));
-
-                    self.pending.insert(k_backlink.into_boxed_slice(), lsm::Blob::Tombstone);
-                    self.pending.insert(k_index_entry, lsm::Blob::Tombstone);
-                };
-
-                try!(cursor.Next().map_err(elmo::wrap_err));
-            }
-        }
-        Ok(())
-    }
-
-    fn make_index_entry_pair(ba_collection_id: &Box<[u8]>, ba_index_id: &Box<[u8]>, ba_record_id: &Box<[u8]>, vals: Vec<(bson::Value, bool)>, unique: bool) -> Result<(Box<[u8]>, Box<[u8]>)> {
+    fn make_index_entry(ba_collection_id: &Box<[u8]>, ba_index_id: &Box<[u8]>, ba_record_id: &Box<[u8]>, vals: Vec<(bson::Value, bool)>, unique: bool) -> Result<Box<[u8]>> {
         let vref = vals.iter().map(|&(ref v,neg)| (v,neg)).collect::<Vec<_>>();
         let k = bson::Value::encode_multi_for_index(&vref, None);
         // TODO capacity
@@ -1412,18 +1346,11 @@ impl<'a> MyWriter<'a> {
             index_entry.push_all(&ba_record_id);
         }
 
-        // do the backward entry first, because the other one takes ownership
-        let mut backlink = vec![];
-        backlink.push(RECORD_ID_TO_INDEX_ENTRY);
-        backlink.push_all(ba_collection_id);
-        backlink.push_all(&ba_index_id);
-        backlink.push_all(ba_record_id);
-        backlink.push_all(&index_entry);
-
-        Ok((index_entry.into_boxed_slice(), backlink.into_boxed_slice()))
+        Ok(index_entry.into_boxed_slice())
     }
 
-    fn update_indexes_insert(&mut self, indexes: &Vec<MyIndexPrep>, ba_collection_id: &Box<[u8]>, ba_record_id: &Box<[u8]>, v: &bson::Document) -> Result<()> {
+    fn get_index_entries(indexes: &Vec<MyIndexPrep>, ba_collection_id: &Box<[u8]>, ba_record_id: &Box<[u8]>, v: &bson::Document) -> Result<Vec<Box<[u8]>>> {
+        let mut a = vec![];
         for ndx in indexes {
             let entries = try!(elmo::get_index_entries(&v, &ndx.normspec, &ndx.weights, &ndx.options));
             // TODO don't look this up here.  store it in the cached info.
@@ -1435,10 +1362,31 @@ impl<'a> MyWriter<'a> {
             // TODO store this in the cache?
             let ba_index_id = u64_to_boxed_varint(ndx.index_id);
             for vals in entries {
-                let (index_entry, backlink) = try!(Self::make_index_entry_pair(ba_collection_id, &ba_index_id, ba_record_id, vals, unique));
-                self.pending.insert(index_entry, lsm::Blob::Array(ba_record_id.clone()));
-                self.pending.insert(backlink, lsm::Blob::Array(box []));
+                let index_entry = try!(Self::make_index_entry(ba_collection_id, &ba_index_id, ba_record_id, vals, unique));
+                a.push(index_entry);
             }
+        }
+        Ok(a)
+    }
+
+    fn update_indexes_delete(&mut self, indexes: &Vec<MyIndexPrep>, ba_collection_id: &Box<[u8]>, ba_record_id: &Box<[u8]>, v: &bson::Document) -> Result<()> {
+        let a = try!(Self::get_index_entries(indexes, ba_collection_id, ba_record_id, v));
+        for e in a {
+            self.pending.insert(e, lsm::Blob::Tombstone);
+        }
+        Ok(())
+    }
+
+    fn update_indexes_insert(&mut self, indexes: &Vec<MyIndexPrep>, ba_collection_id: &Box<[u8]>, ba_record_id: &Box<[u8]>, v: &bson::Document) -> Result<()> {
+        let a = try!(Self::get_index_entries(indexes, ba_collection_id, ba_record_id, v));
+        for e in a {
+            // TODO it might be better here to always put the record id on the
+            // end of the key and store nothing in the value.  maybe introduce
+            // a special flag so we can represent a zero-length value more
+            // efficiently.
+            // but how would we enforce the unique constraint on the value
+            // rather than on the full key with recid appended?
+            self.pending.insert(e, lsm::Blob::Array(ba_record_id.clone()));
         }
         Ok(())
     }
@@ -1503,9 +1451,11 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
                         k.push_all(&ba_collection_id);
                         let ba_record_id = u64_to_boxed_varint(record_id);
                         k.push_all(&ba_record_id);
+
+                        let mut old = try!(get_value_for_key_as_bson(&mut self.cursor, &k)).unwrap();
                         self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(v.to_bson_array().into_boxed_slice()));
 
-                        try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id));
+                        try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id, &old));
                         try!(self.update_indexes_insert(&cw.indexes, &ba_collection_id, &ba_record_id, v));
 
                         Ok(())
@@ -1526,9 +1476,11 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
                 k.push_all(&ba_collection_id);
                 let ba_record_id = u64_to_boxed_varint(record_id);
                 k.push_all(&ba_record_id);
+
+                let mut old = try!(get_value_for_key_as_bson(&mut self.cursor, &k)).unwrap();
                 self.pending.insert(k.into_boxed_slice(), lsm::Blob::Tombstone);
 
-                try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id));
+                try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id, &old));
 
                 Ok(true)
             },
