@@ -1636,7 +1636,7 @@ impl LivingCursor {
 
 pub struct FilterTombstonesCursor { 
     chain: MultiCursor,
-    behind: MultiCursor,
+    behind: Vec<SegmentCursor>,
 }
 
 impl FilterTombstonesCursor {
@@ -1647,10 +1647,18 @@ impl FilterTombstonesCursor {
             // then we could optimize cases where we already know that the key is not present
             // in behind because, for example, we hit the max key in behind already.
 
-            let found = SeekResult::Equal == try!(self.behind.SeekRef(&k, SeekOp::SEEK_EQ));
-            // TODO if the value was found but it is another tombstone, then it is actually
-            // not found
-            Ok(!found)
+            for csr in self.behind.iter_mut() {
+                // TODO we would be fine with false positives on this seek.
+                // TODO we also don't need this seek to result in the cursor being valid.
+                // we just want to know if the key is present.
+                let found = SeekResult::Equal == try!(csr.SeekRef(&k, SeekOp::SEEK_EQ));
+                // TODO if the value was found but it is another tombstone, then it is actually
+                // not found
+                if found {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         } else {
             Ok(false)
         }
@@ -1670,7 +1678,7 @@ impl FilterTombstonesCursor {
         Ok(())
     }
 
-    fn Create(ch: MultiCursor, behind: MultiCursor) -> FilterTombstonesCursor {
+    fn new(ch: MultiCursor, behind: Vec<SegmentCursor>) -> FilterTombstonesCursor {
         FilterTombstonesCursor { 
             chain: ch,
             behind: behind,
@@ -3229,17 +3237,14 @@ fn readOverflow(path: &str, pgsz: usize, firstPage: PageNum, buf: &mut [u8]) -> 
 
 pub struct SegmentCursor {
     path: String,
-    done: Option<Box<Fn() -> ()>>,
-    blocks: Vec<PageBlock>, // TODO will be needed later for stray checking
     fs: File,
-    len: u64,
+    done: Option<Box<Fn() -> ()>>,
+    blocks: Vec<PageBlock>,
     rootPage: PageNum,
+
     pr: PageBuffer,
     currentPage: PageNum,
-    leafKeys: Vec<usize>,
-    previousLeaf: PageNum,
-    currentKey: Option<usize>,
-    prefix: Option<Box<[u8]>>,
+
     firstLeaf: PageNum,
     lastLeaf: PageNum,
     count_keys: usize,
@@ -3248,6 +3253,12 @@ pub struct SegmentCursor {
     filter_len: usize,
     filter_count_funcs: usize,
     filter: Option<Bloom>,
+
+    leafKeys: Vec<usize>,
+    previousLeaf: PageNum,
+    prefix: Option<Box<[u8]>>,
+
+    currentKey: Option<usize>,
 }
 
 impl SegmentCursor {
@@ -3263,12 +3274,6 @@ impl SegmentCursor {
                 .read(true)
                 .open(path));
 
-        // TODO the len is used for checking to make sure we don't stray
-        // to far.  This should probably be done with the blocks provided
-        // by the caller, not by looking at the full length of the file,
-        // which this cursor shouldn't care about.
-        let len = try!(misc::io::seek_len(&mut f));
-
         // TODO apparently the PageBuffer::new() call below is expensive
 
         let mut res = SegmentCursor {
@@ -3276,7 +3281,6 @@ impl SegmentCursor {
             fs: f,
             blocks: blocks,
             done: None,
-            len: len,
             rootPage: rootPage,
             pr: PageBuffer::new(pgsz),
             currentPage: 0,
@@ -3293,16 +3297,16 @@ impl SegmentCursor {
             filter_count_funcs: 0, // temporary
             filter: None, // temporary
         };
+
         // TODO consider keeping the root page around as long as this cursor is around
-        if !try!(res.setCurrentPage(rootPage)) {
-            // TODO fix this error.  or assert, because we previously verified
-            // that the root page was in the block list we were given.
-            return Err(Error::Misc(String::from("failed to read root page")));
-        }
+        try!(res.setCurrentPage(rootPage));
+
         let pt = try!(res.pr.PageType());
         if pt == PageType::LEAF_NODE {
             res.firstLeaf = rootPage;
             res.lastLeaf = rootPage;
+            // TODO we still need to get count_keys
+            // TODO we still need to get count_tombstones
         } else if pt == PageType::PARENT_NODE {
             if ! res.pr.CheckPageFlag(PageFlag::FLAG_ROOT_NODE) { 
                 return Err(Error::CorruptFile("root page lacks flag"));
@@ -3370,36 +3374,61 @@ impl SegmentCursor {
         }
     }
 
-    fn resetLeaf(&mut self) {
-        self.leafKeys.clear();
-        self.previousLeaf = 0;
-        self.currentKey = None;
-        self.prefix = None;
+    fn readLeaf(&mut self) -> Result<()> {
+        let mut cur = 0;
+        let pt = try!(PageType::from_u8(self.pr.GetByte(&mut cur)));
+        if pt != PageType::LEAF_NODE {
+            return Err(Error::CorruptFile("leaf has invalid page type"));
+        }
+        self.pr.GetByte(&mut cur);
+        self.previousLeaf = self.pr.GetInt32(&mut cur) as PageNum;
+        let prefixLen = self.pr.GetByte(&mut cur) as usize;
+        if prefixLen > 0 {
+            // TODO should we just remember prefix as a reference instead of box/copy?
+            let mut a = vec![0;prefixLen].into_boxed_slice();
+            self.pr.GetIntoArray(&mut cur, &mut a);
+            self.prefix = Some(a);
+        } else {
+            self.prefix = None;
+        }
+        let countLeafKeys = self.pr.GetInt16(&mut cur) as usize;
+        // assert countLeafKeys>0
+        // TODO might need to extend capacity here, not just truncate
+        self.leafKeys.truncate(countLeafKeys);
+        while self.leafKeys.len() < countLeafKeys {
+            self.leafKeys.push(0);
+        }
+        for i in 0 .. countLeafKeys {
+            self.leafKeys[i] = cur;
+            self.skipKey(&mut cur);
+            self.skipValue(&mut cur);
+        }
+        Ok(())
     }
 
-    fn setCurrentPage(&mut self, pgnum: PageNum) -> Result<bool> {
-        // TODO this function is silly.  it never returns false.
+    fn setCurrentPage(&mut self, pgnum: PageNum) -> Result<()> {
+        assert!(block_list_contains_page(&self.blocks, pgnum));
 
-        // TODO use self.blocks to make sure we are not straying out of bounds.
-        //assert!(block_list_contains_page(&self.blocks, pgnum));
+        if self.currentPage != pgnum {
+            self.currentPage = pgnum;
 
-        // TODO if currentPage = pgnum already...
-        self.currentPage = pgnum;
-        self.resetLeaf();
-        if 0 == self.currentPage { 
-            Err(Error::InvalidPageNumber)
-        } else {
-            // refuse to go to a page beyond the end of the stream
-            // TODO is this the right place for this check?    
-            let pos = (self.currentPage - 1) as u64 * self.pr.PageSize() as u64;
-            if pos + self.pr.PageSize() as u64 <= self.len {
-                try!(utils::SeekPage(&mut self.fs, self.pr.PageSize(), self.currentPage));
-                try!(self.pr.Read(&mut self.fs));
-                Ok(true)
-            } else {
-                Err(Error::InvalidPageNumber)
+            self.leafKeys.clear();
+            self.previousLeaf = 0;
+            self.currentKey = None;
+            self.prefix = None;
+
+            try!(utils::SeekPage(&mut self.fs, self.pr.PageSize(), self.currentPage));
+            try!(self.pr.Read(&mut self.fs));
+
+            match self.pr.PageType() {
+                Ok(PageType::LEAF_NODE) => {
+                    try!(self.readLeaf());
+                },
+                _ => {
+                },
             }
         }
+        Ok(())
     }
 
     fn nextInLeaf(&mut self) -> bool {
@@ -3463,39 +3492,6 @@ impl SegmentCursor {
         }
     }
 
-    fn readLeaf(&mut self) -> Result<()> {
-        self.resetLeaf();
-        let mut cur = 0;
-        let pt = try!(PageType::from_u8(self.pr.GetByte(&mut cur)));
-        if pt != PageType::LEAF_NODE {
-            return Err(Error::CorruptFile("leaf has invalid page type"));
-        }
-        self.pr.GetByte(&mut cur);
-        self.previousLeaf = self.pr.GetInt32(&mut cur) as PageNum;
-        let prefixLen = self.pr.GetByte(&mut cur) as usize;
-        if prefixLen > 0 {
-            // TODO should we just remember prefix as a reference instead of box/copy?
-            let mut a = vec![0;prefixLen].into_boxed_slice();
-            self.pr.GetIntoArray(&mut cur, &mut a);
-            self.prefix = Some(a);
-        } else {
-            self.prefix = None;
-        }
-        let countLeafKeys = self.pr.GetInt16(&mut cur) as usize;
-        // assert countLeafKeys>0
-        // TODO might need to extend capacity here, not just truncate
-        self.leafKeys.truncate(countLeafKeys);
-        while self.leafKeys.len() < countLeafKeys {
-            self.leafKeys.push(0);
-        }
-        for i in 0 .. countLeafKeys {
-            self.leafKeys[i] = cur;
-            self.skipKey(&mut cur);
-            self.skipValue(&mut cur);
-        }
-        Ok(())
-    }
-
     fn keyInLeaf2<'a>(&'a self, n: usize) -> Result<KeyRef<'a>> { 
         let mut cur = self.leafKeys[n as usize];
         let kflag = self.pr.GetByte(&mut cur);
@@ -3516,114 +3512,6 @@ impl SegmentCursor {
             try!(ostrm.read_to_end(&mut x_k));
             let x_k = x_k.into_boxed_slice();
             Ok(KeyRef::Overflowed(x_k))
-        }
-    }
-
-    #[cfg(remove_me)]
-    fn keyInLeaf(&self, n: usize) -> Result<Box<[u8]>> { 
-        let mut cur = self.leafKeys[n as usize];
-        let kflag = self.pr.GetByte(&mut cur);
-        let klen = self.pr.GetVarint(&mut cur) as usize;
-        let mut res = vec![0;klen].into_boxed_slice();
-        if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
-            match self.prefix {
-                Some(ref a) => {
-                    let prefixLen = a.len();
-                    for i in 0 .. prefixLen {
-                        res[i] = a[i];
-                    }
-                    self.pr.GetIntoArray(&mut cur, &mut res[prefixLen .. klen]);
-                    Ok(res)
-                },
-                None => {
-                    self.pr.GetIntoArray(&mut cur, &mut res);
-                    Ok(res)
-                },
-            }
-        } else {
-            let pgnum = self.pr.GetInt32(&mut cur) as PageNum;
-            try!(readOverflow(&self.path, self.pr.PageSize(), pgnum, &mut res));
-            Ok(res)
-        }
-    }
-
-    #[cfg(remove_me)]
-    fn compareKeyInLeaf(&self, n: usize, other: &[u8]) -> Result<Ordering> {
-        let mut cur = self.leafKeys[n as usize];
-        let kflag = self.pr.GetByte(&mut cur);
-        let klen = self.pr.GetVarint(&mut cur) as usize;
-        if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
-            let res = 
-                match self.prefix {
-                    Some(ref a) => {
-                        self.pr.CompareWithPrefix(cur, a, klen, other)
-                    },
-                    None => {
-                        self.pr.Compare(cur, klen, other)
-                    },
-                };
-            Ok(res)
-        } else {
-            // TODO this could be more efficient. we could compare the key
-            // in place in the overflow without fetching the entire thing.
-
-            // TODO overflowed keys are not prefixed.  should they be?
-            let pgnum = self.pr.GetInt32(&mut cur) as PageNum;
-            let mut k = vec![0;klen].into_boxed_slice();
-            try!(readOverflow(&self.path, self.pr.PageSize(), pgnum, &mut k));
-            let res = bcmp::Compare(&*k, other);
-            Ok(res)
-        }
-    }
-
-    #[cfg(remove_me)]
-    fn compare_two(x: &SegmentCursor, y: &SegmentCursor) -> Result<Ordering> {
-        fn get_info(c: &SegmentCursor) -> Result<(usize, bool, usize, usize)> {
-            match c.currentKey {
-                None => Err(Error::CursorNotValid),
-                Some(n) => {
-                    let mut cur = c.leafKeys[n as usize];
-                    let kflag = c.pr.GetByte(&mut cur);
-                    let klen = c.pr.GetVarint(&mut cur) as usize;
-                    let overflowed = 0 != (kflag & ValueFlag::FLAG_OVERFLOW);
-                    Ok((n, overflowed, cur, klen))
-                },
-            }
-        }
-
-        let (x_n, x_over, x_cur, x_klen) = try!(get_info(x));
-        let (y_n, y_over, y_cur, y_klen) = try!(get_info(y));
-
-        if x_over || y_over {
-            // if either of these keys is overflowed, don't bother
-            // trying to do anything clever.  just read both keys
-            // into memory and compare them.
-            let x_k = try!(x.keyInLeaf(x_n));
-            let y_k = try!(y.keyInLeaf(y_n));
-            Ok(bcmp::Compare(&x_k, &y_k))
-        } else {
-            match (&x.prefix, &y.prefix) {
-                (&Some(ref x_p), &Some(ref y_p)) => {
-                    let x_k = x.pr.get_slice(x_cur, x_klen - x_p.len());
-                    let y_k = y.pr.get_slice(y_cur, y_klen - y_p.len());
-                    Ok(KeyRef::compare_px_py(x_p, x_k, y_p, y_k))
-                },
-                (&Some(ref x_p), &None) => {
-                    let x_k = x.pr.get_slice(x_cur, x_klen - x_p.len());
-                    let y_k = y.pr.get_slice(y_cur, y_klen);
-                    Ok(KeyRef::compare_px_y(x_p, x_k, y_k))
-                },
-                (&None, &Some(ref y_p)) => {
-                    let x_k = x.pr.get_slice(x_cur, x_klen);
-                    let y_k = y.pr.get_slice(y_cur, y_klen - y_p.len());
-                    Ok(KeyRef::compare_x_py(x_k, y_p, y_k))
-                },
-                (&None, &None) => {
-                    let x_k = x.pr.get_slice(x_cur, x_klen);
-                    let y_k = y.pr.get_slice(y_cur, y_klen);
-                    Ok(bcmp::Compare(&x_k, &y_k))
-                },
-            }
         }
     }
 
@@ -3758,31 +3646,19 @@ impl SegmentCursor {
             // fit).  it doesn't matter.  we just skip ahead.
             //
             if self.pr.CheckPageFlag(PageFlag::FLAG_BOUNDARY_NODE) {
-                if try!(self.setCurrentPage(lastInt32)) {
-                    self.searchForwardForLeaf()
-                } else {
-                    Ok(false)
-                }
+                try!(self.setCurrentPage(lastInt32));
+                self.searchForwardForLeaf()
             } else {
                 let lastPage = self.currentPage + lastInt32;
                 let endsOnBoundary = self.pr.CheckPageFlag(PageFlag::FLAG_ENDS_ON_BOUNDARY);
                 if endsOnBoundary {
-                    if try!(self.setCurrentPage(lastPage)) {
-                        let next = self.pr.GetLastInt32() as PageNum;
-                        if try!(self.setCurrentPage(next)) {
-                            self.searchForwardForLeaf()
-                        } else {
-                            Ok(false)
-                        }
-                    } else {
-                        Ok(false)
-                    }
+                    try!(self.setCurrentPage(lastPage));
+                    let next = self.pr.GetLastInt32() as PageNum;
+                    try!(self.setCurrentPage(next));
+                    self.searchForwardForLeaf()
                 } else {
-                    if try!(self.setCurrentPage(lastPage + 1)) {
-                        self.searchForwardForLeaf()
-                    } else {
-                        Ok(false)
-                    }
+                    try!(self.setCurrentPage(lastPage + 1));
+                    self.searchForwardForLeaf()
                 }
             }
         }
@@ -3795,54 +3671,59 @@ impl SegmentCursor {
     }
 
     fn search(&mut self, pg: PageNum, k: &KeyRef, sop:SeekOp) -> Result<SeekResult> {
-        if try!(self.setCurrentPage(pg)) {
-            let pt = try!(self.pr.PageType());
-            if PageType::LEAF_NODE == pt {
-                try!(self.readLeaf());
-                let tmp_countLeafKeys = self.leafKeys.len();
-                let (newCur, equal) = try!(self.searchLeaf(k, 0, (tmp_countLeafKeys - 1), sop, None, None));
-                self.currentKey = newCur;
-                if SeekOp::SEEK_EQ != sop {
-                    if ! self.leafIsValid() {
-                        // if LE or GE failed on a given page, we might need
-                        // to look at the next/prev leaf.
-                        if SeekOp::SEEK_GE == sop {
-                            let nextPage =
-                                if self.pr.CheckPageFlag(PageFlag::FLAG_BOUNDARY_NODE) { self.pr.GetLastInt32() as PageNum }
-                                else if self.currentPage == self.rootPage { 0 }
-                                else { self.currentPage + 1 };
+        try!(self.setCurrentPage(pg));
+        let pt = try!(self.pr.PageType());
+        if PageType::LEAF_NODE == pt {
+            let tmp_countLeafKeys = self.leafKeys.len();
+            let (newCur, equal) = try!(self.searchLeaf(k, 0, (tmp_countLeafKeys - 1), sop, None, None));
+            self.currentKey = newCur;
+            if SeekOp::SEEK_EQ != sop {
+                if ! self.leafIsValid() {
+                    // if LE or GE failed on a given page, we might need
+                    // to look at the next/prev leaf.
+                    if SeekOp::SEEK_GE == sop {
+                        let nextPage =
+                            if self.pr.CheckPageFlag(PageFlag::FLAG_BOUNDARY_NODE) { 
+                                self.pr.GetLastInt32() as PageNum 
+                            } else if self.currentPage == self.rootPage { 
+                                0 
+                            } else { 
+                                self.currentPage + 1 
+                            };
                         if 0 == nextPage {
-                                self.resetLeaf();
-                        } else if try!(self.setCurrentPage(nextPage)) && try!(self.searchForwardForLeaf()) {
-                                try!(self.readLeaf());
+                            self.currentKey = None;
+                        } else {
+                            try!(self.setCurrentPage(nextPage));
+                            if try!(self.searchForwardForLeaf()) {
                                 self.currentKey = Some(0);
                             }
+                        }
+                    } else {
+                        let tmp_previousLeaf = self.previousLeaf;
+                        if 0 == self.previousLeaf {
+                            self.currentKey = None;
                         } else {
-                            let tmp_previousLeaf = self.previousLeaf;
-                            if 0 == self.previousLeaf {
-                                self.resetLeaf();
-                            } else if try!(self.setCurrentPage(tmp_previousLeaf)) {
-                                try!(self.readLeaf());
-                                self.currentKey = Some(self.leafKeys.len() - 1);
+                            try!(self.setCurrentPage(tmp_previousLeaf));
+                            if try!(self.pr.PageType()) != PageType::LEAF_NODE {
+                                return Err(Error::Misc(format!("must be a leaf")));
                             }
+                            self.currentKey = Some(self.leafKeys.len() - 1);
                         }
                     }
                 }
-                if self.currentKey.is_none() {
-                    Ok(SeekResult::Invalid)
-                } else if equal {
-                    Ok(SeekResult::Equal)
-                } else {
-                    Ok(SeekResult::Unequal)
-                }
-            } else if PageType::PARENT_NODE == pt {
-                let next = try!(self.get_next_from_parent_page(k));
-                self.search(next, k, sop)
-            } else {
-                unreachable!();
             }
+            if self.currentKey.is_none() {
+                Ok(SeekResult::Invalid)
+            } else if equal {
+                Ok(SeekResult::Equal)
+            } else {
+                Ok(SeekResult::Unequal)
+            }
+        } else if PageType::PARENT_NODE == pt {
+            let next = try!(self.get_next_from_parent_page(k));
+            self.search(next, k, sop)
         } else {
-            Ok(SeekResult::Invalid)
+            unreachable!();
         }
     }
 
@@ -3878,7 +3759,7 @@ impl ICursor for SegmentCursor {
                         //let other = try!(self.search(root_page, k, sop));
                         //println!("{:?}", other);
                         //assert!(other == SeekResult::Invalid);
-                        self.resetLeaf();
+                        self.currentKey = None;
                         return Ok(SeekResult::Invalid)
                     },
                     BloomFilterResult::Maybe => {
@@ -3955,19 +3836,21 @@ impl ICursor for SegmentCursor {
 
     fn First(&mut self) -> Result<()> {
         let firstLeaf = self.firstLeaf;
-        if try!(self.setCurrentPage(firstLeaf)) {
-            try!(self.readLeaf());
-            self.currentKey = Some(0);
+        try!(self.setCurrentPage(firstLeaf));
+        if try!(self.pr.PageType()) != PageType::LEAF_NODE {
+            return Err(Error::Misc(format!("must be a leaf")));
         }
+        self.currentKey = Some(0);
         Ok(())
     }
 
     fn Last(&mut self) -> Result<()> {
         let lastLeaf = self.lastLeaf;
-        if try!(self.setCurrentPage(lastLeaf)) {
-            try!(self.readLeaf());
-            self.currentKey = Some(self.leafKeys.len() - 1);
+        try!(self.setCurrentPage(lastLeaf));
+        if try!(self.pr.PageType()) != PageType::LEAF_NODE {
+            return Err(Error::Misc(format!("must be a leaf")));
         }
+        self.currentKey = Some(self.leafKeys.len() - 1);
         Ok(())
     }
 
@@ -3986,12 +3869,16 @@ impl ICursor for SegmentCursor {
                     0 
                 };
             if 0 == nextPage {
-                self.resetLeaf();
+                self.currentKey = None;
             } else if !block_list_contains_page(&self.blocks, nextPage) {
-                self.resetLeaf();
-            } else if try!(self.setCurrentPage(nextPage)) && try!(self.searchForwardForLeaf()) {
-                try!(self.readLeaf());
-                self.currentKey = Some(0);
+                self.currentKey = None;
+            } else {
+                try!(self.setCurrentPage(nextPage));
+                if try!(self.searchForwardForLeaf()) {
+                    self.currentKey = Some(0);
+                } else {
+                    self.currentKey = None;
+                }
             }
         }
         Ok(())
@@ -4001,9 +3888,12 @@ impl ICursor for SegmentCursor {
         if !self.prevInLeaf() {
             let previousLeaf = self.previousLeaf;
             if 0 == previousLeaf {
-                self.resetLeaf();
-            } else if try!(self.setCurrentPage(previousLeaf)) {
-                try!(self.readLeaf());
+                self.currentKey = None;
+            } else {
+                try!(self.setCurrentPage(previousLeaf));
+                if try!(self.pr.PageType()) != PageType::LEAF_NODE {
+                    return Err(Error::Misc(format!("must be a leaf")));
+                }
                 self.currentKey = Some(self.leafKeys.len() - 1);
             }
         }
@@ -4298,7 +4188,11 @@ struct SafeHeader {
 struct SafeCursors {
     nextCursorNum: u64,
     cursors: HashMap<u64, SegmentNum>,
-    zombies: HashMap<SegmentNum, SegmentInfo>,
+
+    // a zombie segment is one that was replaced by a merge, but
+    // when the merge was done, it could not be reclaimed as free
+    // blocks because there was an open cursor on it.
+    zombie_segments: HashMap<SegmentNum, SegmentInfo>,
 }
 
 struct InnerPart {
@@ -4371,7 +4265,7 @@ impl db {
         let cursors = SafeCursors {
             nextCursorNum: 1,
             cursors: HashMap::new(),
-            zombies: HashMap::new(),
+            zombie_segments: HashMap::new(),
         };
 
         let inner = InnerPart {
@@ -4469,7 +4363,7 @@ impl InnerPart {
         let mut cursors = self.cursors.lock().unwrap(); // gotta succeed
         let seg = cursors.cursors.remove(&csrnum).expect("gotta be there");
         assert_eq!(seg, segnum);
-        match cursors.zombies.remove(&segnum) {
+        match cursors.zombie_segments.remove(&segnum) {
             Some(info) => {
                 // TODO maybe allow this lock to fail with try_lock.  the
                 // worst that can happen is that these blocks don't get
@@ -4982,12 +4876,10 @@ impl InnerPart {
                             let cursor = try!(Self::getCursor(inner, &st, s));
                             behind.push(cursor);
                         }
-                        // TODO to allow reuse of these behind cursors, we should not
-                        // make a multicursor out of them, just pass the list of subcursors
-                        // to the FilterTombstonesCursor, and pass them as references, don't
-                        // transfer ownership.
-                        let behind = MultiCursor::Create(behind);
-                        let mut cursor = FilterTombstonesCursor::Create(cursor, behind);
+                        // TODO to allow reuse of these behind cursors, we should pass
+                        // them as references, don't transfer ownership.  but then they
+                        // will need to be owned somewhere else.
+                        let mut cursor = FilterTombstonesCursor::new(cursor, behind);
                         try!(cursor.First());
                         // TODO check IsValid here?  to avoid trying to write a segment with no keys.
                         box cursor
@@ -5125,10 +5017,10 @@ impl InnerPart {
             let mut cursors = try!(self.cursors.lock());
             let segmentsWithACursor : HashSet<SegmentNum> = cursors.cursors.iter().map(|t| {let (_,segnum) = t; *segnum}).collect();
             for g in segmentsWithACursor {
-                // don't free anything that has a cursor
+                // don't free any segment that has a cursor
                 match segmentsToBeFreed.remove(&g) {
                     Some(z) => {
-                        cursors.zombies.insert(g, z);
+                        cursors.zombie_segments.insert(g, z);
                     },
                     None => {
                     },
