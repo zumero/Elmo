@@ -2916,8 +2916,8 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I, SeekWrite>(fs: &mut SeekWrite,
     let pgsz = pageManager.PageSize();
     let mut pb = PageBuilder::new(pgsz);
     let mut token = try!(pageManager.Begin());
-    let startingBlk = try!(pageManager.GetBlock(&mut token));
-    try!(utils::SeekPage(fs, pgsz, startingBlk.firstPage));
+    let blk = try!(pageManager.GetBlock(&mut token));
+    try!(utils::SeekPage(fs, pgsz, blk.firstPage));
 
     // TODO this is a buffer just for the purpose of being reused
     // in cases where the blob is provided as a stream, and we need
@@ -2925,24 +2925,12 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I, SeekWrite>(fs: &mut SeekWrite,
     // than overflow.
     let mut vbuf = vec![0;pgsz].into_boxed_slice(); 
 
-    let (blkAfterLeaves, leaves, firstLeaf, count_keys, count_tombstones, filter) = try!(writeLeaves(startingBlk, pageManager, source, estimate_count_keys, &mut vbuf, fs, &mut pb, &mut token));
+    let (blk, leaves, firstLeaf, count_keys, count_tombstones, filter) = try!(writeLeaves(blk, pageManager, source, estimate_count_keys, &mut vbuf, fs, &mut pb, &mut token));
     assert!(count_keys >= count_tombstones);
 
     let filter_count_funcs = filter.count_funcs();
     let filter_bytes = filter.into_bytes();
     //println!("bloom created: {:?}", filter_bytes);
-    let (filter_page, blkAfterLeaves) =
-        // TODO is it always worth writing the filter just because there were more
-        // keys than could fit on a single leaf?
-        // maybe we should write a bloom filter only when there is more than one
-        // generation of parent nodes?
-        if leaves.len() > 1 {
-            let filter_page = blkAfterLeaves.firstPage;
-            let (_, blkAfterLeaves) = try!(writeOverflow(blkAfterLeaves, &mut &*filter_bytes, pageManager, &mut token, fs));
-            (filter_page, blkAfterLeaves)
-        } else {
-            (0, blkAfterLeaves)
-        };
 
     // all the leaves are written.
     // now write the parent pages.
@@ -2955,30 +2943,48 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I, SeekWrite>(fs: &mut SeekWrite,
 
     let lastLeaf = leaves[leaves.len() - 1].page;
 
-    // TODO we don't need this footer unless there was more than one leaf
-    let mut footer = vec![];
-    misc::push_varint(&mut footer, firstLeaf as u64);
-    misc::push_varint(&mut footer, lastLeaf as u64);
-    misc::push_varint(&mut footer, count_keys as u64);
-    misc::push_varint(&mut footer, count_tombstones as u64);
-    misc::push_varint(&mut footer, filter_page as u64);
-    misc::push_varint(&mut footer, filter_bytes.len() as u64);
-    misc::push_varint(&mut footer, filter_count_funcs as u64);
-    let len = footer.len();
-    assert!(len <= 255);
-    footer.push(len as u8);
+    let (root_page, blk) =
+        if leaves.len() > 1 {
+            let (filter_page, blk) =
+                // TODO is it always worth writing the filter just because there were more
+                // keys than could fit on a single leaf?
+                // maybe we should write a bloom filter only when there is more than one
+                // generation of parent nodes?
+                if leaves.len() > 1 {
+                    let filter_page = blk.firstPage;
+                    let (_, blk) = try!(writeOverflow(blk, &mut &*filter_bytes, pageManager, &mut token, fs));
+                    (filter_page, blk)
+                } else {
+                    (0, blk)
+                };
 
-    let (root_page, blk) = {
-        let mut blk = blkAfterLeaves;
-        let mut children = leaves;
-        while children.len() > 1 {
-            let (newBlk, newChildren) = try!(writeParentNodes(blk, &mut children, pgsz, fs, pageManager, &mut token, &footer, &mut pb));
-            assert!(children.is_empty());
-            blk = newBlk;
-            children = newChildren;
-        }
-        (children[0].page, blk)
-    };
+            let mut footer = vec![];
+            misc::push_varint(&mut footer, firstLeaf as u64);
+            misc::push_varint(&mut footer, lastLeaf as u64);
+            misc::push_varint(&mut footer, count_keys as u64);
+            misc::push_varint(&mut footer, count_tombstones as u64);
+            misc::push_varint(&mut footer, filter_page as u64);
+            misc::push_varint(&mut footer, filter_bytes.len() as u64);
+            misc::push_varint(&mut footer, filter_count_funcs as u64);
+            let len = footer.len();
+            assert!(len <= 255);
+            footer.push(len as u8);
+
+            let (root_page, blk) = {
+                let mut blk = blk;
+                let mut children = leaves;
+                while children.len() > 1 {
+                    let (newBlk, newChildren) = try!(writeParentNodes(blk, &mut children, pgsz, fs, pageManager, &mut token, &footer, &mut pb));
+                    assert!(children.is_empty());
+                    blk = newBlk;
+                    children = newChildren;
+                }
+                (children[0].page, blk)
+            };
+            (root_page, blk)
+        } else {
+            (leaves[0].page, blk)
+        };
 
     /*
     {
