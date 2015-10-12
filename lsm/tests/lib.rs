@@ -92,7 +92,7 @@ fn empty_cursor() {
 fn first_prev() {
     fn f() -> lsm::Result<()> {
         let db = try!(lsm::db::new(tempfile("first_prev"), lsm::DEFAULT_SETTINGS));
-        let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}));
+        let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}, 100));
         {
             let lck = try!(db.GetWriteLock());
             try!(lck.commitSegments(vec![g]));
@@ -111,7 +111,7 @@ fn first_prev() {
 fn last_next() {
     fn f() -> lsm::Result<()> {
         let db = try!(lsm::db::new(tempfile("first_prev"), lsm::DEFAULT_SETTINGS));
-        let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}));
+        let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}, 100));
         {
             let lck = try!(db.GetWriteLock());
             try!(lck.commitSegments(vec![g]));
@@ -130,7 +130,7 @@ fn last_next() {
 fn seek() {
     fn f() -> lsm::Result<()> {
         let db = try!(lsm::db::new(tempfile("seek"), lsm::DEFAULT_SETTINGS));
-        let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}));
+        let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}, 100));
         {
             let lck = try!(db.GetWriteLock());
             try!(lck.commitSegments(vec![g]));
@@ -485,7 +485,7 @@ fn many_segments() {
 
         let mut a = Vec::new();
         for i in 0 .. NUM {
-            let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: i * EACH, end: (i+1) * EACH, step: 1}));
+            let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: i * EACH, end: (i+1) * EACH, step: 1}, EACH));
             a.push(g);
         }
         {
@@ -883,7 +883,7 @@ fn threads() {
         let h1 = {
             let data = data.clone();
             let h = thread::spawn(move || -> lsm::Result<()> {
-                let _g = try!(data.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 10000, step: 1}));
+                let _g = try!(data.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 10000, step: 1}, 10000));
                 Ok(())
             });
             h
@@ -892,7 +892,7 @@ fn threads() {
         let h2 = {
             let data = data.clone();
             let h = thread::spawn(move || -> lsm::Result<()> {
-                let _g = try!(data.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 20000, end: 30000, step: 1}));
+                let _g = try!(data.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 20000, end: 30000, step: 1}, 10000));
                 Ok(())
             });
             h
@@ -913,7 +913,7 @@ fn threads() {
 fn key_ref() {
     fn f() -> lsm::Result<()> {
         let db = try!(lsm::db::new(tempfile("key_ref"), lsm::DEFAULT_SETTINGS));
-        let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}));
+        let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}, 100));
         {
             let lck = try!(db.GetWriteLock());
             try!(lck.commitSegments(vec![g]));
@@ -958,7 +958,7 @@ fn threads_with_weird_pairs() {
             let h = {
                 let data = data.clone();
                 let h = thread::spawn(move || -> lsm::Result<()> {
-                    let _g = try!(data.WriteSegmentFromSortedSequence(lsm::GenerateWeirdPairs {cur: i*10, end: i*10+pairs, klen: klen, vlen: vlen}));
+                    let _g = try!(data.WriteSegmentFromSortedSequence(lsm::GenerateWeirdPairs {cur: i*10, end: i*10+pairs, klen: klen, vlen: vlen}, pairs));
                     Ok(())
                 });
                 h
@@ -992,16 +992,16 @@ fn threads_with_weird_pairs() {
 fn no_merge_needed() {
     fn f() -> lsm::Result<()> {
         let db = try!(lsm::db::new(tempfile("no_merge_needed"), lsm::DEFAULT_SETTINGS));
-        let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}));
+        let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}, 100));
         {
             let lck = try!(db.GetWriteLock());
             try!(lck.commitSegments(vec![g]));
         }
 
-        let r = try!(db.merge(0, 2, None));
+        let r = try!(db.merge(0, 0, 2, 32));
         assert!(r.is_none());
 
-        let r = try!(db.merge(1, 2, None));
+        let r = try!(db.merge(1, 1, 2, 32));
         assert!(r.is_none());
 
         Ok(())
@@ -1015,29 +1015,29 @@ fn simple_merge() {
         let db = try!(lsm::db::new(tempfile("simple_merge"), lsm::DEFAULT_SETTINGS));
 
         // no merges needed yet at levels 0, 1, 2
-        let r = try!(db.merge(0, 2, None));
+        let r = try!(db.merge(0, 0, 2, 32));
         assert!(r.is_none());
 
-        let r = try!(db.merge(1, 2, None));
+        let r = try!(db.merge(1, 1, 2, 32));
         assert!(r.is_none());
 
-        let r = try!(db.merge(2, 2, None));
+        let r = try!(db.merge(2, 2, 2, 32));
         assert!(r.is_none());
 
         // write two level 0 segments
-        let g1 = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}));
-        let g2 = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 100, end: 200, step: 2}));
+        let g1 = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}, 100));
+        let g2 = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 100, end: 200, step: 2}, 50));
         {
             let lck = try!(db.GetWriteLock());
             try!(lck.commitSegments(vec![g1, g2]));
         }
 
         // level 1 still needs no merge
-        let r = try!(db.merge(1, 2, None));
+        let r = try!(db.merge(1, 1, 2, 32));
         assert!(r.is_none());
 
         // but level 0 does
-        let r = try!(db.merge(0, 2, None));
+        let r = try!(db.merge(0, 0, 2, 32));
         assert!(r.is_some());
         {
             let lck = try!(db.GetWriteLock());
@@ -1045,27 +1045,27 @@ fn simple_merge() {
         }
 
         // but now it doesn't because we just did it
-        let r = try!(db.merge(0, 2, None));
+        let r = try!(db.merge(0, 0, 2, 32));
         assert!(r.is_none());
 
         // level 1 still needs no merge
-        let r = try!(db.merge(1, 2, None));
+        let r = try!(db.merge(1, 1, 2, 32));
         assert!(r.is_none());
 
         // write two more level 0 segments
-        let g1 = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 300, end: 400, step: 1}));
-        let g2 = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 400, end: 500, step: 2}));
+        let g1 = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 300, end: 400, step: 1}, 100));
+        let g2 = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 400, end: 500, step: 2}, 50));
         {
             let lck = try!(db.GetWriteLock());
             try!(lck.commitSegments(vec![g1, g2]));
         }
 
         // level 1 still needs no merge
-        let r = try!(db.merge(1, 2, None));
+        let r = try!(db.merge(1, 1, 2, 32));
         assert!(r.is_none());
 
         // but level 0 does
-        let r = try!(db.merge(0, 2, None));
+        let r = try!(db.merge(0, 0, 2, 32));
         assert!(r.is_some());
         {
             let lck = try!(db.GetWriteLock());
@@ -1074,7 +1074,7 @@ fn simple_merge() {
 
 
         // and now level 1 does
-        let r = try!(db.merge(1, 2, None));
+        let r = try!(db.merge(1, 1, 2, 32));
         assert!(r.is_some());
         {
             let lck = try!(db.GetWriteLock());
@@ -1083,11 +1083,11 @@ fn simple_merge() {
 
 
         // but not anymore, since we just did it
-        let r = try!(db.merge(1, 2, None));
+        let r = try!(db.merge(1, 1, 2, 32));
         assert!(r.is_none());
 
         // and level 2 does not need a merge
-        let r = try!(db.merge(2, 2, None));
+        let r = try!(db.merge(2, 2, 2, 32));
         assert!(r.is_none());
 
         Ok(())

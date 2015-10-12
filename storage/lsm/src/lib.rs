@@ -368,19 +368,12 @@ fn decode_key_index_id_to_properties(k: &lsm::KeyRef) -> Result<(u64, u64)> {
     Ok((collection_id, index_id))
 }
 
-fn push_varint(v: &mut Vec<u8>, n: u64) {
-    let mut buf = [0; 9];
-    let mut cur = 0;
-    misc::varint::write(&mut buf, &mut cur, n);
-    v.push_all(&buf[0 .. cur]);
-}
-
 fn encode_key_tag_and_varint(tag: u8, id: u64) -> Vec<u8> {
     // TODO capacity
     let mut k = vec![];
     k.push(tag);
 
-    push_varint(&mut k, id);
+    misc::push_varint(&mut k, id);
 
     k
 }
@@ -393,8 +386,8 @@ fn encode_key_index_id_to_properties(collection_id: u64, index_id: u64) -> Vec<u
     // TODO capacity
     let mut k = vec![];
     k.push(INDEX_ID_TO_PROPERTIES);
-    push_varint(&mut k, collection_id);
-    push_varint(&mut k, index_id);
+    misc::push_varint(&mut k, collection_id);
+    misc::push_varint(&mut k, index_id);
     k
 }
 
@@ -456,8 +449,8 @@ fn lsm_map_to_bson(ba: &[u8]) -> lsm::Result<bson::Document> {
 fn find_record(cursor: &mut lsm::LivingCursor, collection_id: u64, id: &bson::Value) -> Result<Option<u64>> {
     let mut k = vec![];
     k.push(INDEX_ENTRY);
-    push_varint(&mut k, collection_id);
-    push_varint(&mut k, PRIMARY_INDEX_ID);
+    misc::push_varint(&mut k, collection_id);
+    misc::push_varint(&mut k, PRIMARY_INDEX_ID);
     let ba = bson::Value::encode_one_for_index(id, false);
     k.push_all(&ba);
     get_value_for_key_as_varint(cursor, &k)
@@ -501,14 +494,14 @@ impl MyConn {
                 // TODO vec capacity
                 let mut kmin = vec![];
                 kmin.push(RECORD);
-                push_varint(&mut kmin, collection_id);
+                misc::push_varint(&mut kmin, collection_id);
                 let kmin = kmin.into_boxed_slice();
                 let min = lsm::Min::new(kmin, lsm::OpGt::GT);
 
                 // TODO vec capacity
                 let mut kmax = vec![];
                 kmax.push(RECORD);
-                push_varint(&mut kmax, collection_id + 1);
+                misc::push_varint(&mut kmax, collection_id + 1);
                 let kmax = kmax.into_boxed_slice();
                 let max = lsm::Max::new(kmax, lsm::OpLt::LT);
 
@@ -623,8 +616,8 @@ impl MyConn {
 
         let mut key_preface = vec![];
         key_preface.push(INDEX_ENTRY);
-        push_varint(&mut key_preface, collection_id);
-        push_varint(&mut key_preface, index_id);
+        misc::push_varint(&mut key_preface, collection_id);
+        misc::push_varint(&mut key_preface, index_id);
 
         let mut cursor =
             match bounds {
@@ -637,6 +630,9 @@ impl MyConn {
                 elmo::QueryBounds::GT_LTE(eqvals, minvals, maxvals) => f_two(has_recid, key_preface, cursor, eqvals, minvals, maxvals, lsm::OpGt::GT, lsm::OpLt::LTE),
                 elmo::QueryBounds::GTE_LTE(eqvals, minvals, maxvals) => f_two(has_recid, key_preface, cursor, eqvals, minvals, maxvals, lsm::OpGt::GTE, lsm::OpLt::LTE),
                 elmo::QueryBounds::EQ(vals) => {
+                    // TODO if this is a unique index (which does not have the recid on the end of
+                    // the key), we should maybe do this SeekRef as SEEK_EQ so the bloom filter
+                    // can be used.
                     let mut kmin = key_preface.clone();
                     bson::Value::push_encode_multi_for_index(&mut kmin, &vals, None);
 
@@ -679,8 +675,8 @@ impl MyConn {
                     Ok(record_id) => {
                         let mut k = vec![];
                         k.push(RECORD);
-                        push_varint(&mut k, collection_id);
-                        push_varint(&mut k, record_id);
+                        misc::push_varint(&mut k, collection_id);
+                        misc::push_varint(&mut k, record_id);
                         try!(cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
                         if cursor.IsValid() {
                             let v = try!(cursor.LiveValueRef().map_err(elmo::wrap_err));
@@ -718,7 +714,7 @@ impl MyConn {
                     // TODO capacity
                     let mut k = vec![];
                     k.push(INDEX_ID_TO_PROPERTIES);
-                    push_varint(&mut k, collection_id);
+                    misc::push_varint(&mut k, collection_id);
                     k.into_boxed_slice()
                 },
                 None => {
@@ -868,7 +864,7 @@ impl<'a> MyWriter<'a> {
                     // TODO capacity
                     let mut k = vec![];
                     k.push(INDEX_ID_TO_PROPERTIES);
-                    push_varint(&mut k, collection_id + 1);
+                    misc::push_varint(&mut k, collection_id + 1);
                     try!(self.cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
                     if self.cursor.IsValid() {
                         let k = try!(self.cursor.KeyRef().map_err(elmo::wrap_err));
@@ -904,7 +900,7 @@ impl<'a> MyWriter<'a> {
                     // TODO capacity
                     let mut k = vec![];
                     k.push(RECORD);
-                    push_varint(&mut k, collection_id + 1);
+                    misc::push_varint(&mut k, collection_id + 1);
                     try!(self.cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
                     if self.cursor.IsValid() {
                         let k = try!(self.cursor.KeyRef().map_err(elmo::wrap_err));
@@ -1071,15 +1067,15 @@ impl<'a> MyWriter<'a> {
     fn delete_by_collection_id_prefix(&mut self, tag: u8, collection_id: u64) -> Result<()> {
         let mut k = vec![];
         k.push(tag);
-        push_varint(&mut k, collection_id);
+        misc::push_varint(&mut k, collection_id);
         self.delete_by_prefix(k.into_boxed_slice())
     }
 
     fn delete_by_index_id_prefix(&mut self, tag: u8, collection_id: u64, index_id: u64) -> Result<()> {
         let mut k = vec![];
         k.push(tag);
-        push_varint(&mut k, collection_id);
-        push_varint(&mut k, index_id);
+        misc::push_varint(&mut k, collection_id);
+        misc::push_varint(&mut k, index_id);
         self.delete_by_prefix(k.into_boxed_slice())
     }
 
@@ -1137,7 +1133,7 @@ impl<'a> MyWriter<'a> {
 
                 let mut k = vec![];
                 k.push(RECORD);
-                push_varint(&mut k, collection_id);
+                misc::push_varint(&mut k, collection_id);
                 let mut cursor = lsm::PrefixCursor::new(&mut self.cursor, k.into_boxed_slice());
                 try!(cursor.First().map_err(elmo::wrap_err));
                 while cursor.IsValid() {
@@ -1666,6 +1662,9 @@ impl<'a> elmo::StorageBase for MyWriter<'a> {
 impl elmo::StorageConnection for MyPublicConn {
     fn begin_write<'a>(&'a self) -> Result<Box<elmo::StorageWriter + 'a>> {
         let tx = try!(self.myconn.conn.GetWriteLock().map_err(elmo::wrap_err));
+
+        // TODO do we need to own this cursor?  maybe the caller should own
+        // one and pass it in?
         let cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
 
         let w = MyWriter {

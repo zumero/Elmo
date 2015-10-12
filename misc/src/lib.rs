@@ -16,6 +16,7 @@
 
 #![feature(associated_consts)]
 #![feature(clone_from_slice)]
+#![feature(vec_push_all)]
 
 extern crate rand;
 
@@ -814,5 +815,12 @@ pub fn remove_first_if_exists<T>(v: &mut Vec<T>) -> Option<T> {
     } else {
         Some(v.remove(0))
     }
+}
+
+pub fn push_varint(v: &mut Vec<u8>, n: u64) {
+    let mut buf = [0; 9];
+    let mut cur = 0;
+    varint::write(&mut buf, &mut cur, n);
+    v.push_all(&buf[0 .. cur]);
 }
 

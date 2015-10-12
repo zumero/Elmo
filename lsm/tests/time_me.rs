@@ -42,14 +42,14 @@ fn time_me() {
 
         let mut a = Vec::new();
         for i in 0 .. 10 {
-            let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: i * NUM, end: (i+1) * NUM, step: i+1}));
+            let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: i * NUM, end: (i+1) * NUM, step: i+1}, NUM / (i + 1)));
             a.push(g);
         }
         {
             let lck = try!(db.GetWriteLock());
             try!(lck.commitSegments(a.clone()));
         }
-        let g3 = try!(db.merge(0, 2, None));
+        let g3 = try!(db.merge(0, 0, 2, 32));
         assert!(g3.is_some());
         let g3 = g3.unwrap();
         {
