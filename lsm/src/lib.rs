@@ -157,6 +157,17 @@ impl<T> From<std::sync::PoisonError<T>> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+pub enum NoMaybe {
+    No,
+    Maybe,
+}
+
+pub enum YesNoMaybe {
+    Yes,
+    No,
+    Maybe,
+}
+
 struct Bloom {
     bits: Vec<u8>,
     funcs: Vec<SipHasher>,
@@ -214,21 +225,21 @@ impl Bloom {
         }
     }
 
-    fn check(&self, v1: &[u8], v2: &[u8]) -> bool {
+    fn check(&self, v1: &[u8], v2: &[u8]) -> NoMaybe {
         //println!("checking: {:?}/{:?}", v1, v2);
         for fi in 0 .. self.funcs.len() {
             let (i, m) = self.do_hash(fi, v1, v2);
             //println!("bits[{}] check: {}", i, self.bits[i]);
             if 0 == self.bits[i] & m {
                 //println!("    false");
-                return false;
+                return NoMaybe::No;;
             }
         }
         //println!("    true");
-        return true;
+        return NoMaybe::Maybe;;
     }
 
-    fn check_keyref(&self, k: &KeyRef) -> bool {
+    fn check_keyref(&self, k: &KeyRef) -> NoMaybe {
         match k {
             &KeyRef::Overflowed(ref a) => self.check(&a, &[]),
             &KeyRef::Prefixed(front, back) => self.check(front, back),
@@ -799,13 +810,6 @@ pub enum SeekResult {
     Invalid,
     Unequal,
     Equal,
-}
-
-#[derive(Copy,Clone,Debug,PartialEq)]
-pub enum BloomFilterResult {
-    NoFilter,
-    No,
-    Maybe,
 }
 
 impl SeekResult {
@@ -1648,14 +1652,17 @@ impl FilterTombstonesCursor {
             // in behind because, for example, we hit the max key in behind already.
 
             for csr in self.behind.iter_mut() {
-                // TODO we would be fine with false positives on this seek.
-                // TODO we also don't need this seek to result in the cursor being valid.
-                // we just want to know if the key is present.
-                let found = SeekResult::Equal == try!(csr.SeekRef(&k, SeekOp::SEEK_EQ));
-                // TODO if the value was found but it is another tombstone, then it is actually
-                // not found
-                if found {
-                    return Ok(false);
+                match try!(csr.has_key(&k)) {
+                    YesNoMaybe::No => {
+                    },
+                    YesNoMaybe::Yes => {
+                        // TODO if the value was found but it is another tombstone, then it is actually
+                        // not found
+                        return Ok(false);
+                    },
+                    YesNoMaybe::Maybe => {
+                        return Ok(false);
+                    },
                 }
             }
             Ok(true)
@@ -3362,17 +3369,34 @@ impl SegmentCursor {
         }
     }
 
-    pub fn bloom_filter_result(&mut self, k: &KeyRef) -> BloomFilterResult {
+    pub fn bloom_filter_result(&self, k: &KeyRef) -> Option<NoMaybe> {
         match self.filter {
-            Some(ref blm) => {
-                if blm.check_keyref(k) {
-                    BloomFilterResult::Maybe
-                } else {
-                    BloomFilterResult::No
-                }
-            },
-            None => BloomFilterResult::NoFilter
+            Some(ref blm) => Some(blm.check_keyref(k)),
+            None => None
         }
+    }
+
+    pub fn has_key(&mut self, k: &KeyRef) -> Result<YesNoMaybe> {
+        try!(self.load_bloom_filter());
+        let r =
+            match self.bloom_filter_result(k) {
+                Some(NoMaybe::No) => {
+                    YesNoMaybe::No
+                },
+                Some(NoMaybe::Maybe) => {
+                    YesNoMaybe::Maybe
+                },
+                None => {
+                    // there isn't a bloom filter.
+                    // this can happen when the segment is a single leaf.
+                    if SeekResult::Equal == try!(self.SeekRef(&k, SeekOp::SEEK_EQ)) {
+                        YesNoMaybe::Yes
+                    } else {
+                        YesNoMaybe::No
+                    }
+                },
+            };
+        Ok(r)
     }
 
     fn readLeaf(&mut self) -> Result<()> {
@@ -3748,32 +3772,6 @@ impl ICursor for SegmentCursor {
     }
 
     fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
-        match sop {
-            SeekOp::SEEK_EQ => {
-                // TODO commenting out the following line basically turns off use of
-                // bloom filters.
-                //try!(self.load_bloom_filter());
-                match self.bloom_filter_result(k) {
-                    BloomFilterResult::No => {
-                        //println!("bloom says no");
-                        //let root_page = self.rootPage;
-                        //let other = try!(self.search(root_page, k, sop));
-                        //println!("{:?}", other);
-                        //assert!(other == SeekResult::Invalid);
-                        self.currentKey = None;
-                        return Ok(SeekResult::Invalid)
-                    },
-                    BloomFilterResult::Maybe => {
-                    },
-                    BloomFilterResult::NoFilter => {
-                    },
-                }
-            },
-            _ => {
-                // bloom filter only helps on SEEK_EQ
-            },
-        }
-
         let root_page = self.rootPage;
         self.search(root_page, k, sop)
     }
