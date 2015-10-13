@@ -811,7 +811,8 @@ pub enum SeekResult {
 impl SeekResult {
     fn from_cursor<T: ICursor>(csr: &T, k: &KeyRef) -> Result<SeekResult> {
         if csr.IsValid() {
-            if Ordering::Equal == try!(csr.KeyCompare(k)) {
+            let kc = try!(csr.KeyRef());
+            if Ordering::Equal == KeyRef::cmp(&kc, k) {
                 Ok(SeekResult::Equal)
             } else {
                 Ok(SeekResult::Unequal)
@@ -854,8 +855,6 @@ pub trait ICursor {
     // way to detect whether a value is a tombstone or not.
     fn ValueLength(&self) -> Result<Option<usize>>; // tombstone is None
 
-    // TODO maybe rm KeyCompare.  now that KeyRef never copies, we shouldn't need this.
-    fn KeyCompare(&self, k: &KeyRef) -> Result<Ordering>;
 }
 
 //#[derive(Copy,Clone)]
@@ -866,9 +865,8 @@ pub struct DbSettings {
     pub PagesPerBlock : PageNum,
 }
 
-pub const DEFAULT_SETTINGS : DbSettings = 
-    DbSettings
-    {
+pub const DEFAULT_SETTINGS: DbSettings = 
+    DbSettings {
         AutoMergeEnabled : true,
         AutoMergeMinimumPages : 4,
         DefaultPageSize : 4096,
@@ -1257,13 +1255,6 @@ impl ICursor for MultiCursor {
         }
     }
 
-    fn KeyCompare(&self, k: &KeyRef) -> Result<Ordering> {
-        match self.cur {
-            None => Err(Error::CursorNotValid),
-            Some(icur) => self.subcursors[icur].KeyCompare(k),
-        }
-    }
-
     fn ValueLength(&self) -> Result<Option<usize>> {
         match self.cur {
             None => Err(Error::CursorNotValid),
@@ -1445,8 +1436,14 @@ impl ICursor for MultiCursor {
                     if (self.dir != Direction::BACKWARD) && (icur != j) { 
                         try!(csr.SeekRef(&k, SeekOp::SEEK_LE));
                     }
-                    if csr.IsValid() && (Ordering::Equal == try!(csr.KeyCompare(&k))) { 
-                        try!(csr.Prev());
+                    if csr.IsValid() {
+                        let eq = {
+                            let kc = try!(csr.KeyRef());
+                            Ordering::Equal == KeyRef::cmp(&kc, &k)
+                        };
+                        if eq {
+                            try!(csr.Prev());
+                        }
                     }
                 }
                 self.cur = try!(self.findMax());
@@ -1526,6 +1523,80 @@ impl LivingCursor {
     fn Create(ch : MultiCursor) -> LivingCursor {
         LivingCursor { chain : ch }
     }
+}
+
+impl ICursor for LivingCursor {
+    fn First(&mut self) -> Result<()> {
+        try!(self.chain.First());
+        try!(self.skipTombstonesForward());
+        Ok(())
+    }
+
+    fn Last(&mut self) -> Result<()> {
+        try!(self.chain.Last());
+        try!(self.skipTombstonesBackward());
+        Ok(())
+    }
+
+    fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
+        self.chain.KeyRef()
+    }
+
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
+        self.chain.ValueRef()
+    }
+
+    fn ValueLength(&self) -> Result<Option<usize>> {
+        self.chain.ValueLength()
+    }
+
+    fn IsValid(&self) -> bool {
+        self.chain.IsValid() 
+            && {
+                let r = self.chain.ValueLength();
+                if r.is_ok() {
+                    r.unwrap().is_some()
+                } else {
+                    false
+                }
+            }
+    }
+
+    fn Next(&mut self) -> Result<()> {
+        try!(self.chain.Next());
+        try!(self.skipTombstonesForward());
+        Ok(())
+    }
+
+    fn Prev(&mut self) -> Result<()> {
+        try!(self.chain.Prev());
+        try!(self.skipTombstonesBackward());
+        Ok(())
+    }
+
+    fn SeekRef(&mut self, k: &KeyRef, sop:SeekOp) -> Result<SeekResult> {
+        let sr = try!(self.chain.SeekRef(k, sop));
+        match sop {
+            SeekOp::SEEK_GE => {
+                if sr.is_valid() && self.chain.ValueLength().unwrap().is_none() {
+                    try!(self.skipTombstonesForward());
+                    SeekResult::from_cursor(&self.chain, k)
+                } else {
+                    Ok(sr)
+                }
+            },
+            SeekOp::SEEK_LE => {
+                if sr.is_valid() && self.chain.ValueLength().unwrap().is_none() {
+                    try!(self.skipTombstonesBackward());
+                    SeekResult::from_cursor(&self.chain, k)
+                } else {
+                    Ok(sr)
+                }
+            },
+            SeekOp::SEEK_EQ => Ok(sr),
+        }
+    }
+
 }
 
 pub struct FilterTombstonesCursor { 
@@ -1618,10 +1689,6 @@ impl ICursor for FilterTombstonesCursor {
 
     fn IsValid(&self) -> bool {
         self.chain.IsValid() 
-    }
-
-    fn KeyCompare(&self, k: &KeyRef) -> Result<Ordering> {
-        self.chain.KeyCompare(k)
     }
 
     fn Next(&mut self) -> Result<()> {
@@ -1843,84 +1910,6 @@ impl<'c> PrefixCursor<'c> {
 
 }
 
-impl ICursor for LivingCursor {
-    fn First(&mut self) -> Result<()> {
-        try!(self.chain.First());
-        try!(self.skipTombstonesForward());
-        Ok(())
-    }
-
-    fn Last(&mut self) -> Result<()> {
-        try!(self.chain.Last());
-        try!(self.skipTombstonesBackward());
-        Ok(())
-    }
-
-    fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
-        self.chain.KeyRef()
-    }
-
-    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
-        self.chain.ValueRef()
-    }
-
-    fn ValueLength(&self) -> Result<Option<usize>> {
-        self.chain.ValueLength()
-    }
-
-    fn IsValid(&self) -> bool {
-        self.chain.IsValid() 
-            && {
-                let r = self.chain.ValueLength();
-                if r.is_ok() {
-                    r.unwrap().is_some()
-                } else {
-                    false
-                }
-            }
-    }
-
-    fn KeyCompare(&self, k: &KeyRef) -> Result<Ordering> {
-        self.chain.KeyCompare(k)
-    }
-
-    fn Next(&mut self) -> Result<()> {
-        try!(self.chain.Next());
-        try!(self.skipTombstonesForward());
-        Ok(())
-    }
-
-    fn Prev(&mut self) -> Result<()> {
-        try!(self.chain.Prev());
-        try!(self.skipTombstonesBackward());
-        Ok(())
-    }
-
-    fn SeekRef(&mut self, k: &KeyRef, sop:SeekOp) -> Result<SeekResult> {
-        let sr = try!(self.chain.SeekRef(k, sop));
-        match sop {
-            SeekOp::SEEK_GE => {
-                if sr.is_valid() && self.chain.ValueLength().unwrap().is_none() {
-                    try!(self.skipTombstonesForward());
-                    SeekResult::from_cursor(&self.chain, k)
-                } else {
-                    Ok(sr)
-                }
-            },
-            SeekOp::SEEK_LE => {
-                if sr.is_valid() && self.chain.ValueLength().unwrap().is_none() {
-                    try!(self.skipTombstonesBackward());
-                    SeekResult::from_cursor(&self.chain, k)
-                } else {
-                    Ok(sr)
-                }
-            },
-            SeekOp::SEEK_EQ => Ok(sr),
-        }
-    }
-
-}
-
 #[derive(Hash,PartialEq,Eq,Copy,Clone,Debug)]
 #[repr(u8)]
 enum PageType {
@@ -2002,26 +1991,26 @@ enum ValueLocation {
 
 struct LeafPair {
     // key gets ownership of kvp.Key
-    key : Box<[u8]>,
-    kLoc : KeyLocation,
-    vLoc : ValueLocation,
+    key: Box<[u8]>,
+    kLoc: KeyLocation,
+    vLoc: ValueLocation,
 }
 
 struct LeafState {
-    sofarLeaf : usize,
-    keys_in_this_leaf : Vec<LeafPair>,
-    prevLeaf : PageNum,
-    prefixLen : usize,
-    firstLeaf : PageNum,
-    leaves : Vec<pgitem>,
-    blk : PageBlock,
+    sofarLeaf: usize,
+    keys_in_this_leaf: Vec<LeafPair>,
+    prevLeaf: PageNum,
+    prefixLen: usize,
+    firstLeaf: PageNum,
+    leaves: Vec<pgitem>,
+    blk: PageBlock,
 }
 
 fn CreateFromSortedSequenceOfKeyValuePairs<I, SeekWrite>(fs: &mut SeekWrite, 
                                                             pageManager: &IPages, 
                                                             source: I,
                                                             estimate_count_keys: usize,
-                                                           ) -> Result<(SegmentNum, PageNum)> where I: Iterator<Item=Result<kvp>>, SeekWrite: Seek+Write {
+                                                           ) -> Result<SegmentNum> where I: Iterator<Item=Result<kvp>>, SeekWrite: Seek+Write {
 
     fn writeOverflow<SeekWrite>(startingBlock: PageBlock, 
                                 ba: &mut Read, 
@@ -2251,7 +2240,7 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I, SeekWrite>(fs: &mut SeekWrite,
             pb.Reset();
             pb.PutByte(PageType::LEAF_NODE.to_u8());
             pb.PutByte(0u8); // flags
-            pb.PutInt32 (st.prevLeaf); // prev page num.
+            pb.PutInt32(st.prevLeaf); // prev page num.
             // TODO prefixLen is one byte.  should it be two?
             pb.PutByte(st.prefixLen as u8);
             if st.prefixLen > 0 {
@@ -2417,6 +2406,9 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I, SeekWrite>(fs: &mut SeekWrite,
 
         // TODO if we are going to use a whole page to write the filter,
         // we might as well use most of that page FOR the filter.
+
+        // TODO any chance we should decide that all filters are the same size?
+
         let blm_size_bytes = std::cmp::max(estimate_count_keys * 10 / 8, 128);;
 
         let blm_count_funcs = 4; // TODO calculate optimal number
@@ -2432,6 +2424,7 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I, SeekWrite>(fs: &mut SeekWrite,
                 count_tombstones += 1;
             }
             /*
+               // this code can be used to verify that we are being given kvps in order
             match prev_key {
                 None => {
                 },
@@ -2835,7 +2828,7 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I, SeekWrite>(fs: &mut SeekWrite,
     // in cases where the blob is provided as a stream, and we need
     // read a bit of it to figure out if it might fit inline rather
     // than overflow.
-    let mut vbuf = vec![0;pgsz].into_boxed_slice(); 
+    let mut vbuf = vec![0; pgsz].into_boxed_slice(); 
 
     let (blk, leaves, firstLeaf, count_keys, count_tombstones, filter) = try!(writeLeaves(blk, pageManager, source, estimate_count_keys, &mut vbuf, fs, &mut pb, &mut token));
     assert!(count_keys >= count_tombstones);
@@ -2909,8 +2902,7 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I, SeekWrite>(fs: &mut SeekWrite,
     */
 
     let g = try!(pageManager.End(token, blk.firstPage, root_page));
-    // TODO why do we return root_page as part of the tuple here?
-    Ok((g, root_page))
+    Ok(g)
 }
 
 struct myOverflowReadStream {
@@ -3229,6 +3221,8 @@ impl SegmentCursor {
     }
 
     fn set_hook(&mut self, done: Box<Fn() -> ()>) {
+        // TODO instead of this thing have a done() hook, should we instead
+        // be wrapping it in a Lend?
         self.done = Some(done);
     }
 
@@ -3361,7 +3355,7 @@ impl SegmentCursor {
     fn nextInLeaf(&mut self) -> bool {
         match self.currentKey {
             Some(cur) => {
-                if (cur+1) < self.leafKeys.len() {
+                if (cur +1 ) < self.leafKeys.len() {
                     self.currentKey = Some(cur + 1);
                     true
                 } else {
@@ -3412,8 +3406,7 @@ impl SegmentCursor {
             let vlen = varint::read(&self.pr, cur) as usize;
             if 0 != (vflag & ValueFlag::FLAG_OVERFLOW) {
                 *cur = *cur + SIZE_32;
-            }
-            else {
+            } else {
                 *cur = *cur + vlen;
             }
         }
@@ -3538,6 +3531,7 @@ impl SegmentCursor {
     // we need to skip any overflows.  when moving backward,
     // this is not necessary, because each leaf has a pointer to
     // the leaf before it.
+    //
     // TODO it's unfortunate that Next is the slower operation
     // when it is far more common than Prev.  OTOH, the pages
     // are written as we stream through a set of kvp objects,
@@ -3727,12 +3721,6 @@ impl ICursor for SegmentCursor {
                 }
             }
         }
-    }
-
-    fn KeyCompare(&self, k_other: &KeyRef) -> Result<Ordering> {
-        let k_me = try!(self.KeyRef());
-        let c = KeyRef::cmp(&k_me, &k_other);
-        Ok(c)
     }
 
     fn First(&mut self) -> Result<()> {
@@ -4095,6 +4083,9 @@ struct SafeCursors {
     // when the merge was done, it could not be reclaimed as free
     // blocks because there was an open cursor on it.
     zombie_segments: HashMap<SegmentNum, SegmentInfo>,
+
+    // we keep a pool of page buffers so we can lend them to a
+    // SegmentCursor.
     pagepool: Vec<Box<[u8]>>,
 }
 
@@ -4453,6 +4444,9 @@ impl InnerPart {
         let buf = pbSegList.Buffer();
         pb.PutVarint(buf.len() as u64);
 
+        // TODO consider disallowing header overflow
+        // how many segments can fit in the header without overflow?
+        // do we ever need more than that really?
         let headerOverflow =
             if pb.Available() >= (buf.len() + 1) {
                 pb.PutByte(0u8);
@@ -4566,9 +4560,7 @@ impl InnerPart {
         Ok((a,b))
     }
 
-    fn commitSegments(&self, 
-                      newSegs: Vec<SegmentNum>
-                     ) -> Result<()> {
+    fn commitSegments(&self, newSegs: Vec<SegmentNum>) -> Result<()> {
         assert_eq!(newSegs.len(), newSegs.iter().map(|g| *g).collect::<HashSet<SegmentNum>>().len());
 
         let mut st = try!(self.header.lock());
@@ -4634,7 +4626,7 @@ impl InnerPart {
     // TODO bad fn name
     fn WriteSegmentFromSortedSequence<I>(&self, source: I, estimate_keys: usize) -> Result<SegmentNum> where I:Iterator<Item=Result<kvp>> {
         let mut fs = try!(self.OpenForWriting());
-        let (g,_) = try!(CreateFromSortedSequenceOfKeyValuePairs(&mut fs, self, source, estimate_keys));
+        let g = try!(CreateFromSortedSequenceOfKeyValuePairs(&mut fs, self, source, estimate_keys));
         Ok(g)
     }
 
@@ -4654,7 +4646,7 @@ impl InnerPart {
             Ok(kvp {Key:k, Value:Blob::Array(v)})
         });
         let mut fs = try!(self.OpenForWriting());
-        let (g,_) = try!(CreateFromSortedSequenceOfKeyValuePairs(&mut fs, self, source, estimate_keys));
+        let g = try!(CreateFromSortedSequenceOfKeyValuePairs(&mut fs, self, source, estimate_keys));
         Ok(g)
     }
 
@@ -4673,14 +4665,14 @@ impl InnerPart {
             Ok(kvp {Key:k, Value:v})
         });
         let mut fs = try!(self.OpenForWriting());
-        let (g,_) = try!(CreateFromSortedSequenceOfKeyValuePairs(&mut fs, self, source, estimate_keys));
+        let g = try!(CreateFromSortedSequenceOfKeyValuePairs(&mut fs, self, source, estimate_keys));
         Ok(g)
     }
 
     fn do_merge(inner: &std::sync::Arc<InnerPart>, segs: Vec<SegmentNum>, cursor: Box<ICursor>, estimate_keys: usize) -> Result<SegmentNum> {
         let source = CursorIterator::new(cursor);
         let mut fs = try!(inner.OpenForWriting());
-        let (g,_) = try!(CreateFromSortedSequenceOfKeyValuePairs(&mut fs, &**inner, source, estimate_keys));
+        let g = try!(CreateFromSortedSequenceOfKeyValuePairs(&mut fs, &**inner, source, estimate_keys));
         //printfn "merged %A to get %A" segs g
         let mut mergeStuff = try!(inner.mergeStuff.lock());
         mergeStuff.pendingMerges.insert(g, segs);

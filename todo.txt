@@ -1,4 +1,23 @@
 
+fix fts in lsm storage
+
+in lsm, when the root lands on a boundary, don't fetch a block only
+to end up giving it back.
+
+make sure stuff gets removed from merging when an error occurs while
+writing a merge segment.
+
+move automerge into a thread.
+
+make sure InnerPart is a singleton per path.
+
+consider disallowing header overflow.  if the segment list gets that
+big, there would be other problems.
+
+consider better (at higher level?) cache of indexes
+
+bloom code needs to calculate optimal number of funcs.
+
 sometimes date1.js gets a network connect failure.  it's right after a
 big test.  and sometimes nestedobj1.js does the same thing.  and it's
 also right after a big test.  why?
@@ -11,8 +30,6 @@ make pgnum a u64?
 same for pgnum but then storage is wasteful,
 want to store as a varint, but then space in the page calculations are
 more complicated.
-
-varint in a separate crate?  but optimizer can't cross crate boundaries.
 
 core feature:  graveyard
 
