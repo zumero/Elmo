@@ -824,7 +824,7 @@ pub fn push_varint(v: &mut Vec<u8>, n: u64) {
     v.push_all(&buf[0 .. cur]);
 }
 
-struct Lend<T> {
+pub struct Lend<T> {
     value: Option<T>,
     done: Box<Fn(T) -> ()>,
 }

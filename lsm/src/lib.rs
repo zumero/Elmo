@@ -3155,7 +3155,7 @@ pub struct SegmentCursor {
     blocks: Vec<PageBlock>,
     rootPage: PageNum,
 
-    pr: Box<[u8]>,
+    pr: misc::Lend<Box<[u8]>>,
     currentPage: PageNum,
 
     firstLeaf: PageNum,
@@ -3175,7 +3175,7 @@ pub struct SegmentCursor {
 
 impl SegmentCursor {
     fn new(path: &str, 
-           pgsz: usize, 
+           page: misc::Lend<Box<[u8]>>,
            rootPage: PageNum, 
            blocks: Vec<PageBlock>
           ) -> Result<SegmentCursor> {
@@ -3186,15 +3186,13 @@ impl SegmentCursor {
                 .read(true)
                 .open(path));
 
-        let buf = vec![0; pgsz].into_boxed_slice();
-
         let mut res = SegmentCursor {
             path: String::from(path),
             fs: f,
             blocks: blocks,
             done: None,
             rootPage: rootPage,
-            pr: buf,
+            pr: page,
             currentPage: 0,
             leafKeys: Vec::new(),
             previousLeaf: 0,
@@ -4109,6 +4107,7 @@ struct SafeCursors {
     // when the merge was done, it could not be reclaimed as free
     // blocks because there was an open cursor on it.
     zombie_segments: HashMap<SegmentNum, SegmentInfo>,
+    pagepool: Vec<Box<[u8]>>,
 }
 
 struct InnerPart {
@@ -4183,6 +4182,7 @@ impl db {
             nextCursorNum: 1,
             cursors: HashMap::new(),
             zombie_segments: HashMap::new(),
+            pagepool: vec![],
         };
 
         let inner = InnerPart {
@@ -4274,6 +4274,12 @@ fn slice_within(sub: &[SegmentNum], within: &[SegmentNum]) -> Result<usize> {
 }
 
 impl InnerPart {
+
+    fn page_done(&self, page: Box<[u8]>) {
+        //println!("page_done");
+        let mut cursors = self.cursors.lock().unwrap(); // gotta succeed
+        cursors.pagepool.push(page);
+    }
 
     fn cursor_dropped(&self, segnum: SegmentNum, csrnum: u64) {
         //println!("cursor_dropped");
@@ -4503,7 +4509,17 @@ impl InnerPart {
                 let done = move || -> () {
                     foo.cursor_dropped(g, csrnum);
                 };
-                let mut csr = try!(SegmentCursor::new(&inner.path, inner.pgsz, rootPage, seg.blocks.clone()));
+                let page =
+                    match cursors.pagepool.pop() {
+                        Some(p) => p,
+                        None => vec![0; inner.pgsz].into_boxed_slice(),
+                    };
+                let foo = inner.clone();
+                let done_page = move |p| -> () {
+                    foo.page_done(p);
+                };
+                let lend_page = misc::Lend::new(page, box done_page);
+                let mut csr = try!(SegmentCursor::new(&inner.path, lend_page, rootPage, seg.blocks.clone()));
 
                 cursors.nextCursorNum = cursors.nextCursorNum + 1;
                 let was = cursors.cursors.insert(csrnum, g);
@@ -4810,6 +4826,8 @@ impl InnerPart {
                                         }
                                     },
                                 };
+                            // TODO so actually, the FilterTombstonesCursor needs EITHER the
+                            // bloom or the SegmentCursor.  it never needs both.
                             behind.push((bloom, cursor));
                         }
                         // TODO to allow reuse of these behind cursors, we should pass
