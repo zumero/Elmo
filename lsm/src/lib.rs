@@ -2947,12 +2947,12 @@ impl myOverflowReadStream {
                 .read(true)
                 .open(path));
         let mut res = 
-            // TODO the vec new below is really slow
+            // TODO the vec new below is really slow.  use a pool?
             myOverflowReadStream {
                 fs: f,
                 len: len,
                 firstPage: firstPage,
-                buf: vec![0;pgsz].into_boxed_slice(),
+                buf: vec![0; pgsz].into_boxed_slice(),
                 currentPage: firstPage,
                 sofarOverall: 0,
                 sofarThisPage: 0,
