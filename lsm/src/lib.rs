@@ -1640,7 +1640,7 @@ impl LivingCursor {
 
 pub struct FilterTombstonesCursor { 
     chain: MultiCursor,
-    behind: Vec<SegmentCursor>,
+    behind: Vec<(Option<std::rc::Rc<Bloom>>, SegmentCursor)>,
 }
 
 impl FilterTombstonesCursor {
@@ -1651,17 +1651,25 @@ impl FilterTombstonesCursor {
             // then we could optimize cases where we already know that the key is not present
             // in behind because, for example, we hit the max key in behind already.
 
-            for csr in self.behind.iter_mut() {
-                match try!(csr.has_key(&k)) {
-                    YesNoMaybe::No => {
+            for pair in self.behind.iter_mut() {
+                let bloom = &pair.0;
+                match bloom {
+                    &Some(ref bloom) => {
+                        match bloom.check_keyref(&k) {
+                            NoMaybe::No => {
+                            },
+                            NoMaybe::Maybe => {
+                                return Ok(false);
+                            },
+                        }
                     },
-                    YesNoMaybe::Yes => {
-                        // TODO if the value was found but it is another tombstone, then it is actually
-                        // not found
-                        return Ok(false);
-                    },
-                    YesNoMaybe::Maybe => {
-                        return Ok(false);
+                    &None => {
+                        let cursor = &mut pair.1;
+                        if SeekResult::Equal == try!(cursor.SeekRef(&k, SeekOp::SEEK_EQ)) {
+                            // TODO if the value was found but it is another tombstone, then it is actually
+                            // not found
+                            return Ok(false);
+                        }
                     },
                 }
             }
@@ -1685,7 +1693,7 @@ impl FilterTombstonesCursor {
         Ok(())
     }
 
-    fn new(ch: MultiCursor, behind: Vec<SegmentCursor>) -> FilterTombstonesCursor {
+    fn new(ch: MultiCursor, behind: Vec<(Option<std::rc::Rc<Bloom>>, SegmentCursor)>) -> FilterTombstonesCursor {
         FilterTombstonesCursor { 
             chain: ch,
             behind: behind,
@@ -3260,7 +3268,6 @@ pub struct SegmentCursor {
     filter_page: PageNum,
     filter_len: usize,
     filter_count_funcs: usize,
-    filter: Option<Bloom>,
 
     leafKeys: Vec<usize>,
     previousLeaf: PageNum,
@@ -3303,7 +3310,6 @@ impl SegmentCursor {
             filter_page: 0, // temporary
             filter_len: 0, // temporary
             filter_count_funcs: 0, // temporary
-            filter: None, // temporary
         };
 
         // TODO consider keeping the root page around as long as this cursor is around
@@ -3352,11 +3358,9 @@ impl SegmentCursor {
         self.count_tombstones
     }
 
-    pub fn load_bloom_filter(&mut self) -> Result<bool> {
-        if self.filter.is_some() {
-            Ok(true)
-        } else if self.filter_page == 0 {
-            Ok(false)
+    fn load_bloom_filter(&self) -> Result<Option<Bloom>> {
+        if self.filter_page == 0 {
+            Ok(None)
         } else {
             //println!("loading bloom filter at page: {}", self.filter_page);
             let mut strm = try!(myOverflowReadStream::new(&self.path, self.pr.PageSize(), self.filter_page, self.filter_len));
@@ -3364,39 +3368,8 @@ impl SegmentCursor {
             try!(strm.read_to_end(&mut v));
             //println!("bloom loaded: {:?}", v);
             let blm = Bloom::new(v, self.filter_count_funcs);
-            self.filter = Some(blm);
-            Ok(true)
+            Ok(Some(blm))
         }
-    }
-
-    pub fn bloom_filter_result(&self, k: &KeyRef) -> Option<NoMaybe> {
-        match self.filter {
-            Some(ref blm) => Some(blm.check_keyref(k)),
-            None => None
-        }
-    }
-
-    pub fn has_key(&mut self, k: &KeyRef) -> Result<YesNoMaybe> {
-        try!(self.load_bloom_filter());
-        let r =
-            match self.bloom_filter_result(k) {
-                Some(NoMaybe::No) => {
-                    YesNoMaybe::No
-                },
-                Some(NoMaybe::Maybe) => {
-                    YesNoMaybe::Maybe
-                },
-                None => {
-                    // there isn't a bloom filter.
-                    // this can happen when the segment is a single leaf.
-                    if SeekResult::Equal == try!(self.SeekRef(&k, SeekOp::SEEK_EQ)) {
-                        YesNoMaybe::Yes
-                    } else {
-                        YesNoMaybe::No
-                    }
-                },
-            };
-        Ok(r)
     }
 
     fn readLeaf(&mut self) -> Result<()> {
@@ -4177,6 +4150,7 @@ struct SafeSegmentsInWaiting {
 struct SafeMergeStuff {
     merging: HashSet<SegmentNum>,
     pendingMerges: HashMap<SegmentNum, Vec<SegmentNum>>,
+    blooms: HashMap<SegmentNum, std::rc::Rc<Bloom>>,
 }
 
 struct SafeHeader {
@@ -4255,6 +4229,7 @@ impl db {
         let mergeStuff = SafeMergeStuff {
             merging: HashSet::new(),
             pendingMerges: HashMap::new(),
+            blooms: HashMap::new(),
         };
 
         let header = SafeHeader {
@@ -4849,7 +4824,7 @@ impl InnerPart {
                         try!(cursor.First());
                         // TODO check IsValid here?  to avoid trying to write a segment with no keys.
                         box cursor
-                    } else if count_segments_behind <= 4 {
+                    } else if count_segments_behind <= 8 {
                         // TODO arbitrary hard-coded limit in the line above
 
                         // there are segments behind the ones we are merging.
@@ -4873,7 +4848,26 @@ impl InnerPart {
                         for i in pos_last_seg .. st.header.currentState.len() {
                             let s = st.header.currentState[i];
                             let cursor = try!(Self::getCursor(inner, &st, s));
-                            behind.push(cursor);
+                            let bloom =
+                                match mergeStuff.blooms.entry(s) {
+                                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                                        Some(e.get().clone())
+                                    },
+                                    std::collections::hash_map::Entry::Vacant(e) => {
+                                        match try!(cursor.load_bloom_filter()) {
+                                            Some(bloom) => {
+                                                let bloom = std::rc::Rc::new(bloom);
+                                                let result = bloom.clone();
+                                                e.insert(bloom);
+                                                Some(result)
+                                            },
+                                            None => {
+                                                None
+                                            },
+                                        }
+                                    },
+                                };
+                            behind.push((bloom, cursor));
                         }
                         // TODO to allow reuse of these behind cursors, we should pass
                         // them as references, don't transfer ownership.  but then they
@@ -5028,6 +5022,8 @@ impl InnerPart {
         }
         let mut blocksToBeFreed = Vec::new();
         for info in segmentsToBeFreed.values() {
+            // TODO any segment being freed should have its bloom filter removed
+            // from the blooms cache.
             blocksToBeFreed.push_all(&info.blocks);
         }
         match oldHeaderOverflow {
