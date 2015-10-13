@@ -885,3 +885,33 @@ impl<T> Drop for Lend<T> {
 }
 
 
+pub mod buf_advance {
+
+    use std;
+    use super::endian;
+    use super::bytes;
+
+    pub fn get_byte(buf: &[u8], cur: &mut usize) -> u8 {
+        let r = buf[*cur];
+        *cur = *cur + 1;
+        r
+    }
+
+    pub fn get_u32(buf: &[u8], cur: &mut usize) -> u32 {
+        let at = *cur;
+        // TODO just buf?  instead of making 4-byte slice.
+        let a = bytes::extract_4(&buf[at .. at + 4]);
+        *cur = *cur + 4;
+        endian::u32_from_bytes_be(a)
+    }
+
+    pub fn get_u16(buf: &[u8], cur: &mut usize) -> u16 {
+        let at = *cur;
+        // TODO just buf?  instead of making 2-byte slice.
+        let a = bytes::extract_2(&buf[at .. at + 2]);
+        let r = endian::u16_from_bytes_be(a);
+        *cur = *cur + 2;
+        r
+    }
+}
+

@@ -1058,109 +1058,6 @@ impl PageBuilder {
 
 }
 
-// TODO this struct should just go away.  just use the buf.
-struct PageBuffer {
-    buf : Box<[u8]>,
-}
-
-impl PageBuffer {
-    fn new(pgsz: usize) -> PageBuffer { 
-        let ba = vec![0;pgsz as usize].into_boxed_slice();
-        PageBuffer { buf:ba } 
-    }
-
-    fn PageSize(&self) -> usize {
-        self.buf.len()
-    }
-
-    fn Read(&mut self, strm: &mut Read) -> io::Result<usize> {
-        misc::io::read_fully(strm, &mut self.buf)
-    }
-
-    fn ReadPart(&mut self, strm: &mut Read, off: usize, len: usize) -> io::Result<usize> {
-        misc::io::read_fully(strm, &mut self.buf[off .. off + len])
-    }
-
-    fn CopyFrom(&mut self, off: usize, from: &[u8]) {
-        // TODO clone from slice?
-        for i in 0 .. from.len() {
-            self.buf[off + i] = from[i];
-        }
-    }
-
-    #[cfg(remove_me)]
-    fn Compare(&self, cur: usize, len: usize, other: &[u8]) -> Ordering {
-        let slice = &self.buf[cur .. cur + len];
-        bcmp::Compare(slice, other)
-    }
-
-    fn PageType(&self) -> Result<PageType> {
-        PageType::from_u8(self.buf[0])
-    }
-
-    fn GetByte(&self, cur: &mut usize) -> u8 {
-        let r = self.buf[*cur];
-        *cur = *cur + 1;
-        r
-    }
-
-    fn GetByteAt(&self, at: usize) -> u8 {
-        let r = self.buf[at];
-        r
-    }
-
-    fn GetInt32(&self, cur: &mut usize) -> u32 {
-        let at = *cur;
-        // TODO just self.buf?  instead of making 4-byte slice.
-        let a = misc::bytes::extract_4(&self.buf[at .. at + SIZE_32]);
-        *cur = *cur + SIZE_32;
-        endian::u32_from_bytes_be(a)
-    }
-
-    fn GetInt32At(&self, at: usize) -> u32 {
-        // TODO just self.buf?  instead of making 4-byte slice.
-        let a = misc::bytes::extract_4(&self.buf[at .. at + SIZE_32]);
-        endian::u32_from_bytes_be(a)
-    }
-
-    fn CheckPageFlag(&self, f: u8) -> bool {
-        0 != (self.buf[1] & f)
-    }
-
-    fn GetLastInt32(&self) -> u32 {
-        let len = self.buf.len();
-        let at = len - 1 * SIZE_32;
-        self.GetInt32At(at)
-    }
-
-    fn GetInt16(&self, cur: &mut usize) -> u16 {
-        let at = *cur;
-        // TODO just self.buf?  instead of making 2-byte slice.
-        let a = misc::bytes::extract_2(&self.buf[at .. at + SIZE_16]);
-        let r = endian::u16_from_bytes_be(a);
-        *cur = *cur + SIZE_16;
-        r
-    }
-
-    fn get_slice(&self, start: usize, len: usize) -> &[u8] {
-        &self.buf[start .. start + len]
-    }
-
-    fn GetIntoArray(&self, cur: &mut usize,  a : &mut [u8]) {
-        let len = a.len();
-        a.clone_from_slice(&self.buf[*cur .. *cur + len]);
-        *cur = *cur + a.len();
-    }
-
-    // TODO this function shows up a lot in the profiler
-    // TODO inline hint?  varint::read() gets inlined here,
-    // but this one does not seem to get inlined anywhere.
-    fn GetVarint(&self, cur: &mut usize) -> u64 {
-        varint::read(&*self.buf, cur)
-    }
-
-}
-
 #[derive(PartialEq,Copy,Clone)]
 enum Direction {
     FORWARD = 0,
@@ -3258,7 +3155,7 @@ pub struct SegmentCursor {
     blocks: Vec<PageBlock>,
     rootPage: PageNum,
 
-    pr: PageBuffer,
+    pr: Box<[u8]>,
     currentPage: PageNum,
 
     firstLeaf: PageNum,
@@ -3289,7 +3186,7 @@ impl SegmentCursor {
                 .read(true)
                 .open(path));
 
-        // TODO apparently the PageBuffer::new() call below is expensive
+        let buf = vec![0; pgsz].into_boxed_slice();
 
         let mut res = SegmentCursor {
             path: String::from(path),
@@ -3297,7 +3194,7 @@ impl SegmentCursor {
             blocks: blocks,
             done: None,
             rootPage: rootPage,
-            pr: PageBuffer::new(pgsz),
+            pr: buf,
             currentPage: 0,
             leafKeys: Vec::new(),
             previousLeaf: 0,
@@ -3315,19 +3212,18 @@ impl SegmentCursor {
         // TODO consider keeping the root page around as long as this cursor is around
         try!(res.setCurrentPage(rootPage));
 
-        let pt = try!(res.pr.PageType());
+        let pt = try!(res.page_type());
         if pt == PageType::LEAF_NODE {
             res.firstLeaf = rootPage;
             res.lastLeaf = rootPage;
             res.count_keys = res.leafKeys.len();
             // TODO we still need to get count_tombstones
         } else if pt == PageType::PARENT_NODE {
-            if ! res.pr.CheckPageFlag(PageFlag::FLAG_ROOT_NODE) { 
+            if !res.check_page_flag(PageFlag::FLAG_ROOT_NODE) { 
                 return Err(Error::CorruptFile("root page lacks flag"));
             }
-            let pg = res.pr.get_slice(0, pgsz);
-            let len_footer = pg[pg.len()-1] as usize;
-            let footer = &pg[pg.len() - 1 - len_footer ..];
+            let len_footer = res.pr[res.pr.len()-1] as usize;
+            let footer = &res.pr[res.pr.len() - 1 - len_footer ..];
             let mut cur = 0;
             res.firstLeaf = varint::read(footer, &mut cur) as u32;
             assert!(block_list_contains_page(&res.blocks, res.firstLeaf));
@@ -3363,7 +3259,7 @@ impl SegmentCursor {
             Ok(None)
         } else {
             //println!("loading bloom filter at page: {}", self.filter_page);
-            let mut strm = try!(myOverflowReadStream::new(&self.path, self.pr.PageSize(), self.filter_page, self.filter_len));
+            let mut strm = try!(myOverflowReadStream::new(&self.path, self.pr.len(), self.filter_page, self.filter_len));
             let mut v = Vec::with_capacity(self.filter_len);
             try!(strm.read_to_end(&mut v));
             //println!("bloom loaded: {:?}", v);
@@ -3374,22 +3270,23 @@ impl SegmentCursor {
 
     fn readLeaf(&mut self) -> Result<()> {
         let mut cur = 0;
-        let pt = try!(PageType::from_u8(self.pr.GetByte(&mut cur)));
+        let pt = try!(PageType::from_u8(self.get_byte(&mut cur)));
         if pt != PageType::LEAF_NODE {
             return Err(Error::CorruptFile("leaf has invalid page type"));
         }
-        self.pr.GetByte(&mut cur);
-        self.previousLeaf = self.pr.GetInt32(&mut cur) as PageNum;
-        let prefixLen = self.pr.GetByte(&mut cur) as usize;
+        self.get_byte(&mut cur);
+        self.previousLeaf = self.get_u32(&mut cur) as PageNum;
+        let prefixLen = self.get_byte(&mut cur) as usize;
         if prefixLen > 0 {
             // TODO should we just remember prefix as a reference instead of box/copy?
-            let mut a = vec![0;prefixLen].into_boxed_slice();
-            self.pr.GetIntoArray(&mut cur, &mut a);
+            let mut a = vec![0; prefixLen].into_boxed_slice();
+            a.clone_from_slice(&self.pr[cur .. cur + prefixLen]);
+            cur = cur + prefixLen;
             self.prefix = Some(a);
         } else {
             self.prefix = None;
         }
-        let countLeafKeys = self.pr.GetInt16(&mut cur) as usize;
+        let countLeafKeys = self.get_u16(&mut cur) as usize;
         // assert countLeafKeys>0
         // TODO might need to extend capacity here, not just truncate
         self.leafKeys.truncate(countLeafKeys);
@@ -3404,6 +3301,52 @@ impl SegmentCursor {
         Ok(())
     }
 
+    fn page_type(&self) -> Result<PageType> {
+        PageType::from_u8(self.pr[0])
+    }
+
+    fn check_page_flag(&self, f: u8) -> bool {
+        0 != (self.pr[1] & f)
+    }
+
+    // TODO use buf_advance
+    fn get_byte(&self, cur: &mut usize) -> u8 {
+        let r = self.pr[*cur];
+        *cur = *cur + 1;
+        r
+    }
+
+    // TODO use buf_advance
+    fn get_u32(&self, cur: &mut usize) -> u32 {
+        let at = *cur;
+        // TODO just self.pr?  instead of making 4-byte slice.
+        let a = misc::bytes::extract_4(&self.pr[at .. at + SIZE_32]);
+        *cur = *cur + SIZE_32;
+        endian::u32_from_bytes_be(a)
+    }
+
+    // TODO use buf_advance
+    fn get_u16(&self, cur: &mut usize) -> u16 {
+        let at = *cur;
+        // TODO just self.pr?  instead of making 2-byte slice.
+        let a = misc::bytes::extract_2(&self.pr[at .. at + SIZE_16]);
+        let r = endian::u16_from_bytes_be(a);
+        *cur = *cur + SIZE_16;
+        r
+    }
+
+    fn get_u32_at(&self, at: usize) -> u32 {
+        // TODO just self.pr?  instead of making 4-byte slice.
+        let a = misc::bytes::extract_4(&self.pr[at .. at + SIZE_32]);
+        endian::u32_from_bytes_be(a)
+    }
+
+    fn get_u32_last(&self) -> u32 {
+        let len = self.pr.len();
+        let at = len - 1 * SIZE_32;
+        self.get_u32_at(at)
+    }
+
     fn setCurrentPage(&mut self, pgnum: PageNum) -> Result<()> {
         assert!(block_list_contains_page(&self.blocks, pgnum));
 
@@ -3415,10 +3358,10 @@ impl SegmentCursor {
             self.currentKey = None;
             self.prefix = None;
 
-            try!(utils::SeekPage(&mut self.fs, self.pr.PageSize(), self.currentPage));
-            try!(self.pr.Read(&mut self.fs));
+            try!(utils::SeekPage(&mut self.fs, self.pr.len(), self.currentPage));
+            try!(misc::io::read_fully(&mut self.fs, &mut self.pr));
 
-            match self.pr.PageType() {
+            match self.page_type() {
                 Ok(PageType::LEAF_NODE) => {
                     try!(self.readLeaf());
                 },
@@ -3462,8 +3405,8 @@ impl SegmentCursor {
     }
 
     fn skipKey(&self, cur: &mut usize) {
-        let kflag = self.pr.GetByte(cur);
-        let klen = self.pr.GetVarint(cur) as usize;
+        let kflag = self.get_byte(cur);
+        let klen = varint::read(&self.pr, cur) as usize;
         if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
             let prefixLen = match self.prefix {
                 Some(ref a) => a.len(),
@@ -3476,11 +3419,11 @@ impl SegmentCursor {
     }
 
     fn skipValue(&self, cur: &mut usize) {
-        let vflag = self.pr.GetByte(cur);
+        let vflag = self.get_byte(cur);
         if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) { 
             ()
         } else {
-            let vlen = self.pr.GetVarint(cur) as usize;
+            let vlen = varint::read(&self.pr, cur) as usize;
             if 0 != (vflag & ValueFlag::FLAG_OVERFLOW) {
                 *cur = *cur + SIZE_32;
             }
@@ -3492,20 +3435,20 @@ impl SegmentCursor {
 
     fn keyInLeaf2<'a>(&'a self, n: usize) -> Result<KeyRef<'a>> { 
         let mut cur = self.leafKeys[n as usize];
-        let kflag = self.pr.GetByte(&mut cur);
-        let klen = self.pr.GetVarint(&mut cur) as usize;
+        let kflag = self.get_byte(&mut cur);
+        let klen = varint::read(&self.pr, &mut cur) as usize;
         if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
             match self.prefix {
                 Some(ref a) => {
-                    Ok(KeyRef::Prefixed(&a, self.pr.get_slice(cur, klen - a.len())))
+                    Ok(KeyRef::Prefixed(&a, &self.pr[cur .. cur + klen - a.len()]))
                 },
                 None => {
-                    Ok(KeyRef::Array(self.pr.get_slice(cur, klen)))
+                    Ok(KeyRef::Array(&self.pr[cur .. cur + klen]))
                 },
             }
         } else {
-            let pgnum = self.pr.GetInt32(&mut cur) as PageNum;
-            let mut ostrm = try!(myOverflowReadStream::new(&self.path, self.pr.PageSize(), pgnum, klen));
+            let pgnum = self.get_u32(&mut cur) as PageNum;
+            let mut ostrm = try!(myOverflowReadStream::new(&self.path, self.pr.len(), pgnum, klen));
             let mut x_k = Vec::with_capacity(klen);
             try!(ostrm.read_to_end(&mut x_k));
             let x_k = x_k.into_boxed_slice();
@@ -3548,25 +3491,25 @@ impl SegmentCursor {
 
     fn get_next_from_parent_page(&mut self, kq: &KeyRef) -> Result<PageNum> {
         let mut cur = 0;
-        let pt = try!(PageType::from_u8(self.pr.GetByte(&mut cur)));
+        let pt = try!(PageType::from_u8(self.get_byte(&mut cur)));
         if  pt != PageType::PARENT_NODE {
             return Err(Error::CorruptFile("parent page has invalid page type"));
         }
         cur = cur + 1; // page flags
-        let count = self.pr.GetInt16(&mut cur);
+        let count = self.get_u16(&mut cur);
         let mut found = None;
         for i in 0 .. count {
-            let kflag = self.pr.GetByte(&mut cur);
-            let klen = self.pr.GetVarint(&mut cur) as usize;
+            let kflag = self.get_byte(&mut cur);
+            let klen = varint::read(&self.pr, &mut cur) as usize;
             let k =
                 if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
-                    let k = KeyRef::Array(self.pr.get_slice(cur, klen));
+                    let k = KeyRef::Array(&self.pr[cur .. cur + klen]);
                     cur = cur + klen;
                     k
                 } else {
-                    let firstPage = self.pr.GetInt32(&mut cur) as PageNum;
+                    let firstPage = self.get_u32(&mut cur) as PageNum;
                     // TODO move the following line outside the loop?
-                    let pgsz = self.pr.PageSize();
+                    let pgsz = self.pr.len();
                     let mut ostrm = try!(myOverflowReadStream::new(&self.path, pgsz, firstPage, klen));
                     let mut x_k = Vec::with_capacity(klen);
                     try!(ostrm.read_to_end(&mut x_k));
@@ -3585,8 +3528,8 @@ impl SegmentCursor {
             },
             Some(found) => {
                 for i in found+1 .. count {
-                    let kflag = self.pr.GetByte(&mut cur);
-                    let klen = self.pr.GetVarint(&mut cur) as usize;
+                    let kflag = self.get_byte(&mut cur);
+                    let klen = varint::read(&self.pr, &mut cur) as usize;
                     if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
                         cur = cur + klen;
                     } else {
@@ -3597,11 +3540,11 @@ impl SegmentCursor {
         }
         let found = found.unwrap_or(count);
         for _ in 0 .. found {
-            let b = self.pr.GetByte(&mut cur);
+            let b = self.get_byte(&mut cur);
             let len = misc::varint::first_byte_to_len(b);
             cur = cur + len - 1;
         }
-        let pg = self.pr.GetVarint(&mut cur) as PageNum;
+        let pg = varint::read(&self.pr, &mut cur) as PageNum;
         Ok(pg)
     }
 
@@ -3618,7 +3561,7 @@ impl SegmentCursor {
     // a perf difference if there are overflow pages between
     // the leaves.
     fn searchForwardForLeaf(&mut self) -> Result<bool> {
-        let pt = try!(self.pr.PageType());
+        let pt = try!(self.page_type());
         if pt == PageType::LEAF_NODE { 
             Ok(true)
         } else if pt == PageType::PARENT_NODE { 
@@ -3628,7 +3571,7 @@ impl SegmentCursor {
         } else {
             assert!(pt == PageType::OVERFLOW_NODE);
 
-            let lastInt32 = self.pr.GetLastInt32() as PageNum;
+            let lastInt32 = self.get_u32_last() as PageNum;
             //
             // an overflow page has a value in its LastInt32 which
             // is one of two things.
@@ -3643,15 +3586,15 @@ impl SegmentCursor {
             // boundary page (in the case where the overflow didn't
             // fit).  it doesn't matter.  we just skip ahead.
             //
-            if self.pr.CheckPageFlag(PageFlag::FLAG_BOUNDARY_NODE) {
+            if self.check_page_flag(PageFlag::FLAG_BOUNDARY_NODE) {
                 try!(self.setCurrentPage(lastInt32));
                 self.searchForwardForLeaf()
             } else {
                 let lastPage = self.currentPage + lastInt32;
-                let endsOnBoundary = self.pr.CheckPageFlag(PageFlag::FLAG_ENDS_ON_BOUNDARY);
+                let endsOnBoundary = self.check_page_flag(PageFlag::FLAG_ENDS_ON_BOUNDARY);
                 if endsOnBoundary {
                     try!(self.setCurrentPage(lastPage));
-                    let next = self.pr.GetLastInt32() as PageNum;
+                    let next = self.get_u32_last() as PageNum;
                     try!(self.setCurrentPage(next));
                     self.searchForwardForLeaf()
                 } else {
@@ -3670,7 +3613,7 @@ impl SegmentCursor {
 
     fn search(&mut self, pg: PageNum, k: &KeyRef, sop:SeekOp) -> Result<SeekResult> {
         try!(self.setCurrentPage(pg));
-        let pt = try!(self.pr.PageType());
+        let pt = try!(self.page_type());
         if PageType::LEAF_NODE == pt {
             let tmp_countLeafKeys = self.leafKeys.len();
             let (newCur, equal) = try!(self.searchLeaf(k, 0, (tmp_countLeafKeys - 1), sop, None, None));
@@ -3681,8 +3624,8 @@ impl SegmentCursor {
                     // to look at the next/prev leaf.
                     if SeekOp::SEEK_GE == sop {
                         let nextPage =
-                            if self.pr.CheckPageFlag(PageFlag::FLAG_BOUNDARY_NODE) { 
-                                self.pr.GetLastInt32() as PageNum 
+                            if self.check_page_flag(PageFlag::FLAG_BOUNDARY_NODE) { 
+                                self.get_u32_last() as PageNum 
                             } else if self.currentPage == self.rootPage { 
                                 0 
                             } else { 
@@ -3702,7 +3645,7 @@ impl SegmentCursor {
                             self.currentKey = None;
                         } else {
                             try!(self.setCurrentPage(tmp_previousLeaf));
-                            if try!(self.pr.PageType()) != PageType::LEAF_NODE {
+                            if try!(self.page_type()) != PageType::LEAF_NODE {
                                 return Err(Error::Misc(format!("must be a leaf")));
                             }
                             self.currentKey = Some(self.leafKeys.len() - 1);
@@ -3764,17 +3707,17 @@ impl ICursor for SegmentCursor {
 
                 self.skipKey(&mut pos);
 
-                let vflag = self.pr.GetByte(&mut pos);
+                let vflag = self.get_byte(&mut pos);
                 if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) {
                     Ok(ValueRef::Tombstone)
                 } else {
-                    let vlen = self.pr.GetVarint(&mut pos) as usize;
+                    let vlen = varint::read(&self.pr, &mut pos) as usize;
                     if 0 != (vflag & ValueFlag::FLAG_OVERFLOW) {
-                        let pgnum = self.pr.GetInt32(&mut pos) as PageNum;
-                        let strm = try!(myOverflowReadStream::new(&self.path, self.pr.PageSize(), pgnum, vlen));
+                        let pgnum = self.get_u32(&mut pos) as PageNum;
+                        let strm = try!(myOverflowReadStream::new(&self.path, self.pr.len(), pgnum, vlen));
                         Ok(ValueRef::Overflowed(vlen, box strm))
                     } else {
-                        Ok(ValueRef::Array(self.pr.get_slice(pos, vlen)))
+                        Ok(ValueRef::Array(&self.pr[pos .. pos + vlen]))
                     }
                 }
             }
@@ -3789,11 +3732,11 @@ impl ICursor for SegmentCursor {
 
                 self.skipKey(&mut cur);
 
-                let vflag = self.pr.GetByte(&mut cur);
+                let vflag = self.get_byte(&mut cur);
                 if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) { 
                     Ok(None)
                 } else {
-                    let vlen = self.pr.GetVarint(&mut cur) as usize;
+                    let vlen = varint::read(&self.pr, &mut cur) as usize;
                     Ok(Some(vlen))
                 }
             }
@@ -3809,7 +3752,7 @@ impl ICursor for SegmentCursor {
     fn First(&mut self) -> Result<()> {
         let firstLeaf = self.firstLeaf;
         try!(self.setCurrentPage(firstLeaf));
-        if try!(self.pr.PageType()) != PageType::LEAF_NODE {
+        if try!(self.page_type()) != PageType::LEAF_NODE {
             return Err(Error::Misc(format!("must be a leaf")));
         }
         self.currentKey = Some(0);
@@ -3819,7 +3762,7 @@ impl ICursor for SegmentCursor {
     fn Last(&mut self) -> Result<()> {
         let lastLeaf = self.lastLeaf;
         try!(self.setCurrentPage(lastLeaf));
-        if try!(self.pr.PageType()) != PageType::LEAF_NODE {
+        if try!(self.page_type()) != PageType::LEAF_NODE {
             return Err(Error::Misc(format!("must be a leaf")));
         }
         self.currentKey = Some(self.leafKeys.len() - 1);
@@ -3829,9 +3772,9 @@ impl ICursor for SegmentCursor {
     fn Next(&mut self) -> Result<()> {
         if !self.nextInLeaf() {
             let nextPage =
-                if self.pr.CheckPageFlag(PageFlag::FLAG_BOUNDARY_NODE) { 
-                    self.pr.GetLastInt32() as PageNum 
-                } else if try!(self.pr.PageType()) == PageType::LEAF_NODE {
+                if self.check_page_flag(PageFlag::FLAG_BOUNDARY_NODE) { 
+                    self.get_u32_last() as PageNum 
+                } else if try!(self.page_type()) == PageType::LEAF_NODE {
                     if self.currentPage == self.rootPage { 
                         0 
                     } else { 
@@ -3863,7 +3806,7 @@ impl ICursor for SegmentCursor {
                 self.currentKey = None;
             } else {
                 try!(self.setCurrentPage(previousLeaf));
-                if try!(self.pr.PageType()) != PageType::LEAF_NODE {
+                if try!(self.page_type()) != PageType::LEAF_NODE {
                     return Err(Error::Misc(format!("must be a leaf")));
                 }
                 self.currentKey = Some(self.leafKeys.len() - 1);
@@ -3938,9 +3881,9 @@ impl PendingSegment {
 }
 
 fn readHeader(path: &str) -> Result<(HeaderData, usize, PageNum, SegmentNum)> {
-    fn read<R>(fs: &mut R) -> Result<PageBuffer> where R : Read {
-        let mut pr = PageBuffer::new(HEADER_SIZE_IN_BYTES);
-        let got = try!(pr.Read(fs));
+    fn read<R>(fs: &mut R) -> Result<Box<[u8]>> where R : Read {
+        let mut pr = vec![0; HEADER_SIZE_IN_BYTES].into_boxed_slice();
+        let got = try!(misc::io::read_fully(fs, &mut pr));
         if got < HEADER_SIZE_IN_BYTES {
             Err(Error::CorruptFile("invalid header"))
         } else {
@@ -3948,14 +3891,14 @@ fn readHeader(path: &str) -> Result<(HeaderData, usize, PageNum, SegmentNum)> {
         }
     }
 
-    fn parse<R>(pr: &PageBuffer, cur: &mut usize, fs: &mut R) -> Result<(HeaderData, usize)> where R : Read+Seek {
-        fn readSegmentList(pr: &PageBuffer, cur: &mut usize) -> Result<(Vec<SegmentNum>,HashMap<SegmentNum,SegmentInfo>)> {
-            fn readBlockList(prBlocks: &PageBuffer, cur: &mut usize) -> Vec<PageBlock> {
-                let count = prBlocks.GetVarint(cur) as usize;
+    fn parse<R>(pr: &Box<[u8]>, cur: &mut usize, fs: &mut R) -> Result<(HeaderData, usize)> where R : Read+Seek {
+        fn readSegmentList(pr: &Box<[u8]>, cur: &mut usize) -> Result<(Vec<SegmentNum>,HashMap<SegmentNum,SegmentInfo>)> {
+            fn readBlockList(prBlocks: &Box<[u8]>, cur: &mut usize) -> Vec<PageBlock> {
+                let count = varint::read(&prBlocks, cur) as usize;
                 let mut a = Vec::with_capacity(count);
                 for _ in 0 .. count {
-                    let firstPage = prBlocks.GetVarint(cur) as PageNum;
-                    let countPages = prBlocks.GetVarint(cur) as PageNum;
+                    let firstPage = varint::read(&prBlocks, cur) as PageNum;
+                    let countPages = varint::read(&prBlocks, cur) as PageNum;
                     // blocks are stored as firstPage/count rather than as
                     // firstPage/lastPage, because the count will always be
                     // smaller as a varint
@@ -3964,14 +3907,14 @@ fn readHeader(path: &str) -> Result<(HeaderData, usize, PageNum, SegmentNum)> {
                 a
             }
 
-            let count = pr.GetVarint(cur) as usize;
+            let count = varint::read(&pr, cur) as usize;
             let mut a = Vec::with_capacity(count);
             let mut m = HashMap::with_capacity(count);
             for _ in 0 .. count {
-                let g = pr.GetVarint(cur) as SegmentNum;
+                let g = varint::read(&pr, cur) as SegmentNum;
                 a.push(g);
-                let root_page = pr.GetVarint(cur) as PageNum;
-                let age = pr.GetVarint(cur) as u32;
+                let root_page = varint::read(&pr, cur) as PageNum;
+                let age = varint::read(&pr, cur) as u32;
                 let blocks = readBlockList(pr, cur);
                 if !block_list_contains_page(&blocks, root_page) {
                     return Err(Error::RootPageNotInSegmentBlockList);
@@ -3989,28 +3932,28 @@ fn readHeader(path: &str) -> Result<(HeaderData, usize, PageNum, SegmentNum)> {
 
         // --------
 
-        let pgsz = pr.GetInt32(cur) as usize;
-        let changeCounter = pr.GetVarint(cur);
-        let mergeCounter = pr.GetVarint(cur);
-        let lenSegmentList = pr.GetVarint(cur) as usize;
+        let pgsz = misc::buf_advance::get_u32(&pr, cur) as usize;
+        let changeCounter = varint::read(&pr, cur);
+        let mergeCounter = varint::read(&pr, cur);
+        let lenSegmentList = varint::read(&pr, cur) as usize;
 
-        let overflowed = pr.GetByte(cur) != 0u8;
+        let overflowed = pr[*cur] != 0u8;
+        *cur += 1;
         let (state, segments_info, blk) = 
             if overflowed {
-                let lenChunk1 = pr.GetInt32(cur) as usize;
+                let lenChunk1 = misc::buf_advance::get_u32(&pr, cur) as usize;
                 let lenChunk2 = lenSegmentList - lenChunk1;
-                let firstPageChunk2 = pr.GetInt32(cur) as PageNum;
+                let firstPageChunk2 = misc::buf_advance::get_u32(&pr, cur) as PageNum;
                 let extraPages = lenChunk2 / pgsz + if (lenChunk2 % pgsz) != 0 { 1 } else { 0 };
                 let extraPages = extraPages as PageNum;
                 let lastPageChunk2 = firstPageChunk2 + extraPages - 1;
-                let mut pr2 = PageBuffer::new(lenSegmentList);
+                let mut pr2 = vec![0; lenSegmentList].into_boxed_slice();
                 // TODO chain?
                 // copy from chunk1 into pr2
-                let chunk1 = pr.get_slice(*cur, lenChunk1);
-                pr2.CopyFrom(0, chunk1);
+                misc::bytes::copy_into(&pr[*cur .. *cur + lenChunk1], &mut pr2[0 .. lenChunk1]);
                 // now get chunk2 and copy it in as well
                 try!(utils::SeekPage(fs, pgsz, firstPageChunk2));
-                try!(pr2.ReadPart(fs, lenChunk1, lenChunk2));
+                try!(misc::io::read_fully(fs, &mut pr2[lenChunk1 .. lenChunk1 + lenChunk2]));
                 let mut cur2 = 0;
                 let (state, segments_info) = try!(readSegmentList(&pr2, &mut cur2));
                 (state, segments_info, Some (PageBlock::new(firstPageChunk2, lastPageChunk2)))
