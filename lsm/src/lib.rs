@@ -4089,6 +4089,7 @@ struct SafeCursors {
     pagepool: Vec<Box<[u8]>>,
 }
 
+// TODO there can be only one InnerPart instance per path
 struct InnerPart {
     path: String,
     pgsz: usize,
@@ -4120,6 +4121,8 @@ impl WriteLock {
 // TODO rename this
 pub struct db {
     inner: std::sync::Arc<InnerPart>,
+
+    // TODO there can be only one of the following per path
     write_lock: Mutex<WriteLock>,
 }
 

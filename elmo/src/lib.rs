@@ -2023,6 +2023,10 @@ impl Connection {
     pub fn update(&self, db: &str, coll: &str, updates: &mut Vec<bson::Document>, factory: &ConnectionFactory) -> Result<Vec<Result<(i32, i32, Option<bson::Value>)>>> {
         let mut results = Vec::new();
         {
+            // TODO the following is sqlite-specific.
+            // in fact, the lsm backend probably doesn't need a factory at all.
+            // in fact, it's a bad idea for the lsm backend.
+
             // rconn needs to be opened here.  if we try to open it later,
             // just before the case where we actually need it, we can't,
             // because the process of opening a connection tries to create
