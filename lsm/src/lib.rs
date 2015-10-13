@@ -14,11 +14,8 @@
     limitations under the License.
 */
 
-#![feature(core)]
-#![feature(collections)]
 #![feature(box_syntax)]
 #![feature(convert)]
-#![feature(collections_drain)]
 #![feature(associated_consts)]
 #![feature(vec_push_all)]
 #![feature(clone_from_slice)]
@@ -32,7 +29,6 @@
 extern crate misc;
 
 use misc::endian;
-use misc::bufndx;
 use misc::varint;
 
 use std::io;
@@ -625,7 +621,7 @@ impl<'a> LiveValueRef<'a> {
                 k.push_all(a);
                 Blob::Array(k.into_boxed_slice())
             },
-            LiveValueRef::Overflowed(len, r) => Blob::Stream(r),
+            LiveValueRef::Overflowed(_, r) => Blob::Stream(r),
         }
     }
 
@@ -698,7 +694,7 @@ impl<'a> ValueRef<'a> {
                 k.push_all(a);
                 Blob::Array(k.into_boxed_slice())
             },
-            ValueRef::Overflowed(len, r) => Blob::Stream(r),
+            ValueRef::Overflowed(_, r) => Blob::Stream(r),
             ValueRef::Tombstone => Blob::Tombstone,
         }
     }
@@ -892,14 +888,11 @@ pub struct SegmentInfo {
 }
 
 pub mod utils {
-    use std::io;
     use std::io::Seek;
-    use std::io::Read;
     use std::io::SeekFrom;
     use super::PageNum;
     use super::Error;
     use super::Result;
-    use super::misc;
 
     pub fn SeekPage(strm: &mut Seek, pgsz: usize, pageNumber: PageNum) -> Result<u64> {
         if 0==pageNumber { 
@@ -1421,8 +1414,8 @@ impl ICursor for MultiCursor {
                         let (before, middle, after) = split3(&mut *self.subcursors, icur);
                         let icsr = &middle[0];
                         let ki = try!(icsr.KeyRef());
-                        half(self.dir, &ki, before);
-                        half(self.dir, &ki, after);
+                        try!(half(self.dir, &ki, before));
+                        try!(half(self.dir, &ki, after));
                     }
                 }
 
@@ -2120,7 +2113,7 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I, SeekWrite>(fs: &mut SeekWrite,
                 let sofar = loop_sofar;
                 let firstBlk = loop_firstBlk;
                 {
-                    let mut curpage = (try!(fs.seek(SeekFrom::Current(0))) / (pgsz as u64) + 1) as PageNum;
+                    let curpage = (try!(fs.seek(SeekFrom::Current(0))) / (pgsz as u64) + 1) as PageNum;
                     assert!(firstBlk.firstPage == curpage);
                 }
                 let (putFirst, finished) = try!(buildFirstPage(ba, pbFirstOverflow, pgsz));
@@ -2782,7 +2775,6 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I, SeekWrite>(fs: &mut SeekWrite,
             let neededEitherWay = 1 + varint::space_needed_for(pair.key.len() as u64) + varint::space_needed_for(pgnum as u64);
             let neededForInline = neededEitherWay + pair.key.len();
             let neededForOverflow = neededEitherWay + SIZE_32;
-            let couldBeRoot = st.nextGeneration.is_empty();
 
             let available = calcAvailable(&st, pgsz);
             let fitsInline = available >= neededForInline;
@@ -2965,10 +2957,6 @@ impl myOverflowReadStream {
             };
         try!(res.ReadFirstPage());
         Ok(res)
-    }
-
-    fn len(&self) -> usize {
-        self.len
     }
 
     // TODO consider supporting Seek trait
@@ -3182,7 +3170,7 @@ impl SegmentCursor {
 
         // TODO consider not passing in the path, and instead,
         // making the cursor call back to inner.OpenForReading...
-        let mut f = try!(OpenOptions::new()
+        let f = try!(OpenOptions::new()
                 .read(true)
                 .open(path));
 
@@ -3525,7 +3513,7 @@ impl SegmentCursor {
             None => {
             },
             Some(found) => {
-                for i in found+1 .. count {
+                for _ in found+1 .. count {
                     let kflag = self.get_byte(&mut cur);
                     let klen = varint::read(&self.pr, &mut cur) as usize;
                     if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
@@ -4351,6 +4339,7 @@ impl InnerPart {
     // this code should not be called in a release build.  it helps
     // finds problems by zeroing out pages in blocks that
     // have been freed.
+    #[cfg(remove_me)]
     fn stomp(&self, blocks:Vec<PageBlock>) -> Result<()> {
         let bad = vec![0;self.pgsz as usize].into_boxed_slice();
         let mut fs = try!(OpenOptions::new()
@@ -4809,7 +4798,7 @@ impl InnerPart {
                             let cursor = try!(Self::getCursor(inner, &st, s));
                             let bloom =
                                 match mergeStuff.blooms.entry(s) {
-                                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                                    std::collections::hash_map::Entry::Occupied(e) => {
                                         Some(e.get().clone())
                                     },
                                     std::collections::hash_map::Entry::Vacant(e) => {

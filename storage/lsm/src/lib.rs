@@ -651,7 +651,7 @@ impl MyConn {
 
         let seq = {
             // DISTINCT. we don't want this producing the same record twice.
-            let mut q = try!(seq.collect::<Result<Vec<_>>>());
+            let q = try!(seq.collect::<Result<Vec<_>>>());
             let mut seen = HashSet::new();
             let mut a = vec![];
             for x in q {
@@ -1221,7 +1221,7 @@ impl<'a> MyWriter<'a> {
                 None => {
                     // fine
                 },
-                Some(collection_id) => {
+                Some(_collection_id) => {
                     // error
                     return Err(elmo::Error::Misc(String::from("renameCollection to something that already exists")));
                 },
@@ -1448,7 +1448,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
                         let ba_record_id = u64_to_boxed_varint(record_id);
                         k.push_all(&ba_record_id);
 
-                        let mut old = try!(get_value_for_key_as_bson(&mut self.cursor, &k)).unwrap();
+                        let old = try!(get_value_for_key_as_bson(&mut self.cursor, &k)).unwrap();
                         self.pending.insert(k.into_boxed_slice(), lsm::Blob::Array(v.to_bson_array().into_boxed_slice()));
 
                         try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id, &old));
@@ -1473,7 +1473,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
                 let ba_record_id = u64_to_boxed_varint(record_id);
                 k.push_all(&ba_record_id);
 
-                let mut old = try!(get_value_for_key_as_bson(&mut self.cursor, &k)).unwrap();
+                let old = try!(get_value_for_key_as_bson(&mut self.cursor, &k)).unwrap();
                 self.pending.insert(k.into_boxed_slice(), lsm::Blob::Tombstone);
 
                 try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id, &old));

@@ -887,16 +887,17 @@ impl<T> Drop for Lend<T> {
 
 pub mod buf_advance {
 
-    use std;
     use super::endian;
     use super::bytes;
 
+    #[inline]
     pub fn get_byte(buf: &[u8], cur: &mut usize) -> u8 {
         let r = buf[*cur];
         *cur = *cur + 1;
         r
     }
 
+    #[inline]
     pub fn get_u32(buf: &[u8], cur: &mut usize) -> u32 {
         let at = *cur;
         // TODO just buf?  instead of making 4-byte slice.
@@ -905,6 +906,7 @@ pub mod buf_advance {
         endian::u32_from_bytes_be(a)
     }
 
+    #[inline]
     pub fn get_u16(buf: &[u8], cur: &mut usize) -> u16 {
         let at = *cur;
         // TODO just buf?  instead of making 2-byte slice.
