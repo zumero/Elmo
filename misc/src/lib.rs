@@ -824,3 +824,64 @@ pub fn push_varint(v: &mut Vec<u8>, n: u64) {
     v.push_all(&buf[0 .. cur]);
 }
 
+struct Lend<T> {
+    value: Option<T>,
+    done: Box<Fn(T) -> ()>,
+}
+
+impl<T> Lend<T> {
+    pub fn new(value: T, done: Box<Fn(T) -> ()>) -> Lend<T> {
+        Lend {
+            value: Some(value),
+            done: done,
+        }
+    }
+
+    pub fn detach(mut self) -> T {
+        let value = self.value.take().unwrap();
+        value
+    }
+}
+
+impl<T> AsRef<T> for Lend<T> {
+    fn as_ref(&self) -> &T {
+        match self.value.as_ref() {
+            Some(v) => v,
+            None => panic!("smartpointer missing its value.")
+        }
+    }
+}
+
+impl<T> AsMut<T> for Lend<T> {
+    fn as_mut(&mut self) -> &mut T {
+        match self.value.as_mut() {
+            Some(v) => v,
+            None => panic!("smartpointer missing its value.")
+        }
+    }
+}
+
+impl<T> std::ops::Deref for Lend<T> {
+    type Target = T;
+
+    fn deref<'a>(&'a self) -> &'a T {
+        self.as_ref()
+    }
+
+}
+
+impl<T> std::ops::DerefMut for Lend<T> {
+    fn deref_mut<'a>(&'a mut self) -> &'a mut T {
+        self.as_mut()
+    }
+
+}
+
+impl<T> Drop for Lend<T> {
+    fn drop(&mut self) {
+        let value = self.value.take().unwrap();
+        (*self.done)(value);
+    }
+}
+
+
