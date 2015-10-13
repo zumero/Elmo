@@ -3035,6 +3035,7 @@ impl myOverflowReadStream {
                 .read(true)
                 .open(path));
         let mut res = 
+            // TODO the vec new below is really slow
             myOverflowReadStream {
                 fs: f,
                 len: len,
@@ -3305,7 +3306,7 @@ impl SegmentCursor {
         if pt == PageType::LEAF_NODE {
             res.firstLeaf = rootPage;
             res.lastLeaf = rootPage;
-            // TODO we still need to get count_keys
+            res.count_keys = res.leafKeys.len();
             // TODO we still need to get count_tombstones
         } else if pt == PageType::PARENT_NODE {
             if ! res.pr.CheckPageFlag(PageFlag::FLAG_ROOT_NODE) { 
