@@ -31,6 +31,9 @@ extern crate misc;
 use misc::endian;
 use misc::varint;
 
+use std::sync::mpsc;
+use std::thread;
+
 use std::io;
 use std::io::Seek;
 use std::io::Read;
@@ -4075,6 +4078,10 @@ struct SafeHeader {
     header: HeaderData,
 }
 
+struct SafeNotify {
+    notify: mpsc::Sender<Vec<SegmentNum>>,
+}
+
 struct SafeCursors {
     nextCursorNum: u64,
     cursors: HashMap<u64, SegmentNum>,
@@ -4089,7 +4096,7 @@ struct SafeCursors {
     pagepool: Vec<Box<[u8]>>,
 }
 
-// TODO there can be only one InnerPart instance per path
+// there can be only one InnerPart instance per path
 struct InnerPart {
     path: String,
     pgsz: usize,
@@ -4102,6 +4109,7 @@ struct InnerPart {
     segmentsInWaiting: Mutex<SafeSegmentsInWaiting>,
     mergeStuff: Mutex<SafeMergeStuff>,
     cursors: Mutex<SafeCursors>,
+    notify: Mutex<SafeNotify>,
 }
 
 pub struct WriteLock {
@@ -4122,12 +4130,12 @@ impl WriteLock {
 pub struct db {
     inner: std::sync::Arc<InnerPart>,
 
-    // TODO there can be only one of the following per path
+    // there can be only one of the following per path
     write_lock: Mutex<WriteLock>,
 }
 
 impl db {
-    pub fn new(path: String, settings : DbSettings) -> Result<db> {
+    pub fn new(path: String, settings : DbSettings) -> Result<std::sync::Arc<db>> {
 
         let (header, pgsz, firstAvailablePage, nextAvailableSegmentNum) = try!(readHeader(&path));
 
@@ -4167,6 +4175,12 @@ impl db {
             pagepool: vec![],
         };
 
+        let (tx, rx): (mpsc::Sender<Vec<SegmentNum>>, mpsc::Receiver<Vec<SegmentNum>>) = mpsc::channel();
+
+        let notify = SafeNotify {
+            notify: tx, 
+        };
+
         let inner = InnerPart {
             path: path,
             pgsz: pgsz,
@@ -4177,14 +4191,37 @@ impl db {
             segmentsInWaiting: Mutex::new(segmentsInWaiting),
             mergeStuff: Mutex::new(mergeStuff),
             cursors: Mutex::new(cursors),
+            notify: Mutex::new(notify),
         };
 
         let inner = std::sync::Arc::new(inner);
         let lck = WriteLock { inner: inner.clone() };
+
         let res = db {
             inner: inner,
             write_lock: Mutex::new(lck),
         };
+        let res = std::sync::Arc::new(res);
+
+        {
+            let res = res.clone();
+            thread::spawn(move || {
+                loop {
+                    match rx.recv() {
+                        Ok(new_segs) => {
+                            // TODO there should be a way to send a message to this
+                            // thread telling it to stop.
+                            res.after_commit(new_segs);
+                        },
+                        Err(e) => {
+                            // TODO what now?
+                        },
+                    }
+                }
+            });
+
+        }
+
         Ok(res)
     }
 
@@ -4193,6 +4230,30 @@ impl db {
     pub fn GetWriteLock(&self) -> Result<std::sync::MutexGuard<WriteLock>> {
         let lck = try!(self.write_lock.lock());
         Ok(lck)
+    }
+
+    fn after_commit(&self, new_segs: Vec<SegmentNum>) -> Result<()> {
+        //println!("got new segs: {:?}", new_segs);
+        // TODO tweak this automerge algorithm.  give it options.  etc.
+        for i in 0 .. 8 {
+            let mut at_least_once_in_this_level = false;
+            loop {
+                match try!(self.merge(i, i, 4, 8)) {
+                    Some(seg) => {
+                        let lck = try!(self.GetWriteLock());
+                        try!(lck.commitMerge(seg));
+                        at_least_once_in_this_level = true;
+                    },
+                    None => {
+                        break;
+                    },
+                }
+            }
+            if !at_least_once_in_this_level {
+                break;
+            }
+        }
+        Ok(())
     }
 
     // the following methods are passthrus, exposing inner
@@ -4270,11 +4331,15 @@ impl InnerPart {
         assert_eq!(seg, segnum);
         match cursors.zombie_segments.remove(&segnum) {
             Some(info) => {
-                // TODO maybe allow this lock to fail with try_lock.  the
-                // worst that can happen is that these blocks don't get
-                // reclaimed until some other day.
-                let mut space = self.space.lock().unwrap(); // gotta succeed
-                self.addFreeBlocks(&mut space, info.blocks);
+                match self.space.try_lock() {
+                    Ok(mut space) => {
+                        self.addFreeBlocks(&mut space, info.blocks);
+                    },
+                    Err(_) => {
+                        // worst that can happen is that these blocks don't get
+                        // reclaimed until some other day.
+                    },
+                }
             },
             None => {
             },
@@ -4623,6 +4688,10 @@ impl InnerPart {
         // note that we intentionally do not release the writeLock here.
         // you can change the segment list more than once while holding
         // the writeLock.  the writeLock gets released when you Dispose() it.
+
+        let notify = try!(self.notify.lock());
+        try!(notify.notify.send(newSegs).map_err(wrap_err));
+
         Ok(())
     }
 
@@ -4850,9 +4919,6 @@ impl InnerPart {
         }
     }
 
-    // TODO maybe commitSegments and commitMerge should be the same function.
-    // just check to see if the segment being committed is a merge.  if so,
-    // do the extra paperwork.
     fn commitMerge(&self, newSegNum:SegmentNum) -> Result<()> {
 
         let mut st = try!(self.header.lock());

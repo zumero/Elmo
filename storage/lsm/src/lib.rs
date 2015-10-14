@@ -1387,46 +1387,6 @@ impl<'a> MyWriter<'a> {
         Ok(())
     }
 
-    fn merge(&self, min_level: u32, max_level: u32, min_segs: usize, max_segs: usize) -> Result<bool> {
-        let r = self.myconn.conn.merge(min_level, max_level, min_segs, max_segs).map_err(elmo::wrap_err);
-        if r.is_err() {
-            println!("from merge: {:?}", r);
-        }
-        let r = try!(r);
-        match r {
-            Some(seg) => {
-                //println!("{}: merged segment: {}", level, seg);
-                try!(self.tx.commitMerge(seg).map_err(elmo::wrap_err));
-                Ok(true)
-            },
-            None => {
-                //println!("{}: no merge needed", level);
-                Ok(false)
-            },
-        }
-    }
-
-    fn automerge(&self) -> Result<()> {
-        let mut count_merges = 0;
-        for i in 0 .. 16 {
-            let mut at_least_once_in_this_level = false;
-            loop {
-                let merged = try!(self.merge(i, i, 4, 8));
-                if !merged {
-                    break;
-                }
-                count_merges = count_merges + 1;
-                at_least_once_in_this_level = true;
-            }
-            if !at_least_once_in_this_level {
-                break;
-            }
-        }
-        // TODO consider something like:
-        //try!(self.merge(0, 40, 8, 16));
-        Ok(())
-    }
-
 }
 
 impl<'a> elmo::StorageWriter for MyWriter<'a> {
@@ -1508,7 +1468,6 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
             let pending = std::mem::replace(&mut self.pending, HashMap::new());
             let g = try!(self.myconn.conn.WriteSegment2(pending).map_err(elmo::wrap_err));
             try!(self.tx.commitSegments(vec![g]).map_err(elmo::wrap_err));
-            try!(self.automerge());
         }
         Ok(())
     }
@@ -1688,7 +1647,7 @@ impl elmo::StorageConnection for MyPublicConn {
     }
 }
 
-fn base_connect(name: &str) -> lsm::Result<lsm::db> {
+fn base_connect(name: &str) -> lsm::Result<std::sync::Arc<lsm::db>> {
     lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS)
 }
 
@@ -1704,7 +1663,7 @@ impl MyFactory {
         let f =
             MyFactory {
                 filename: filename,
-                conn: std::sync::Arc::new(conn),
+                conn: conn,
             };
         Ok(f)
     }
