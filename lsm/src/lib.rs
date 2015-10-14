@@ -1601,7 +1601,7 @@ impl ICursor for LivingCursor {
 
 pub struct FilterTombstonesCursor { 
     chain: MultiCursor,
-    behind: Vec<(Option<std::rc::Rc<Bloom>>, SegmentCursor)>,
+    behind: Vec<(Option<std::sync::Arc<Bloom>>, SegmentCursor)>,
 }
 
 impl FilterTombstonesCursor {
@@ -1654,7 +1654,7 @@ impl FilterTombstonesCursor {
         Ok(())
     }
 
-    fn new(ch: MultiCursor, behind: Vec<(Option<std::rc::Rc<Bloom>>, SegmentCursor)>) -> FilterTombstonesCursor {
+    fn new(ch: MultiCursor, behind: Vec<(Option<std::sync::Arc<Bloom>>, SegmentCursor)>) -> FilterTombstonesCursor {
         FilterTombstonesCursor { 
             chain: ch,
             behind: behind,
@@ -4067,7 +4067,7 @@ struct SafeSegmentsInWaiting {
 struct SafeMergeStuff {
     merging: HashSet<SegmentNum>,
     pendingMerges: HashMap<SegmentNum, Vec<SegmentNum>>,
-    blooms: HashMap<SegmentNum, std::rc::Rc<Bloom>>,
+    blooms: HashMap<SegmentNum, std::sync::Arc<Bloom>>,
 }
 
 struct SafeHeader {
@@ -4799,7 +4799,7 @@ impl InnerPart {
                                     std::collections::hash_map::Entry::Vacant(e) => {
                                         match try!(cursor.load_bloom_filter()) {
                                             Some(bloom) => {
-                                                let bloom = std::rc::Rc::new(bloom);
+                                                let bloom = std::sync::Arc::new(bloom);
                                                 let result = bloom.clone();
                                                 e.insert(bloom);
                                                 Some(result)

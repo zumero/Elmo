@@ -211,7 +211,7 @@ struct MyWriter<'a> {
 }
 
 struct MyConn {
-    conn: lsm::db,
+    conn: std::sync::Arc<lsm::db>,
 }
 
 struct MyPublicConn {
@@ -1692,35 +1692,35 @@ fn base_connect(name: &str) -> lsm::Result<lsm::db> {
     lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS)
 }
 
-pub fn connect(name: &str) -> Result<Box<elmo::StorageConnection>> {
-    let conn = try!(base_connect(name).map_err(elmo::wrap_err));
-    let c = MyConn {
-        conn: conn,
-    };
-    let c = MyPublicConn {
-        myconn: std::rc::Rc::new(c)
-    };
-    Ok(box c)
-}
-
 #[derive(Clone)]
 pub struct MyFactory {
     filename: String,
+    conn: std::sync::Arc<lsm::db>,
 }
 
 impl MyFactory {
-    pub fn new(filename: String) -> MyFactory {
-        MyFactory {
-            filename: filename,
-        }
+    pub fn new(filename: String) -> elmo::Result<MyFactory> {
+        let conn = try!(base_connect(&filename).map_err(elmo::wrap_err));
+        let f =
+            MyFactory {
+                filename: filename,
+                conn: std::sync::Arc::new(conn),
+            };
+        Ok(f)
     }
+
 }
 
 impl elmo::ConnectionFactory for MyFactory {
     fn open(&self) -> elmo::Result<elmo::Connection> {
-        let conn = try!(connect(&self.filename));
-        let conn = elmo::Connection::new(conn);
-        Ok(conn)
+        let c = MyConn {
+            conn: self.conn.clone(),
+        };
+        let c = MyPublicConn {
+            myconn: std::rc::Rc::new(c)
+        };
+        let c = elmo::Connection::new(box c);
+        Ok(c)
     }
 
     fn clone_for_new_thread(&self) -> Box<elmo::ConnectionFactory + Send> {

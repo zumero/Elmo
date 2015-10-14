@@ -1,4 +1,6 @@
 
+how much perf trouble is being caused by all these mutexes and Arcs?
+
 fix fts in lsm storage
 
 in lsm, when the root lands on a boundary, don't fetch a block only

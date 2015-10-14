@@ -1532,7 +1532,14 @@ pub fn serve(factory: Box<elmo::ConnectionFactory>) {
 }
 
 pub fn main() {
-    let factory = elmo_lsm::MyFactory::new(String::from("elmodata.lsm"));
-    serve(box factory);
+    match elmo_lsm::MyFactory::new(String::from("elmodata.lsm")) {
+        Ok(factory) => {
+            serve(box factory);
+        },
+        Err(e) => {
+            println!("Error: {}", e);
+            panic!();
+        },
+    }
 }
 
