@@ -2834,7 +2834,9 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I, SeekWrite>(fs: &mut SeekWrite,
     let mut vbuf = vec![0; pgsz].into_boxed_slice(); 
 
     let (blk, leaves, firstLeaf, count_keys, count_tombstones, filter) = try!(writeLeaves(blk, pageManager, source, estimate_count_keys, &mut vbuf, fs, &mut pb, &mut token));
+    assert!(count_keys > 0);
     assert!(count_keys >= count_tombstones);
+    assert!(leaves.len() > 0);
 
     let filter_count_funcs = filter.count_funcs();
     let filter_bytes = filter.into_bytes();
@@ -2853,7 +2855,7 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I, SeekWrite>(fs: &mut SeekWrite,
 
     let (root_page, blk) =
         if leaves.len() > 1 {
-            let (filter_page, blk) =
+            let (filter_page, filter_len, blk) =
                 // TODO is it always worth writing the filter just because there were more
                 // keys than could fit on a single leaf?
                 // maybe we should write a bloom filter only when there is more than one
@@ -2861,9 +2863,9 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I, SeekWrite>(fs: &mut SeekWrite,
                 if leaves.len() > 1 {
                     let filter_page = blk.firstPage;
                     let (_, blk) = try!(writeOverflow(blk, &mut &*filter_bytes, pageManager, &mut token, fs));
-                    (filter_page, blk)
+                    (filter_page, filter_bytes.len(), blk)
                 } else {
-                    (0, blk)
+                    (0, 0, blk)
                 };
 
             let mut footer = vec![];
@@ -2872,7 +2874,7 @@ fn CreateFromSortedSequenceOfKeyValuePairs<I, SeekWrite>(fs: &mut SeekWrite,
             misc::push_varint(&mut footer, count_keys as u64);
             misc::push_varint(&mut footer, count_tombstones as u64);
             misc::push_varint(&mut footer, filter_page as u64);
-            misc::push_varint(&mut footer, filter_bytes.len() as u64);
+            misc::push_varint(&mut footer, filter_len as u64);
             misc::push_varint(&mut footer, filter_count_funcs as u64);
             let len = footer.len();
             assert!(len <= 255);
@@ -3198,7 +3200,16 @@ impl SegmentCursor {
             res.firstLeaf = rootPage;
             res.lastLeaf = rootPage;
             res.count_keys = res.leafKeys.len();
-            // TODO we still need to get count_tombstones
+            let mut count_tombstones = 0;
+            for i in 0 .. res.leafKeys.len() {
+                let mut pos = res.leafKeys[i];
+                res.skipKey(&mut pos);
+                let vflag = res.get_byte(&mut pos);
+                if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) {
+                    count_tombstones += 1;
+                }
+            }
+            res.count_tombstones = count_tombstones;
         } else if pt == PageType::PARENT_NODE {
             if !res.check_page_flag(PageFlag::FLAG_ROOT_NODE) { 
                 return Err(Error::CorruptFile("root page lacks flag"));
@@ -3229,12 +3240,16 @@ impl SegmentCursor {
         self.done = Some(done);
     }
 
-    fn count_keys(&self) -> usize {
+    pub fn count_keys(&self) -> usize {
         self.count_keys
     }
 
-    fn count_tombstones(&self) -> usize {
+    pub fn count_tombstones(&self) -> usize {
         self.count_tombstones
+    }
+
+    pub fn filter_len(&self) -> usize {
+        self.filter_len
     }
 
     fn load_bloom_filter(&self) -> Result<Option<Bloom>> {
@@ -4067,6 +4082,13 @@ struct SafeSegmentsInWaiting {
     segmentsInWaiting: HashMap<SegmentNum, SegmentInfo>,
 }
 
+// TODO
+struct PendingMerge {
+    old_segments: Vec<SegmentNum>,
+    new_segment: Option<SegmentNum>,
+    level: u32,
+}
+
 struct SafeMergeStuff {
     merging: HashSet<SegmentNum>,
     pendingMerges: HashMap<SegmentNum, Vec<SegmentNum>>,
@@ -4076,10 +4098,6 @@ struct SafeMergeStuff {
 struct SafeHeader {
     // TODO one level too much nesting
     header: HeaderData,
-}
-
-struct SafeNotify {
-    notify: mpsc::Sender<Vec<SegmentNum>>,
 }
 
 struct SafeCursors {
@@ -4109,20 +4127,30 @@ struct InnerPart {
     segmentsInWaiting: Mutex<SafeSegmentsInWaiting>,
     mergeStuff: Mutex<SafeMergeStuff>,
     cursors: Mutex<SafeCursors>,
-    notify: Mutex<SafeNotify>,
 }
 
 pub struct WriteLock {
-    inner: std::sync::Arc<InnerPart>
+    inner: std::sync::Arc<InnerPart>,
+    notify_0: mpsc::Sender<Vec<SegmentNum>>,
+    notify_merge_others: Vec<mpsc::Sender<SegmentNum>>,
 }
 
 impl WriteLock {
     pub fn commitSegments(&self, newSegs: Vec<SegmentNum>) -> Result<()> {
-        self.inner.commitSegments(newSegs)
+        // TODO avoid clone
+        try!(self.inner.commitSegments(newSegs.clone()));
+        try!(self.notify_0.send(newSegs).map_err(wrap_err));
+        Ok(())
     }
 
     pub fn commitMerge(&self, newSegNum:SegmentNum) -> Result<()> {
-        self.inner.commitMerge(newSegNum)
+        let age = try!(self.inner.commitMerge(newSegNum));
+        assert!(age > 0);
+        let age = (age - 1) as usize;
+        if age < self.notify_merge_others.len() {
+            try!(self.notify_merge_others[age].send(newSegNum).map_err(wrap_err));
+        }
+        Ok(())
     }
 }
 
@@ -4175,11 +4203,15 @@ impl db {
             pagepool: vec![],
         };
 
-        let (tx, rx): (mpsc::Sender<Vec<SegmentNum>>, mpsc::Receiver<Vec<SegmentNum>>) = mpsc::channel();
+        let (tx_0, rx_0): (mpsc::Sender<Vec<SegmentNum>>, mpsc::Receiver<Vec<SegmentNum>>) = mpsc::channel();
 
-        let notify = SafeNotify {
-            notify: tx, 
-        };
+        let mut notify_merge_others = vec![];
+        let mut receivers = vec![];
+        for age in 1 .. 8 {
+            let (tx, rx): (mpsc::Sender<SegmentNum>, mpsc::Receiver<SegmentNum>) = mpsc::channel();
+            notify_merge_others.push(tx);
+            receivers.push((age, rx));
+        }
 
         let inner = InnerPart {
             path: path,
@@ -4191,11 +4223,16 @@ impl db {
             segmentsInWaiting: Mutex::new(segmentsInWaiting),
             mergeStuff: Mutex::new(mergeStuff),
             cursors: Mutex::new(cursors),
-            notify: Mutex::new(notify),
         };
 
         let inner = std::sync::Arc::new(inner);
-        let lck = WriteLock { inner: inner.clone() };
+
+        let lck = 
+            WriteLock { 
+                inner: inner.clone(),
+                notify_0: tx_0,
+                notify_merge_others: notify_merge_others,
+            };
 
         let res = db {
             inner: inner,
@@ -4207,14 +4244,35 @@ impl db {
             let res = res.clone();
             thread::spawn(move || {
                 loop {
-                    match rx.recv() {
+                    match rx_0.recv() {
                         Ok(new_segs) => {
                             // TODO there should be a way to send a message to this
                             // thread telling it to stop.
-                            res.after_commit(new_segs);
+                            res.merge_0(new_segs);
                         },
                         Err(e) => {
                             // TODO what now?
+                            panic!();
+                        },
+                    }
+                }
+            });
+
+        }
+
+        for (age, rx) in receivers {
+            let res = res.clone();
+            thread::spawn(move || {
+                loop {
+                    match rx.recv() {
+                        Ok(new_seg) => {
+                            // TODO there should be a way to send a message to this
+                            // thread telling it to stop.
+                            res.merge_others(age, new_seg);
+                        },
+                        Err(e) => {
+                            // TODO what now?
+                            panic!();
                         },
                     }
                 }
@@ -4252,6 +4310,36 @@ impl db {
             if !at_least_once_in_this_level {
                 break;
             }
+        }
+        Ok(())
+    }
+
+    fn merge_0(&self, new_segs: Vec<SegmentNum>) -> Result<()> {
+        //println!("got new segs: {:?}", new_segs);
+        // TODO tweak this automerge algorithm.  give it options.  etc.
+        loop {
+            match try!(self.merge(0, 0, 2, 8)) {
+                Some(seg) => {
+                    let lck = try!(self.GetWriteLock());
+                    try!(lck.commitMerge(seg));
+                },
+                None => {
+                    break;
+                },
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_others(&self, age: u32, new_seg: SegmentNum) -> Result<()> {
+        //println!("got new segs: {:?}", new_segs);
+        match try!(self.merge(age, age, 4, 8)) {
+            Some(seg) => {
+                let lck = try!(self.GetWriteLock());
+                try!(lck.commitMerge(seg));
+            },
+            None => {
+            },
         }
         Ok(())
     }
@@ -4689,9 +4777,6 @@ impl InnerPart {
         // you can change the segment list more than once while holding
         // the writeLock.  the writeLock gets released when you Dispose() it.
 
-        let notify = try!(self.notify.lock());
-        try!(notify.notify.send(newSegs).map_err(wrap_err));
-
         Ok(())
     }
 
@@ -4824,7 +4909,7 @@ impl InnerPart {
 
                 let last_seg_being_merged = segs[segs.len() - 1];
                 let pos_last_seg = st.header.currentState.iter().position(|s| *s == last_seg_being_merged).expect("gotta be there");
-                let count_segments_behind = st.header.currentState.len() - 1 - pos_last_seg;
+                let count_segments_behind = st.header.currentState.len() - (pos_last_seg + 1);
 
                 let cursor: Box<ICursor> =
                     if count_segments_behind == 0 {
@@ -4833,8 +4918,6 @@ impl InnerPart {
                         // so all tombstones can be filtered.
                         // so we just wrap in a LivingCursor.
                         let mut cursor = LivingCursor::Create(cursor);
-                        try!(cursor.First());
-                        // TODO check IsValid here?  to avoid trying to write a segment with no keys.
                         box cursor
                     } else if count_segments_behind <= 8 {
                         // TODO arbitrary hard-coded limit in the line above
@@ -4857,8 +4940,8 @@ impl InnerPart {
 
                         // TODO capacity
                         let mut behind = vec![];
-                        for i in pos_last_seg .. st.header.currentState.len() {
-                            let s = st.header.currentState[i];
+                        for s in &st.header.currentState[pos_last_seg + 1 ..] {
+                            let s = *s;
                             let cursor = try!(Self::getCursor(inner, &st, s));
                             let bloom =
                                 match mergeStuff.blooms.entry(s) {
@@ -4887,12 +4970,8 @@ impl InnerPart {
                         // them as references, don't transfer ownership.  but then they
                         // will need to be owned somewhere else.
                         let mut cursor = FilterTombstonesCursor::new(cursor, behind);
-                        try!(cursor.First());
-                        // TODO check IsValid here?  to avoid trying to write a segment with no keys.
                         box cursor
                     } else {
-                        let mut cursor = cursor;
-                        try!(cursor.First());
                         box cursor
                     };
 
@@ -4903,10 +4982,12 @@ impl InnerPart {
         };
 
         match mrg {
-            Some((segs, cursor, estimate_keys)) => {
-                // note that cursor.First() should have already been called
-
-                // TODO check IsValid here?  to avoid trying to write a segment with no keys.
+            Some((segs, mut cursor, estimate_keys)) => {
+                // note that cursor.First() should NOT have already been called
+                try!(cursor.First());
+                if !cursor.IsValid() {
+                    println!("TODO HEY this segment is going to be empty");
+                }
                 let g = try!(Self::do_merge(inner, segs, cursor, estimate_keys));
                 // TODO if something goes wrong here, the function will exit with
                 // an error but mergeStuff.merging will still contain the segments we are
@@ -4919,7 +5000,7 @@ impl InnerPart {
         }
     }
 
-    fn commitMerge(&self, newSegNum:SegmentNum) -> Result<()> {
+    fn commitMerge(&self, newSegNum:SegmentNum) -> Result<u32> {
 
         let mut st = try!(self.header.lock());
         let mut waiting = try!(self.segmentsInWaiting.lock());
@@ -5046,7 +5127,7 @@ impl InnerPart {
         // note that we intentionally do not release the writeLock here.
         // you can change the segment list more than once while holding
         // the writeLock.  the writeLock gets released when you Dispose() it.
-        Ok(())
+        Ok(age_of_new_segment)
     }
 
 }

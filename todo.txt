@@ -1,4 +1,14 @@
 
+once saw a crash on too many files open, apparently crashed in the merge
+thread, poisoned the mutex, etc.  this probably was a case where the
+automerge thread got too far behind and a multicursor on the entire
+current state involved a lot of segments.
+
+another bizarre set of test runs:
+rm data file, ran a release build, took over 8 min.
+rm data file, ran it again with no code changes, took 55 seconds.  
+leave data file, ran it again, over 5 min.
+
 how much perf trouble is being caused by all these mutexes and Arcs?
 
 fix fts in lsm storage

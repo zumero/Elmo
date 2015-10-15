@@ -32,6 +32,10 @@ fn list_segments(name: &str) -> Result<(),lsm::Error> {
     let (segments, infos) = try!(db.list_segments());
     for s in segments.iter() {
         println!("{}: {:?}", s, infos[s]);
+        let mut cursor = try!(db.OpenSegmentCursor(*s));
+        println!("    keys: {}", cursor.count_keys());
+        println!("    tombstones: {}", cursor.count_tombstones());
+        println!("    filter_len: {}", cursor.filter_len());
     }
     Ok(())
 }
