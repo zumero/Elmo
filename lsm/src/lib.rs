@@ -42,6 +42,7 @@ use std::io::SeekFrom;
 use std::cmp::Ordering;
 use std::fs::File;
 use std::fs::OpenOptions;
+
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -164,6 +165,7 @@ pub enum MergePromotionRule {
     Threshold(usize),
 }
 
+#[derive(Debug)]
 pub enum NoMaybe {
     No,
     Maybe,
@@ -891,6 +893,7 @@ impl SegmentInfo {
 }
 
 // TODO why is this pub?
+// TODO why is this even a module?
 pub mod utils {
     use std::io::Seek;
     use std::io::SeekFrom;
@@ -4320,6 +4323,10 @@ impl DatabaseFile {
         InnerPart::open_cursor_on_active_segment(&self.inner, n)
     }
 
+    pub fn merge_pending_segments(&self, segments: Vec<SegmentLocation>) -> Result<SegmentLocation> {
+        InnerPart::merge_pending_segments(&self.inner, segments)
+    }
+
     pub fn open_cursor_on_pending_segment(&self, location: SegmentLocation) -> Result<SegmentCursor> {
         InnerPart::open_cursor_on_pending_segment(&self.inner, location)
     }
@@ -4364,8 +4371,8 @@ fn slice_within(sub: &[SegmentNum], within: &[SegmentNum]) -> Result<usize> {
 
 impl InnerPart {
 
-    fn page_done(&self, page: Box<[u8]>) {
-        //println!("page_done");
+    fn return_page_to_pool(&self, page: Box<[u8]>) {
+        //println!("return_page_to_pool");
         match self.pagepool.try_lock() {
             Ok(mut pagepool) => {
                 //println!("returned a page");
@@ -4628,7 +4635,7 @@ impl InnerPart {
         };
         let foo = inner.clone();
         let done_page = move |p| -> () {
-            foo.page_done(p);
+            foo.return_page_to_pool(p);
         };
         let page = misc::Lend::new(page, box done_page);
         Ok(page)
@@ -4664,7 +4671,6 @@ impl InnerPart {
         Ok(location)
     }
 
-    // TODO we also need a way to open a cursor on segments in waiting
     fn open_cursor(inner: &std::sync::Arc<InnerPart>) -> Result<LivingCursor> {
         // TODO this cursor needs to expose the changeCounter and segment list
         // on which it is based. for optimistic writes.  caller can grab a cursor,
@@ -4673,16 +4679,19 @@ impl InnerPart {
         // commit their writes.  if so, nevermind the written segments and start over.
 
         let st = try!(inner.header.lock());
-        let mut clist = Vec::with_capacity(st.header.currentState.len());
-        for g in st.header.currentState.iter() {
-            clist.push(try!(Self::get_cursor_on_active_segment(inner, &*st, *g)));
-        }
-        let mc = MultiCursor::Create(clist);
+        let cursors = 
+            st.header.currentState
+            .iter()
+            .map(|g| Self::get_cursor_on_active_segment(inner, &st, *g))
+            .collect::<Result<Vec<_>>>();
+        let cursors = try!(cursors);
+        let mc = MultiCursor::Create(cursors);
         let lc = LivingCursor::Create(mc);
         Ok(lc)
     }
 
     fn get_page(inner: &std::sync::Arc<InnerPart>, pgnum: PageNum) -> Result<Box<[u8]>> {
+        // OpenForReading?
         let mut f = try!(OpenOptions::new()
                 .read(true)
                 .create(true)

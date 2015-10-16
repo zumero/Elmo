@@ -1,4 +1,8 @@
 
+disallow promote on level 7
+
+figure out proper limits for how much should be at each level
+
 fix all the lsm tests
 
 update rust nightly
