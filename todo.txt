@@ -1,18 +1,16 @@
 
-disallow promote on level 7
+tune block sizes for perf?
 
 figure out proper limits for how much should be at each level
 
 fix all the lsm tests
 
-update rust nightly
+update rust nightly?
 
 separate lsm code into multiple files (modules) so we can get 
 better privacy on struct fields
 
 separate merge() into find_merge() and write_merge_segment()?
-
-can we gather/calc stats on false positives on bloom filters?
 
 rethink how merged segments are reclaimed into free space.
 locking issues.
@@ -29,7 +27,13 @@ with no free blocks)
 diag_lsm:  dump level_sizes?  or is list_segments enough, since we
 usually have only one segment per level?
 
-need a function to merge two pending segments
+implement a pending transaction manager.  allows crud operations.
+accumulates them in a BTreeMap.  automatically flushes them out to
+a pending segment when it gets too large.  automatically merges its
+pending segments when there are more than one.  queries, automatically
+putting its pending segment into the cursor.
+
+need an API to add a pending segment to the free block list.
 
 need a function to get a cursor with a pending segment in front of it
 

@@ -50,6 +50,15 @@ use std::collections::HashSet;
 const SIZE_32: usize = 4; // like std::mem::size_of::<u32>()
 const SIZE_16: usize = 2; // like std::mem::size_of::<u16>()
 
+// all new segments start at level 0.
+//
+// level 0 size limit is 0 because it is unused, because promotion
+// out of level 0 is not based on a size threshold.
+//
+// final level size limit is 0 because it is unused, because nothing ever
+// gets promoted out of the last level.
+const LEVEL_SIZE_LIMITS_IN_MB: [u64; 8] = [0, 2, 8, 32, 128, 512, 2048, 0];
+
 pub type PageNum = u32;
 // type PageSize = u32;
 
@@ -3917,7 +3926,7 @@ struct InnerPart {
 pub struct WriteLock {
     inner: std::sync::Arc<InnerPart>,
     notify_0: mpsc::Sender<SegmentNum>,
-    notify_merge_others: Vec<mpsc::Sender<u32>>,
+    notify_merged_segment: Vec<mpsc::Sender<(SegmentNum, u32)>>,
 }
 
 impl WriteLock {
@@ -3933,23 +3942,36 @@ impl WriteLock {
             match pm.new_segment {
                 Some(ref info) => {
                     if info.level == pm.merge_level {
+                        // we only want to notify if this was a promotion.
+                        // this merge was just cleaning up a level and
+                        // leaving the resulting segment in that same level.
                         None
                     } else {
+                        // this merge resulted in a segment getting promoted
+                        // to the next level.  need to notify that level,
+                        // because it might need a merge now.
                         Some(info.level)
                     }
                 },
                 None => {
+                    // this merge did not result in a segment.  this happens
+                    // because tombstones.
                     None
                 },
             };
-        try!(self.inner.commit_merge(pm));
+        let new_segnum = try!(self.inner.commit_merge(pm));
         match notify {
             Some(level) => {
-                // TODO arg here is unused right now, 0
+                // the unwrap in the following line is correct.
+                // if notify.is_some(), then commit_merge() has to
+                // return a segment number.
+                let new_segnum = new_segnum.unwrap();
+
+                // level 0 is not in this array
+                assert!(level > 0);
                 let level = (level - 1) as usize;
-                if level < self.notify_merge_others.len() {
-                    try!(self.notify_merge_others[level].send(0).map_err(wrap_err));
-                }
+                assert!(level < self.notify_merged_segment.len());
+                try!(self.notify_merged_segment[level].send((new_segnum, (level + 1) as u32)).map_err(wrap_err));
             },
             None => {
             },
@@ -4000,12 +4022,11 @@ impl DatabaseFile {
 
         let (tx_0, rx_0): (mpsc::Sender<SegmentNum>, mpsc::Receiver<SegmentNum>) = mpsc::channel();
 
-        let mut notify_merge_others = vec![];
+        let mut notify_merged_segment = vec![];
         let mut receivers = vec![];
-        for level in 1 .. 7 {
-            // TODO u32 arg is unused right now
-            let (tx, rx): (mpsc::Sender<u32>, mpsc::Receiver<u32>) = mpsc::channel();
-            notify_merge_others.push(tx);
+        for level in 1 .. LEVEL_SIZE_LIMITS_IN_MB.len() {
+            let (tx, rx): (mpsc::Sender<(SegmentNum, u32)>, mpsc::Receiver<(SegmentNum, u32)>) = mpsc::channel();
+            notify_merged_segment.push(tx);
             receivers.push((level, rx));
         }
 
@@ -4026,7 +4047,7 @@ impl DatabaseFile {
             WriteLock { 
                 inner: inner.clone(),
                 notify_0: tx_0,
-                notify_merge_others: notify_merge_others,
+                notify_merged_segment: notify_merged_segment,
             };
 
         let res = DatabaseFile {
@@ -4062,15 +4083,16 @@ impl DatabaseFile {
 
         }
 
-        for (level, rx) in receivers {
+        for (closure_level, rx) in receivers {
             let res = res.clone();
             thread::spawn(move || {
                 loop {
                     match rx.recv() {
-                        Ok(what_is_this_for) => {
+                        Ok((new_segnum, level)) => {
+                            assert!(level == (closure_level as u32));
                             // TODO there should be a way to send a message to this
                             // thread telling it to stop.
-                            match res.merge_others(level) {
+                            match res.merge_others(new_segnum, level) {
                                 Ok(()) => {
                                 },
                                 Err(e) => {
@@ -4093,9 +4115,10 @@ impl DatabaseFile {
     }
 
     fn merge_0(&self, new_segnum: SegmentNum) -> Result<()> {
-        //println!("got new segs: {:?}", new_segs);
-        // TODO tweak this automerge algorithm.  give it options.  etc.
         loop {
+            // all new segments come in at level 0.
+            // we want to merge and promote them to level 1 as
+            // quickly as possible.
             match try!(self.merge(0, 2, 8, MergePromotionRule::Promote)) {
                 Some(seg) => {
                     let lck = try!(self.lock_write());
@@ -4109,15 +4132,20 @@ impl DatabaseFile {
         Ok(())
     }
 
-    fn merge_others(&self, level: u32) -> Result<()> {
-        //println!("got new segs: {:?}", new_segs);
-        // TODO tweak this automerge algorithm.  give it options.  etc.
-        // TODO tune the level page limits
-        let mut page_limit_for_this_level = 1;
-        for _ in 0 .. level {
-            page_limit_for_this_level *= 100;
-        }
-        match try!(self.merge(level, 2, 8, MergePromotionRule::Threshold(page_limit_for_this_level as usize))) {
+    fn merge_others(&self, new_segnum: SegmentNum, level: u32) -> Result<()> {
+        // level 0 gets handled elsewhere
+        assert!(level > 0);
+        assert!((level as usize) < LEVEL_SIZE_LIMITS_IN_MB.len());
+        let promotion =
+            if (level as usize) == LEVEL_SIZE_LIMITS_IN_MB.len() - 1 {
+                MergePromotionRule::Stay
+            } else {
+                let mb = LEVEL_SIZE_LIMITS_IN_MB[level as usize];
+                let bytes = mb * 1024 * 1024;
+                let pages = bytes / (self.inner.pgsz as u64);
+                MergePromotionRule::Threshold(pages as usize)
+            };
+        match try!(self.merge(level, 2, 8, promotion)) {
             Some(seg) => {
                 let lck = try!(self.lock_write());
                 try!(lck.commit_merge(seg));
@@ -4793,8 +4821,8 @@ impl InnerPart {
         }
     }
 
-    fn commit_merge(&self, pm: PendingMerge) -> Result<()> {
-        let segmentsBeingReplaced = {
+    fn commit_merge(&self, pm: PendingMerge) -> Result<Option<SegmentNum>> {
+        let (segmentsBeingReplaced, new_segnum) = {
             let mut st = try!(self.header.lock());
 
             // TODO assert new_seg shares no pages with any seg in current state
@@ -4803,6 +4831,7 @@ impl InnerPart {
             // so that we're not keeping a reference that inhibits our ability to
             // get other references a little later in the function.
 
+            // TODO why does this Set need to be created?
             let oldAsSet: HashSet<SegmentNum> = pm.old_segments.iter().map(|g| *g).collect();
             assert!(oldAsSet.len() == pm.old_segments.len());
 
@@ -4829,25 +4858,28 @@ impl InnerPart {
                 newHeader.currentState.remove(ndxFirstOld);
             }
 
-            match pm.new_segment {
-                None => {
-                    // a merge resulted in what would have been an empty segment.
-                    // this happens because tombstones
-                },
-                Some(new_seg) => {
-                    let new_segnum = newHeader.next_segnum;
-                    newHeader.next_segnum += 1;
-                    newHeader.currentState.insert(ndxFirstOld, new_segnum);
-                    newHeader.segments_info.insert(new_segnum, new_seg);
-                },
-            }
+            let new_segnum =
+                match pm.new_segment {
+                    None => {
+                        None
+                        // a merge resulted in what would have been an empty segment.
+                        // this happens because tombstones
+                    },
+                    Some(new_seg) => {
+                        let new_segnum = newHeader.next_segnum;
+                        newHeader.next_segnum += 1;
+                        newHeader.currentState.insert(ndxFirstOld, new_segnum);
+                        newHeader.segments_info.insert(new_segnum, new_seg);
+                        Some(new_segnum)
+                    },
+                };
 
             newHeader.mergeCounter = newHeader.mergeCounter + 1;
 
             let mut fs = try!(self.OpenForWriting());
             try!(self.write_header(&mut st, &mut fs, newHeader));
 
-            segmentsBeingReplaced
+            (segmentsBeingReplaced, new_segnum)
         };
 
         {
@@ -4884,7 +4916,7 @@ impl InnerPart {
         // note that we intentionally do not release the writeLock here.
         // you can change the segment list more than once while holding
         // the writeLock.  the writeLock gets released when you Dispose() it.
-        Ok(())
+        Ok(new_segnum)
     }
 
 }
