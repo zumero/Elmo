@@ -42,6 +42,7 @@ use std::io::SeekFrom;
 use std::cmp::Ordering;
 use std::fs::File;
 use std::fs::OpenOptions;
+
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -164,6 +165,7 @@ pub enum MergePromotionRule {
     Threshold(usize),
 }
 
+#[derive(Debug)]
 pub enum NoMaybe {
     No,
     Maybe,
@@ -184,8 +186,8 @@ impl Bloom {
     fn new(bits: Vec<u8>, count_funcs: usize) -> Self {
         let mut funcs = vec![];
         for i in 0 .. count_funcs {
-            let k0 = i * count_funcs;
-            let k1 = (i + 1) * count_funcs;
+            let k0 = i * count_funcs * 13;
+            let k1 = (i + 1) * count_funcs * 29;
             funcs.push(SipHasher::new_with_keys(k0 as u64, k1 as u64));
         }
         Bloom {
@@ -891,6 +893,7 @@ impl SegmentInfo {
 }
 
 // TODO why is this pub?
+// TODO why is this even a module?
 pub mod utils {
     use std::io::Seek;
     use std::io::SeekFrom;
@@ -1605,9 +1608,68 @@ impl ICursor for LivingCursor {
 
 }
 
-pub struct FilterTombstonesCursor { 
+struct BloomStat {
+    bloom: std::sync::Arc<Bloom>,
+    count_keys: u32,
+    correct: u32,
+    wrong: Vec<Box<[u8]>>,
+}
+
+impl BloomStat {
+    fn new(bloom: std::sync::Arc<Bloom>, count_keys: u32) -> Self {
+        BloomStat {
+            bloom: bloom,
+            count_keys: count_keys,
+            correct: 0,
+            wrong: vec![],
+        }
+    }
+}
+
+struct FilterTombstonesCursor { 
     chain: MultiCursor,
-    behind: Vec<(Option<std::sync::Arc<Bloom>>, SegmentCursor)>,
+    behind: Vec<(Option<BloomStat>, SegmentCursor)>,
+}
+
+impl Drop for FilterTombstonesCursor {
+    fn drop(&mut self) {
+        for pair in self.behind.iter() {
+            let bloom = &pair.0;
+            match bloom {
+                &Some(ref bs) => {
+                    if (bs.correct as usize) < bs.wrong.len() {
+                        let len = bs.bloom.bits.len();
+                        println!("bits = {:?}", bs.bloom.bits);
+                        println!("count_keys = {}", bs.count_keys);
+                        println!("correct = {}", bs.correct);
+                        println!("wrong ({}) = {:?}", bs.wrong.len(), bs.wrong);
+                        for k in bs.wrong.iter() {
+                            let b = bs.bloom.check(k, &[]);
+                            match b {
+                                NoMaybe::No => {
+                                    println!("double wrong: {:?}", k);
+                                },
+                                NoMaybe::Maybe => {
+                                },
+                            }
+                        }
+                        for k in bs.wrong.iter() {
+                            let b = bs.bloom.check(&[], k);
+                            match b {
+                                NoMaybe::No => {
+                                    println!("triple wrong: {:?}", k);
+                                },
+                                NoMaybe::Maybe => {
+                                },
+                            }
+                        }
+                    }
+                },
+                &None => {
+                },
+            }
+        }
+    }
 }
 
 impl FilterTombstonesCursor {
@@ -1619,18 +1681,25 @@ impl FilterTombstonesCursor {
             // in behind because, for example, we hit the max key in behind already.
 
             for pair in self.behind.iter_mut() {
-                let bloom = &pair.0;
+                let bloom = &mut pair.0;
                 match bloom {
-                    &Some(ref bloom) => {
-                        match bloom.check_keyref(&k) {
+                    &mut Some(ref mut bs) => {
+                        match bs.bloom.check_keyref(&k) {
                             NoMaybe::No => {
                             },
                             NoMaybe::Maybe => {
+                                let cursor = &mut pair.1;
+                                if SeekResult::Equal == try!(cursor.SeekRef(&k, SeekOp::SEEK_EQ)) {
+                                    bs.correct += 1;
+                                } else {
+                                    //println!("wrong for {:?}", k);
+                                    bs.wrong.push(k.into_boxed_slice());
+                                }
                                 return Ok(false);
                             },
                         }
                     },
-                    &None => {
+                    &mut None => {
                         let cursor = &mut pair.1;
                         if SeekResult::Equal == try!(cursor.SeekRef(&k, SeekOp::SEEK_EQ)) {
                             // TODO if the value was found but it is another tombstone, then it is actually
@@ -1660,7 +1729,7 @@ impl FilterTombstonesCursor {
         Ok(())
     }
 
-    fn new(ch: MultiCursor, behind: Vec<(Option<std::sync::Arc<Bloom>>, SegmentCursor)>) -> FilterTombstonesCursor {
+    fn new(ch: MultiCursor, behind: Vec<(Option<BloomStat>, SegmentCursor)>) -> FilterTombstonesCursor {
         FilterTombstonesCursor { 
             chain: ch,
             behind: behind,
@@ -2415,7 +2484,8 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
 
         // TODO any chance we should decide that all filters are the same size?
 
-        let blm_size_bytes = std::cmp::max(estimate_count_keys * 10 / 8, 128);;
+        //let blm_size_bytes = std::cmp::max(estimate_count_keys * 2, 1024);;
+        let blm_size_bytes = 4000;
 
         let blm_count_funcs = 4; // TODO calculate optimal number
         let mut blm = Bloom::new(vec![0; blm_size_bytes], blm_count_funcs);
@@ -2863,7 +2933,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                 // keys than could fit on a single leaf?
                 // maybe we should write a bloom filter only when there is more than one
                 // generation of parent nodes?
-                if leaves.len() > 1 {
+                if false && leaves.len() > 1 {
                     let filter_page = blk.firstPage;
                     let (_, blk) = try!(write_overflow(blk, &mut &*filter_bytes, pageManager, &mut token, fs));
                     (filter_page, filter_bytes.len(), blk)
@@ -4320,6 +4390,10 @@ impl DatabaseFile {
         InnerPart::open_cursor_on_active_segment(&self.inner, n)
     }
 
+    pub fn merge_pending_segments(&self, segments: Vec<SegmentLocation>) -> Result<SegmentLocation> {
+        InnerPart::merge_pending_segments(&self.inner, segments)
+    }
+
     pub fn open_cursor_on_pending_segment(&self, location: SegmentLocation) -> Result<SegmentCursor> {
         InnerPart::open_cursor_on_pending_segment(&self.inner, location)
     }
@@ -4364,8 +4438,8 @@ fn slice_within(sub: &[SegmentNum], within: &[SegmentNum]) -> Result<usize> {
 
 impl InnerPart {
 
-    fn page_done(&self, page: Box<[u8]>) {
-        //println!("page_done");
+    fn return_page_to_pool(&self, page: Box<[u8]>) {
+        //println!("return_page_to_pool");
         match self.pagepool.try_lock() {
             Ok(mut pagepool) => {
                 //println!("returned a page");
@@ -4628,7 +4702,7 @@ impl InnerPart {
         };
         let foo = inner.clone();
         let done_page = move |p| -> () {
-            foo.page_done(p);
+            foo.return_page_to_pool(p);
         };
         let page = misc::Lend::new(page, box done_page);
         Ok(page)
@@ -4656,7 +4730,7 @@ impl InnerPart {
         let estimate_keys = 
             cursors
             .iter()
-            .map(|c| c.count_keys() - c.count_tombstones())
+            .map(|c| c.count_keys() )
             .sum();
 
         let cursor = box MultiCursor::Create(cursors);
@@ -4664,7 +4738,6 @@ impl InnerPart {
         Ok(location)
     }
 
-    // TODO we also need a way to open a cursor on segments in waiting
     fn open_cursor(inner: &std::sync::Arc<InnerPart>) -> Result<LivingCursor> {
         // TODO this cursor needs to expose the changeCounter and segment list
         // on which it is based. for optimistic writes.  caller can grab a cursor,
@@ -4673,16 +4746,19 @@ impl InnerPart {
         // commit their writes.  if so, nevermind the written segments and start over.
 
         let st = try!(inner.header.lock());
-        let mut clist = Vec::with_capacity(st.header.currentState.len());
-        for g in st.header.currentState.iter() {
-            clist.push(try!(Self::get_cursor_on_active_segment(inner, &*st, *g)));
-        }
-        let mc = MultiCursor::Create(clist);
+        let cursors = 
+            st.header.currentState
+            .iter()
+            .map(|g| Self::get_cursor_on_active_segment(inner, &st, *g))
+            .collect::<Result<Vec<_>>>();
+        let cursors = try!(cursors);
+        let mc = MultiCursor::Create(cursors);
         let lc = LivingCursor::Create(mc);
         Ok(lc)
     }
 
     fn get_page(inner: &std::sync::Arc<InnerPart>, pgnum: PageNum) -> Result<Box<[u8]>> {
+        // OpenForReading?
         let mut f = try!(OpenOptions::new()
                 .read(true)
                 .create(true)
@@ -4854,7 +4930,7 @@ impl InnerPart {
                 let estimate_keys = 
                     cursors
                     .iter()
-                    .map(|c| c.count_keys() - c.count_tombstones())
+                    .map(|c| c.count_keys() )
                     .sum();
 
                 for g in merge_seg_nums.iter() {
@@ -4903,9 +4979,21 @@ impl InnerPart {
                             let s = *s;
                             let cursor = try!(Self::get_cursor_on_active_segment(inner, &st, s));
                             let bloom =
+                                        match try!(cursor.load_bloom_filter()) {
+                                            Some(bloom) => {
+                                                let bloom = std::sync::Arc::new(bloom);
+                                                Some(BloomStat::new(bloom, cursor.count_keys() as u32))
+                                            },
+                                            None => {
+                                                None
+                                            },
+                                        };
+                            /*
+                            let bloom =
                                 match mergeStuff.blooms.entry(s) {
                                     std::collections::hash_map::Entry::Occupied(e) => {
-                                        Some(e.get().clone())
+                                        let bloom = e.get().clone();
+                                        Some(BloomStat::new(bloom, cursor.count_keys() as u32))
                                     },
                                     std::collections::hash_map::Entry::Vacant(e) => {
                                         match try!(cursor.load_bloom_filter()) {
@@ -4913,7 +5001,7 @@ impl InnerPart {
                                                 let bloom = std::sync::Arc::new(bloom);
                                                 let result = bloom.clone();
                                                 e.insert(bloom);
-                                                Some(result)
+                                                Some(BloomStat::new(result, cursor.count_keys() as u32))
                                             },
                                             None => {
                                                 None
@@ -4921,9 +5009,11 @@ impl InnerPart {
                                         }
                                     },
                                 };
+                            */
                             // TODO so actually, the FilterTombstonesCursor needs EITHER the
                             // bloom or the SegmentCursor.  it never needs both.
-                            behind.push((bloom, cursor));
+                            //behind.push((bloom, cursor));
+                            behind.push((None, cursor));
                         }
                         // TODO to allow reuse of these behind cursors, we should pass
                         // them as references, don't transfer ownership.  but then they
