@@ -2669,7 +2669,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             items.push(pair);
         }
         assert!(children.len() == 1);
-        let pgitem {page: pgnum, key: key} = children.remove(0);
+        let pgitem {page: pgnum, key} = children.remove(0);
         assert!(children.is_empty());
 
         let root =
@@ -3636,6 +3636,8 @@ struct HeaderData {
     mergeCounter: u64,
 }
 
+// TODO how big should the header be?  this defines the minimum size of a
+// database file.
 const HEADER_SIZE_IN_BYTES: usize = 4096;
 
 impl PendingSegment {
@@ -3649,7 +3651,7 @@ impl PendingSegment {
     fn AddBlock(&mut self, b: PageBlock) {
         //println!("seg {:?} got block {:?}", self.segnum, b);
         let len = self.blockList.len();
-        if (! (self.blockList.is_empty())) && (b.firstPage == self.blockList[len-1].lastPage+1) {
+        if (! (self.blockList.is_empty())) && (b.firstPage == self.blockList[len - 1].lastPage+1) {
             // note that by consolidating blocks here, the segment info list will
             // not have information about the fact that the two blocks were
             // originally separate.  that's okay, since all we care about here is
@@ -3658,8 +3660,8 @@ impl PendingSegment {
             // page, even though its pointer to the next block goes to the very
             // next page, because its page manager happened to give it a block
             // which immediately follows the one it had.
-            self.blockList[len-1].lastPage = b.lastPage;
-            assert!(self.blockList[len-1].firstPage <= self.blockList[len-1].lastPage);
+            self.blockList[len - 1].lastPage = b.lastPage;
+            assert!(self.blockList[len - 1].firstPage <= self.blockList[len - 1].lastPage);
         } else {
             self.blockList.push(b);
         }
@@ -3667,12 +3669,12 @@ impl PendingSegment {
 
     fn End(mut self, unused_page: PageNum) -> (Vec<PageBlock>, Option<PageBlock>) {
         let len = self.blockList.len();
-        assert!(self.blockList[len-1].contains_page(unused_page));
+        assert!(self.blockList[len - 1].contains_page(unused_page));
         let leftovers = {
-            if unused_page > self.blockList[len-1].firstPage {
-                let givenLastPage = self.blockList[len-1].lastPage;
-                self.blockList[len-1].lastPage = unused_page - 1;
-                assert!(self.blockList[len-1].firstPage <= self.blockList[len-1].lastPage);
+            if unused_page > self.blockList[len - 1].firstPage {
+                let givenLastPage = self.blockList[len - 1].lastPage;
+                self.blockList[len - 1].lastPage = unused_page - 1;
+                assert!(self.blockList[len - 1].firstPage <= self.blockList[len - 1].lastPage);
                 Some (PageBlock::new(unused_page, givenLastPage))
             } else {
                 // this is one of those dorky cases where we they asked for a block
@@ -3805,8 +3807,8 @@ fn consolidateBlockList(blocks: &mut Vec<PageBlock>) {
         }
         let mut did = false;
         for i in 1 .. blocks.len() {
-            if blocks[i-1].lastPage+1 == blocks[i].firstPage {
-                blocks[i-1].lastPage = blocks[i].lastPage;
+            if blocks[i - 1].lastPage+1 == blocks[i].firstPage {
+                blocks[i - 1].lastPage = blocks[i].lastPage;
                 blocks.remove(i);
                 did = true;
                 break;
@@ -3825,12 +3827,12 @@ fn invertBlockList(blocks: &Vec<PageBlock>) -> Vec<PageBlock> {
         result.push(blocks[i]);
     }
     result.sort_by(|a,b| a.firstPage.cmp(&b.firstPage));
-    for i in 0 .. len-1 {
+    for i in 0 .. len - 1 {
         result[i].firstPage = result[i].lastPage+1;
         result[i].lastPage = result[i+1].firstPage-1;
         assert!(result[i].firstPage <= result[i].lastPage);
     }
-    result.remove(len-1);
+    result.remove(len - 1);
     result
 }
 
@@ -3979,9 +3981,12 @@ impl DatabaseFile {
 
         let (header, pgsz, firstAvailablePage) = try!(read_header(&path));
 
+        // when we first open the file, we find all the blocks that are in use by
+        // an active segment.  all OTHER blocks are considered free.
         let mut blocks = listAllBlocks(&header, pgsz);
         consolidateBlockList(&mut blocks);
         let mut freeBlocks = invertBlockList(&blocks);
+        // we want the largest blocks at the front of the list
         freeBlocks.sort_by(|a,b| b.count_pages().cmp(&a.count_pages()));
 
         let space = Space {
@@ -4012,7 +4017,7 @@ impl DatabaseFile {
 
         let mut senders = vec![];
         let mut receivers = vec![];
-        for level in 0 .. LEVEL_SIZE_LIMITS_IN_MB.len() {
+        for _level in 0 .. LEVEL_SIZE_LIMITS_IN_MB.len() {
             let (tx, rx): (mpsc::Sender<AutomergeMessage>, mpsc::Receiver<AutomergeMessage>) = mpsc::channel();
             senders.push(tx);
             receivers.push(rx);
@@ -4103,7 +4108,7 @@ impl DatabaseFile {
             };
         match try!(self.merge(level, 2, 8, promotion)) {
             Some(seg) => {
-                let lck = try!(self.lock_write());
+                let lck = try!(self.get_write_lock());
                 try!(lck.commit_merge(seg));
             },
             None => {
@@ -4114,7 +4119,7 @@ impl DatabaseFile {
 
     // TODO func to ask for the write lock without blocking?
 
-    pub fn lock_write(&self) -> Result<std::sync::MutexGuard<WriteLock>> {
+    pub fn get_write_lock(&self) -> Result<std::sync::MutexGuard<WriteLock>> {
         let lck = try!(self.write_lock.lock());
         Ok(lck)
     }
@@ -4146,8 +4151,12 @@ impl DatabaseFile {
         InnerPart::merge(&self.inner, level, min_segs, max_segs, promote)
     }
 
-    pub fn list_segments(&self) -> Result<(Vec<SegmentNum>,HashMap<SegmentNum, SegmentInfo>)> {
+    pub fn list_segments(&self) -> Result<(Vec<SegmentNum>, HashMap<SegmentNum, SegmentInfo>)> {
         InnerPart::list_segments(&self.inner)
+    }
+
+    pub fn release_pending_segment(&self, location: SegmentLocation) -> Result<()> {
+        InnerPart::release_pending_segment(&self.inner, location)
     }
 
     pub fn list_free_blocks(&self) -> Result<Vec<PageBlock>> {
@@ -4199,11 +4208,14 @@ impl InnerPart {
         let mut cursors = self.cursors.lock().unwrap(); // gotta succeed
         let seg = cursors.cursors.remove(&csrnum).expect("gotta be there");
         assert_eq!(seg, segnum);
+        // TODO hey.  we can't reclaim this zombie unless we know
+        // that the cursor we just dropped was the only cursor on the
+        // zombie segment.
         match cursors.zombie_segments.remove(&segnum) {
             Some(info) => {
                 match self.space.try_lock() {
                     Ok(mut space) => {
-                        self.addFreeBlocks(&mut space, info.location.blocks);
+                        Self::addFreeBlocks(&mut space, info.location.blocks);
                     },
                     Err(_) => {
                         // worst that can happen is that these blocks don't get
@@ -4284,7 +4296,7 @@ impl InnerPart {
         Ok(())
     }
 
-    fn addFreeBlocks(&self, space: &mut Space, blocks:Vec<PageBlock>) {
+    fn addFreeBlocks(space: &mut Space, blocks:Vec<PageBlock>) {
 
         // all additions to the freeBlocks list should happen here
         // by calling this function.
@@ -4506,6 +4518,12 @@ impl InnerPart {
     fn list_free_blocks(inner: &std::sync::Arc<InnerPart>) -> Result<Vec<PageBlock>> {
         let space = try!(inner.space.lock());
         Ok(space.freeBlocks.clone())
+    }
+
+    fn release_pending_segment(inner: &std::sync::Arc<InnerPart>, location: SegmentLocation) -> Result<()> {
+        let mut space = try!(inner.space.lock());
+        Self::addFreeBlocks(&mut space, location.blocks);
+        Ok(())
     }
 
     fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<(Vec<SegmentNum>, HashMap<SegmentNum, SegmentInfo>)> {
@@ -4848,7 +4866,7 @@ impl InnerPart {
         let mut segmentsToBeFreed = segmentsBeingReplaced;
         {
             let mut cursors = try!(self.cursors.lock());
-            let segmentsWithACursor : HashSet<SegmentNum> = cursors.cursors.iter().map(|t| {let (_,segnum) = t; *segnum}).collect();
+            let segmentsWithACursor: HashSet<SegmentNum> = cursors.cursors.iter().map(|t| {let (_,segnum) = t; *segnum}).collect();
             for g in segmentsWithACursor {
                 // don't free any segment that has a cursor
                 match segmentsToBeFreed.remove(&g) {
@@ -4866,7 +4884,7 @@ impl InnerPart {
         }
         {
             let mut space = try!(self.space.lock());
-            self.addFreeBlocks(&mut space, blocksToBeFreed);
+            Self::addFreeBlocks(&mut space, blocksToBeFreed);
         }
 
         // note that we intentionally do not release the writeLock here.
@@ -4903,7 +4921,7 @@ impl IPages for InnerPart {
         let mut space = try!(self.space.lock());
         //printfn "wrote %A: %A" g blocks
         match leftovers {
-            Some(b) => self.addFreeBlocks(&mut space, vec![b]),
+            Some(b) => Self::addFreeBlocks(&mut space, vec![b]),
             None => ()
         }
         Ok(info)

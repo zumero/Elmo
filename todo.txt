@@ -1,4 +1,6 @@
 
+can we get rid of mergeStuff.merging?
+
 tune block sizes for perf?
 
 figure out proper limits for how much should be at each level
@@ -13,7 +15,9 @@ better privacy on struct fields
 separate merge() into find_merge() and write_merge_segment()?
 
 rethink how merged segments are reclaimed into free space.
-locking issues.
+locking issues.  send a message to a separate thread, telling
+it that the segment has become a zombie, and to reclaim it
+whenever possible?
 
 should min_segs on merges really be 2?  that means every
 merge that promotes will automatically cause a merge in the
@@ -62,8 +66,6 @@ make sure stuff gets removed from merging when an error occurs while
 writing a merge segment.
 
 consider better (at higher level?) cache of elmo indexes
-
-bloom code needs to calculate optimal number of funcs.
 
 we're using usize all over the place for cases size and index into a page.
 this is sad, because a page will never exceed 32 bits, and probably will

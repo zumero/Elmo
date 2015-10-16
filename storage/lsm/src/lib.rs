@@ -1621,7 +1621,7 @@ impl<'a> elmo::StorageBase for MyWriter<'a> {
 
 impl elmo::StorageConnection for MyPublicConn {
     fn begin_write<'a>(&'a self) -> Result<Box<elmo::StorageWriter + 'a>> {
-        let tx = try!(self.myconn.conn.lock_write().map_err(elmo::wrap_err));
+        let tx = try!(self.myconn.conn.get_write_lock().map_err(elmo::wrap_err));
 
         // TODO do we need to own this cursor?  maybe the caller should own
         // one and pass it in?

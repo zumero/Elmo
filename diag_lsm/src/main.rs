@@ -90,7 +90,7 @@ fn merge(name: &str, merge_level: u32, min_segs: usize, max_segs: usize) -> Resu
     match try!(db.merge(merge_level, min_segs, max_segs, lsm::MergePromotionRule::Promote)) {
         Some(pm) => {
             //println!("merged segment: {:?}", pm);
-            let lck = try!(db.lock_write());
+            let lck = try!(db.get_write_lock());
             try!(lck.commit_merge(pm));
             Ok(())
         },
