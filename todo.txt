@@ -1,4 +1,36 @@
 
+fix all the lsm tests
+
+update rust nightly
+
+separate lsm code into multiple files (modules) so we can get 
+better privacy on struct fields
+
+separate merge() into find_merge() and write_merge_segment()?
+
+can we gather/calc stats on false positives on bloom filters?
+
+rethink how merged segments are reclaimed into free space.
+locking issues.
+
+should min_segs on merges really be 2?  that means every
+merge that promotes will automatically cause a merge in the
+next level.
+
+ability to merge entire file  (into what level? 2?)
+
+ability to compact a file (write entire thing into one clean new file
+with no free blocks)
+
+diag_lsm:  dump level_sizes?  or is list_segments enough, since we
+usually have only one segment per level?
+
+need a function to merge two pending segments
+
+need a function to get a cursor with a pending segment in front of it
+
+ability to reserve a piece of each page for things like crypto
+
 once saw a crash on too many files open, apparently crashed in the merge
 thread, poisoned the mutex, etc.  this probably was a case where the
 automerge thread got too far behind and a multicursor on the entire
@@ -19,10 +51,7 @@ to end up giving it back.
 make sure stuff gets removed from merging when an error occurs while
 writing a merge segment.
 
-consider disallowing header overflow.  if the segment list gets that
-big, there would be other problems.
-
-consider better (at higher level?) cache of indexes
+consider better (at higher level?) cache of elmo indexes
 
 bloom code needs to calculate optimal number of funcs.
 

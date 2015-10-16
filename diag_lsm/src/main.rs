@@ -15,25 +15,27 @@
 */
 
 #![feature(convert)]
+#![feature(iter_arith)]
 
 extern crate lsm;
 
 use lsm::ICursor;
 
 fn dump_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
-    let db = try!(lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let page = try!(db.get_page(pgnum));
     println!("{:?}", page);
     Ok(())
 }
 
 fn list_segments(name: &str) -> Result<(),lsm::Error> {
-    let db = try!(lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let (segments, infos) = try!(db.list_segments());
     for s in segments.iter() {
         println!("{}: {:?}", s, infos[s]);
-        let mut cursor = try!(db.OpenSegmentCursor(*s));
+        let mut cursor = try!(db.open_cursor_on_active_segment(*s));
         println!("    keys: {}", cursor.count_keys());
+        println!("    pages: {}", infos[s].count_pages());
         println!("    tombstones: {}", cursor.count_tombstones());
         println!("    filter_len: {}", cursor.filter_len());
     }
@@ -41,15 +43,17 @@ fn list_segments(name: &str) -> Result<(),lsm::Error> {
 }
 
 fn list_free_blocks(name: &str) -> Result<(),lsm::Error> {
-    let db = try!(lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let blocks = try!(db.list_free_blocks());
     println!("{:?}", blocks);
+    let total_pages: usize = blocks.iter().map(|pb: &lsm::PageBlock| pb.count_pages() as usize).sum();
+    println!("total pages: {}", total_pages);
     Ok(())
 }
 
 fn list_keys(name: &str) -> Result<(),lsm::Error> {
-    let db = try!(lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS));
-    let mut cursor = try!(db.OpenCursor());
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let mut cursor = try!(db.open_cursor());
     try!(cursor.First());
     while cursor.IsValid() {
         {
@@ -65,8 +69,8 @@ fn list_keys(name: &str) -> Result<(),lsm::Error> {
 }
 
 fn dump_segment(name: &str, segnum: u64) -> Result<(),lsm::Error> {
-    let db = try!(lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS));
-    let mut cursor = try!(db.OpenSegmentCursor(segnum));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let mut cursor = try!(db.open_cursor_on_active_segment(segnum));
     try!(cursor.First());
     while cursor.IsValid() {
         {
@@ -81,13 +85,14 @@ fn dump_segment(name: &str, segnum: u64) -> Result<(),lsm::Error> {
     Ok(())
 }
 
-fn merge(name: &str, min_level: u32, max_level: u32, min_segs: usize, max_segs: usize) -> Result<(),lsm::Error> {
-    let db = try!(lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS));
-    match try!(db.merge(min_level, max_level, min_segs, max_segs)) {
-        Some(seg) => {
-            println!("merged segment: {}", seg);
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitMerge(seg));
+fn merge(name: &str, merge_level: u32, min_segs: usize, max_segs: usize) -> Result<(),lsm::Error> {
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    // TODO not sure this promotion rule is what we want here
+    match try!(db.merge(merge_level, min_segs, max_segs, lsm::MergePromotionRule::Promote)) {
+        Some(pm) => {
+            //println!("merged segment: {:?}", pm);
+            let lck = try!(db.lock_write());
+            try!(lck.commit_merge(pm));
             Ok(())
         },
         None => {
@@ -110,14 +115,13 @@ fn result_main() -> Result<(),lsm::Error> {
     let cmd = args[2].as_str();
     match cmd {
         "merge" => {
-            if args.len() < 7 {
+            if args.len() < 6 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
-            let min_level = args[3].parse::<u32>().unwrap();
-            let max_level = args[4].parse::<u32>().unwrap();
-            let min_segs = args[5].parse::<usize>().unwrap();
-            let max_segs = args[6].parse::<usize>().unwrap();
-            merge(name, min_level, max_level, min_segs, max_segs)
+            let merge_level = args[3].parse::<u32>().unwrap();
+            let min_segs = args[4].parse::<usize>().unwrap();
+            let max_segs = args[5].parse::<usize>().unwrap();
+            merge(name, merge_level, min_segs, max_segs)
         },
         "dump_page" => {
             if args.len() < 4 {

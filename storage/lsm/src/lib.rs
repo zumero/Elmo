@@ -18,6 +18,7 @@
 #![feature(associated_consts)]
 #![feature(vec_push_all)]
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -202,7 +203,7 @@ struct MyReader {
 struct MyWriter<'a> {
     myconn: std::rc::Rc<MyConn>,
     tx: std::sync::MutexGuard<'a, lsm::WriteLock>,
-    pending: HashMap<Box<[u8]>,lsm::Blob>,
+    pending: BTreeMap<Box<[u8]>, lsm::Blob>,
     max_collection_id: Option<u64>,
     max_record_id: HashMap<u64, u64>,
     max_index_id: HashMap<u64, u64>,
@@ -211,7 +212,7 @@ struct MyWriter<'a> {
 }
 
 struct MyConn {
-    conn: std::sync::Arc<lsm::db>,
+    conn: std::sync::Arc<lsm::DatabaseFile>,
 }
 
 struct MyPublicConn {
@@ -481,7 +482,7 @@ impl MyConn {
     fn get_reader_collection_scan(&self, db: &str, coll: &str) -> Result<MyCollectionReader> {
         // check to see if the collection exists and get its id
         let k = encode_key_name_to_collection_id(db, coll);
-        let mut cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        let mut cursor = try!(self.conn.open_cursor().map_err(elmo::wrap_err));
         match try!(get_value_for_key_as_varint(&mut cursor, &k)) {
             None => {
                 let rdr = 
@@ -525,7 +526,7 @@ impl MyConn {
     }
 
     fn get_reader_regular_index_scan(&self, ndx: &elmo::IndexInfo, bounds: elmo::QueryBounds) -> Result<MyCollectionReader> {
-        let mut cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        let mut cursor = try!(self.conn.open_cursor().map_err(elmo::wrap_err));
         let collection_id = 
             match try!(get_value_for_key_as_varint(&mut cursor, &encode_key_name_to_collection_id(&ndx.db, &ndx.coll))) {
                 Some(id) => id,
@@ -668,7 +669,7 @@ impl MyConn {
         // index entry, looks up the actual record and yields THAT.  in
         // sqlite, this was a join.
 
-        let mut cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        let mut cursor = try!(self.conn.open_cursor().map_err(elmo::wrap_err));
         let seq = seq.map(
             move |record_id: Result<u64>| -> Result<elmo::Row> {
                 match record_id {
@@ -746,7 +747,7 @@ impl MyConn {
     }
 
     fn list_all_index_infos(&self) -> Result<Vec<elmo::IndexInfo>> {
-        let mut cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        let mut cursor = try!(self.conn.open_cursor().map_err(elmo::wrap_err));
         let indexes = try!(self.base_list_indexes(&mut cursor, None));
         let indexes = indexes.into_iter().map(
             |(collection_id, index_id, mut index_properties)| {
@@ -777,7 +778,7 @@ impl MyConn {
     }
 
     fn list_index_infos_for_collection(&self, db: &str, coll: &str) -> Result<Vec<elmo::IndexInfo>> {
-        let mut cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        let mut cursor = try!(self.conn.open_cursor().map_err(elmo::wrap_err));
         let k = encode_key_name_to_collection_id(db, coll);
         match try!(get_value_for_key_as_varint(&mut cursor, &k)) {
             None => {
@@ -828,7 +829,7 @@ impl MyConn {
     }
 
     fn base_list_collection_infos(&self) -> Result<Vec<elmo::CollectionInfo>> {
-        let mut cursor = try!(self.conn.OpenCursor().map_err(elmo::wrap_err));
+        let mut cursor = try!(self.conn.open_cursor().map_err(elmo::wrap_err));
         let collections = try!(self.base_list_collections(&mut cursor));
         let collections = collections.into_iter().map(
             |(collection_id, db, coll)| {
@@ -1465,9 +1466,9 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
 
     fn commit(mut self: Box<Self>) -> Result<()> {
         if !self.pending.is_empty() {
-            let pending = std::mem::replace(&mut self.pending, HashMap::new());
-            let g = try!(self.myconn.conn.WriteSegment2(pending).map_err(elmo::wrap_err));
-            try!(self.tx.commitSegments(vec![g]).map_err(elmo::wrap_err));
+            let pending = std::mem::replace(&mut self.pending, BTreeMap::new());
+            let seg = try!(self.myconn.conn.write_segment(pending).map_err(elmo::wrap_err));
+            try!(self.tx.commit_segment(seg).map_err(elmo::wrap_err));
         }
         Ok(())
     }
@@ -1620,16 +1621,16 @@ impl<'a> elmo::StorageBase for MyWriter<'a> {
 
 impl elmo::StorageConnection for MyPublicConn {
     fn begin_write<'a>(&'a self) -> Result<Box<elmo::StorageWriter + 'a>> {
-        let tx = try!(self.myconn.conn.GetWriteLock().map_err(elmo::wrap_err));
+        let tx = try!(self.myconn.conn.lock_write().map_err(elmo::wrap_err));
 
         // TODO do we need to own this cursor?  maybe the caller should own
         // one and pass it in?
-        let cursor = try!(self.myconn.conn.OpenCursor().map_err(elmo::wrap_err));
+        let cursor = try!(self.myconn.conn.open_cursor().map_err(elmo::wrap_err));
 
         let w = MyWriter {
             myconn: self.myconn.clone(),
             tx: tx,
-            pending: HashMap::new(),
+            pending: BTreeMap::new(),
             max_collection_id: None,
             max_record_id: HashMap::new(),
             max_index_id: HashMap::new(),
@@ -1647,14 +1648,14 @@ impl elmo::StorageConnection for MyPublicConn {
     }
 }
 
-fn base_connect(name: &str) -> lsm::Result<std::sync::Arc<lsm::db>> {
-    lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS)
+fn base_connect(name: &str) -> lsm::Result<std::sync::Arc<lsm::DatabaseFile>> {
+    lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS)
 }
 
 #[derive(Clone)]
 pub struct MyFactory {
     filename: String,
-    conn: std::sync::Arc<lsm::db>,
+    conn: std::sync::Arc<lsm::DatabaseFile>,
 }
 
 impl MyFactory {

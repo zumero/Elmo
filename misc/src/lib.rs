@@ -51,6 +51,15 @@ pub fn new_bson_objectid_rand() -> [u8; 12] {
     ba
 }
 
+pub fn new_bytes_rand(n: usize) -> Box<[u8]> {
+    // TODO slow?
+    let mut a = vec![];
+    for _ in 0 .. n {
+        a.push(rand::random::<u8>());
+    }
+    a.into_boxed_slice()
+}
+
 pub fn tempfile(base: &str) -> String {
     let _ = std::fs::create_dir("tmp");
     let file = "tmp/".to_string() + base + "_" + &tid();
