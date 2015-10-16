@@ -31,7 +31,9 @@ implement a pending transaction manager.  allows crud operations.
 accumulates them in a BTreeMap.  automatically flushes them out to
 a pending segment when it gets too large.  automatically merges its
 pending segments when there are more than one.  queries, automatically
-putting its pending segment into the cursor.
+putting its pending segment into the cursor.  notice when values
+are actually stream and write them to disk so we don't have too
+many files open.
 
 need an API to add a pending segment to the free block list.
 

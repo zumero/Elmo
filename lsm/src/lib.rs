@@ -732,16 +732,12 @@ pub trait ICursor {
 
 //#[derive(Copy,Clone)]
 pub struct DbSettings {
-    pub AutoMergeEnabled : bool,
-    pub AutoMergeMinimumPages : PageNum,
     pub DefaultPageSize : usize,
     pub PagesPerBlock : PageNum,
 }
 
 pub const DEFAULT_SETTINGS: DbSettings = 
     DbSettings {
-        AutoMergeEnabled : true,
-        AutoMergeMinimumPages : 4,
         DefaultPageSize : 4096,
         PagesPerBlock : 256,
     };
@@ -907,14 +903,6 @@ impl PageBuilder {
         res
     }
 
-    #[cfg(remove_me)]
-    fn PutStream(&mut self, s: &mut Read, len: usize) -> io::Result<usize> {
-        let n = try!(self.PutStream2(s, len));
-        // TODO if n != len fail, which may mean a different result type here
-        let res : io::Result<usize> = Ok(len);
-        res
-    }
-
     fn PutArray(&mut self, ba: &[u8]) {
         self.buf[self.cur .. self.cur + ba.len()].clone_from_slice(ba);
         self.cur = self.cur + ba.len();
@@ -946,11 +934,6 @@ impl PageBuilder {
         self.cur = self.cur + SIZE_16;
     }
 
-    #[cfg(remove_me)]
-    fn PutInt16At(&mut self, at: usize, ov: u16) {
-        write_u16_be(&mut self.buf[at .. at + SIZE_16], ov);
-    }
-
     fn PutVarint(&mut self, ov: u64) {
         varint::write(&mut *self.buf, &mut self.cur, ov);
     }
@@ -959,9 +942,10 @@ impl PageBuilder {
 
 #[derive(PartialEq,Copy,Clone)]
 enum Direction {
-    FORWARD = 0,
-    BACKWARD = 1,
-    WANDERING = 2,
+    // TODO why do we need to assign these specific values?
+    Forward = 0,
+    Backward = 1,
+    Wandering = 2,
 }
 
 struct MultiCursor { 
@@ -1090,7 +1074,7 @@ impl MultiCursor {
     }
 
     fn findMin(&mut self) -> Result<Option<usize>> {
-        self.dir = Direction::FORWARD;
+        self.dir = Direction::Forward;
         if self.subcursors.is_empty() {
             Ok(None)
         } else {
@@ -1100,7 +1084,7 @@ impl MultiCursor {
     }
 
     fn findMax(&mut self) -> Result<Option<usize>> {
-        self.dir = Direction::BACKWARD; 
+        self.dir = Direction::Backward; 
         if self.subcursors.is_empty() {
             Ok(None)
         } else {
@@ -1119,7 +1103,7 @@ impl MultiCursor {
             subcursors: s, 
             sorted: sorted.into_boxed_slice(), 
             cur: None, 
-            dir: Direction::WANDERING,
+            dir: Direction::Wandering,
         }
     }
 
@@ -1195,11 +1179,11 @@ impl ICursor for MultiCursor {
                 // the current direction of the multicursor tells us
                 // something about the state of all the others.
 
-                if self.dir == Direction::FORWARD {
+                if self.dir == Direction::Forward {
                     // this is the happy case.  each cursor is at most
                     // one step away.
 
-                    // direction is FORWARD, so we know that every valid cursor
+                    // direction is Forward, so we know that every valid cursor
                     // is pointing at a key which is either == to icur, or
                     // it is already the min key > icur.
 
@@ -1231,10 +1215,10 @@ impl ICursor for MultiCursor {
 
                     fn half(dir: Direction, ki: &KeyRef, subs: &mut [SegmentCursor]) -> Result<()> {
                         match dir {
-                            Direction::FORWARD => {
+                            Direction::Forward => {
                                 unreachable!();
                             },
-                            Direction::BACKWARD => {
+                            Direction::Backward => {
                                 // this case isn't too bad.  each cursor is either
                                 // one step away or two.
                                 
@@ -1275,7 +1259,7 @@ impl ICursor for MultiCursor {
                                                 }
                                             },
                                             Ordering::Greater => {
-                                                // should never happen, because BACKWARD
+                                                // should never happen, because Backward
                                                 unreachable!();
                                             },
                                             Ordering::Equal => {
@@ -1293,7 +1277,7 @@ impl ICursor for MultiCursor {
 
                                 Ok(())
                             },
-                            Direction::WANDERING => {
+                            Direction::Wandering => {
                                 // we have no idea where all the other cursors are.
                                 // so we have to do a seek on each one.
 
@@ -1341,7 +1325,7 @@ impl ICursor for MultiCursor {
                 };
                 for j in 0 .. self.subcursors.len() {
                     let csr = &mut self.subcursors[j];
-                    if (self.dir != Direction::BACKWARD) && (icur != j) { 
+                    if (self.dir != Direction::Backward) && (icur != j) { 
                         try!(csr.SeekRef(&k, SeekOp::SEEK_LE));
                     }
                     if csr.IsValid() {
@@ -1362,7 +1346,7 @@ impl ICursor for MultiCursor {
 
     fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
         self.cur = None;
-        self.dir = Direction::WANDERING;
+        self.dir = Direction::Wandering;
         for j in 0 .. self.subcursors.len() {
             let sr = try!(self.subcursors[j].SeekRef(k, sop));
             if sr.is_valid_and_equal() { 
