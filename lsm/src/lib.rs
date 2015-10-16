@@ -47,10 +47,6 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use std::hash::Hash;
-use std::hash::Hasher;
-use std::hash::SipHasher;
-
 const SIZE_32: usize = 4; // like std::mem::size_of::<u32>()
 const SIZE_16: usize = 2; // like std::mem::size_of::<u16>()
 
@@ -164,109 +160,6 @@ pub enum MergePromotionRule {
     Stay,
     Threshold(usize),
 }
-
-#[derive(Debug)]
-pub enum NoMaybe {
-    No,
-    Maybe,
-}
-
-pub enum YesNoMaybe {
-    Yes,
-    No,
-    Maybe,
-}
-
-struct Bloom {
-    bits: Vec<u8>,
-    funcs: Vec<SipHasher>,
-}
-
-impl Bloom {
-    fn new(bits: Vec<u8>, count_funcs: usize) -> Self {
-        let mut funcs = vec![];
-        for i in 0 .. count_funcs {
-            let k0 = i * count_funcs;
-            let k1 = (i + 1) * count_funcs;
-            funcs.push(SipHasher::new_with_keys(k0 as u64, k1 as u64));
-        }
-        Bloom {
-            bits: bits,
-            funcs: funcs,
-        }
-    }
-
-    fn into_bytes(self) -> Vec<u8> {
-        self.bits
-    }
-
-    fn count_funcs(&self) -> usize {
-        self.funcs.len()
-    }
-
-    fn find_bit(i: u64) -> (usize, u8) {
-        let i = i / 8;
-        let j = i % 8;
-        let m = 1 << j;
-        (i as usize, m as u8)
-    }
-
-    fn do_hash(&self, fi: usize, v1: &[u8], v2: &[u8]) -> (usize, u8) {
-        // TODO this clone is so very sad
-        let mut f = self.funcs[fi].clone();
-        f.write(v1);
-        f.write(v2);
-        let h = f.finish();
-        let num_bits = (self.bits.len() * 8) as u64;
-        let b = h % num_bits;
-        let (i, m) = Self::find_bit(b);
-        //println!("k: {:?}/{:?} for func {} bits.len {} funcs.len {} goes to {}, {}, {}", v1, v2, fi, self.bits.len(), self.funcs.len(), h, i, m);
-        (i, m)
-    }
-
-    fn set(&mut self, v1: &[u8], v2: &[u8]) {
-        //println!("setting: {:?}/{:?}", v1, v2);
-        for fi in 0 .. self.funcs.len() {
-            let (i, m) = self.do_hash(fi, v1, v2);
-            //println!("bits[{}] before: {}", i, self.bits[i]);
-            self.bits[i] = self.bits[i] | m;
-            //println!("bits[{}] after: {}", i, self.bits[i]);
-        }
-    }
-
-    fn check(&self, v1: &[u8], v2: &[u8]) -> NoMaybe {
-        //println!("checking: {:?}/{:?}", v1, v2);
-        for fi in 0 .. self.funcs.len() {
-            let (i, m) = self.do_hash(fi, v1, v2);
-            //println!("bits[{}] check: {}", i, self.bits[i]);
-            if 0 == self.bits[i] & m {
-                //println!("    false");
-                return NoMaybe::No;;
-            }
-        }
-        //println!("    true");
-        return NoMaybe::Maybe;;
-    }
-
-    fn check_keyref(&self, k: &KeyRef) -> NoMaybe {
-        match k {
-            &KeyRef::Overflowed(ref a) => self.check(&a, &[]),
-            &KeyRef::Prefixed(front, back) => self.check(front, back),
-            &KeyRef::Array(a) => self.check(a, &[]),
-        }
-    }
-
-}
-
-#[test]
-fn bloom_test_1() {
-    let mut blm = Bloom::new(vec![0; 32], 4);
-    let k = [1, 3, 5, 7, 9];
-    assert!(!blm.check(&k));
-    blm.set(&k);
-    assert!(blm.check(&k));
-}
-
 
 // kvp is the struct used to provide key-value pairs downward,
 // for storage into the database.
@@ -810,8 +703,6 @@ impl SeekResult {
     }
 }
 
-// TODO I think maybe only SegmentCursor needs Prev/Last, and
-// probably only in the future for fractional cascading.
 pub trait ICursor {
     fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult>;
     fn First(&mut self) -> Result<()>;
@@ -857,8 +748,7 @@ pub struct SegmentLocation {
 
 impl SegmentLocation {
     pub fn new(root_page: PageNum, blocks: Vec<PageBlock>) -> Self {
-        // TODO
-        // assert!(block_list_contains_page(&res.location.blocks, res.firstLeaf));
+        assert!(block_list_contains_page(&blocks, root_page));
         SegmentLocation {
             root_page: root_page,
             blocks: blocks,
@@ -1610,7 +1500,7 @@ impl ICursor for LivingCursor {
 
 pub struct FilterTombstonesCursor { 
     chain: MultiCursor,
-    behind: Vec<(Option<std::sync::Arc<Bloom>>, SegmentCursor)>,
+    behind: Vec<SegmentCursor>,
 }
 
 impl FilterTombstonesCursor {
@@ -1621,26 +1511,11 @@ impl FilterTombstonesCursor {
             // then we could optimize cases where we already know that the key is not present
             // in behind because, for example, we hit the max key in behind already.
 
-            for pair in self.behind.iter_mut() {
-                let bloom = &pair.0;
-                match bloom {
-                    &Some(ref bloom) => {
-                        match bloom.check_keyref(&k) {
-                            NoMaybe::No => {
-                            },
-                            NoMaybe::Maybe => {
-                                return Ok(false);
-                            },
-                        }
-                    },
-                    &None => {
-                        let cursor = &mut pair.1;
-                        if SeekResult::Equal == try!(cursor.SeekRef(&k, SeekOp::SEEK_EQ)) {
-                            // TODO if the value was found but it is another tombstone, then it is actually
-                            // not found
-                            return Ok(false);
-                        }
-                    },
+            for mut cursor in self.behind.iter_mut() {
+                if SeekResult::Equal == try!(cursor.SeekRef(&k, SeekOp::SEEK_EQ)) {
+                    // TODO if the value was found but it is another tombstone, then it is actually
+                    // not found
+                    return Ok(false);
                 }
             }
             Ok(true)
@@ -1663,7 +1538,7 @@ impl FilterTombstonesCursor {
         Ok(())
     }
 
-    fn new(ch: MultiCursor, behind: Vec<(Option<std::sync::Arc<Bloom>>, SegmentCursor)>) -> FilterTombstonesCursor {
+    fn new(ch: MultiCursor, behind: Vec<SegmentCursor>) -> FilterTombstonesCursor {
         FilterTombstonesCursor { 
             chain: ch,
             behind: behind,
@@ -2018,7 +1893,6 @@ struct LeafState {
 fn create_segment<I, SeekWrite>(fs: &mut SeekWrite, 
                                                             pageManager: &IPages, 
                                                             source: I,
-                                                            estimate_count_keys: usize,
                                                            ) -> Result<SegmentLocation> where I: Iterator<Item=Result<kvp>>, SeekWrite: Seek+Write {
 
     fn write_overflow<SeekWrite>(startingBlock: PageBlock, 
@@ -2233,12 +2107,11 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
     fn write_leaves<I,SeekWrite>(leavesBlk: PageBlock,
                                 pageManager: &IPages,
                                 source: I,
-                                estimate_count_keys: usize,
                                 vbuf: &mut [u8],
                                 fs: &mut SeekWrite, 
                                 pb: &mut PageBuilder,
                                 token: &mut PendingSegment,
-                                ) -> Result<(PageBlock, Vec<pgitem>, PageNum, usize, usize, Bloom)> where I: Iterator<Item=Result<kvp>> , SeekWrite : Seek+Write {
+                                ) -> Result<(PageBlock, Vec<pgitem>, PageNum, usize, usize)> where I: Iterator<Item=Result<kvp>> , SeekWrite : Seek+Write {
         // 2 for the page type and flags
         // 4 for the prev page
         // 2 for the stored count
@@ -2413,22 +2286,11 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
         let mut count_keys = 0;
         let mut count_tombstones = 0;
 
-        // TODO if we are going to use a whole page to write the filter,
-        // we might as well use most of that page FOR the filter.
-
-        // TODO any chance we should decide that all filters are the same size?
-
-        let blm_size_bytes = std::cmp::max(estimate_count_keys * 10 / 8, 128);;
-
-        let blm_count_funcs = 4; // TODO calculate optimal number
-        let mut blm = Bloom::new(vec![0; blm_size_bytes], blm_count_funcs);
-
         for result_pair in source {
             count_keys += 1;
 
             let mut pair = try!(result_pair);
             let k = pair.Key;
-            blm.set(&k, &[]);
             if pair.Value.is_tombstone() {
                 count_tombstones += 1;
             }
@@ -2650,7 +2512,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             let isRootNode = st.leaves.is_empty();
             try!(writeLeaf(&mut st, isRootNode, pb, fs, pgsz, pageManager, &mut *token));
         }
-        Ok((st.blk, st.leaves, st.firstLeaf, count_keys, count_tombstones, blm))
+        Ok((st.blk, st.leaves, st.firstLeaf, count_keys, count_tombstones))
     }
 
     fn write_parent_nodes<SeekWrite>(startingBlk: PageBlock, 
@@ -2839,14 +2701,10 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
     // than overflow.
     let mut vbuf = vec![0; pgsz].into_boxed_slice(); 
 
-    let (blk, leaves, firstLeaf, count_keys, count_tombstones, filter) = try!(write_leaves(blk, pageManager, source, estimate_count_keys, &mut vbuf, fs, &mut pb, &mut token));
+    let (blk, leaves, firstLeaf, count_keys, count_tombstones) = try!(write_leaves(blk, pageManager, source, &mut vbuf, fs, &mut pb, &mut token));
     assert!(count_keys > 0);
     assert!(count_keys >= count_tombstones);
     assert!(leaves.len() > 0);
-
-    let filter_count_funcs = filter.count_funcs();
-    let filter_bytes = filter.into_bytes();
-    //println!("bloom created: {:?}", filter_bytes);
 
     // all the leaves are written.
     // now write the parent pages.
@@ -2861,27 +2719,11 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
 
     let (root_page, blk) =
         if leaves.len() > 1 {
-            let (filter_page, filter_len, blk) =
-                // TODO is it always worth writing the filter just because there were more
-                // keys than could fit on a single leaf?
-                // maybe we should write a bloom filter only when there is more than one
-                // generation of parent nodes?
-                if leaves.len() > 1 {
-                    let filter_page = blk.firstPage;
-                    let (_, blk) = try!(write_overflow(blk, &mut &*filter_bytes, pageManager, &mut token, fs));
-                    (filter_page, filter_bytes.len(), blk)
-                } else {
-                    (0, 0, blk)
-                };
-
             let mut footer = vec![];
             misc::push_varint(&mut footer, firstLeaf as u64);
             misc::push_varint(&mut footer, lastLeaf as u64);
             misc::push_varint(&mut footer, count_keys as u64);
             misc::push_varint(&mut footer, count_tombstones as u64);
-            misc::push_varint(&mut footer, filter_page as u64);
-            misc::push_varint(&mut footer, filter_len as u64);
-            misc::push_varint(&mut footer, filter_count_funcs as u64);
             let len = footer.len();
             assert!(len <= 255);
             footer.push(len as u8);
@@ -3152,9 +2994,6 @@ pub struct SegmentCursor {
     lastLeaf: PageNum,
     count_keys: usize,
     count_tombstones: usize,
-    filter_page: PageNum,
-    filter_len: usize,
-    filter_count_funcs: usize,
 
     leafKeys: Vec<usize>,
     previousLeaf: PageNum,
@@ -3193,9 +3032,6 @@ impl SegmentCursor {
             lastLeaf: 0, // temporary
             count_keys: 0, // temporary
             count_tombstones: 0, // temporary
-            filter_page: 0, // temporary
-            filter_len: 0, // temporary
-            filter_count_funcs: 0, // temporary
         };
 
         // TODO consider keeping a copy of the root page around as long as this cursor is around
@@ -3225,15 +3061,12 @@ impl SegmentCursor {
             let footer = &res.pr[res.pr.len() - 1 - len_footer ..];
             let mut cur = 0;
             res.firstLeaf = varint::read(footer, &mut cur) as u32;
-            assert!(block_list_contains_page(&res.location.blocks, res.firstLeaf));
+            assert!(res.location.contains_page(res.firstLeaf));
             res.lastLeaf = varint::read(footer, &mut cur) as u32;
-            assert!(block_list_contains_page(&res.location.blocks, res.lastLeaf));
+            assert!(res.location.contains_page(res.lastLeaf));
             res.count_keys = varint::read(footer, &mut cur) as usize;
             res.count_tombstones = varint::read(footer, &mut cur) as usize;
             assert!(res.count_keys >= res.count_tombstones);
-            res.filter_page = varint::read(footer, &mut cur) as PageNum;
-            res.filter_len = varint::read(footer, &mut cur) as usize;
-            res.filter_count_funcs = varint::read(footer, &mut cur) as usize;
         } else {
             return Err(Error::CorruptFile("root page has invalid page type"));
         }
@@ -3253,24 +3086,6 @@ impl SegmentCursor {
 
     pub fn count_tombstones(&self) -> usize {
         self.count_tombstones
-    }
-
-    pub fn filter_len(&self) -> usize {
-        self.filter_len
-    }
-
-    fn load_bloom_filter(&self) -> Result<Option<Bloom>> {
-        if self.filter_page == 0 {
-            Ok(None)
-        } else {
-            //println!("loading bloom filter at page: {}", self.filter_page);
-            let mut strm = try!(OverflowReader::new(&self.path, self.pr.len(), self.filter_page, self.filter_len));
-            let mut v = Vec::with_capacity(self.filter_len);
-            try!(strm.read_to_end(&mut v));
-            //println!("bloom loaded: {:?}", v);
-            let blm = Bloom::new(v, self.filter_count_funcs);
-            Ok(Some(blm))
-        }
     }
 
     fn readLeaf(&mut self) -> Result<()> {
@@ -3353,7 +3168,7 @@ impl SegmentCursor {
     }
 
     fn setCurrentPage(&mut self, pgnum: PageNum) -> Result<()> {
-        assert!(block_list_contains_page(&self.location.blocks, pgnum));
+        assert!(self.location.contains_page(pgnum));
 
         if self.currentPage != pgnum {
             self.currentPage = pgnum;
@@ -3784,7 +3599,7 @@ impl ICursor for SegmentCursor {
                 };
             if 0 == nextPage {
                 self.currentKey = None;
-            } else if !block_list_contains_page(&self.location.blocks, nextPage) {
+            } else if !self.location.contains_page(nextPage) {
                 self.currentKey = None;
             } else {
                 try!(self.setCurrentPage(nextPage));
@@ -3889,7 +3704,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
         }
     }
 
-    fn parse<R>(pr: &Box<[u8]>, cur: &mut usize, fs: &mut R) -> Result<(HeaderData, usize)> where R : Read+Seek {
+    fn parse(pr: &Box<[u8]>, cur: &mut usize) -> Result<(HeaderData, usize)> {
         fn readSegmentList(pr: &Box<[u8]>, cur: &mut usize) -> Result<(Vec<SegmentNum>, HashMap<SegmentNum, SegmentInfo>)> {
             fn readBlockList(prBlocks: &Box<[u8]>, cur: &mut usize) -> Vec<PageBlock> {
                 let count = varint::read(&prBlocks, cur) as usize;
@@ -3937,9 +3752,8 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
         let changeCounter = varint::read(&pr, cur);
         let mergeCounter = varint::read(&pr, cur);
         let next_segnum = varint::read(&pr, cur);
-        let lenSegmentList = varint::read(&pr, cur) as usize;
 
-        let (state,segments_info) = try!(readSegmentList(pr, cur));
+        let (state, segments_info) = try!(readSegmentList(pr, cur));
 
         let hd = 
             HeaderData {
@@ -3970,7 +3784,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
         try!(fs.seek(SeekFrom::Start(0 as u64)));
         let pr = try!(read(&mut fs));
         let mut cur = 0;
-        let (h, pgsz) = try!(parse(&pr, &mut cur, &mut fs));
+        let (h, pgsz) = try!(parse(&pr, &mut cur));
         let nextAvailablePage = calcNextPage(pgsz, len as usize);
         Ok((h, pgsz, nextAvailablePage))
     } else {
@@ -4063,10 +3877,6 @@ struct SafeMergeStuff {
     // it keeps track of which segments are being merged,
     // so we don't try to merge something that is already being merged.
     merging: HashSet<SegmentNum>,
-    // TODO bloom cache doesn't really go here, but
-    // the merge code (FilterTombstonesCursor) is the
-    // only thing that uses it.
-    blooms: HashMap<SegmentNum, std::sync::Arc<Bloom>>,
 }
 
 struct SafeHeader {
@@ -4172,7 +3982,6 @@ impl DatabaseFile {
 
         let mergeStuff = SafeMergeStuff {
             merging: HashSet::new(),
-            blooms: HashMap::new(),
         };
 
         let header = SafeHeader {
@@ -4234,7 +4043,14 @@ impl DatabaseFile {
                         Ok(new_segnum) => {
                             // TODO there should be a way to send a message to this
                             // thread telling it to stop.
-                            res.merge_0(new_segnum);
+                            match res.merge_0(new_segnum) {
+                                Ok(()) => {
+                                },
+                                Err(e) => {
+                                    // TODO what now?
+                                    panic!();
+                                },
+                            }
                         },
                         Err(e) => {
                             // TODO what now?
@@ -4254,7 +4070,14 @@ impl DatabaseFile {
                         Ok(what_is_this_for) => {
                             // TODO there should be a way to send a message to this
                             // thread telling it to stop.
-                            res.merge_others(level);
+                            match res.merge_others(level) {
+                                Ok(()) => {
+                                },
+                                Err(e) => {
+                                    // TODO what now?
+                                    panic!();
+                                },
+                            }
                         },
                         Err(e) => {
                             // TODO what now?
@@ -4514,7 +4337,7 @@ impl InnerPart {
     fn write_header(&self, 
                    st: &mut SafeHeader, 
                    fs: &mut File, 
-                   mut hdr: HeaderData
+                   hdr: HeaderData
                   ) -> Result<()> {
         fn spaceNeededForSegmentInfo(info: &SegmentInfo) -> usize {
             let mut a = 0;
@@ -4573,7 +4396,6 @@ impl InnerPart {
 
         let pbSegList = buildSegmentList(&hdr);
         let buf = pbSegList.Buffer();
-        pb.PutVarint(buf.len() as u64);
 
         if pb.Available() >= (buf.len() + 1) {
             pb.PutArray(buf);
@@ -4649,7 +4471,7 @@ impl InnerPart {
 
     fn open_cursor_on_pending_segment(inner: &std::sync::Arc<InnerPart>, location: SegmentLocation) -> Result<SegmentCursor> {
         let page = try!(Self::get_loaner_page(inner));
-        let mut cursor = try!(SegmentCursor::new(&inner.path, page, location));
+        let cursor = try!(SegmentCursor::new(&inner.path, page, location));
         Ok(cursor)
     }
 
@@ -4660,14 +4482,9 @@ impl InnerPart {
             .map(|loc| Self::open_cursor_on_pending_segment(inner, loc))
             .collect::<Result<Vec<_>>>();
         let cursors = try!(cursors);
-        let estimate_keys = 
-            cursors
-            .iter()
-            .map(|c| c.count_keys() - c.count_tombstones())
-            .sum();
 
         let cursor = box MultiCursor::Create(cursors);
-        let mut location = try!(Self::write_merge_segment(inner, cursor, estimate_keys));
+        let location = try!(Self::write_merge_segment(inner, cursor));
         Ok(location)
     }
 
@@ -4747,20 +4564,19 @@ impl InnerPart {
     }
 
     fn write_segment(&self, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<SegmentLocation> {
-        let estimate_keys = pairs.len();
         let source = pairs.into_iter().map(|t| {
             let (k, v) = t;
             Ok(kvp {Key:k, Value:v})
         });
         let mut fs = try!(self.OpenForWriting());
-        let seg = try!(create_segment(&mut fs, self, source, estimate_keys));
+        let seg = try!(create_segment(&mut fs, self, source));
         Ok(seg)
     }
 
-    fn write_merge_segment(inner: &std::sync::Arc<InnerPart>, cursor: Box<ICursor>, estimate_keys: usize) -> Result<SegmentLocation> {
+    fn write_merge_segment(inner: &std::sync::Arc<InnerPart>, cursor: Box<ICursor>) -> Result<SegmentLocation> {
         let source = CursorIterator::new(cursor);
         let mut fs = try!(inner.OpenForWriting());
-        let seg = try!(create_segment(&mut fs, &**inner, source, estimate_keys));
+        let seg = try!(create_segment(&mut fs, &**inner, source));
         Ok(seg)
     }
 
@@ -4860,12 +4676,6 @@ impl InnerPart {
                     .collect::<Result<Vec<_>>>();
                 let cursors = try!(cursors);
 
-                let estimate_keys = 
-                    cursors
-                    .iter()
-                    .map(|c| c.count_keys() - c.count_tombstones())
-                    .sum();
-
                 for g in merge_seg_nums.iter() {
                     mergeStuff.merging.insert(*g);
                 }
@@ -4885,7 +4695,7 @@ impl InnerPart {
                         // there is nothing behind.
                         // so all tombstones can be filtered.
                         // so we just wrap in a LivingCursor.
-                        let mut cursor = LivingCursor::Create(cursor);
+                        let cursor = LivingCursor::Create(cursor);
                         box cursor
                     } else if count_segments_behind <= 8 {
                         // TODO arbitrary hard-coded limit in the line above
@@ -4911,39 +4721,18 @@ impl InnerPart {
                         for s in &st.header.currentState[pos_last_seg + 1 ..] {
                             let s = *s;
                             let cursor = try!(Self::get_cursor_on_active_segment(inner, &st, s));
-                            let bloom =
-                                match mergeStuff.blooms.entry(s) {
-                                    std::collections::hash_map::Entry::Occupied(e) => {
-                                        Some(e.get().clone())
-                                    },
-                                    std::collections::hash_map::Entry::Vacant(e) => {
-                                        match try!(cursor.load_bloom_filter()) {
-                                            Some(bloom) => {
-                                                let bloom = std::sync::Arc::new(bloom);
-                                                let result = bloom.clone();
-                                                e.insert(bloom);
-                                                Some(result)
-                                            },
-                                            None => {
-                                                None
-                                            },
-                                        }
-                                    },
-                                };
-                            // TODO so actually, the FilterTombstonesCursor needs EITHER the
-                            // bloom or the SegmentCursor.  it never needs both.
-                            behind.push((bloom, cursor));
+                            behind.push(cursor);
                         }
                         // TODO to allow reuse of these behind cursors, we should pass
                         // them as references, don't transfer ownership.  but then they
                         // will need to be owned somewhere else.
-                        let mut cursor = FilterTombstonesCursor::new(cursor, behind);
+                        let cursor = FilterTombstonesCursor::new(cursor, behind);
                         box cursor
                     } else {
                         box cursor
                     };
 
-                Some((merge_seg_nums, pages_in_merge_segments, pages_in_merge_level, cursor, estimate_keys))
+                Some((merge_seg_nums, pages_in_merge_segments, pages_in_merge_level, cursor))
             } else {
                 //println!("no merge");
                 None
@@ -4951,7 +4740,7 @@ impl InnerPart {
         };
 
         match step1 {
-            Some((merge_seg_nums, pages_in_merge_segments, pages_in_merge_level, mut cursor, estimate_keys)) => {
+            Some((merge_seg_nums, pages_in_merge_segments, pages_in_merge_level, mut cursor)) => {
                 // TODO if something goes wrong here, the function will exit with
                 // an error but mergeStuff.merging will still contain the segments we are
                 // trying to merge, which will prevent them from EVER being merged.
@@ -4960,7 +4749,7 @@ impl InnerPart {
                 try!(cursor.First());
                 let seg = 
                     if cursor.IsValid() {
-                        let mut location = try!(Self::write_merge_segment(inner, cursor, estimate_keys));
+                        let location = try!(Self::write_merge_segment(inner, cursor));
                         let pages_in_new_segment = location.count_pages();
                         //println!("pages_in_new_segment: {}", pages_in_new_segment);
                         // TODO is the following assert always true?
@@ -5085,8 +4874,6 @@ impl InnerPart {
         }
         let mut blocksToBeFreed = Vec::new();
         for info in segmentsToBeFreed.values() {
-            // TODO any segment being freed should have its bloom filter removed
-            // from the blooms cache.
             blocksToBeFreed.push_all(&info.location.blocks);
         }
         {
@@ -5124,10 +4911,7 @@ impl IPages for InnerPart {
         let (blocks, leftovers) = ps.End(unused_page);
         assert!(!block_list_contains_page(&blocks, unused_page));
         assert!(block_list_contains_page(&blocks, root_page));
-        let info = SegmentLocation {
-            root_page: root_page,
-            blocks: blocks,
-        };
+        let info = SegmentLocation::new(root_page, blocks);
         let mut space = try!(self.space.lock());
         //printfn "wrote %A: %A" g blocks
         match leftovers {
