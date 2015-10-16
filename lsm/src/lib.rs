@@ -3923,17 +3923,20 @@ struct InnerPart {
     pagepool: Mutex<SafePagePool>,
 }
 
+enum AutomergeMessage {
+    NewSegment(SegmentNum, u32),
+    Terminate,
+}
+
 pub struct WriteLock {
     inner: std::sync::Arc<InnerPart>,
-    notify_0: mpsc::Sender<SegmentNum>,
-    notify_merged_segment: Vec<mpsc::Sender<(SegmentNum, u32)>>,
+    notify_automerge: Vec<mpsc::Sender<AutomergeMessage>>,
 }
 
 impl WriteLock {
     pub fn commit_segment(&self, new_seg: SegmentLocation) -> Result<()> {
-        // TODO avoid this clone:
         let segnum = try!(self.inner.commit_segment(new_seg));
-        try!(self.notify_0.send(segnum).map_err(wrap_err));
+        try!(self.notify_automerge[0].send(AutomergeMessage::NewSegment(segnum, 0)).map_err(wrap_err));
         Ok(())
     }
 
@@ -3967,11 +3970,11 @@ impl WriteLock {
                 // return a segment number.
                 let new_segnum = new_segnum.unwrap();
 
-                // level 0 is not in this array
+                // nothing gets "promoted" to level 0.
+                // new segments start in level 0
                 assert!(level > 0);
-                let level = (level - 1) as usize;
-                assert!(level < self.notify_merged_segment.len());
-                try!(self.notify_merged_segment[level].send((new_segnum, (level + 1) as u32)).map_err(wrap_err));
+                assert!((level as usize) < self.notify_automerge.len());
+                try!(self.notify_automerge[level as usize].send(AutomergeMessage::NewSegment(new_segnum, level as u32)).map_err(wrap_err));
             },
             None => {
             },
@@ -4020,14 +4023,15 @@ impl DatabaseFile {
             pages: vec![],
         };
 
-        let (tx_0, rx_0): (mpsc::Sender<SegmentNum>, mpsc::Receiver<SegmentNum>) = mpsc::channel();
+        // each merge level is handled by its own thread.  a Rust channel is used to
+        // notify that thread of merge work to be done.
 
-        let mut notify_merged_segment = vec![];
+        let mut senders = vec![];
         let mut receivers = vec![];
-        for level in 1 .. LEVEL_SIZE_LIMITS_IN_MB.len() {
-            let (tx, rx): (mpsc::Sender<(SegmentNum, u32)>, mpsc::Receiver<(SegmentNum, u32)>) = mpsc::channel();
-            notify_merged_segment.push(tx);
-            receivers.push((level, rx));
+        for level in 0 .. LEVEL_SIZE_LIMITS_IN_MB.len() {
+            let (tx, rx): (mpsc::Sender<AutomergeMessage>, mpsc::Receiver<AutomergeMessage>) = mpsc::channel();
+            senders.push(tx);
+            receivers.push(rx);
         }
 
         let inner = InnerPart {
@@ -4046,8 +4050,7 @@ impl DatabaseFile {
         let lck = 
             WriteLock { 
                 inner: inner.clone(),
-                notify_0: tx_0,
-                notify_merged_segment: notify_merged_segment,
+                notify_automerge: senders,
             };
 
         let res = DatabaseFile {
@@ -4056,48 +4059,29 @@ impl DatabaseFile {
         };
         let res = std::sync::Arc::new(res);
 
-        {
-            let res = res.clone();
-            thread::spawn(move || {
-                loop {
-                    match rx_0.recv() {
-                        Ok(new_segnum) => {
-                            // TODO there should be a way to send a message to this
-                            // thread telling it to stop.
-                            match res.merge_0(new_segnum) {
-                                Ok(()) => {
-                                },
-                                Err(e) => {
-                                    // TODO what now?
-                                    panic!();
-                                },
-                            }
-                        },
-                        Err(e) => {
-                            // TODO what now?
-                            panic!();
-                        },
-                    }
-                }
-            });
+        // TODO so when we do send Terminate messages to these threads?
+        // impl Drop for DatabaseFile ? 
 
-        }
-
-        for (closure_level, rx) in receivers {
+        for (closure_level, rx) in receivers.into_iter().enumerate() {
             let res = res.clone();
             thread::spawn(move || {
                 loop {
                     match rx.recv() {
-                        Ok((new_segnum, level)) => {
-                            assert!(level == (closure_level as u32));
-                            // TODO there should be a way to send a message to this
-                            // thread telling it to stop.
-                            match res.merge_others(new_segnum, level) {
-                                Ok(()) => {
+                        Ok(msg) => {
+                            match msg {
+                                AutomergeMessage::NewSegment(new_segnum, level) => {
+                                    assert!(level == (closure_level as u32));
+                                    match res.automerge_level(new_segnum, level) {
+                                        Ok(()) => {
+                                        },
+                                        Err(e) => {
+                                            // TODO what now?
+                                            panic!();
+                                        },
+                                    }
                                 },
-                                Err(e) => {
-                                    // TODO what now?
-                                    panic!();
+                                AutomergeMessage::Terminate => {
+                                    break;
                                 },
                             }
                         },
@@ -4114,32 +4098,20 @@ impl DatabaseFile {
         Ok(res)
     }
 
-    fn merge_0(&self, new_segnum: SegmentNum) -> Result<()> {
-        loop {
-            // all new segments come in at level 0.
-            // we want to merge and promote them to level 1 as
-            // quickly as possible.
-            match try!(self.merge(0, 2, 8, MergePromotionRule::Promote)) {
-                Some(seg) => {
-                    let lck = try!(self.lock_write());
-                    try!(lck.commit_merge(seg));
-                },
-                None => {
-                    break;
-                },
-            }
-        }
-        Ok(())
-    }
-
-    fn merge_others(&self, new_segnum: SegmentNum, level: u32) -> Result<()> {
-        // level 0 gets handled elsewhere
-        assert!(level > 0);
+    fn automerge_level(&self, new_segnum: SegmentNum, level: u32) -> Result<()> {
         assert!((level as usize) < LEVEL_SIZE_LIMITS_IN_MB.len());
         let promotion =
-            if (level as usize) == LEVEL_SIZE_LIMITS_IN_MB.len() - 1 {
+            if level == 0 {
+                // all new segments come in at level 0.
+                // we want to merge and promote them to level 1 as
+                // quickly as possible.
+                MergePromotionRule::Promote
+            } else if (level as usize) == LEVEL_SIZE_LIMITS_IN_MB.len() - 1 {
+                // nothing gets promoted out of the last level.
                 MergePromotionRule::Stay
             } else {
+                // for all the levels in between, we promote when the
+                // level reaches a certain threshold of size.
                 let mb = LEVEL_SIZE_LIMITS_IN_MB[level as usize];
                 let bytes = mb * 1024 * 1024;
                 let pages = bytes / (self.inner.pgsz as u64);
