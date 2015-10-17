@@ -57,7 +57,7 @@ const SIZE_16: usize = 2; // like std::mem::size_of::<u16>()
 //
 // final level size limit is 0 because it is unused, because nothing ever
 // gets promoted out of the last level.
-const LEVEL_SIZE_LIMITS_IN_MB: [u64; 8] = [0, 2, 8, 32, 128, 512, 2048, 0];
+const LEVEL_SIZE_LIMITS_IN_KB: [u64; 4] = [0, 400, 40000, 0];
 
 pub type PageNum = u32;
 // type PageSize = u32;
@@ -4017,7 +4017,7 @@ impl DatabaseFile {
 
         let mut senders = vec![];
         let mut receivers = vec![];
-        for _level in 0 .. LEVEL_SIZE_LIMITS_IN_MB.len() {
+        for _level in 0 .. LEVEL_SIZE_LIMITS_IN_KB.len() {
             let (tx, rx): (mpsc::Sender<AutomergeMessage>, mpsc::Receiver<AutomergeMessage>) = mpsc::channel();
             senders.push(tx);
             receivers.push(rx);
@@ -4088,21 +4088,21 @@ impl DatabaseFile {
     }
 
     fn automerge_level(&self, new_segnum: SegmentNum, level: u32) -> Result<()> {
-        assert!((level as usize) < LEVEL_SIZE_LIMITS_IN_MB.len());
+        assert!((level as usize) < LEVEL_SIZE_LIMITS_IN_KB.len());
         let promotion =
             if level == 0 {
                 // all new segments come in at level 0.
                 // we want to merge and promote them to level 1 as
                 // quickly as possible.
                 MergePromotionRule::Promote
-            } else if (level as usize) == LEVEL_SIZE_LIMITS_IN_MB.len() - 1 {
+            } else if (level as usize) == LEVEL_SIZE_LIMITS_IN_KB.len() - 1 {
                 // nothing gets promoted out of the last level.
                 MergePromotionRule::Stay
             } else {
                 // for all the levels in between, we promote when the
                 // level reaches a certain threshold of size.
-                let mb = LEVEL_SIZE_LIMITS_IN_MB[level as usize];
-                let bytes = mb * 1024 * 1024;
+                let mb = LEVEL_SIZE_LIMITS_IN_KB[level as usize];
+                let bytes = mb * 1024;
                 let pages = bytes / (self.inner.pgsz as u64);
                 MergePromotionRule::Threshold(pages as usize)
             };
