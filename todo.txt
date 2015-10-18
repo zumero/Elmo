@@ -1,4 +1,7 @@
 
+after several runs of the test suite in the same database file,
+the amount of free blocks in the file is awfully big.
+
 can we get rid of mergeStuff.merging?
 
 tune block sizes for perf?

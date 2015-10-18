@@ -2712,19 +2712,24 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
 
     let (root_page, blk) =
         if leaves.len() > 1 {
-            let mut footer = vec![];
-            misc::push_varint(&mut footer, firstLeaf as u64);
-            misc::push_varint(&mut footer, lastLeaf as u64);
-            misc::push_varint(&mut footer, count_keys as u64);
-            misc::push_varint(&mut footer, count_tombstones as u64);
-            let len = footer.len();
-            assert!(len <= 255);
-            footer.push(len as u8);
+            let mut depth = 0;
 
             let (root_page, blk) = {
                 let mut blk = blk;
                 let mut children = leaves;
                 while children.len() > 1 {
+                    depth += 1;
+
+                    let mut footer = vec![];
+                    misc::push_varint(&mut footer, firstLeaf as u64);
+                    misc::push_varint(&mut footer, lastLeaf as u64);
+                    misc::push_varint(&mut footer, count_keys as u64);
+                    misc::push_varint(&mut footer, count_tombstones as u64);
+                    misc::push_varint(&mut footer, depth as u64);
+                    let len = footer.len();
+                    assert!(len <= 255);
+                    footer.push(len as u8);
+
                     let (newBlk, newChildren) = try!(write_parent_nodes(blk, &mut children, pgsz, fs, pageManager, &mut token, &footer, &mut pb));
                     assert!(children.is_empty());
                     blk = newBlk;
@@ -2987,6 +2992,7 @@ pub struct SegmentCursor {
     lastLeaf: PageNum,
     count_keys: usize,
     count_tombstones: usize,
+    depth: u32,
 
     leafKeys: Vec<usize>,
     previousLeaf: PageNum,
@@ -2996,9 +3002,6 @@ pub struct SegmentCursor {
 }
 
 impl SegmentCursor {
-    // TODO it would be nice if a SegmentCursor could tell us the depth of
-    // its btree
-
     fn new(path: &str, 
            page: misc::Lend<Box<[u8]>>,
            location: SegmentLocation
@@ -3025,6 +3028,7 @@ impl SegmentCursor {
             lastLeaf: 0, // temporary
             count_keys: 0, // temporary
             count_tombstones: 0, // temporary
+            depth: 0, // temporary
         };
 
         // TODO consider keeping a copy of the root page around as long as this cursor is around
@@ -3060,6 +3064,7 @@ impl SegmentCursor {
             res.count_keys = varint::read(footer, &mut cur) as usize;
             res.count_tombstones = varint::read(footer, &mut cur) as usize;
             assert!(res.count_keys >= res.count_tombstones);
+            res.depth = varint::read(footer, &mut cur) as u32;
         } else {
             return Err(Error::CorruptFile("root page has invalid page type"));
         }
@@ -3079,6 +3084,10 @@ impl SegmentCursor {
 
     pub fn count_tombstones(&self) -> usize {
         self.count_tombstones
+    }
+
+    pub fn depth(&self) -> u32 {
+        self.depth
     }
 
     fn readLeaf(&mut self) -> Result<()> {

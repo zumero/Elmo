@@ -37,6 +37,7 @@ fn list_segments(name: &str) -> Result<(),lsm::Error> {
         println!("    keys: {}", cursor.count_keys());
         println!("    pages: {}", infos[s].count_pages());
         println!("    tombstones: {}", cursor.count_tombstones());
+        println!("    depth: {}", cursor.depth());
     }
     Ok(())
 }
