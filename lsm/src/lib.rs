@@ -173,8 +173,8 @@ pub enum MergePromotionRule {
 // kvp is the struct used to provide key-value pairs downward,
 // for storage into the database.
 struct kvp {
-    Key : Box<[u8]>,
-    Value : Blob,
+    Key: Box<[u8]>,
+    Value: Blob,
 }
 
 #[derive(Debug)]
@@ -2097,6 +2097,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
         writeOneBlock(0, startingBlock, fs, ba, pgsz, &mut pbOverflow, &mut pbFirstOverflow, pageManager, token)
     }
 
+    // TODO the tuple return value of this func has gotten out of hand
     fn write_leaves<I,SeekWrite>(leavesBlk: PageBlock,
                                 pageManager: &IPages,
                                 source: I,
@@ -2104,7 +2105,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                                 fs: &mut SeekWrite, 
                                 pb: &mut PageBuilder,
                                 token: &mut PendingSegment,
-                                ) -> Result<(PageBlock, Vec<pgitem>, PageNum, usize, usize)> where I: Iterator<Item=Result<kvp>> , SeekWrite : Seek+Write {
+                                ) -> Result<(PageBlock, Vec<pgitem>, PageNum, usize, usize, u64, u64)> where I: Iterator<Item=Result<kvp>> , SeekWrite : Seek+Write {
         // 2 for the page type and flags
         // 4 for the prev page
         // 2 for the stored count
@@ -2239,6 +2240,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             }
         }
 
+        // TODO this could be a method on ValueLocation
         fn vLocNeed (vloc: &ValueLocation) -> usize {
             match *vloc {
                 ValueLocation::Tombstone => {
@@ -2278,11 +2280,15 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
         //let mut prev_key: Option<Box<[u8]>> = None;
         let mut count_keys = 0;
         let mut count_tombstones = 0;
+        let mut total_size_keys = 0;
+        let mut total_size_values = 0;
 
         for result_pair in source {
             count_keys += 1;
 
             let mut pair = try!(result_pair);
+            total_size_keys += pair.Key.len() as u64;
+
             let k = pair.Key;
             if pair.Value.is_tombstone() {
                 count_tombstones += 1;
@@ -2307,7 +2313,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             // TODO is it possible for this to conclude that the key must be overflowed
             // when it would actually fit because of prefixing?
 
-            let (blkAfterKey,kloc) = 
+            let (blkAfterKey, kloc) = 
                 if k.len() <= maxKeyInline {
                     (st.blk, KeyLocation::Inline)
                 } else {
@@ -2356,7 +2362,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                                     },
                                     Blob::Stream(ref mut strm) => {
                                         let valuePage = blkAfterKey.firstPage;
-                                        let (len,newBlk) = try!(write_overflow(blkAfterKey, &mut *strm, pageManager, token, fs));
+                                        let (len, newBlk) = try!(write_overflow(blkAfterKey, &mut *strm, pageManager, token, fs));
                                         (newBlk, ValueLocation::Overflowed(len, valuePage))
                                     },
                                     Blob::Array(a) => {
@@ -2433,6 +2439,20 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                     }
             };
 
+            let len_value =
+                match vloc {
+                    ValueLocation::Tombstone => {
+                        0
+                    },
+                    ValueLocation::Buffer(ref vbuf) => {
+                        vbuf.len() as u64
+                    },
+                    ValueLocation::Overflowed(vlen,_) => {
+                        vlen as u64
+                    },
+                };
+            total_size_values += len_value;
+
             // whether/not the key/value are to be overflowed is now already decided.
             // now all we have to do is decide if this key/value are going into this leaf
             // or not.  note that it is possible to overflow these and then have them not
@@ -2505,7 +2525,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             let isRootNode = st.leaves.is_empty();
             try!(writeLeaf(&mut st, isRootNode, pb, fs, pgsz, pageManager, &mut *token));
         }
-        Ok((st.blk, st.leaves, st.firstLeaf, count_keys, count_tombstones))
+        Ok((st.blk, st.leaves, st.firstLeaf, count_keys, count_tombstones, total_size_keys, total_size_values))
     }
 
     fn write_parent_nodes<SeekWrite>(startingBlk: PageBlock, 
@@ -2694,7 +2714,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
     // than overflow.
     let mut vbuf = vec![0; pgsz].into_boxed_slice(); 
 
-    let (blk, leaves, firstLeaf, count_keys, count_tombstones) = try!(write_leaves(blk, pageManager, source, &mut vbuf, fs, &mut pb, &mut token));
+    let (blk, leaves, firstLeaf, count_keys, count_tombstones, total_size_keys, total_size_values) = try!(write_leaves(blk, pageManager, source, &mut vbuf, fs, &mut pb, &mut token));
     assert!(count_keys > 0);
     assert!(count_keys >= count_tombstones);
     assert!(leaves.len() > 0);
@@ -2725,7 +2745,10 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                     misc::push_varint(&mut footer, lastLeaf as u64);
                     misc::push_varint(&mut footer, count_keys as u64);
                     misc::push_varint(&mut footer, count_tombstones as u64);
+                    misc::push_varint(&mut footer, total_size_keys as u64);
+                    misc::push_varint(&mut footer, total_size_values as u64);
                     misc::push_varint(&mut footer, depth as u64);
+                    // TODO this might be a good place to a checksum hash
                     let len = footer.len();
                     assert!(len <= 255);
                     footer.push(len as u8);
@@ -2992,6 +3015,8 @@ pub struct SegmentCursor {
     lastLeaf: PageNum,
     count_keys: usize,
     count_tombstones: usize,
+    total_size_keys: u64,
+    total_size_values: u64,
     depth: u32,
 
     leafKeys: Vec<usize>,
@@ -3028,6 +3053,8 @@ impl SegmentCursor {
             lastLeaf: 0, // temporary
             count_keys: 0, // temporary
             count_tombstones: 0, // temporary
+            total_size_keys: 0, // temporary
+            total_size_values: 0, // temporary
             depth: 0, // temporary
         };
 
@@ -3064,6 +3091,8 @@ impl SegmentCursor {
             res.count_keys = varint::read(footer, &mut cur) as usize;
             res.count_tombstones = varint::read(footer, &mut cur) as usize;
             assert!(res.count_keys >= res.count_tombstones);
+            res.total_size_keys = varint::read(footer, &mut cur) as u64;
+            res.total_size_values = varint::read(footer, &mut cur) as u64;
             res.depth = varint::read(footer, &mut cur) as u32;
         } else {
             return Err(Error::CorruptFile("root page has invalid page type"));
@@ -3084,6 +3113,14 @@ impl SegmentCursor {
 
     pub fn count_tombstones(&self) -> usize {
         self.count_tombstones
+    }
+
+    pub fn total_size_keys(&self) -> u64 {
+        self.total_size_keys
+    }
+
+    pub fn total_size_values(&self) -> u64 {
+        self.total_size_values
     }
 
     pub fn depth(&self) -> u32 {
