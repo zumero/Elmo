@@ -1,4 +1,15 @@
 
+if we need lots of blocks for a given segment, do we really want
+to use a little blocks of 1-2 pages just because they are on the
+free list?
+
+it might be nice for merges to pass a hint down to create_segment()
+which estimates how many pages will be needed so that it can
+pass that hint on when it asks for a block so it can avoid using
+little tiny blocks.
+
+when free space appears at the end of a file, truncate it
+
 after several runs of the test suite in the same database file,
 the amount of free blocks in the file is awfully big.
 

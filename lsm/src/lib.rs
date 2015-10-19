@@ -4276,8 +4276,9 @@ impl InnerPart {
 
     fn getBlock(&self, space: &mut Space, specificSizeInPages: PageNum) -> PageBlock {
         if specificSizeInPages > 0 {
+            // TODO this code isn't used anymore
             if space.freeBlocks.is_empty() || specificSizeInPages > space.freeBlocks[0].count_pages() {
-                let newBlk = PageBlock::new(space.nextPage, space.nextPage+specificSizeInPages-1);
+                let newBlk = PageBlock::new(space.nextPage, space.nextPage + specificSizeInPages - 1);
                 space.nextPage = space.nextPage + specificSizeInPages;
                 newBlk
             } else {
@@ -4285,7 +4286,7 @@ impl InnerPart {
                 if headBlk.count_pages() > specificSizeInPages {
                     // trim the block to size
                     let blk2 = PageBlock::new(headBlk.firstPage,
-                                              headBlk.firstPage+specificSizeInPages-1); 
+                                              headBlk.firstPage + specificSizeInPages - 1); 
                     space.freeBlocks[0].firstPage = space.freeBlocks[0].firstPage + specificSizeInPages;
                     assert!(space.freeBlocks[0].firstPage <= space.freeBlocks[0].lastPage);
                     // TODO problem: the list is probably no longer sorted.  is this okay?
@@ -4299,7 +4300,7 @@ impl InnerPart {
         } else {
             if space.freeBlocks.is_empty() {
                 let size = self.settings.PagesPerBlock;
-                let newBlk = PageBlock::new(space.nextPage, space.nextPage+size-1) ;
+                let newBlk = PageBlock::new(space.nextPage, space.nextPage + size - 1) ;
                 space.nextPage = space.nextPage + size;
                 newBlk
             } else {
@@ -4352,6 +4353,9 @@ impl InnerPart {
         // inside a critical section.  but the benefit is considered
         // worth the trouble.
         
+        // TODO should we instead prefer to give out blocks earlier in
+        // the file, rather than giving out the largest blocks?
+
         // TODO it is important that freeBlocks contains no overlaps.
         // add debug-only checks to verify?
 
@@ -4360,7 +4364,14 @@ impl InnerPart {
         // should this be a configurable setting?
 
         // TODO if the last block of the file is free, consider just
-        // moving nextPage back.
+        // moving nextPage.  and truncate the file size.
+
+        // TODO actually, this list can have pages that are beyond
+        // the end of the file.  if somebody asks for a 1 MB block
+        // at the end, and then only writes one page, the file only
+        // gets extended one page.  so if it then gives the rest
+        // back, the rest of it will be considered "free", even though
+        // it exists beyond the current end of the file.
 
         for b in blocks {
             space.freeBlocks.push(b);
@@ -4966,6 +4977,12 @@ impl IPages for InnerPart {
         let info = SegmentLocation::new(root_page, blocks);
         let mut space = try!(self.space.lock());
         //printfn "wrote %A: %A" g blocks
+        let len = {
+            let mut fs = try!(self.OpenForReading());
+            let len = try!(misc::io::seek_len(&mut fs));
+            len
+        };
+        // TODO adjust "free" stuff for the actual end of the file
         match leftovers {
             Some(b) => Self::addFreeBlocks(&mut space, vec![b]),
             None => ()
