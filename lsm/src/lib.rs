@@ -4252,21 +4252,13 @@ impl InnerPart {
         let mut cursors = self.cursors.lock().unwrap(); // gotta succeed
         let seg = cursors.cursors.remove(&csrnum).expect("gotta be there");
         assert_eq!(seg, segnum);
-        // TODO hey.  we can't reclaim this zombie unless we know
+        // TODO hey.  actually we can't reclaim this zombie unless we know
         // that the cursor we just dropped was the only cursor on the
         // zombie segment.
         match cursors.zombie_segments.remove(&segnum) {
             Some(info) => {
-                match self.space.try_lock() {
-                    Ok(mut space) => {
-                        Self::addFreeBlocks(&mut space, info.location.blocks);
-                    },
-                    Err(_) => {
-                        //println!("lost zombie: {:?}", info);
-                        // worst that can happen is that these blocks don't get
-                        // reclaimed until some other day.
-                    },
-                }
+                let mut space = self.space.lock().unwrap();
+                Self::addFreeBlocks(&mut space, info.location.blocks);
             },
             None => {
             },
@@ -4374,12 +4366,11 @@ impl InnerPart {
         // back, the rest of it will be considered "free", even though
         // it exists beyond the current end of the file.
 
-//        println!("adding free blocks: {:?}", blocks);
+        //println!("adding free blocks: {:?}", blocks);
         for b in blocks {
             space.freeBlocks.push(b);
         }
         consolidateBlockList(&mut space.freeBlocks);
-/*
         let mut free_at_end = None;
         for (i, b) in space.freeBlocks.iter().enumerate() {
             if b.lastPage == space.nextPage - 1 {
@@ -4389,13 +4380,12 @@ impl InnerPart {
             }
         }
         if let Some(i) = free_at_end {
-            println!("    killing free_at_end: {:?}", space.freeBlocks[i]);
+            //println!("    killing free_at_end: {:?}", space.freeBlocks[i]);
             space.nextPage = space.freeBlocks[i].firstPage;
             space.freeBlocks.remove(i);
         }
-*/
         space.freeBlocks.sort_by(|a,b| b.count_pages().cmp(&a.count_pages()));
-//        println!("    space now: {:?}", space);
+        //println!("    space now: {:?}", space);
     }
 
     // a stored segmentinfo for a segment is a single blob of bytes.
@@ -4995,11 +4985,14 @@ impl IPages for InnerPart {
         let info = SegmentLocation::new(root_page, blocks);
         let mut space = try!(self.space.lock());
         //printfn "wrote %A: %A" g blocks
+        /*
+        // TODO not sure why, but this code ends up making the file huge
         let len = {
             let mut fs = try!(self.OpenForReading());
             let len = try!(misc::io::seek_len(&mut fs));
             len
         };
+        */
         // TODO adjust "free" stuff for the actual end of the file
         match leftovers {
             Some(b) => Self::addFreeBlocks(&mut space, vec![b]),
