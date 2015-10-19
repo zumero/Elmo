@@ -90,7 +90,7 @@ fn dump_segment(name: &str, segnum: u64) -> Result<(),lsm::Error> {
 fn merge(name: &str, merge_level: u32, min_segs: usize, max_segs: usize) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     // TODO not sure this promotion rule is what we want here
-    match try!(db.merge(merge_level, min_segs, max_segs, lsm::MergePromotionRule::Promote)) {
+    match try!(db.merge(merge_level, min_segs, max_segs, lsm::MergePromotionRule::Stay)) {
         Some(pm) => {
             //println!("merged segment: {:?}", pm);
             let lck = try!(db.get_write_lock());

@@ -591,23 +591,6 @@ pub mod io {
         Ok(endian::i32_from_bytes_le(ba))
     }
 
-    // This code was ported from F# which assumes that any Stream
-    // that supports Seek also can give you its Length.  That method
-    // isn't part of the Seek trait, but this implementation should
-    // suffice.
-    pub fn seek_len<R>(fs: &mut R) -> io::Result<u64> where R : Seek {
-        // remember where we started (like Tell)
-        let pos = try!(fs.seek(SeekFrom::Current(0)));
-
-        // seek to the end
-        let len = try!(fs.seek(SeekFrom::End(0)));
-
-        // restore to where we were
-        let _ = try!(fs.seek(SeekFrom::Start(pos)));
-
-        Ok(len)
-    }
-
 }
 
 pub struct Sqlite4Num {

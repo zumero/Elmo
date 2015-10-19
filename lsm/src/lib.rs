@@ -3820,7 +3820,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
             .create(true)
             .open(&path));
 
-    let len = try!(misc::io::seek_len(&mut fs));
+    let len = try!(fs.metadata()).len();
     if len > 0 {
         try!(fs.seek(SeekFrom::Start(0 as u64)));
         let pr = try!(read(&mut fs));
@@ -3878,6 +3878,9 @@ fn invertBlockList(blocks: &Vec<PageBlock>) -> Vec<PageBlock> {
         result[i].lastPage = result[i+1].firstPage-1;
         assert!(result[i].firstPage <= result[i].lastPage);
     }
+    // this function finds the space between the blocks.
+    // the last block didn't get touched, and is still a block in use.
+    // so remove it.
     result.remove(len - 1);
     result
 }
@@ -4023,18 +4026,30 @@ pub struct DatabaseFile {
 impl DatabaseFile {
     pub fn new(path: String, settings : DbSettings) -> Result<std::sync::Arc<DatabaseFile>> {
 
-        let (header, pgsz, firstAvailablePage) = try!(read_header(&path));
+        let (header, pgsz, first_available_page) = try!(read_header(&path));
 
         // when we first open the file, we find all the blocks that are in use by
         // an active segment.  all OTHER blocks are considered free.
         let mut blocks = listAllBlocks(&header, pgsz);
         consolidateBlockList(&mut blocks);
+        //println!("blocks in use: {:?}", blocks);
+        let last_page_used = blocks[blocks.len() - 1].lastPage;
         let mut freeBlocks = invertBlockList(&blocks);
+        if first_available_page > (last_page_used + 1) {
+            let blk = PageBlock::new(last_page_used + 1, first_available_page - 1);
+            freeBlocks.push(blk);
+            // TODO it is tempting to truncate the file here.  but this might not
+            // be the right place.  we should preserve the ability to open a file
+            // read-only.
+        }
+        //println!("free blocks: {:?}", freeBlocks);
         // we want the largest blocks at the front of the list
         freeBlocks.sort_by(|a,b| b.count_pages().cmp(&a.count_pages()));
 
         let space = Space {
-            nextPage: firstAvailablePage, 
+            // TODO maybe we should just ignore the actual end of the file
+            // and set nextPage to last_page_used + 1, and not add the block above
+            nextPage: first_available_page, 
             freeBlocks: freeBlocks,
         };
 
@@ -4258,7 +4273,7 @@ impl InnerPart {
         match cursors.zombie_segments.remove(&segnum) {
             Some(info) => {
                 let mut space = self.space.lock().unwrap();
-                Self::addFreeBlocks(&mut space, info.location.blocks);
+                Self::addFreeBlocks(&mut space, &self.path, self.pgsz, info.location.blocks);
             },
             None => {
             },
@@ -4336,7 +4351,7 @@ impl InnerPart {
         Ok(())
     }
 
-    fn addFreeBlocks(space: &mut Space, blocks:Vec<PageBlock>) {
+    fn addFreeBlocks(space: &mut Space, path: &str, page_size: usize, blocks:Vec<PageBlock>) -> Result<()> {
 
         // all additions to the freeBlocks list should happen here
         // by calling this function.
@@ -4356,16 +4371,6 @@ impl InnerPart {
         // don't want to bother with it?  what about a single-page block?
         // should this be a configurable setting?
 
-        // TODO if the last block of the file is free, consider just
-        // moving nextPage.  and truncate the file size.
-
-        // TODO actually, this list can have pages that are beyond
-        // the end of the file.  if somebody asks for a 1 MB block
-        // at the end, and then only writes one page, the file only
-        // gets extended one page.  so if it then gives the rest
-        // back, the rest of it will be considered "free", even though
-        // it exists beyond the current end of the file.
-
         //println!("adding free blocks: {:?}", blocks);
         for b in blocks {
             space.freeBlocks.push(b);
@@ -4384,8 +4389,22 @@ impl InnerPart {
             space.nextPage = space.freeBlocks[i].firstPage;
             space.freeBlocks.remove(i);
         }
+
+        let file_length = try!(std::fs::metadata(path)).len();
+        let page_size = page_size as u64;
+        let first_page_beyond = (file_length / page_size + 1) as u32;
+        if first_page_beyond > space.nextPage {
+            let fs = try!(OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    );
+            try!(fs.set_len(((space.nextPage - 1) as u64) * page_size));
+        }
+
         space.freeBlocks.sort_by(|a,b| b.count_pages().cmp(&a.count_pages()));
         //println!("    space now: {:?}", space);
+        Ok(())
     }
 
     // a stored segmentinfo for a segment is a single blob of bytes.
@@ -4471,9 +4490,6 @@ impl InnerPart {
         Ok(())
     }
 
-    // TODO this function looks for the segment in the header.segments_info,
-    // which means it cannot be used to open a cursor on a pendingSegment,
-    // which we think we might need in the future.
     fn get_cursor_on_active_segment(inner: &std::sync::Arc<InnerPart>, 
                  st: &SafeHeader,
                  g: SegmentNum
@@ -4485,6 +4501,7 @@ impl InnerPart {
                 let csrnum = cursors.nextCursorNum;
                 let foo = inner.clone();
                 let done = move || -> () {
+                    // TODO this should propagate errors
                     foo.cursor_dropped(g, csrnum);
                 };
                 let page = try!(Self::get_loaner_page(inner));
@@ -4587,7 +4604,7 @@ impl InnerPart {
 
     fn release_pending_segment(inner: &std::sync::Arc<InnerPart>, location: SegmentLocation) -> Result<()> {
         let mut space = try!(inner.space.lock());
-        Self::addFreeBlocks(&mut space, location.blocks);
+        try!(Self::addFreeBlocks(&mut space, &inner.path, inner.pgsz, location.blocks));
         Ok(())
     }
 
@@ -4933,9 +4950,10 @@ impl InnerPart {
             let mut cursors = try!(self.cursors.lock());
             let segmentsWithACursor: HashSet<SegmentNum> = cursors.cursors.iter().map(|t| {let (_,segnum) = t; *segnum}).collect();
             for g in segmentsWithACursor {
-                // don't free any segment that has a cursor
+                // don't free any segment that has a cursor.  yet.
                 match segmentsToBeFreed.remove(&g) {
                     Some(z) => {
+                        //println!("zombie: {:?}", z);
                         cursors.zombie_segments.insert(g, z);
                     },
                     None => {
@@ -4949,7 +4967,7 @@ impl InnerPart {
         }
         {
             let mut space = try!(self.space.lock());
-            Self::addFreeBlocks(&mut space, blocksToBeFreed);
+            try!(Self::addFreeBlocks(&mut space, &self.path, self.pgsz, blocksToBeFreed));
         }
 
         // note that we intentionally do not release the writeLock here.
@@ -4984,18 +5002,8 @@ impl IPages for InnerPart {
         assert!(block_list_contains_page(&blocks, root_page));
         let info = SegmentLocation::new(root_page, blocks);
         let mut space = try!(self.space.lock());
-        //printfn "wrote %A: %A" g blocks
-        /*
-        // TODO not sure why, but this code ends up making the file huge
-        let len = {
-            let mut fs = try!(self.OpenForReading());
-            let len = try!(misc::io::seek_len(&mut fs));
-            len
-        };
-        */
-        // TODO adjust "free" stuff for the actual end of the file
         match leftovers {
-            Some(b) => Self::addFreeBlocks(&mut space, vec![b]),
+            Some(b) => try!(Self::addFreeBlocks(&mut space, &self.path, self.pgsz, vec![b])),
             None => ()
         }
         Ok(info)
