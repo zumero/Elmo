@@ -3883,25 +3883,23 @@ fn invertBlockList(blocks: &Vec<PageBlock>) -> Vec<PageBlock> {
 }
 
 fn listAllBlocks(h: &HeaderData, pgsz: usize) -> Vec<PageBlock> {
-    let headerBlock = PageBlock::new(1, (HEADER_SIZE_IN_BYTES / pgsz) as PageNum);
     let mut blocks = Vec::new();
 
-    // TODO inner function not needed anymore
-    fn grab(blocks: &mut Vec<PageBlock>, from: &HashMap<SegmentNum, SegmentInfo>) {
-        for info in from.values() {
-            for b in info.location.blocks.iter() {
-                blocks.push(*b);
-            }
+    let headerBlock = PageBlock::new(1, (HEADER_SIZE_IN_BYTES / pgsz) as PageNum);
+    blocks.push(headerBlock);
+
+    for info in h.segments_info.values() {
+        for b in info.location.blocks.iter() {
+            blocks.push(*b);
         }
     }
 
-    grab(&mut blocks, &h.segments_info);
-    blocks.push(headerBlock);
     blocks
 }
 
 use std::sync::Mutex;
 
+#[derive(Debug)]
 struct Space {
     nextPage: PageNum,
     freeBlocks: Vec<PageBlock>,
@@ -4059,7 +4057,7 @@ impl DatabaseFile {
         };
 
         // each merge level is handled by its own thread.  a Rust channel is used to
-        // notify that thread of merge work to be done.
+        // notify that thread that there is merge work to be done.
 
         let mut senders = vec![];
         let mut receivers = vec![];
@@ -4264,6 +4262,7 @@ impl InnerPart {
                         Self::addFreeBlocks(&mut space, info.location.blocks);
                     },
                     Err(_) => {
+                        //println!("lost zombie: {:?}", info);
                         // worst that can happen is that these blocks don't get
                         // reclaimed until some other day.
                     },
@@ -4302,10 +4301,12 @@ impl InnerPart {
                 let size = self.settings.PagesPerBlock;
                 let newBlk = PageBlock::new(space.nextPage, space.nextPage + size - 1) ;
                 space.nextPage = space.nextPage + size;
+//                println!("new block: {:?}  nextPage: {}", newBlk, space.nextPage);
                 newBlk
             } else {
                 let headBlk = space.freeBlocks[0];
                 space.freeBlocks.remove(0);
+//                println!("used free block: {:?}", headBlk);
                 headBlk
             }
         }
@@ -4373,11 +4374,28 @@ impl InnerPart {
         // back, the rest of it will be considered "free", even though
         // it exists beyond the current end of the file.
 
+//        println!("adding free blocks: {:?}", blocks);
         for b in blocks {
             space.freeBlocks.push(b);
         }
         consolidateBlockList(&mut space.freeBlocks);
+/*
+        let mut free_at_end = None;
+        for (i, b) in space.freeBlocks.iter().enumerate() {
+            if b.lastPage == space.nextPage - 1 {
+                // this block can simply be removed and nextPage moved back
+                free_at_end = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = free_at_end {
+            println!("    killing free_at_end: {:?}", space.freeBlocks[i]);
+            space.nextPage = space.freeBlocks[i].firstPage;
+            space.freeBlocks.remove(i);
+        }
+*/
         space.freeBlocks.sort_by(|a,b| b.count_pages().cmp(&a.count_pages()));
+//        println!("    space now: {:?}", space);
     }
 
     // a stored segmentinfo for a segment is a single blob of bytes.
