@@ -4246,7 +4246,10 @@ impl InnerPart {
         match self.pagepool.try_lock() {
             Ok(mut pagepool) => {
                 //println!("returned a page");
-                pagepool.pages.push(page);
+                // TODO arbitrary hard-coded limit
+                if pagepool.pages.len() < 100 {
+                    pagepool.pages.push(page);
+                }
             },
             Err(std::sync::TryLockError::Poisoned(_)) => {
                 panic!("poisoned");
