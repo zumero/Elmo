@@ -3911,6 +3911,7 @@ fn listAllBlocks(h: &HeaderData, pgsz: usize) -> Vec<PageBlock> {
 }
 
 use std::sync::Mutex;
+use std::sync::RwLock;
 
 #[derive(Debug)]
 struct Space {
@@ -3951,8 +3952,7 @@ struct InnerPart {
     pgsz: usize,
     settings: DbSettings,
 
-    // TODO should the header mutex be an RWLock?
-    header: Mutex<HeaderData>,
+    header: RwLock<HeaderData>,
 
     space: Mutex<Space>,
     mergeStuff: Mutex<SafeMergeStuff>,
@@ -4082,7 +4082,7 @@ impl DatabaseFile {
             path: path,
             pgsz: pgsz,
             settings: settings, 
-            header: Mutex::new(header),
+            header: RwLock::new(header),
             space: Mutex::new(space),
             mergeStuff: Mutex::new(mergeStuff),
             pagepool: Mutex::new(pagepool),
@@ -4537,7 +4537,7 @@ impl InnerPart {
     }
 
     fn open_cursor_on_active_segment(inner: &std::sync::Arc<InnerPart>, g: SegmentNum) -> Result<SegmentCursor> {
-        let st = try!(inner.header.lock());
+        let st = try!(inner.header.read());
         let cursor = try!(Self::get_cursor_on_active_segment(inner, &*st, g));
         Ok(cursor)
     }
@@ -4568,7 +4568,7 @@ impl InnerPart {
         // compare the two cursors to see if anything important changed.  if not,
         // commit their writes.  if so, nevermind the written segments and start over.
 
-        let header = try!(inner.header.lock());
+        let header = try!(inner.header.read());
         let cursors = 
             header.current_state
             .iter()
@@ -4604,7 +4604,7 @@ impl InnerPart {
     }
 
     fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<(Vec<SegmentNum>, HashMap<SegmentNum, SegmentInfo>)> {
-        let header = try!(inner.header.lock());
+        let header = try!(inner.header.read());
         let a = header.current_state.clone();
         let b = header.segments_info.clone();
         Ok((a,b))
@@ -4616,7 +4616,7 @@ impl InnerPart {
             location: new_seg,
             level: 0,
         };
-        let mut header = try!(self.header.lock());
+        let mut header = try!(self.header.write());
 
         // TODO assert new_seg shares no pages with any seg in current state
 
@@ -4659,7 +4659,7 @@ impl InnerPart {
     fn merge(inner: &std::sync::Arc<InnerPart>, merge_level: u32, min_segs: usize, max_segs: usize, promote: MergePromotionRule) -> Result<Option<PendingMerge>> {
         assert!(min_segs <= max_segs);
         let step1 = {
-            let header = try!(inner.header.lock());
+            let header = try!(inner.header.read());
 
             if header.current_state.len() == 0 {
                 return Ok(None)
@@ -4871,7 +4871,7 @@ impl InnerPart {
 
     fn commit_merge(&self, pm: PendingMerge) -> Result<Option<SegmentNum>> {
         let (segmentsBeingReplaced, new_segnum) = {
-            let mut header = try!(self.header.lock());
+            let mut header = try!(self.header.write());
 
             // TODO assert new_seg shares no pages with any seg in current state
 
