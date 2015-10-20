@@ -3906,6 +3906,14 @@ use std::sync::Mutex;
 struct Space {
     nextPage: PageNum,
     freeBlocks: Vec<PageBlock>,
+
+    nextCursorNum: u64,
+    cursors: HashMap<u64, SegmentNum>,
+
+    // a zombie segment is one that was replaced by a merge, but
+    // when the merge was done, it could not be reclaimed as free
+    // blocks because there was an open cursor on it.
+    zombie_segments: HashMap<SegmentNum, SegmentInfo>,
 }
 
 pub struct PendingMerge {
@@ -3931,16 +3939,6 @@ struct SafePagePool {
     pages: Vec<Box<[u8]>>,
 }
 
-struct SafeCursors {
-    nextCursorNum: u64,
-    cursors: HashMap<u64, SegmentNum>,
-
-    // a zombie segment is one that was replaced by a merge, but
-    // when the merge was done, it could not be reclaimed as free
-    // blocks because there was an open cursor on it.
-    zombie_segments: HashMap<SegmentNum, SegmentInfo>,
-}
-
 // there can be only one InnerPart instance per path
 struct InnerPart {
     path: String,
@@ -3952,7 +3950,6 @@ struct InnerPart {
 
     space: Mutex<Space>,
     mergeStuff: Mutex<SafeMergeStuff>,
-    cursors: Mutex<SafeCursors>,
     pagepool: Mutex<SafePagePool>,
 }
 
@@ -4051,6 +4048,9 @@ impl DatabaseFile {
             // and set nextPage to last_page_used + 1, and not add the block above
             nextPage: first_available_page, 
             freeBlocks: freeBlocks,
+            nextCursorNum: 1,
+            cursors: HashMap::new(),
+            zombie_segments: HashMap::new(),
         };
 
         let mergeStuff = SafeMergeStuff {
@@ -4059,12 +4059,6 @@ impl DatabaseFile {
 
         let header = SafeHeader {
             header: header, 
-        };
-
-        let cursors = SafeCursors {
-            nextCursorNum: 1,
-            cursors: HashMap::new(),
-            zombie_segments: HashMap::new(),
         };
 
         let pagepool = SafePagePool {
@@ -4089,7 +4083,6 @@ impl DatabaseFile {
             header: Mutex::new(header),
             space: Mutex::new(space),
             mergeStuff: Mutex::new(mergeStuff),
-            cursors: Mutex::new(cursors),
             pagepool: Mutex::new(pagepool),
         };
 
@@ -4264,15 +4257,14 @@ impl InnerPart {
 
     fn cursor_dropped(&self, segnum: SegmentNum, csrnum: u64) {
         //println!("cursor_dropped");
-        let mut cursors = self.cursors.lock().unwrap(); // gotta succeed
-        let seg = cursors.cursors.remove(&csrnum).expect("gotta be there");
+        let mut space = self.space.lock().unwrap(); // gotta succeed
+        let seg = space.cursors.remove(&csrnum).expect("gotta be there");
         assert_eq!(seg, segnum);
         // TODO hey.  actually we can't reclaim this zombie unless we know
         // that the cursor we just dropped was the only cursor on the
         // zombie segment.
-        match cursors.zombie_segments.remove(&segnum) {
+        match space.zombie_segments.remove(&segnum) {
             Some(info) => {
-                let mut space = self.space.lock().unwrap();
                 Self::addFreeBlocks(&mut space, &self.path, self.pgsz, info.location.blocks);
             },
             None => {
@@ -4497,8 +4489,8 @@ impl InnerPart {
         match st.header.segments_info.get(&g) {
             None => Err(Error::Misc(String::from("get_cursor_on_active_segment: segment not found"))),
             Some(seg) => {
-                let mut cursors = try!(inner.cursors.lock());
-                let csrnum = cursors.nextCursorNum;
+                let mut space = try!(inner.space.lock());
+                let csrnum = space.nextCursorNum;
                 let foo = inner.clone();
                 let done = move || -> () {
                     // TODO this should propagate errors
@@ -4507,8 +4499,8 @@ impl InnerPart {
                 let page = try!(Self::get_loaner_page(inner));
                 let mut csr = try!(SegmentCursor::new(&inner.path, page, seg.location.clone()));
 
-                cursors.nextCursorNum = cursors.nextCursorNum + 1;
-                let was = cursors.cursors.insert(csrnum, g);
+                space.nextCursorNum = space.nextCursorNum + 1;
+                let was = space.cursors.insert(csrnum, g);
                 assert!(was.is_none());
                 csr.set_hook(box done);
                 Ok(csr)
@@ -4947,26 +4939,23 @@ impl InnerPart {
 
         let mut segmentsToBeFreed = segmentsBeingReplaced;
         {
-            let mut cursors = try!(self.cursors.lock());
-            let segmentsWithACursor: HashSet<SegmentNum> = cursors.cursors.iter().map(|t| {let (_,segnum) = t; *segnum}).collect();
+            let mut space = try!(self.space.lock());
+            let segmentsWithACursor: HashSet<SegmentNum> = space.cursors.iter().map(|t| {let (_,segnum) = t; *segnum}).collect();
             for g in segmentsWithACursor {
                 // don't free any segment that has a cursor.  yet.
                 match segmentsToBeFreed.remove(&g) {
                     Some(z) => {
                         //println!("zombie: {:?}", z);
-                        cursors.zombie_segments.insert(g, z);
+                        space.zombie_segments.insert(g, z);
                     },
                     None => {
                     },
                 }
             }
-        }
-        let mut blocksToBeFreed = Vec::new();
-        for info in segmentsToBeFreed.values() {
-            blocksToBeFreed.push_all(&info.location.blocks);
-        }
-        {
-            let mut space = try!(self.space.lock());
+            let mut blocksToBeFreed = Vec::new();
+            for info in segmentsToBeFreed.values() {
+                blocksToBeFreed.push_all(&info.location.blocks);
+            }
             try!(Self::addFreeBlocks(&mut space, &self.path, self.pgsz, blocksToBeFreed));
         }
 
