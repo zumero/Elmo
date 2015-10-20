@@ -3672,10 +3672,20 @@ impl ICursor for SegmentCursor {
 
 #[derive(Clone)]
 struct HeaderData {
-    // TODO currentState is an ordered copy of segments_info.Keys.  eliminate duplication?
-    // or add assertions and tests to make sure they never get out of sync?  we wish
-    // we had a form of HashMap that kept track of ordering.
-    currentState: Vec<SegmentNum>,
+    // TODO for range splitting, we need to represent the current_state
+    // differently.
+    //
+    // we could represent this vertically:  each vertical represents a
+    // key range.  each key range has its own current_state.  merge is
+    // pretty simple.  cursors are more complicated.  we would need
+    // each row of what used to be a SegmentCursor in the MultiCursor
+    // would need to be constructed using one SegmentCursor from each
+    // vertical.  probably need something like WideCursor so that a
+    // horizontal set of SegmentCursors can appear to be one.
+    //
+    // or we could represent this horizontally:  TODO
+
+    current_state: Vec<SegmentNum>,
     segments_info: HashMap<SegmentNum, SegmentInfo>,
     next_segnum: SegmentNum,
     changeCounter: u64,
@@ -3798,7 +3808,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
 
         let hd = 
             HeaderData {
-                currentState: state,
+                current_state: state,
                 segments_info: segments_info,
                 changeCounter: changeCounter,
                 mergeCounter: mergeCounter,
@@ -3834,7 +3844,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
             HeaderData
             {
                 segments_info: HashMap::new(),
-                currentState: Vec::new(),
+                current_state: Vec::new(),
                 changeCounter: 0,
                 mergeCounter: 0,
                 next_segnum: 1,
@@ -4416,8 +4426,8 @@ impl InnerPart {
         }
 
         fn spaceForHeader(h: &HeaderData) -> usize {
-            let mut a = varint::space_needed_for(h.currentState.len() as u64);
-            // TODO use currentState with a lookup into h.segments_info instead?
+            let mut a = varint::space_needed_for(h.current_state.len() as u64);
+            // TODO use current_state with a lookup into h.segments_info instead?
             // should be the same, right?
             for (g,info) in h.segments_info.iter() {
                 a = a + spaceNeededForSegmentInfo(&info) + varint::space_needed_for(*g);
@@ -4429,8 +4439,8 @@ impl InnerPart {
             let space = spaceForHeader(h);
             let mut pb = PageBuilder::new(space);
             // TODO format version number
-            pb.PutVarint(h.currentState.len() as u64);
-            for g in h.currentState.iter() {
+            pb.PutVarint(h.current_state.len() as u64);
+            for g in h.current_state.iter() {
                 pb.PutVarint(*g);
                 match h.segments_info.get(&g) {
                     Some(info) => {
@@ -4444,7 +4454,7 @@ impl InnerPart {
                         }
                         pb.PutVarint(info.level as u64);
                     },
-                    None => panic!("segment num in currentState but not in segments_info")
+                    None => panic!("segment num in current_state but not in segments_info")
                 }
             }
             assert!(0 == pb.Available());
@@ -4560,7 +4570,7 @@ impl InnerPart {
 
         let header = try!(inner.header.lock());
         let cursors = 
-            header.currentState
+            header.current_state
             .iter()
             .map(|g| Self::get_cursor_on_active_segment(inner, &header, *g))
             .collect::<Result<Vec<_>>>();
@@ -4595,7 +4605,7 @@ impl InnerPart {
 
     fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<(Vec<SegmentNum>, HashMap<SegmentNum, SegmentInfo>)> {
         let header = try!(inner.header.lock());
-        let a = header.currentState.clone();
+        let a = header.current_state.clone();
         let b = header.segments_info.clone();
         Ok((a,b))
     }
@@ -4615,15 +4625,12 @@ impl InnerPart {
         let new_segnum = newHeader.next_segnum;
         newHeader.next_segnum += 1;
         newHeader.segments_info.insert(new_segnum, new_seg);
-        newHeader.currentState.insert(0, new_segnum);
+        newHeader.current_state.insert(0, new_segnum);
 
         newHeader.changeCounter = newHeader.changeCounter + 1;
 
         let mut fs = try!(self.OpenForWriting());
         try!(self.write_header(&mut header, &mut fs, newHeader));
-
-        //printfn "after commit, currentState: %A" header.currentState
-        //printfn "after commit, segments_info: %A" header.segments_info
 
         // note that we intentionally do not release the writeLock here.
         // you can change the segment list more than once while holding
@@ -4654,13 +4661,13 @@ impl InnerPart {
         let step1 = {
             let header = try!(inner.header.lock());
 
-            if header.currentState.len() == 0 {
+            if header.current_state.len() == 0 {
                 return Ok(None)
             }
 
             //println!("merge_level: {}", merge_level);
             //println!("promote: {:?}", promote);
-            //println!("currentState: {:?}", header.currentState);
+            //println!("current_state: {:?}", header.current_state);
             //println!("segments_info: {:?}", header.segments_info);
             let mut level_sizes = HashMap::new();
             for (_, ref info) in header.segments_info.iter() {
@@ -4678,7 +4685,7 @@ impl InnerPart {
             //println!("level_sizes: {:?}", level_sizes);
 
             let level_group = 
-                header.currentState
+                header.current_state
                 .iter()
                 .filter(|g| {
                     let info = header.segments_info.get(&g).unwrap();
@@ -4699,7 +4706,7 @@ impl InnerPart {
             //println!("pages_in_merge_level: {:?}", pages_in_merge_level);
 
             // make sure this is contiguous
-            assert!(slice_within(level_group.as_slice(), header.currentState.as_slice()).is_ok());
+            assert!(slice_within(level_group.as_slice(), header.current_state.as_slice()).is_ok());
 
             let mut merge_seg_nums = Vec::new();
 
@@ -4755,8 +4762,8 @@ impl InnerPart {
                 };
 
                 let last_seg_being_merged = merge_seg_nums[merge_seg_nums.len() - 1];
-                let pos_last_seg = header.currentState.iter().position(|s| *s == last_seg_being_merged).expect("gotta be there");
-                let count_segments_behind = header.currentState.len() - (pos_last_seg + 1);
+                let pos_last_seg = header.current_state.iter().position(|s| *s == last_seg_being_merged).expect("gotta be there");
+                let count_segments_behind = header.current_state.len() - (pos_last_seg + 1);
 
                 let cursor: Box<ICursor> =
                     if count_segments_behind == 0 {
@@ -4787,7 +4794,7 @@ impl InnerPart {
 
                         // TODO capacity
                         let mut behind = vec![];
-                        for s in &header.currentState[pos_last_seg + 1 ..] {
+                        for s in &header.current_state[pos_last_seg + 1 ..] {
                             let s = *s;
                             let cursor = try!(Self::get_cursor_on_active_segment(inner, &header, s));
                             behind.push(cursor);
@@ -4876,10 +4883,10 @@ impl InnerPart {
             let oldAsSet: HashSet<SegmentNum> = pm.old_segments.iter().map(|g| *g).collect();
             assert!(oldAsSet.len() == pm.old_segments.len());
 
-            // now we need to verify that the segments being replaced are in currentState
+            // now we need to verify that the segments being replaced are in current_state
             // and contiguous.
 
-            let ndxFirstOld = try!(slice_within(pm.old_segments.as_slice(), header.currentState.as_slice()));
+            let ndxFirstOld = try!(slice_within(pm.old_segments.as_slice(), header.current_state.as_slice()));
 
             // now we construct a newHeader
 
@@ -4896,7 +4903,7 @@ impl InnerPart {
             // remove old segments from current state
 
             for _ in &pm.old_segments {
-                newHeader.currentState.remove(ndxFirstOld);
+                newHeader.current_state.remove(ndxFirstOld);
             }
 
             let new_segnum =
@@ -4909,7 +4916,7 @@ impl InnerPart {
                     Some(new_seg) => {
                         let new_segnum = newHeader.next_segnum;
                         newHeader.next_segnum += 1;
-                        newHeader.currentState.insert(ndxFirstOld, new_segnum);
+                        newHeader.current_state.insert(ndxFirstOld, new_segnum);
                         newHeader.segments_info.insert(new_segnum, new_seg);
                         Some(new_segnum)
                     },
