@@ -3929,10 +3929,6 @@ struct SafeMergeStuff {
     merging: HashSet<SegmentNum>,
 }
 
-struct SafeHeader {
-    header: HeaderData,
-}
-
 struct SafePagePool {
     // we keep a pool of page buffers so we can lend them to
     // SegmentCursors.
@@ -3946,7 +3942,7 @@ struct InnerPart {
     settings: DbSettings,
 
     // TODO should the header mutex be an RWLock?
-    header: Mutex<SafeHeader>,
+    header: Mutex<HeaderData>,
 
     space: Mutex<Space>,
     mergeStuff: Mutex<SafeMergeStuff>,
@@ -4055,10 +4051,6 @@ impl DatabaseFile {
 
         let mergeStuff = SafeMergeStuff {
             merging: HashSet::new(),
-        };
-
-        let header = SafeHeader {
-            header: header, 
         };
 
         let pagepool = SafePagePool {
@@ -4407,7 +4399,7 @@ impl InnerPart {
     // all in varints
 
     fn write_header(&self, 
-                   st: &mut SafeHeader, 
+                   dest: &mut HeaderData, 
                    fs: &mut File, 
                    hdr: HeaderData
                   ) -> Result<()> {
@@ -4478,15 +4470,15 @@ impl InnerPart {
         try!(fs.seek(SeekFrom::Start(0)));
         try!(pb.Write(fs));
         try!(fs.flush());
-        st.header = hdr;
+        *dest = hdr;
         Ok(())
     }
 
     fn get_cursor_on_active_segment(inner: &std::sync::Arc<InnerPart>, 
-                 st: &SafeHeader,
+                 header: &HeaderData,
                  g: SegmentNum
                 ) -> Result<SegmentCursor> {
-        match st.header.segments_info.get(&g) {
+        match header.segments_info.get(&g) {
             None => Err(Error::Misc(String::from("get_cursor_on_active_segment: segment not found"))),
             Some(seg) => {
                 let mut space = try!(inner.space.lock());
@@ -4566,11 +4558,11 @@ impl InnerPart {
         // compare the two cursors to see if anything important changed.  if not,
         // commit their writes.  if so, nevermind the written segments and start over.
 
-        let st = try!(inner.header.lock());
+        let header = try!(inner.header.lock());
         let cursors = 
-            st.header.currentState
+            header.currentState
             .iter()
-            .map(|g| Self::get_cursor_on_active_segment(inner, &st, *g))
+            .map(|g| Self::get_cursor_on_active_segment(inner, &header, *g))
             .collect::<Result<Vec<_>>>();
         let cursors = try!(cursors);
         let mc = MultiCursor::Create(cursors);
@@ -4602,9 +4594,9 @@ impl InnerPart {
     }
 
     fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<(Vec<SegmentNum>, HashMap<SegmentNum, SegmentInfo>)> {
-        let st = try!(inner.header.lock());
-        let a = st.header.currentState.clone();
-        let b = st.header.segments_info.clone();
+        let header = try!(inner.header.lock());
+        let a = header.currentState.clone();
+        let b = header.segments_info.clone();
         Ok((a,b))
     }
 
@@ -4614,11 +4606,11 @@ impl InnerPart {
             location: new_seg,
             level: 0,
         };
-        let mut st = try!(self.header.lock());
+        let mut header = try!(self.header.lock());
 
         // TODO assert new_seg shares no pages with any seg in current state
 
-        let mut newHeader = st.header.clone();
+        let mut newHeader = header.clone();
 
         let new_segnum = newHeader.next_segnum;
         newHeader.next_segnum += 1;
@@ -4628,7 +4620,7 @@ impl InnerPart {
         newHeader.changeCounter = newHeader.changeCounter + 1;
 
         let mut fs = try!(self.OpenForWriting());
-        try!(self.write_header(&mut st, &mut fs, newHeader));
+        try!(self.write_header(&mut header, &mut fs, newHeader));
 
         //printfn "after commit, currentState: %A" header.currentState
         //printfn "after commit, segments_info: %A" header.segments_info
@@ -4660,18 +4652,18 @@ impl InnerPart {
     fn merge(inner: &std::sync::Arc<InnerPart>, merge_level: u32, min_segs: usize, max_segs: usize, promote: MergePromotionRule) -> Result<Option<PendingMerge>> {
         assert!(min_segs <= max_segs);
         let step1 = {
-            let st = try!(inner.header.lock());
+            let header = try!(inner.header.lock());
 
-            if st.header.currentState.len() == 0 {
+            if header.currentState.len() == 0 {
                 return Ok(None)
             }
 
             //println!("merge_level: {}", merge_level);
             //println!("promote: {:?}", promote);
-            //println!("currentState: {:?}", st.header.currentState);
-            //println!("segments_info: {:?}", st.header.segments_info);
+            //println!("currentState: {:?}", header.currentState);
+            //println!("segments_info: {:?}", header.segments_info);
             let mut level_sizes = HashMap::new();
-            for (_, ref info) in st.header.segments_info.iter() {
+            for (_, ref info) in header.segments_info.iter() {
                 let pages = info.location.count_pages();
                 match level_sizes.entry(&info.level) {
                     std::collections::hash_map::Entry::Occupied(mut e) => {
@@ -4686,10 +4678,10 @@ impl InnerPart {
             //println!("level_sizes: {:?}", level_sizes);
 
             let level_group = 
-                st.header.currentState
+                header.currentState
                 .iter()
                 .filter(|g| {
-                    let info = st.header.segments_info.get(&g).unwrap();
+                    let info = header.segments_info.get(&g).unwrap();
                     info.level == merge_level
                 })
                 .map(|g| *g)
@@ -4707,7 +4699,7 @@ impl InnerPart {
             //println!("pages_in_merge_level: {:?}", pages_in_merge_level);
 
             // make sure this is contiguous
-            assert!(slice_within(level_group.as_slice(), st.header.currentState.as_slice()).is_ok());
+            assert!(slice_within(level_group.as_slice(), header.currentState.as_slice()).is_ok());
 
             let mut merge_seg_nums = Vec::new();
 
@@ -4740,7 +4732,7 @@ impl InnerPart {
                     .iter()
                     .map(
                         |g| {
-                            let info = st.header.segments_info.get(g).unwrap();
+                            let info = header.segments_info.get(g).unwrap();
                             info.location.count_pages()
                         })
                     .sum();
@@ -4749,7 +4741,7 @@ impl InnerPart {
                 let cursors = 
                     merge_seg_nums
                     .iter()
-                    .map(|g| Self::get_cursor_on_active_segment(inner, &st, *g))
+                    .map(|g| Self::get_cursor_on_active_segment(inner, &header, *g))
                     .collect::<Result<Vec<_>>>();
                 let cursors = try!(cursors);
 
@@ -4763,8 +4755,8 @@ impl InnerPart {
                 };
 
                 let last_seg_being_merged = merge_seg_nums[merge_seg_nums.len() - 1];
-                let pos_last_seg = st.header.currentState.iter().position(|s| *s == last_seg_being_merged).expect("gotta be there");
-                let count_segments_behind = st.header.currentState.len() - (pos_last_seg + 1);
+                let pos_last_seg = header.currentState.iter().position(|s| *s == last_seg_being_merged).expect("gotta be there");
+                let count_segments_behind = header.currentState.len() - (pos_last_seg + 1);
 
                 let cursor: Box<ICursor> =
                     if count_segments_behind == 0 {
@@ -4795,9 +4787,9 @@ impl InnerPart {
 
                         // TODO capacity
                         let mut behind = vec![];
-                        for s in &st.header.currentState[pos_last_seg + 1 ..] {
+                        for s in &header.currentState[pos_last_seg + 1 ..] {
                             let s = *s;
-                            let cursor = try!(Self::get_cursor_on_active_segment(inner, &st, s));
+                            let cursor = try!(Self::get_cursor_on_active_segment(inner, &header, s));
                             behind.push(cursor);
                         }
                         // TODO to allow reuse of these behind cursors, we should pass
@@ -4872,7 +4864,7 @@ impl InnerPart {
 
     fn commit_merge(&self, pm: PendingMerge) -> Result<Option<SegmentNum>> {
         let (segmentsBeingReplaced, new_segnum) = {
-            let mut st = try!(self.header.lock());
+            let mut header = try!(self.header.lock());
 
             // TODO assert new_seg shares no pages with any seg in current state
 
@@ -4887,11 +4879,11 @@ impl InnerPart {
             // now we need to verify that the segments being replaced are in currentState
             // and contiguous.
 
-            let ndxFirstOld = try!(slice_within(pm.old_segments.as_slice(), st.header.currentState.as_slice()));
+            let ndxFirstOld = try!(slice_within(pm.old_segments.as_slice(), header.currentState.as_slice()));
 
             // now we construct a newHeader
 
-            let mut newHeader = st.header.clone();
+            let mut newHeader = header.clone();
 
             // remove the old segmentinfos, keeping them for later
 
@@ -4926,7 +4918,7 @@ impl InnerPart {
             newHeader.mergeCounter = newHeader.mergeCounter + 1;
 
             let mut fs = try!(self.OpenForWriting());
-            try!(self.write_header(&mut st, &mut fs, newHeader));
+            try!(self.write_header(&mut header, &mut fs, newHeader));
 
             (segmentsBeingReplaced, new_segnum)
         };
