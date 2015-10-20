@@ -3951,10 +3951,18 @@ struct InnerPart {
     space: Mutex<Space>,
     mergeStuff: Mutex<SafeMergeStuff>,
     pagepool: Mutex<SafePagePool>,
+    notify_block: Mutex<mpsc::Sender<BlockMessage>>,
 }
 
 enum AutomergeMessage {
     NewSegment(SegmentNum, u32),
+    Terminate,
+}
+
+enum BlockMessage {
+    CursorDropped(u64),
+    DeadSegment(SegmentNum, SegmentInfo),
+    Leftover(PageBlock),
     Terminate,
 }
 
@@ -4076,6 +4084,8 @@ impl DatabaseFile {
             receivers.push(rx);
         }
 
+        let (tx_space, rx_space): (mpsc::Sender<BlockMessage>, mpsc::Receiver<BlockMessage>) = mpsc::channel();
+
         let inner = InnerPart {
             path: path,
             pgsz: pgsz,
@@ -4084,6 +4094,7 @@ impl DatabaseFile {
             space: Mutex::new(space),
             mergeStuff: Mutex::new(mergeStuff),
             pagepool: Mutex::new(pagepool),
+            notify_block: Mutex::new(tx_space),
         };
 
         let inner = std::sync::Arc::new(inner);
@@ -4094,17 +4105,68 @@ impl DatabaseFile {
                 notify_automerge: senders,
             };
 
-        let res = DatabaseFile {
+        let db = DatabaseFile {
             inner: inner,
             write_lock: Mutex::new(lck),
         };
-        let res = std::sync::Arc::new(res);
+        let db = std::sync::Arc::new(db);
 
         // TODO so when we do send Terminate messages to these threads?
         // impl Drop for DatabaseFile ? 
 
+        {
+            let db = db.clone();
+            thread::spawn(move || {
+                loop {
+                    match rx_space.recv() {
+                        Ok(msg) => {
+                            match msg {
+                                BlockMessage::CursorDropped(cursor_num) => {
+                                    match db.inner.cursor_dropped(cursor_num) {
+                                        Ok(()) => {
+                                        },
+                                        Err(e) => {
+                                            // TODO what now?
+                                            panic!();
+                                        },
+                                    }
+                                },
+                                BlockMessage::DeadSegment(segnum, info) => {
+                                    match db.inner.dead_segment(segnum, info) {
+                                        Ok(()) => {
+                                        },
+                                        Err(e) => {
+                                            // TODO what now?
+                                            panic!();
+                                        },
+                                    }
+                                },
+                                BlockMessage::Leftover(blk) => {
+                                    match db.inner.leftover(blk) {
+                                        Ok(()) => {
+                                        },
+                                        Err(e) => {
+                                            // TODO what now?
+                                            panic!();
+                                        },
+                                    }
+                                },
+                                BlockMessage::Terminate => {
+                                    break;
+                                },
+                            }
+                        },
+                        Err(e) => {
+                            // TODO what now?
+                            panic!();
+                        },
+                    }
+                }
+            });
+        }
+
         for (closure_level, rx) in receivers.into_iter().enumerate() {
-            let res = res.clone();
+            let db = db.clone();
             thread::spawn(move || {
                 loop {
                     match rx.recv() {
@@ -4112,7 +4174,7 @@ impl DatabaseFile {
                             match msg {
                                 AutomergeMessage::NewSegment(new_segnum, level) => {
                                     assert!(level == (closure_level as u32));
-                                    match res.automerge_level(new_segnum, level) {
+                                    match db.automerge_level(new_segnum, level) {
                                         Ok(()) => {
                                         },
                                         Err(e) => {
@@ -4136,7 +4198,7 @@ impl DatabaseFile {
 
         }
 
-        Ok(res)
+        Ok(db)
     }
 
     fn automerge_level(&self, new_segnum: SegmentNum, level: u32) -> Result<()> {
@@ -4255,21 +4317,37 @@ impl InnerPart {
         }
     }
 
-    fn cursor_dropped(&self, segnum: SegmentNum, csrnum: u64) {
-        //println!("cursor_dropped");
-        let mut space = self.space.lock().unwrap(); // gotta succeed
+    fn dead_segment(&self, g: SegmentNum, info: SegmentInfo) -> Result<()> {
+        let mut space = try!(self.space.lock());
+        let segmentsWithACursor: HashSet<SegmentNum> = space.cursors.iter().map(|t| {let (_,segnum) = t; *segnum}).collect();
+        if segmentsWithACursor.contains(&g) {
+            space.zombie_segments.insert(g, info);
+        } else {
+            try!(Self::addFreeBlocks(&mut space, &self.path, self.pgsz, info.location.blocks));
+        }
+        Ok(())
+    }
+
+    fn leftover(&self, blk: PageBlock) -> Result<()> {
+        let mut space = try!(self.space.lock());
+        try!(Self::addFreeBlocks(&mut space, &self.path, self.pgsz, vec![blk]));
+        Ok(())
+    }
+
+    fn cursor_dropped(&self, csrnum: u64) -> Result<()> {
+        let mut space = try!(self.space.lock());
         let seg = space.cursors.remove(&csrnum).expect("gotta be there");
-        assert_eq!(seg, segnum);
         // TODO hey.  actually we can't reclaim this zombie unless we know
         // that the cursor we just dropped was the only cursor on the
         // zombie segment.
-        match space.zombie_segments.remove(&segnum) {
+        match space.zombie_segments.remove(&seg) {
             Some(info) => {
-                Self::addFreeBlocks(&mut space, &self.path, self.pgsz, info.location.blocks);
+                try!(Self::addFreeBlocks(&mut space, &self.path, self.pgsz, info.location.blocks));
             },
             None => {
             },
         }
+        Ok(())
     }
 
     fn getBlock(&self, space: &mut Space, specificSizeInPages: PageNum) -> PageBlock {
@@ -4492,9 +4570,10 @@ impl InnerPart {
                 let mut space = try!(inner.space.lock());
                 let csrnum = space.nextCursorNum;
                 let foo = inner.clone();
+                // TODO this should use misc::Lend<>
                 let done = move || -> () {
-                    // TODO this should propagate errors
-                    foo.cursor_dropped(g, csrnum);
+                    let mut tx = foo.notify_block.lock().unwrap();
+                    tx.send(BlockMessage::CursorDropped(csrnum));
                 };
                 let page = try!(Self::get_loaner_page(inner));
                 let mut csr = try!(SegmentCursor::new(&inner.path, page, seg.location.clone()));
@@ -4937,26 +5016,11 @@ impl InnerPart {
             }
         }
 
-        let mut segmentsToBeFreed = segmentsBeingReplaced;
         {
-            let mut space = try!(self.space.lock());
-            let segmentsWithACursor: HashSet<SegmentNum> = space.cursors.iter().map(|t| {let (_,segnum) = t; *segnum}).collect();
-            for g in segmentsWithACursor {
-                // don't free any segment that has a cursor.  yet.
-                match segmentsToBeFreed.remove(&g) {
-                    Some(z) => {
-                        //println!("zombie: {:?}", z);
-                        space.zombie_segments.insert(g, z);
-                    },
-                    None => {
-                    },
-                }
+            let mut tx = try!(self.notify_block.lock());
+            for (g, info) in segmentsBeingReplaced {
+                try!(tx.send(BlockMessage::DeadSegment(g, info)).map_err(wrap_err));
             }
-            let mut blocksToBeFreed = Vec::new();
-            for info in segmentsToBeFreed.values() {
-                blocksToBeFreed.push_all(&info.location.blocks);
-            }
-            try!(Self::addFreeBlocks(&mut space, &self.path, self.pgsz, blocksToBeFreed));
         }
 
         // note that we intentionally do not release the writeLock here.
@@ -4990,10 +5054,13 @@ impl IPages for InnerPart {
         assert!(!block_list_contains_page(&blocks, unused_page));
         assert!(block_list_contains_page(&blocks, root_page));
         let info = SegmentLocation::new(root_page, blocks);
-        let mut space = try!(self.space.lock());
         match leftovers {
-            Some(b) => try!(Self::addFreeBlocks(&mut space, &self.path, self.pgsz, vec![b])),
-            None => ()
+            Some(b) => {
+                let mut tx = try!(self.notify_block.lock());
+                try!(tx.send(BlockMessage::Leftover(b)).map_err(wrap_err));
+            },
+            None => {
+            },
         }
         Ok(info)
     }
