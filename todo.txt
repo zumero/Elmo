@@ -1,4 +1,6 @@
 
+range splitting
+
 if we need lots of blocks for a given segment, do we really want
 to use a little blocks of 1-2 pages just because they are on the
 free list?
@@ -8,10 +10,8 @@ which estimates how many pages will be needed so that it can
 pass that hint on when it asks for a block so it can avoid using
 little tiny blocks.
 
-when free space appears at the end of a file, truncate it
-
-after several runs of the test suite in the same database file,
-the amount of free blocks in the file is awfully big.
+make sure stuff gets removed from merging when an error occurs while
+writing a merge segment.
 
 can we get rid of mergeStuff.merging?
 
@@ -53,21 +53,9 @@ putting its pending segment into the cursor.  notice when values
 are actually stream and write them to disk so we don't have too
 many files open.
 
-need an API to add a pending segment to the free block list.
-
 need a function to get a cursor with a pending segment in front of it
 
 ability to reserve a piece of each page for things like crypto
-
-once saw a crash on too many files open, apparently crashed in the merge
-thread, poisoned the mutex, etc.  this probably was a case where the
-automerge thread got too far behind and a multicursor on the entire
-current state involved a lot of segments.
-
-another bizarre set of test runs:
-rm data file, ran a release build, took over 8 min.
-rm data file, ran it again with no code changes, took 55 seconds.  
-leave data file, ran it again, over 5 min.
 
 how much perf trouble is being caused by all these mutexes and Arcs?
 
@@ -75,9 +63,6 @@ fix fts in lsm storage
 
 in lsm, when the root lands on a boundary, don't fetch a block only
 to end up giving it back.
-
-make sure stuff gets removed from merging when an error occurs while
-writing a merge segment.
 
 consider better (at higher level?) cache of elmo indexes
 
@@ -125,8 +110,6 @@ let's not panic (int underflow) when we try to write a segment
 but the source iterator provides no pairs
 
 https://github.com/zslayton/lifeguard
-
-stray, block list, etc
 
 cleanup bcmp and friends
 
