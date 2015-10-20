@@ -4094,17 +4094,17 @@ impl DatabaseFile {
                 notify_automerge: senders,
             };
 
-        let res = DatabaseFile {
+        let db = DatabaseFile {
             inner: inner,
             write_lock: Mutex::new(lck),
         };
-        let res = std::sync::Arc::new(res);
+        let db = std::sync::Arc::new(db);
 
         // TODO so when we do send Terminate messages to these threads?
         // impl Drop for DatabaseFile ? 
 
         for (closure_level, rx) in receivers.into_iter().enumerate() {
-            let res = res.clone();
+            let db = db.clone();
             thread::spawn(move || {
                 loop {
                     match rx.recv() {
@@ -4112,7 +4112,7 @@ impl DatabaseFile {
                             match msg {
                                 AutomergeMessage::NewSegment(new_segnum, level) => {
                                     assert!(level == (closure_level as u32));
-                                    match res.automerge_level(new_segnum, level) {
+                                    match db.automerge_level(new_segnum, level) {
                                         Ok(()) => {
                                         },
                                         Err(e) => {
@@ -4136,7 +4136,7 @@ impl DatabaseFile {
 
         }
 
-        Ok(res)
+        Ok(db)
     }
 
     fn automerge_level(&self, new_segnum: SegmentNum, level: u32) -> Result<()> {
@@ -4492,8 +4492,9 @@ impl InnerPart {
                 let mut space = try!(inner.space.lock());
                 let csrnum = space.nextCursorNum;
                 let foo = inner.clone();
+                // TODO this should use misc::Lend<>
                 let done = move || -> () {
-                    // TODO this should propagate errors
+                    // TODO this wants to propagate errors
                     foo.cursor_dropped(g, csrnum);
                 };
                 let page = try!(Self::get_loaner_page(inner));
@@ -4990,10 +4991,13 @@ impl IPages for InnerPart {
         assert!(!block_list_contains_page(&blocks, unused_page));
         assert!(block_list_contains_page(&blocks, root_page));
         let info = SegmentLocation::new(root_page, blocks);
-        let mut space = try!(self.space.lock());
         match leftovers {
-            Some(b) => try!(Self::addFreeBlocks(&mut space, &self.path, self.pgsz, vec![b])),
-            None => ()
+            Some(b) => {
+                let mut space = try!(self.space.lock());
+                try!(Self::addFreeBlocks(&mut space, &self.path, self.pgsz, vec![b]));
+            },
+            None => {
+            },
         }
         Ok(info)
     }
