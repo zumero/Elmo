@@ -4925,9 +4925,9 @@ impl InnerPart {
             //println!("promote: {:?}", promote);
             //println!("state: {:?}", header.state);
             //println!("segments_info: {:?}", header.segments_info);
-            // TODO wrong.  confine this to only the current range
             let mut level_sizes = HashMap::new();
-            for (_, ref info) in header.segments_info.iter() {
+            for segnum in header.state[range].state.iter() {
+                let info = header.segments_info.get(segnum).unwrap();
                 let pages = info.location.count_pages();
                 match level_sizes.entry(&info.level) {
                     std::collections::hash_map::Entry::Occupied(mut e) => {
