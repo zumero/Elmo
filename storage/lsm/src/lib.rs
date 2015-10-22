@@ -281,7 +281,7 @@ pub const PRIMARY_INDEX_ID: u64 = 0;
 ///     recid (varint)
 /// value:
 ///     doc (bson)
-pub const RECORD: u8 = 30;
+pub const RECORD: u8 = 70;
 
 /// key:
 ///     (tag)
@@ -291,7 +291,10 @@ pub const RECORD: u8 = 30;
 ///     recid (varint) (not present when index option unique)
 /// value:
 ///     recid (varint) (present only when index option unique?)
-pub const INDEX_ENTRY: u8 = 40;
+pub const INDEX_ENTRY: u8 = 140;
+
+// TODO consider encoding primary and secondary indexes
+// separately.
 
 fn encode_key_name_to_collection_id(db: &str, coll: &str) -> Box<[u8]> {
     // TODO capacity
@@ -1434,6 +1437,8 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
                 let ba_record_id = u64_to_boxed_varint(record_id);
                 k.push_all(&ba_record_id);
 
+                // TODO if there are no secondary indexes, we should be able to avoid
+                // lookup of the old record.
                 let old = try!(get_value_for_key_as_bson(&mut self.cursor, &k)).unwrap();
                 self.pending.insert(k.into_boxed_slice(), lsm::Blob::Tombstone);
 

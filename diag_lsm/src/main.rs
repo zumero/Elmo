@@ -30,16 +30,19 @@ fn dump_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
 
 fn list_segments(name: &str) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
-    let (segments, infos) = try!(db.list_segments());
-    for s in segments.iter() {
-        println!("{}: {:?}", s, infos[s]);
-        let mut cursor = try!(db.open_cursor_on_active_segment(*s));
-        println!("    keys: {}", cursor.count_keys());
-        println!("    pages: {}", infos[s].count_pages());
-        println!("    tombstones: {}", cursor.count_tombstones());
-        println!("    total_size_keys: {}", cursor.total_size_keys());
-        println!("    total_size_values: {}", cursor.total_size_values());
-        println!("    depth: {}", cursor.depth());
+    let (ranges, infos) = try!(db.list_segments());
+    for i in 0 .. ranges.len() {
+        println!("---- range: {}", i);
+        for s in ranges[i].state.iter() {
+            println!("{}: {:?}", s, infos[s]);
+            let mut cursor = try!(db.open_cursor_on_active_segment(*s));
+            println!("    keys: {}", cursor.count_keys());
+            println!("    pages: {}", infos[s].count_pages());
+            println!("    tombstones: {}", cursor.count_tombstones());
+            println!("    total_size_keys: {}", cursor.total_size_keys());
+            println!("    total_size_values: {}", cursor.total_size_values());
+            println!("    depth: {}", cursor.depth());
+        }
     }
     Ok(())
 }
@@ -87,10 +90,10 @@ fn dump_segment(name: &str, segnum: u64) -> Result<(),lsm::Error> {
     Ok(())
 }
 
-fn merge(name: &str, merge_level: u32, min_segs: usize, max_segs: usize) -> Result<(),lsm::Error> {
+fn merge(name: &str, range: usize, merge_level: u32, min_segs: usize, max_segs: usize) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     // TODO not sure this promotion rule is what we want here
-    match try!(db.merge(merge_level, min_segs, max_segs, lsm::MergePromotionRule::Stay)) {
+    match try!(db.merge(range, merge_level, min_segs, max_segs, lsm::MergePromotionRule::Stay)) {
         Some(pm) => {
             //println!("merged segment: {:?}", pm);
             let lck = try!(db.get_write_lock());
@@ -117,13 +120,14 @@ fn result_main() -> Result<(),lsm::Error> {
     let cmd = args[2].as_str();
     match cmd {
         "merge" => {
-            if args.len() < 6 {
+            if args.len() < 7 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
-            let merge_level = args[3].parse::<u32>().unwrap();
-            let min_segs = args[4].parse::<usize>().unwrap();
-            let max_segs = args[5].parse::<usize>().unwrap();
-            merge(name, merge_level, min_segs, max_segs)
+            let range = args[3].parse::<usize>().unwrap();
+            let merge_level = args[4].parse::<u32>().unwrap();
+            let min_segs = args[5].parse::<usize>().unwrap();
+            let max_segs = args[6].parse::<usize>().unwrap();
+            merge(name, range, merge_level, min_segs, max_segs)
         },
         "dump_page" => {
             if args.len() < 4 {
