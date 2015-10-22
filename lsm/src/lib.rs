@@ -871,20 +871,6 @@ impl PageBuilder {
         strm.write_all(&*self.buf)
     }
 
-    #[cfg(remove_me)]
-    fn PageSize(&self) -> usize {
-        self.buf.len()
-    }
-
-    fn Buffer(&self) -> &[u8] {
-        &self.buf
-    }
-    
-    #[cfg(remove_me)]
-    fn Position(&self) -> usize {
-        self.cur
-    }
-
     fn Available(&self) -> usize {
         self.buf.len() - self.cur
     }
@@ -3166,10 +3152,8 @@ fn readOverflow(path: &str, pgsz: usize, firstPage: PageNum, buf: &mut [u8]) -> 
 }
 
 pub struct SegmentCursor {
-    // TODO probably replace path with a callback as well.
-    // and then probably combine them into one trait.
     path: String,
-    read_page: Box<Fn(PageNum, &mut [u8]) -> Result<()>>,
+    f: std::rc::Rc<std::cell::RefCell<File>>,
     done: Option<Box<Fn() -> ()>>,
     location: SegmentLocation,
 
@@ -3193,14 +3177,14 @@ pub struct SegmentCursor {
 
 impl SegmentCursor {
     fn new(path: &str, 
-           read_page: Box<Fn(PageNum, &mut [u8]) -> Result<()> + 'static>,
+           f: std::rc::Rc<std::cell::RefCell<File>>,
            page: misc::Lend<Box<[u8]>>,
            location: SegmentLocation
           ) -> Result<SegmentCursor> {
 
         let mut res = SegmentCursor {
             path: String::from(path),
-            read_page: read_page,
+            f: f,
             location: location,
             done: None,
             pr: page,
@@ -3377,7 +3361,11 @@ impl SegmentCursor {
             self.currentKey = None;
             self.prefix = None;
 
-            try!((self.read_page)(self.currentPage, &mut self.pr));
+            {
+                let f = &mut *(self.f.borrow_mut());
+                try!(utils::SeekPage(f, self.pr.len(), self.currentPage));
+                try!(misc::io::read_fully(f, &mut self.pr));
+            }
 
             match self.page_type() {
                 Ok(PageType::LEAF_NODE) => {
@@ -4529,6 +4517,13 @@ impl InnerPart {
                 .open(&self.path)
     }
 
+    fn open_file_for_cursor(&self) -> io::Result<std::rc::Rc<std::cell::RefCell<File>>> {
+        let f = try!(self.OpenForReading());
+        let f = std::cell::RefCell::new(f);
+        let f = std::rc::Rc::new(f);
+        Ok(f)
+    }
+
     // this code should not be called in a release build.  it helps
     // finds problems by zeroing out pages in blocks that
     // have been freed.
@@ -4689,17 +4684,7 @@ impl InnerPart {
                     foo.cursor_dropped(g, csrnum);
                 };
                 let page = try!(Self::get_loaner_page(inner));
-                // TODO I suppose we could pass the Rc<RefCell<File>> into
-                // the SegmentCursor instead of a closure.
-                let read_page = 
-                    move |pgnum: PageNum, dest: &mut [u8]| -> Result<()>
-                    {
-                        let f = &mut *(f.borrow_mut());
-                        try!(utils::SeekPage(f, dest.len(), pgnum));
-                        try!(misc::io::read_fully(f, dest));
-                        Ok(())
-                    };
-                let mut csr = try!(SegmentCursor::new(&inner.path, box read_page, page, seg.location.clone()));
+                let mut csr = try!(SegmentCursor::new(&inner.path, f, page, seg.location.clone()));
 
                 space.nextCursorNum = space.nextCursorNum + 1;
                 let was = space.cursors.insert(csrnum, g);
@@ -4737,26 +4722,15 @@ impl InnerPart {
 
     fn open_cursor_on_active_segment(inner: &std::sync::Arc<InnerPart>, g: SegmentNum) -> Result<SegmentCursor> {
         let st = try!(inner.header.read());
-        let f = try!(inner.OpenForReading());
-        let f = std::cell::RefCell::new(f);
-        let f = std::rc::Rc::new(f);
+        let f = try!(inner.open_file_for_cursor());
         let cursor = try!(Self::get_cursor_on_active_segment(inner, &*st, g, f));
         Ok(cursor)
     }
 
     fn open_cursor_on_pending_segment(inner: &std::sync::Arc<InnerPart>, location: SegmentLocation) -> Result<SegmentCursor> {
         let page = try!(Self::get_loaner_page(inner));
-        let f = try!(inner.OpenForReading());
-        let f = std::cell::RefCell::new(f);
-        let read_page = 
-            move |pgnum: PageNum, dest: &mut [u8]| -> Result<()>
-            {
-                let f = &mut *(f.borrow_mut());
-                try!(utils::SeekPage(f, dest.len(), pgnum));
-                try!(misc::io::read_fully(f, dest));
-                Ok(())
-            };
-        let cursor = try!(SegmentCursor::new(&inner.path, box read_page, page, location));
+        let f = try!(inner.open_file_for_cursor());
+        let cursor = try!(SegmentCursor::new(&inner.path, f, page, location));
         // note no set_hook here
         Ok(cursor)
     }
@@ -4789,9 +4763,7 @@ impl InnerPart {
         let header = try!(inner.header.read());
         let mut cursors = vec![];
         let mut generation = 0;
-        let f = try!(inner.OpenForReading());
-        let f = std::cell::RefCell::new(f);
-        let f = std::rc::Rc::new(f);
+        let f = try!(inner.open_file_for_cursor());
         loop {
             let mut cursors_for_this_generation = vec![];
             let mut any = false;
@@ -5031,9 +5003,7 @@ impl InnerPart {
                     .sum();
                 //println!("pages_in_merge_segments: {}", pages_in_merge_segments);
                 assert!(pages_in_merge_segments <= pages_in_merge_level);
-                let f = try!(inner.OpenForReading());
-                let f = std::cell::RefCell::new(f);
-                let f = std::rc::Rc::new(f);
+                let f = try!(inner.open_file_for_cursor());
                 let cursors = 
                     merge_seg_nums
                     .iter()
