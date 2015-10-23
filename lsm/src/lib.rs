@@ -2931,6 +2931,41 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                     assert!(len <= 255);
                     footer.push(len as u8);
 
+                    // before we write this layer of parent nodes, we trim all the
+                    // keys to the shortest prefix that will suffice.
+
+                    for i in 1 .. children.len() {
+                        let shorter = {
+                            let mut shorter = None;
+                            let k = &children[i].first_key;
+                            let prev = &children[i - 1].last_key;
+
+                            let mut len = k.len();
+                            loop {
+                                if len == 0 || Ordering::Greater != bcmp::Compare(&k[ .. len], prev) {
+                                    assert!(len < k.len());
+                                    shorter = Some(len + 1);
+                                    break;
+                                }
+                                if len > 0 {
+                                    len -= 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            shorter
+                        };
+
+                        if let Some(len) = shorter {
+                            if len < children[i].first_key.len() {
+                                //println!("can shorten key from {} to {}", children[i].first_key.len(), len);
+                                let mut v = Vec::with_capacity(len);
+                                v.push_all(&children[i].first_key[ .. len]);
+                                children[i].first_key = v.into_boxed_slice();
+                            }
+                        }
+                    }
+
                     let (newBlk, newChildren) = try!(write_parent_nodes(blk, &children, pgsz, fs, pageManager, &mut token, &footer, &mut pb));
                     blk = newBlk;
                     children = newChildren;

@@ -23,16 +23,11 @@ do we need IDatabase if there is only one implementation
 of it?  same for IWriteLock.  no.  rs version eliminates
 them.
 
-range splitting
-
 fractional cascading
 
 range deletes.  graveyard.
 
 bloom filters?
-
-try to improve the performance of multicursor.  more like
-rs version?
 
 lz4 stream
 
@@ -53,7 +48,4 @@ look at reducing memory allocations in writeLeaves.  (done?)
 still concerned about how much we are copying byte[] for keys
 
 what are the embedded pointers in the runs in SQLite4 LSM?
-
-create shorter synthetic keys in the parent nodes?
-
 
