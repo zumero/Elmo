@@ -3668,6 +3668,7 @@ impl SegmentCursor {
             }
         } else if PageType::PARENT_NODE == pt {
             let next = try!(self.get_next_from_parent_page(k));
+            assert!(next != pg);
             self.search(next, k, sop)
         } else {
             unreachable!();
