@@ -1979,12 +1979,10 @@ mod PageFlag {
 
 #[derive(Debug)]
 // this struct is used to remember pages we have written.
-// for each page, we need to remember a key, and it needs
-// to be in a box because the original copy is gone and
-// the page has been written out to disk.
 struct pgitem {
     page: PageNum,
-    key: Box<[u8]>,
+    first_key: Box<[u8]>,
+    last_key: Box<[u8]>,
 }
 
 struct ParentState {
@@ -2261,7 +2259,10 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
         // 4 for lastInt32 (which isn't in pb.Available)
         const LEAF_PAGE_OVERHEAD: usize = 2 + 4 + 2 + 4;
 
-        fn buildLeaf(st: &mut LeafState, pb: &mut PageBuilder) -> Box<[u8]> {
+        // returns the first and last key in the leaf.  if there is only one key
+        // in the leaf, it will return two copies of it, which is sad, but that
+        // case should be considered pathological.
+        fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (Box<[u8]>, Box<[u8]>) {
             pb.Reset();
             pb.PutByte(PageType::LEAF_NODE.to_u8());
             pb.PutByte(0u8); // flags
@@ -2306,17 +2307,33 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                 }
             }
 
-            // deal with all the keys except the last one
-            for lp in st.keys_in_this_leaf.drain(0 .. count_keys_in_this_leaf-1) {
-                f(pb, st.prefixLen, &lp);
-            }
-            assert!(st.keys_in_this_leaf.len() == 1);
-
+            // deal with the first key separately
             let lp = st.keys_in_this_leaf.remove(0); 
-            assert!(st.keys_in_this_leaf.is_empty());
-
+            assert!(st.keys_in_this_leaf.len() == count_keys_in_this_leaf - 1);
             f(pb, st.prefixLen, &lp);
-            lp.key
+            let first_key = lp.key;
+
+            if st.keys_in_this_leaf.len() == 0 {
+                // there was only one key in this leaf.
+                let last_key = first_key.clone();
+                (first_key, last_key)
+            } else {
+                if st.keys_in_this_leaf.len() > 1 {
+                    // deal with all the remaining keys except the last one
+                    for lp in st.keys_in_this_leaf.drain(0 .. count_keys_in_this_leaf - 2) {
+                        f(pb, st.prefixLen, &lp);
+                    }
+                }
+                assert!(st.keys_in_this_leaf.len() == 1);
+
+                // now the last key
+                let lp = st.keys_in_this_leaf.remove(0); 
+                assert!(st.keys_in_this_leaf.is_empty());
+                f(pb, st.prefixLen, &lp);
+
+                let last_key = lp.key;
+                (first_key, last_key)
+            }
         }
 
         fn writeLeaf<SeekWrite>(st: &mut LeafState, 
@@ -2327,7 +2344,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                                 pageManager: &IPages,
                                 token: &mut PendingSegment,
                                ) -> Result<()> where SeekWrite : Seek+Write { 
-            let last_key = buildLeaf(st, pb);
+            let (first_key, last_key) = build_leaf(st, pb);
             assert!(st.keys_in_this_leaf.is_empty());
             let thisPageNumber = st.blk.firstPage;
             let firstLeaf = if st.leaves.is_empty() { thisPageNumber } else { st.firstLeaf };
@@ -2350,7 +2367,11 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             if nextBlk.firstPage != (thisPageNumber + 1) && !isRootPage {
                 try!(utils::SeekPage(fs, pgsz, nextBlk.firstPage));
             }
-            let pg = pgitem {page:thisPageNumber, key:last_key};
+            let pg = pgitem {
+                page: thisPageNumber, 
+                first_key: first_key,
+                last_key: last_key
+            };
             st.leaves.push(pg);
             st.sofarLeaf = 0;
             st.prevLeaf = thisPageNumber;
@@ -2704,27 +2725,33 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             }
         }
 
-        fn buildParentPage(items: &mut Vec<pgitem>,
+        fn build_parent_page(items: &mut Vec<pgitem>,
                            lastPtr: PageNum, 
                            overflows: &HashMap<usize,PageNum>,
                            pb : &mut PageBuilder,
-                          ) {
+                          ) -> (Box<[u8]>, Box<[u8]>) {
             pb.Reset();
             pb.PutByte(PageType::PARENT_NODE.to_u8());
             pb.PutByte(0u8);
             pb.PutInt16(items.len() as u16);
+
+            // yes, the following line is correct.
+            // the last_key field is the one being written, and we need the first of them.
+            let first_key = items[0].last_key.clone();
+            let last_key = items[items.len() - 1].last_key.clone();
+
             // store all the keys, n of them
             for (i,x) in items.iter().enumerate() {
                 match overflows.get(&i) {
                     Some(pg) => {
                         pb.PutByte(ValueFlag::FLAG_OVERFLOW);
-                        pb.PutVarint(x.key.len() as u64);
+                        pb.PutVarint(x.last_key.len() as u64);
                         pb.PutInt32(*pg as PageNum);
                     },
                     None => {
                         pb.PutByte(0u8);
-                        pb.PutVarint(x.key.len() as u64);
-                        pb.PutArray(&x.key);
+                        pb.PutVarint(x.last_key.len() as u64);
+                        pb.PutArray(&x.last_key);
                     },
                 }
             }
@@ -2733,13 +2760,14 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                 pb.PutVarint(x.page as u64);
             }
             pb.PutVarint(lastPtr as u64);
+
+            (first_key, last_key)
         }
 
         fn writeParentPage<SeekWrite>(st: &mut ParentState, 
                                       items: &mut Vec<pgitem>,
                                       overflows: &HashMap<usize,PageNum>,
                                       pgnum: PageNum,
-                                      key: Box<[u8]>,
                                       pb: &mut PageBuilder, 
                                       fs: &mut SeekWrite,
                                       pageManager: &IPages,
@@ -2749,7 +2777,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                                      ) -> Result<()> where SeekWrite : Seek+Write {
             // assert st.sofar > 0
             let thisPageNumber = st.blk.firstPage;
-            buildParentPage(items, pgnum, &overflows, pb);
+            let (first_key, last_key) = build_parent_page(items, pgnum, &overflows, pb);
             let nextBlk =
                 match root {
                     Some(footer) => {
@@ -2780,7 +2808,11 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             }
             st.sofar = 0;
             st.blk = nextBlk;
-            let pg = pgitem {page:thisPageNumber, key:key};
+            let pg = pgitem {
+                page: thisPageNumber, 
+                first_key: first_key,
+                last_key: last_key,
+            };
             st.nextGeneration.push(pg);
             Ok(())
         }
@@ -2798,8 +2830,8 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
         for pair in children.drain(0 .. count_children - 1) {
             let pgnum = pair.page;
 
-            let neededEitherWay = 1 + varint::space_needed_for(pair.key.len() as u64) + varint::space_needed_for(pgnum as u64);
-            let neededForInline = neededEitherWay + pair.key.len();
+            let neededEitherWay = 1 + varint::space_needed_for(pair.last_key.len() as u64) + varint::space_needed_for(pgnum as u64);
+            let neededForInline = neededEitherWay + pair.last_key.len();
             let neededForOverflow = neededEitherWay + SIZE_32;
 
             let available = calcAvailable(&st, pgsz);
@@ -2808,15 +2840,11 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             // page might be a boundary page, thus it would need the 4 bytes in lastint32.
             let wouldFitInlineOnNextPage = (pgsz - PARENT_PAGE_OVERHEAD + 4) >= neededForInline;
             let fitsOverflow = available >= neededForOverflow;
-            let writeThisPage = (! fitsInline) && (wouldFitInlineOnNextPage || (! fitsOverflow));
+            let writeThisPage = (!fitsInline) && (wouldFitInlineOnNextPage || (!fitsOverflow));
 
             if writeThisPage {
                 // assert sofar > 0
-                // we need to make a copy of this key because writeParentPage needs to own one,
-                // but we still need to put this pair in the items (below).
-                let mut copy_key = vec![0; pair.key.len()].into_boxed_slice(); 
-                copy_key.clone_from_slice(&pair.key);
-                try!(writeParentPage(&mut st, &mut items, &overflows, pair.page, copy_key, pb, fs, pageManager, pgsz, &mut *token, None));
+                try!(writeParentPage(&mut st, &mut items, &overflows, pair.page, pb, fs, pageManager, pgsz, &mut *token, None));
                 assert!(items.is_empty());
             }
 
@@ -2829,7 +2857,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                 st.sofar = st.sofar + neededForInline;
             } else {
                 let keyOverflowFirstPage = st.blk.firstPage;
-                let (_,newBlk) = try!(write_overflow(st.blk, &mut &*pair.key, pageManager, token, fs));
+                let (_,newBlk) = try!(write_overflow(st.blk, &mut &*pair.last_key, pageManager, token, fs));
                 st.sofar = st.sofar + neededForOverflow;
                 st.blk = newBlk;
                 // items.len() is the index that this pair is about to get, just below
@@ -2838,7 +2866,9 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             items.push(pair);
         }
         assert!(children.len() == 1);
-        let pgitem {page: pgnum, key} = children.remove(0);
+        let pgitem {page: pgnum, first_key, last_key} = children.remove(0);
+        // TODO insert comment here to explain why the first_key and last_key from the
+        // last child are not needed.
         assert!(children.is_empty());
 
         let root =
@@ -2847,7 +2877,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             } else {
                 None
             };
-        try!(writeParentPage(&mut st, &mut items, &overflows, pgnum, key, pb, fs, pageManager, pgsz, &mut *token, root));
+        try!(writeParentPage(&mut st, &mut items, &overflows, pgnum, pb, fs, pageManager, pgsz, &mut *token, root));
         Ok((st.blk,st.nextGeneration))
     }
 
@@ -3500,10 +3530,10 @@ impl SegmentCursor {
         if  pt != PageType::PARENT_NODE {
             return Err(Error::CorruptFile("parent page has invalid page type"));
         }
-        cur = cur + 1; // page flags
-        let count = self.get_u16(&mut cur);
+        cur = cur + 1; // skip the page flags
+        let count_keys = self.get_u16(&mut cur);
         let mut found = None;
-        for i in 0 .. count {
+        for i in 0 .. count_keys {
             let kflag = self.get_byte(&mut cur);
             let klen = varint::read(&self.pr, &mut cur) as usize;
             let k =
@@ -3532,18 +3562,21 @@ impl SegmentCursor {
             None => {
             },
             Some(found) => {
-                for _ in found+1 .. count {
+                // gotta skip the rest of the keys
+                for _ in found + 1 .. count_keys {
                     let kflag = self.get_byte(&mut cur);
                     let klen = varint::read(&self.pr, &mut cur) as usize;
                     if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
                         cur = cur + klen;
                     } else {
+                        // the page num for overflow is a u32
+                        // TODO why not a varint?
                         cur = cur + 4;
                     };
                 }
             },
         }
-        let found = found.unwrap_or(count);
+        let found = found.unwrap_or(count_keys);
         for _ in 0 .. found {
             let b = self.get_byte(&mut cur);
             let len = misc::varint::first_byte_to_len(b);
@@ -4926,7 +4959,8 @@ impl InnerPart {
             //println!("promote: {:?}", promote);
             //println!("state: {:?}", header.state);
             //println!("segments_info: {:?}", header.segments_info);
-            // TODO wrong.  confine this to only the current range
+            // TODO wrong?  confine this to only the current range?
+            // probably need per-range settings for promotion.
             let mut level_sizes = HashMap::new();
             for (_, ref info) in header.segments_info.iter() {
                 let pages = info.location.count_pages();
