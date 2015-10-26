@@ -2281,13 +2281,13 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             fn f(pb: &mut PageBuilder, prefixLen: usize, lp: &LeafPair) {
                 match lp.kLoc {
                     KeyLocation::Inline => {
-                        pb.PutByte(0u8); // flags
-                        pb.PutVarint(lp.key.len() as u64);
+                        // inline key len is stored * 2, always an even number
+                        pb.PutVarint((lp.key.len() * 2) as u64);
                         pb.PutArray(&lp.key[prefixLen .. lp.key.len()]);
                     },
                     KeyLocation::Overflowed(kpage) => {
-                        pb.PutByte(ValueFlag::FLAG_OVERFLOW);
-                        pb.PutVarint(lp.key.len() as u64);
+                        // overflowed key len is stored * 2 + 1, always odd
+                        pb.PutVarint((lp.key.len() * 2 + 1) as u64);
                         pb.PutInt32(kpage);
                     },
                 }
@@ -2393,8 +2393,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             pgsz 
             - LEAF_PAGE_OVERHEAD 
             - 1 // prefixLen
-            - 1 // key flags
-            - varint::space_needed_for(pgsz as u64) // approx worst case inline key len
+            - varint::space_needed_for((pgsz * 2) as u64) // approx worst case inline key len
             - 1 // value flags
             - 9 // worst case varint value len
             - NEEDED_FOR_OVERFLOW_PAGE_NUMBER; // overflowed value page
@@ -2403,10 +2402,15 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             let klen = k.len();
             match *kloc {
                 KeyLocation::Inline => {
-                    1 + varint::space_needed_for(klen as u64) + klen - prefixLen
+                    0
+                    + varint::space_needed_for((klen * 2) as u64) 
+                    + klen 
+                    - prefixLen
                 },
                 KeyLocation::Overflowed(_) => {
-                    1 + varint::space_needed_for(klen as u64) + NEEDED_FOR_OVERFLOW_PAGE_NUMBER
+                    0
+                    + varint::space_needed_for((klen * 2 + 1) as u64) 
+                    + NEEDED_FOR_OVERFLOW_PAGE_NUMBER
                 },
             }
         }
@@ -2493,31 +2497,30 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                     (newBlk, KeyLocation::Overflowed(vPage))
                 };
 
-            // the max limit of an inline value is when the key is inline
-            // on a new page.
+            let maxValueInline = {
+                // the max limit of an inline value is when the key is inline
+                // on a new page.
 
-            // TODO this is a usize, so it might cause integer underflow.
-            let availableOnNewPageAfterKey = 
-                pgsz 
-                - LEAF_PAGE_OVERHEAD 
-                - 1 // prefixLen
-                - 1 // key flags
-                - varint::space_needed_for(k.len() as u64)
-                - k.len() 
-                - 1 // value flags
-                ;
+                let needed_for_key_inline_on_new_page = 
+                    LEAF_PAGE_OVERHEAD 
+                    + 1 // prefixLen
+                    + varint::space_needed_for((k.len() * 2) as u64)
+                    + k.len() 
+                    + 1 // value flags
+                    ;
 
-            // availableOnNewPageAfterKey needs to accomodate the value and its length as a varint.
-            // it might already be <=0 because of the key length
-
-            let maxValueInline = 
-                if availableOnNewPageAfterKey > 0 {
-                    let neededForVarintLen = varint::space_needed_for(availableOnNewPageAfterKey as u64);
-                    let avail2 = availableOnNewPageAfterKey - neededForVarintLen;
-                    if avail2 > 0 { avail2 } else { 0 }
+                if pgsz > needed_for_key_inline_on_new_page {
+                    let available = pgsz - needed_for_key_inline_on_new_page;
+                    let neededForVarintLen = varint::space_needed_for(available as u64);
+                    if available > neededForVarintLen {
+                        available - neededForVarintLen
+                    } else {
+                        0
+                    }
                 } else {
                     0
-                };
+                }
+            };
 
             let (blkAfterValue, vloc) = 
                 match pair.Value {
@@ -2682,9 +2685,9 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             // note that the LeafPair struct gets ownership of the key provided
             // from above.
             let lp = LeafPair {
-                        key:k,
-                        kLoc:kloc,
-                        vLoc:vloc,
+                        key: k,
+                        kLoc: kloc,
+                        vLoc: vloc,
                         };
 
             st.sofarLeaf=sofar + leafPairSize(newPrefixLen, &lp);
@@ -2747,13 +2750,13 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                 let key = &children[i_next].first_key;
                 match overflows.get(&i_next) {
                     Some(pg) => {
-                        pb.PutByte(ValueFlag::FLAG_OVERFLOW);
-                        pb.PutVarint(key.len() as u64);
+                        // overflowed key len is stored * 2 + 1, always an odd number
+                        pb.PutVarint((key.len() * 2 + 1) as u64);
                         pb.PutInt32(*pg as PageNum);
                     },
                     None => {
-                        pb.PutByte(0u8);
-                        pb.PutVarint(key.len() as u64);
+                        // inline key len is stored * 2, always an even number
+                        pb.PutVarint((key.len() * 2) as u64);
                         pb.PutArray(key);
                     },
                 }
@@ -2836,9 +2839,9 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             // to fit this child into this parent page, we need room for the
             // the child's page num, and for the first_key of the next child.
 
-            let neededEitherWay = 1 + varint::space_needed_for(key.len() as u64) + varint::space_needed_for(this_child.page as u64);
-            let neededForInline = neededEitherWay + key.len();
-            let neededForOverflow = neededEitherWay + SIZE_32;
+            let neededEitherWay = varint::space_needed_for(this_child.page as u64);
+            let neededForInline = neededEitherWay + varint::space_needed_for((key.len() * 2) as u64) + key.len();
+            let neededForOverflow = neededEitherWay + varint::space_needed_for((key.len() * 2 + 1) as u64) + SIZE_32;
 
             let available = calcAvailable(&st, pgsz);
             let fitsInline = available >= neededForInline;
@@ -3474,9 +3477,11 @@ impl SegmentCursor {
     }
 
     fn skipKey(&self, cur: &mut usize) {
-        let kflag = self.get_byte(cur);
         let klen = varint::read(&self.pr, cur) as usize;
-        if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
+        let inline = 0 == klen % 2;
+        let klen = klen / 2;
+
+        if inline {
             let prefixLen = match self.prefix {
                 Some(ref a) => a.len(),
                 None => 0
@@ -3503,9 +3508,10 @@ impl SegmentCursor {
 
     fn keyInLeaf2<'a>(&'a self, n: usize) -> Result<KeyRef<'a>> { 
         let mut cur = self.leafKeys[n as usize];
-        let kflag = self.get_byte(&mut cur);
         let klen = varint::read(&self.pr, &mut cur) as usize;
-        if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
+        let inline = 0 == klen % 2;
+        let klen = klen / 2;
+        if inline {
             match self.prefix {
                 Some(ref a) => {
                     Ok(KeyRef::Prefixed(&a, &self.pr[cur .. cur + klen - a.len()]))
@@ -3567,10 +3573,11 @@ impl SegmentCursor {
         let count_keys = self.get_u16(&mut cur);
         let mut found = None;
         for i in 0 .. count_keys {
-            let kflag = self.get_byte(&mut cur);
             let klen = varint::read(&self.pr, &mut cur) as usize;
+            let inline = 0 == klen % 2;
+            let klen = klen / 2;
             let k =
-                if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
+                if inline {
                     let k = KeyRef::Array(&self.pr[cur .. cur + klen]);
                     cur = cur + klen;
                     k
@@ -3597,9 +3604,10 @@ impl SegmentCursor {
             Some(found) => {
                 // gotta skip the rest of the keys
                 for _ in found + 1 .. count_keys {
-                    let kflag = self.get_byte(&mut cur);
                     let klen = varint::read(&self.pr, &mut cur) as usize;
-                    if 0 == (kflag & ValueFlag::FLAG_OVERFLOW) {
+                    let inline = 0 == klen % 2;
+                    let klen = klen / 2;
+                    if inline {
                         cur = cur + klen;
                     } else {
                         // the page num for overflow is a u32

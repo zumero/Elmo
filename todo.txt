@@ -1,5 +1,5 @@
 
-range splitting
+drop db needs to wait until threads end?
 
 if we need lots of blocks for a given segment, do we really want
 to use a little blocks of 1-2 pages just because they are on the

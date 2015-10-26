@@ -7,6 +7,9 @@ authors = [ "Eric Sink <eric@zumero.com>" ]
 [dependencies.lsm]
 path = "../lsm"
 
+[dependencies]
+rand = "*"
+
 # The testing profile, used for `cargo test`
 [profile.test]
 opt-level = 3

@@ -17,9 +17,14 @@
 #![feature(convert)]
 #![feature(iter_arith)]
 
-extern crate lsm;
+use std::collections::BTreeMap;
 
+extern crate lsm;
 use lsm::ICursor;
+
+extern crate rand;
+use rand::Rng;
+use rand::SeedableRng;
 
 fn dump_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
@@ -107,6 +112,43 @@ fn merge(name: &str, range: usize, merge_level: u32, min_segs: usize, max_segs: 
     }
 }
 
+fn add_numbers(name: &str, count: u64, start: u64, step: u64) -> Result<(),lsm::Error> {
+    let mut pending = BTreeMap::new();
+    for i in 0 .. count {
+        let val = start + i * step;
+        let k = format!("{:08}", val).into_bytes().into_boxed_slice();
+        let v = format!("{}", val).into_bytes().into_boxed_slice();
+        pending.insert(k, lsm::Blob::Array(v));
+    }
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
+    let lck = try!(db.get_write_lock());
+    try!(lck.commit_segment(seg).map_err(lsm::wrap_err));
+    Ok(())
+}
+
+fn add_random(name: &str, count: u64, seed: usize, klen: usize, vlen: usize) -> Result<(),lsm::Error> {
+    fn make(rng: &mut rand::StdRng, max_len: usize) -> Box<[u8]> {
+        let len = (rng.next_u64() as usize) % max_len + 1;
+        let mut k = vec![0u8; len].into_boxed_slice();
+        rng.fill_bytes(&mut k);
+        k
+    }
+
+    let mut rng = rand::StdRng::from_seed(&[seed]);
+    let mut pending = BTreeMap::new();
+    for i in 0 .. count {
+        let k = make(&mut rng, klen);
+        let v = make(&mut rng, vlen);
+        pending.insert(k, lsm::Blob::Array(v));
+    }
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
+    let lck = try!(db.get_write_lock());
+    try!(lck.commit_segment(seg).map_err(lsm::wrap_err));
+    Ok(())
+}
+
 fn result_main() -> Result<(),lsm::Error> {
     let args: Vec<_> = std::env::args().collect();
     println!("args: {:?}", args);
@@ -119,6 +161,25 @@ fn result_main() -> Result<(),lsm::Error> {
     let name = args[1].as_str();
     let cmd = args[2].as_str();
     match cmd {
+        "add_random" => {
+            if args.len() < 7 {
+                return Err(lsm::Error::Misc(String::from("too few args")));
+            }
+            let count = args[3].parse::<u64>().unwrap();
+            let seed = args[4].parse::<usize>().unwrap();
+            let klen = args[5].parse::<usize>().unwrap();
+            let vlen = args[6].parse::<usize>().unwrap();
+            add_random(name, count, seed, klen, vlen)
+        },
+        "add_numbers" => {
+            if args.len() < 6 {
+                return Err(lsm::Error::Misc(String::from("too few args")));
+            }
+            let count = args[3].parse::<u64>().unwrap();
+            let start = args[4].parse::<u64>().unwrap();
+            let step = args[5].parse::<u64>().unwrap();
+            add_numbers(name, count, start, step)
+        },
         "merge" => {
             if args.len() < 7 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
