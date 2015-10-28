@@ -3378,6 +3378,29 @@ pub enum ChildCursor {
 }
 
 impl ChildCursor {
+    fn new(path: &str, 
+           f: std::rc::Rc<std::cell::RefCell<File>>,
+           buf: misc::Lend<Box<[u8]>>
+          ) -> Result<ChildCursor> {
+        let pt = try!(PageType::from_u8(buf[0]));
+        let sub = 
+            match pt {
+                PageType::LEAF_NODE => {
+                    let sub = try!(LeafCursor::new(path, f, buf));
+                    ChildCursor::Leaf(sub)
+                },
+                PageType::PARENT_NODE => {
+                    let sub = try!(ParentPageCursor::new(path, f, buf));
+                    ChildCursor::Parent(sub)
+                },
+                PageType::OVERFLOW_NODE => {
+                    return Err(Error::CorruptFile("child page has invalid page type"));
+                },
+            };
+
+        Ok(sub)
+    }
+
     fn read_page(&mut self, pg: PageNum) -> Result<()> {
         match self {
             &mut ChildCursor::Leaf(ref mut c) => {
@@ -3489,21 +3512,7 @@ impl ParentPageCursor {
             try!(misc::io::read_fully(f, &mut child_buf));
         }
 
-        let pt_child = try!(PageType::from_u8(child_buf[0]));
-        let sub = 
-            match pt_child {
-                PageType::LEAF_NODE => {
-                    let sub = try!(LeafCursor::new(path, f.clone(), child_buf));
-                    ChildCursor::Leaf(sub)
-                },
-                PageType::PARENT_NODE => {
-                    let sub = try!(ParentPageCursor::new(path, f.clone(), child_buf));
-                    ChildCursor::Parent(sub)
-                },
-                PageType::OVERFLOW_NODE => {
-                    return Err(Error::CorruptFile("child page has invalid page type"));
-                },
-            };
+        let sub = try!(ChildCursor::new(path, f.clone(), child_buf));
 
         let mut res = ParentPageCursor {
             path: String::from(path),
