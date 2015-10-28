@@ -38,13 +38,7 @@ fn list_segments(name: &str) -> Result<(),lsm::Error> {
     let (segments, infos) = try!(db.list_segments());
     for s in segments.iter() {
         println!("{}: {:?}", s, infos[s]);
-        let mut cursor = try!(db.open_cursor_on_active_segment(*s));
-        println!("    keys: {}", cursor.count_keys());
         println!("    pages: {}", infos[s].count_pages());
-        println!("    tombstones: {}", cursor.count_tombstones());
-        println!("    total_size_keys: {}", cursor.total_size_keys());
-        println!("    total_size_values: {}", cursor.total_size_values());
-        println!("    depth: {}", cursor.depth());
     }
     Ok(())
 }

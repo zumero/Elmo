@@ -3115,10 +3115,6 @@ impl LeafCursor {
         Ok(res)
     }
 
-    pub fn count_keys(&self) -> usize {
-        self.keys.len()
-    }
-
     fn parse_page(&mut self) -> Result<()> {
         self.currentKey = None;
         self.prefix = None;
@@ -3529,10 +3525,6 @@ impl ParentPageCursor {
         Ok(res)
     }
 
-    pub fn count_keys(&self) -> usize {
-        self.keys.len()
-    }
-
     fn parse_page(pr: &[u8], keys: &mut Vec<usize>, children: &mut Vec<PageNum>) -> Result<()> {
         let mut cur = 0;
         let pt = try!(PageType::from_u8(misc::buf_advance::get_byte(pr, &mut cur)));
@@ -3750,11 +3742,6 @@ pub struct SegmentCursor {
 
     firstLeaf: PageNum,
     lastLeaf: PageNum,
-    count_keys: usize,
-    count_tombstones: usize,
-    total_size_keys: u64,
-    total_size_values: u64,
-    depth: u32,
 
     leafKeys: Vec<usize>,
     previousLeaf: PageNum,
@@ -3783,11 +3770,6 @@ impl SegmentCursor {
             prefix: None,
             firstLeaf: 0, // temporary
             lastLeaf: 0, // temporary
-            count_keys: 0, // temporary
-            count_tombstones: 0, // temporary
-            total_size_keys: 0, // temporary
-            total_size_values: 0, // temporary
-            depth: 0, // temporary
         };
 
         // TODO consider keeping a copy of the root page around as long as this cursor is around
@@ -3798,17 +3780,6 @@ impl SegmentCursor {
         if pt == PageType::LEAF_NODE {
             res.firstLeaf = res.location.root_page;
             res.lastLeaf = res.location.root_page;
-            res.count_keys = res.leafKeys.len();
-            let mut count_tombstones = 0;
-            for i in 0 .. res.leafKeys.len() {
-                let mut pos = res.leafKeys[i];
-                res.skipKey(&mut pos);
-                let vflag = res.get_byte(&mut pos);
-                if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) {
-                    count_tombstones += 1;
-                }
-            }
-            res.count_tombstones = count_tombstones;
         } else if pt == PageType::PARENT_NODE {
             if !res.check_page_flag(PageFlag::FLAG_ROOT_NODE) { 
                 return Err(Error::CorruptFile("root page lacks flag"));
@@ -3820,12 +3791,6 @@ impl SegmentCursor {
             assert!(res.location.contains_page(res.firstLeaf));
             res.lastLeaf = varint::read(footer, &mut cur) as u32;
             assert!(res.location.contains_page(res.lastLeaf));
-            res.count_keys = varint::read(footer, &mut cur) as usize;
-            res.count_tombstones = varint::read(footer, &mut cur) as usize;
-            assert!(res.count_keys >= res.count_tombstones);
-            res.total_size_keys = varint::read(footer, &mut cur) as u64;
-            res.total_size_values = varint::read(footer, &mut cur) as u64;
-            res.depth = varint::read(footer, &mut cur) as u32;
         } else {
             return Err(Error::CorruptFile("root page has invalid page type"));
         }
@@ -3837,26 +3802,6 @@ impl SegmentCursor {
         // TODO instead of this thing have a done() hook, should we instead
         // be wrapping it in a Lend?
         self.done = Some(done);
-    }
-
-    pub fn count_keys(&self) -> usize {
-        self.count_keys
-    }
-
-    pub fn count_tombstones(&self) -> usize {
-        self.count_tombstones
-    }
-
-    pub fn total_size_keys(&self) -> u64 {
-        self.total_size_keys
-    }
-
-    pub fn total_size_values(&self) -> u64 {
-        self.total_size_values
-    }
-
-    pub fn depth(&self) -> u32 {
-        self.depth
     }
 
     fn readLeaf(&mut self) -> Result<()> {
