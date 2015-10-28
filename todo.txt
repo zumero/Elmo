@@ -166,6 +166,11 @@ read bson value without alloc?  but then we need to give references into
 the buffer, which might be big.  that's basically read bson value with
 only one (big) alloc for the object itself.
 
+TODO this cursor needs to expose the changeCounter and segment list
+on which it is based. for optimistic writes.  caller can grab a cursor,
+do their writes, then grab the writelock, and grab another cursor, then
+compare the two cursors to see if anything important changed.  if not,
+commit their writes.  if so, nevermind the written segments and start over.
 
 
 

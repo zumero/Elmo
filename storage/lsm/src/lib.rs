@@ -281,7 +281,7 @@ pub const PRIMARY_INDEX_ID: u64 = 0;
 ///     recid (varint)
 /// value:
 ///     doc (bson)
-pub const RECORD: u8 = 70;
+pub const RECORD: u8 = 30;
 
 /// key:
 ///     (tag)
@@ -291,7 +291,7 @@ pub const RECORD: u8 = 70;
 ///     recid (varint) (not present when index option unique)
 /// value:
 ///     recid (varint) (present only when index option unique?)
-pub const INDEX_ENTRY: u8 = 140;
+pub const INDEX_ENTRY: u8 = 40;
 
 // TODO consider encoding primary and secondary indexes
 // separately.
