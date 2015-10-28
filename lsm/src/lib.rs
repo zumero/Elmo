@@ -3084,6 +3084,652 @@ fn readOverflow(path: &str, pgsz: usize, firstPage: PageNum, buf: &mut [u8]) -> 
     Ok(res)
 }
 
+pub struct LeafCursor {
+    path: String,
+    f: std::rc::Rc<std::cell::RefCell<File>>,
+    pr: misc::Lend<Box<[u8]>>,
+
+    prefix: Option<Box<[u8]>>,
+    keys: Vec<usize>,
+
+    currentKey: Option<usize>,
+}
+
+impl LeafCursor {
+    fn new(path: &str, 
+           f: std::rc::Rc<std::cell::RefCell<File>>,
+           buf: misc::Lend<Box<[u8]>>
+          ) -> Result<LeafCursor> {
+
+        let mut res = LeafCursor {
+            path: String::from(path),
+            f: f,
+            pr: buf,
+            keys: Vec::new(),
+            currentKey: None,
+            prefix: None,
+        };
+
+        try!(res.parse_page());
+
+        Ok(res)
+    }
+
+    pub fn count_keys(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn parse_page(&mut self) -> Result<()> {
+        self.currentKey = None;
+        self.prefix = None;
+
+        let mut cur = 0;
+        let pt = try!(PageType::from_u8(misc::buf_advance::get_byte(&self.pr, &mut cur)));
+        if pt != PageType::LEAF_NODE {
+            return Err(Error::CorruptFile("leaf has invalid page type"));
+        }
+        misc::buf_advance::get_byte(&self.pr, &mut cur);
+        let unused = misc::buf_advance::get_u32(&self.pr, &mut cur) as PageNum;
+        let prefixLen = misc::buf_advance::get_byte(&self.pr, &mut cur) as usize;
+        if prefixLen > 0 {
+            // TODO should we just remember prefix as a reference instead of box/copy?
+            let mut a = vec![0; prefixLen].into_boxed_slice();
+            a.clone_from_slice(&self.pr[cur .. cur + prefixLen]);
+            cur = cur + prefixLen;
+            self.prefix = Some(a);
+        } else {
+            self.prefix = None;
+        }
+        let count_keys = misc::buf_advance::get_u16(&self.pr, &mut cur) as usize;
+        // assert count_keys>0
+        misc::set_vec_len(&mut self.keys, 0, count_keys);
+        for i in 0 .. count_keys {
+            self.keys[i] = cur;
+            self.skipKey(&mut cur);
+            self.skipValue(&mut cur);
+        }
+
+        Ok(())
+    }
+
+    fn read_page(&mut self, pgnum: PageNum) -> Result<()> {
+        {
+            let f = &mut *(self.f.borrow_mut());
+            try!(utils::SeekPage(f, self.pr.len(), pgnum));
+            try!(misc::io::read_fully(f, &mut self.pr));
+        }
+        try!(self.parse_page());
+        Ok(())
+    }
+
+    fn skipKey(&self, cur: &mut usize) {
+        let klen = varint::read(&self.pr, cur) as usize;
+        let inline = 0 == klen % 2;
+        let klen = klen / 2;
+
+        if inline {
+            let prefixLen = match self.prefix {
+                Some(ref a) => a.len(),
+                None => 0
+            };
+            *cur = *cur + (klen - prefixLen);
+        } else {
+            *cur = *cur + SIZE_32;
+        }
+    }
+
+    fn skipValue(&self, cur: &mut usize) {
+        let vflag = misc::buf_advance::get_byte(&self.pr, cur);
+        if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) { 
+            ()
+        } else {
+            let vlen = varint::read(&self.pr, cur) as usize;
+            if 0 != (vflag & ValueFlag::FLAG_OVERFLOW) {
+                *cur = *cur + SIZE_32;
+            } else {
+                *cur = *cur + vlen;
+            }
+        }
+    }
+
+    fn keyInLeaf2<'a>(&'a self, n: usize) -> Result<KeyRef<'a>> { 
+        let mut cur = self.keys[n as usize];
+        let klen = varint::read(&self.pr, &mut cur) as usize;
+        let inline = 0 == klen % 2;
+        let klen = klen / 2;
+        if inline {
+            match self.prefix {
+                Some(ref a) => {
+                    Ok(KeyRef::Prefixed(&a, &self.pr[cur .. cur + klen - a.len()]))
+                },
+                None => {
+                    Ok(KeyRef::Array(&self.pr[cur .. cur + klen]))
+                },
+            }
+        } else {
+            let pgnum = misc::buf_advance::get_u32(&self.pr, &mut cur) as PageNum;
+            let mut ostrm = try!(OverflowReader::new(&self.path, self.pr.len(), pgnum, klen));
+            let mut x_k = Vec::with_capacity(klen);
+            try!(ostrm.read_to_end(&mut x_k));
+            let x_k = x_k.into_boxed_slice();
+            Ok(KeyRef::Overflowed(x_k))
+        }
+    }
+
+    fn searchLeaf(&mut self, k: &KeyRef, min: usize, max: usize, sop: SeekOp, le: Option<usize>, ge: Option<usize>) -> Result<(Option<usize>, bool)> {
+        if max < min {
+            match sop {
+                SeekOp::SEEK_EQ => Ok((None, false)),
+                SeekOp::SEEK_LE => Ok((le, false)),
+                SeekOp::SEEK_GE => Ok((ge, false)),
+            }
+        } else {
+            let mid = (max + min) / 2;
+            // assert mid >= 0
+            let cmp = {
+                let q = try!(self.keyInLeaf2(mid));
+                KeyRef::cmp(&q, k)
+            };
+            match cmp {
+                Ordering::Equal => Ok((Some(mid), true)),
+                Ordering::Less => self.searchLeaf(k, (mid+1), max, sop, Some(mid), ge),
+                Ordering::Greater => 
+                    // we could just recurse with mid-1, but that would overflow if
+                    // mod is 0, so we catch that case here.
+                    if mid==0 { 
+                        match sop {
+                            SeekOp::SEEK_EQ => Ok((None, false)),
+                            SeekOp::SEEK_LE => Ok((le, false)),
+                            SeekOp::SEEK_GE => Ok((Some(mid), false)),
+                        }
+                    } else { 
+                        self.searchLeaf(k, min, (mid-1), sop, le, Some(mid))
+                    },
+            }
+        }
+    }
+
+    fn leafIsValid(&self) -> bool {
+        // TODO the bounds check of self.currentKey against self.keys.len() could be an assert
+        let ok = (!self.keys.is_empty()) && (self.currentKey.is_some()) && (self.currentKey.expect("just did is_some") as usize) < self.keys.len();
+        ok
+    }
+
+    fn search(&mut self, k: &KeyRef, sop:SeekOp) -> Result<SeekResult> {
+        let tmp_countLeafKeys = self.keys.len();
+        let (newCur, equal) = try!(self.searchLeaf(k, 0, (tmp_countLeafKeys - 1), sop, None, None));
+        self.currentKey = newCur;
+        if self.currentKey.is_none() {
+            Ok(SeekResult::Invalid)
+        } else if equal {
+            Ok(SeekResult::Equal)
+        } else {
+            Ok(SeekResult::Unequal)
+        }
+    }
+
+}
+
+impl ICursor for LeafCursor {
+    fn IsValid(&self) -> bool {
+        self.leafIsValid()
+    }
+
+    fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
+        self.search(k, sop)
+    }
+
+    fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
+        match self.currentKey {
+            None => Err(Error::CursorNotValid),
+            Some(currentKey) => self.keyInLeaf2(currentKey),
+        }
+    }
+
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
+        match self.currentKey {
+            None => Err(Error::CursorNotValid),
+            Some(currentKey) => {
+                let mut pos = self.keys[currentKey as usize];
+
+                self.skipKey(&mut pos);
+
+                let vflag = misc::buf_advance::get_byte(&self.pr, &mut pos);
+                if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) {
+                    Ok(ValueRef::Tombstone)
+                } else {
+                    let vlen = varint::read(&self.pr, &mut pos) as usize;
+                    if 0 != (vflag & ValueFlag::FLAG_OVERFLOW) {
+                        let pgnum = misc::buf_advance::get_u32(&self.pr, &mut pos) as PageNum;
+                        let strm = try!(OverflowReader::new(&self.path, self.pr.len(), pgnum, vlen));
+                        Ok(ValueRef::Overflowed(vlen, box strm))
+                    } else {
+                        Ok(ValueRef::Array(&self.pr[pos .. pos + vlen]))
+                    }
+                }
+            }
+        }
+    }
+
+    fn ValueLength(&self) -> Result<Option<usize>> {
+        match self.currentKey {
+            None => Err(Error::CursorNotValid),
+            Some(currentKey) => {
+                let mut cur = self.keys[currentKey as usize];
+
+                self.skipKey(&mut cur);
+
+                let vflag = misc::buf_advance::get_byte(&self.pr, &mut cur);
+                if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) { 
+                    Ok(None)
+                } else {
+                    let vlen = varint::read(&self.pr, &mut cur) as usize;
+                    Ok(Some(vlen))
+                }
+            }
+        }
+    }
+
+    fn First(&mut self) -> Result<()> {
+        self.currentKey = Some(0);
+        Ok(())
+    }
+
+    fn Last(&mut self) -> Result<()> {
+        self.currentKey = Some(self.keys.len() - 1);
+        Ok(())
+    }
+
+    fn Next(&mut self) -> Result<()> {
+        match self.currentKey {
+            Some(cur) => {
+                if (cur + 1) < self.keys.len() {
+                    self.currentKey = Some(cur + 1);
+                } else {
+                    self.currentKey = None;
+                }
+            },
+            None => {
+            },
+        }
+        Ok(())
+    }
+
+    fn Prev(&mut self) -> Result<()> {
+        match self.currentKey {
+            Some(cur) => {
+                if cur > 0 {
+                    self.currentKey = Some(cur - 1);
+                } else {
+                    self.currentKey = None;
+                }
+            },
+            None => {
+            },
+        }
+        Ok(())
+    }
+
+}
+
+pub enum ChildCursor {
+    Leaf(LeafCursor),
+    Parent(ParentPageCursor),
+}
+
+impl ChildCursor {
+    fn read_page(&mut self, pg: PageNum) -> Result<()> {
+        match self {
+            &mut ChildCursor::Leaf(ref mut c) => {
+                try!(c.read_page(pg));
+            },
+            &mut ChildCursor::Parent(ref mut c) => {
+                try!(c.read_page(pg));
+            },
+        }
+        Ok(())
+    }
+}
+
+impl ICursor for ChildCursor {
+    fn IsValid(&self) -> bool {
+        match self {
+            &ChildCursor::Leaf(ref c) => c.IsValid(),
+            &ChildCursor::Parent(ref c) => c.IsValid(),
+        }
+    }
+
+    fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
+        match self {
+            &mut ChildCursor::Leaf(ref mut c) => c.SeekRef(k, sop),
+            &mut ChildCursor::Parent(ref mut c) => c.SeekRef(k, sop),
+        }
+    }
+
+    fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
+        match self {
+            &ChildCursor::Leaf(ref c) => c.KeyRef(),
+            &ChildCursor::Parent(ref c) => c.KeyRef(),
+        }
+    }
+
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
+        match self {
+            &ChildCursor::Leaf(ref c) => c.ValueRef(),
+            &ChildCursor::Parent(ref c) => c.ValueRef(),
+        }
+    }
+
+    fn ValueLength(&self) -> Result<Option<usize>> {
+        match self {
+            &ChildCursor::Leaf(ref c) => c.ValueLength(),
+            &ChildCursor::Parent(ref c) => c.ValueLength(),
+        }
+    }
+
+    fn First(&mut self) -> Result<()> {
+        match self {
+            &mut ChildCursor::Leaf(ref mut c) => c.First(),
+            &mut ChildCursor::Parent(ref mut c) => c.First(),
+        }
+    }
+
+    fn Last(&mut self) -> Result<()> {
+        match self {
+            &mut ChildCursor::Leaf(ref mut c) => c.Last(),
+            &mut ChildCursor::Parent(ref mut c) => c.Last(),
+        }
+    }
+
+    fn Next(&mut self) -> Result<()> {
+        match self {
+            &mut ChildCursor::Leaf(ref mut c) => c.Next(),
+            &mut ChildCursor::Parent(ref mut c) => c.Next(),
+        }
+    }
+
+    fn Prev(&mut self) -> Result<()> {
+        match self {
+            &mut ChildCursor::Leaf(ref mut c) => c.Prev(),
+            &mut ChildCursor::Parent(ref mut c) => c.Prev(),
+        }
+    }
+
+}
+
+pub struct ParentPageCursor {
+    path: String,
+    f: std::rc::Rc<std::cell::RefCell<File>>,
+    pr: misc::Lend<Box<[u8]>>,
+
+    keys: Vec<usize>,
+    children: Vec<PageNum>,
+
+    cur_child: Option<usize>,
+    sub: Box<ChildCursor>,
+}
+
+impl ParentPageCursor {
+    fn new(path: &str, 
+           f: std::rc::Rc<std::cell::RefCell<File>>,
+           buf: misc::Lend<Box<[u8]>>
+          ) -> Result<ParentPageCursor> {
+
+        let mut keys = vec![];
+        let mut children = vec![];
+        try!(Self::parse_page(&buf, &mut keys, &mut children));
+
+        let child_buf = vec![0; buf.len()].into_boxed_slice();
+        let done_page = move |p| -> () {
+        };
+        let mut child_buf = misc::Lend::new(child_buf, box done_page);
+        {
+            let f = &mut *(f.borrow_mut());
+            try!(utils::SeekPage(f, child_buf.len(), children[0]));
+            try!(misc::io::read_fully(f, &mut child_buf));
+        }
+
+        let pt_child = try!(PageType::from_u8(child_buf[0]));
+        let sub = 
+            match pt_child {
+                PageType::LEAF_NODE => {
+                    let sub = try!(LeafCursor::new(path, f.clone(), child_buf));
+                    ChildCursor::Leaf(sub)
+                },
+                PageType::PARENT_NODE => {
+                    let sub = try!(ParentPageCursor::new(path, f.clone(), child_buf));
+                    ChildCursor::Parent(sub)
+                },
+                PageType::OVERFLOW_NODE => {
+                    return Err(Error::CorruptFile("child page has invalid page type"));
+                },
+            };
+
+        let mut res = ParentPageCursor {
+            path: String::from(path),
+            f: f,
+            pr: buf,
+
+            keys: keys,
+            children: children,
+
+            cur_child: Some(0),
+            sub: box sub,
+        };
+
+        Ok(res)
+    }
+
+    pub fn count_keys(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn parse_page(pr: &[u8], keys: &mut Vec<usize>, children: &mut Vec<PageNum>) -> Result<()> {
+        let mut cur = 0;
+        let pt = try!(PageType::from_u8(misc::buf_advance::get_byte(pr, &mut cur)));
+        if  pt != PageType::PARENT_NODE {
+            return Err(Error::CorruptFile("parent page has invalid page type"));
+        }
+        cur = cur + 1; // skip the page flags
+        let count_keys = misc::buf_advance::get_u16(pr, &mut cur) as usize;
+        misc::set_vec_len(keys, 0, count_keys);
+        for i in 0 .. count_keys {
+            keys.push(cur);
+
+            let klen = varint::read(&pr, &mut cur) as usize;
+            let inline = 0 == klen % 2;
+            let klen = klen / 2;
+
+            if inline {
+                cur = cur + klen;
+            } else {
+                cur = cur + SIZE_32;
+            }
+        }
+        let count_children = count_keys + 1;
+        misc::set_vec_len(children, 0, count_children);
+        for i in 0 .. count_children {
+            let pg = varint::read(&pr, &mut cur) as PageNum;
+            children.push(pg);
+        }
+
+        Ok(())
+    }
+
+    fn set_child(&mut self, i: usize) -> Result<()> {
+        let pg = self.children[i];
+        try!(self.sub.read_page(pg));
+        self.cur_child = Some(i);
+        Ok(())
+    }
+
+    fn read_page(&mut self, pgnum: PageNum) -> Result<()> {
+        {
+            let f = &mut *(self.f.borrow_mut());
+            try!(utils::SeekPage(f, self.pr.len(), pgnum));
+            try!(misc::io::read_fully(f, &mut self.pr));
+        }
+        try!(Self::parse_page(&self.pr, &mut self.keys, &mut self.children));
+
+        Ok(())
+    }
+
+    fn key<'a>(&'a self, n: usize) -> Result<KeyRef<'a>> { 
+        let mut cur = self.keys[n as usize];
+        let klen = varint::read(&self.pr, &mut cur) as usize;
+        let inline = 0 == klen % 2;
+        let klen = klen / 2;
+        if inline {
+            Ok(KeyRef::Array(&self.pr[cur .. cur + klen]))
+        } else {
+            let pgnum = misc::buf_advance::get_u32(&self.pr, &mut cur) as PageNum;
+            let mut ostrm = try!(OverflowReader::new(&self.path, self.pr.len(), pgnum, klen));
+            let mut x_k = Vec::with_capacity(klen);
+            try!(ostrm.read_to_end(&mut x_k));
+            let x_k = x_k.into_boxed_slice();
+            Ok(KeyRef::Overflowed(x_k))
+        }
+    }
+
+    fn search(&mut self, kq: &KeyRef) -> Result<usize> {
+        let mut found = None;
+        for i in 0 .. self.keys.len() {
+            let k = try!(self.key(i));
+            let cmp = KeyRef::cmp(kq, &k);
+            if cmp == Ordering::Less {
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            None => Ok(self.children.len() - 1),
+            Some(found) => Ok(found),
+        }
+    }
+
+}
+
+impl ICursor for ParentPageCursor {
+    fn IsValid(&self) -> bool {
+        match self.cur_child {
+            None => false,
+            Some(i) => {
+                self.sub.IsValid()
+            },
+        }
+    }
+
+    fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
+        let child = try!(self.search(k));
+        try!(self.set_child(child));
+        let sr = try!(self.sub.SeekRef(k, sop));
+        let sr = 
+            match sr {
+                SeekResult::Equal => {
+                    sr
+                },
+                SeekResult::Unequal => {
+                    sr
+                },
+                SeekResult::Invalid => {
+                    match sop {
+                        SeekOp::SEEK_EQ => {
+                            sr
+                        },
+                        SeekOp::SEEK_GE => {
+                            if child + 1 < self.children.len() {
+                                try!(self.set_child(child + 1));
+                                try!(self.sub.First());
+                                SeekResult::Unequal
+                            } else {
+                                sr
+                            }
+                        },
+                        SeekOp::SEEK_LE => {
+                            if child > 0 {
+                                try!(self.set_child(child - 1));
+                                try!(self.sub.Last());
+                                SeekResult::Unequal
+                            } else {
+                                sr
+                            }
+                        },
+                    }
+                },
+            };
+        Ok(sr)
+    }
+
+    fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
+        match self.cur_child {
+            None => Err(Error::CursorNotValid),
+            Some(i) => {
+                self.sub.KeyRef()
+            },
+        }
+    }
+
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
+        match self.cur_child {
+            None => Err(Error::CursorNotValid),
+            Some(i) => {
+                self.sub.ValueRef()
+            },
+        }
+    }
+
+    fn ValueLength(&self) -> Result<Option<usize>> {
+        match self.cur_child {
+            None => Err(Error::CursorNotValid),
+            Some(i) => {
+                self.sub.ValueLength()
+            },
+        }
+    }
+
+    fn First(&mut self) -> Result<()> {
+        try!(self.set_child(0));
+        self.sub.First()
+    }
+
+    fn Last(&mut self) -> Result<()> {
+        let count_keys = self.keys.len();
+        try!(self.set_child(count_keys - 1));
+        self.sub.First()
+    }
+
+    fn Next(&mut self) -> Result<()> {
+        match self.cur_child {
+            None => Err(Error::CursorNotValid),
+            Some(i) => {
+                try!(self.sub.Next());
+                if !self.sub.IsValid() && i + 1 < self.children.len() {
+                    try!(self.set_child(i + 1));
+                    self.sub.First()
+                } else {
+                    Ok(())
+                }
+            },
+        }
+    }
+
+    fn Prev(&mut self) -> Result<()> {
+        match self.cur_child {
+            None => Err(Error::CursorNotValid),
+            Some(i) => {
+                try!(self.sub.Prev());
+                if !self.sub.IsValid() && i > 0 {
+                    try!(self.set_child(i - 1));
+                    self.sub.Last()
+                } else {
+                    Ok(())
+                }
+            },
+        }
+    }
+
+}
+
 pub struct SegmentCursor {
     path: String,
     f: std::rc::Rc<std::cell::RefCell<File>>,

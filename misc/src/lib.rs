@@ -66,6 +66,14 @@ pub fn tempfile(base: &str) -> String {
     file
 }
 
+pub fn set_vec_len<T: Copy>(v: &mut Vec<T>, val: T, len: usize) {
+    v.truncate(len);
+    // TODO put val into all the entries that are already there?
+    while v.len() < len {
+        v.push(val);
+    }
+}
+
 pub fn insert_vec_into_vec<T>(dest: &mut Vec<T>, ndx: usize, from: Vec<T>) {
     for x in from.into_iter().rev() {
         dest.insert(ndx, x);
