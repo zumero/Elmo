@@ -35,7 +35,8 @@ fn dump_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
 
 fn list_segments(name: &str) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
-    let (ranges, infos) = try!(db.list_segments());
+    let (young, levels, locations) = try!(db.list_segments());
+    /*
     for i in 0 .. ranges.len() {
         println!("---- range: {}", i);
         for s in ranges[i].state.iter() {
@@ -49,6 +50,10 @@ fn list_segments(name: &str) -> Result<(),lsm::Error> {
             println!("    depth: {}", cursor.depth());
         }
     }
+    */
+    println!("{:?}", young);
+    println!("{:?}", levels);
+    println!("{:?}", locations);
     Ok(())
 }
 
@@ -95,23 +100,6 @@ fn dump_segment(name: &str, segnum: u64) -> Result<(),lsm::Error> {
     Ok(())
 }
 
-fn merge(name: &str, range: usize, merge_level: u32, min_segs: usize, max_segs: usize) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
-    // TODO not sure this promotion rule is what we want here
-    match try!(db.merge(range, merge_level, min_segs, max_segs, lsm::MergePromotionRule::Stay)) {
-        Some(pm) => {
-            //println!("merged segment: {:?}", pm);
-            let lck = try!(db.get_write_lock());
-            try!(lck.commit_merge(pm));
-            Ok(())
-        },
-        None => {
-            println!("no merge needed");
-            Ok(())
-        },
-    }
-}
-
 fn add_numbers(name: &str, count: u64, start: u64, step: u64) -> Result<(),lsm::Error> {
     let mut pending = BTreeMap::new();
     for i in 0 .. count {
@@ -121,9 +109,9 @@ fn add_numbers(name: &str, count: u64, start: u64, step: u64) -> Result<(),lsm::
         pending.insert(k, lsm::Blob::Array(v));
     }
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
-    let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
+    let seg = try!(db.write_run(pending).map_err(lsm::wrap_err));
     let lck = try!(db.get_write_lock());
-    try!(lck.commit_segment(seg).map_err(lsm::wrap_err));
+    try!(lck.commit_run(seg).map_err(lsm::wrap_err));
     Ok(())
 }
 
@@ -143,9 +131,9 @@ fn add_random(name: &str, count: u64, seed: usize, klen: usize, vlen: usize) -> 
         pending.insert(k, lsm::Blob::Array(v));
     }
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
-    let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
+    let seg = try!(db.write_run(pending).map_err(lsm::wrap_err));
     let lck = try!(db.get_write_lock());
-    try!(lck.commit_segment(seg).map_err(lsm::wrap_err));
+    try!(lck.commit_run(seg).map_err(lsm::wrap_err));
     Ok(())
 }
 
@@ -179,16 +167,6 @@ fn result_main() -> Result<(),lsm::Error> {
             let start = args[4].parse::<u64>().unwrap();
             let step = args[5].parse::<u64>().unwrap();
             add_numbers(name, count, start, step)
-        },
-        "merge" => {
-            if args.len() < 7 {
-                return Err(lsm::Error::Misc(String::from("too few args")));
-            }
-            let range = args[3].parse::<usize>().unwrap();
-            let merge_level = args[4].parse::<u32>().unwrap();
-            let min_segs = args[5].parse::<usize>().unwrap();
-            let max_segs = args[6].parse::<usize>().unwrap();
-            merge(name, range, merge_level, min_segs, max_segs)
         },
         "dump_page" => {
             if args.len() < 4 {

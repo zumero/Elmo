@@ -50,14 +50,9 @@ use std::collections::HashSet;
 const SIZE_32: usize = 4; // like std::mem::size_of::<u32>()
 const SIZE_16: usize = 2; // like std::mem::size_of::<u16>()
 
-// all new segments start at level 0.
-//
-// level 0 size limit is 0 because it is unused, because promotion
-// out of level 0 is not based on a size threshold.
-//
-// final level size limit is 0 because it is unused, because nothing ever
-// gets promoted out of the last level.
-const LEVEL_SIZE_LIMITS_IN_KB: [u64; 4] = [0, 400, 40000, 0];
+// the young level is not included in the following count
+
+const NUM_LEVELS: usize = 4;
 
 pub type PageNum = u32;
 // type PageSize = u32;
@@ -163,13 +158,6 @@ impl<T> From<std::sync::PoisonError<T>> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug)]
-pub enum MergePromotionRule {
-    Promote,
-    Stay,
-    Threshold(usize),
-}
-
 // kvp is the struct used to provide key-value pairs downward,
 // for storage into the database.
 struct kvp {
@@ -180,6 +168,14 @@ struct kvp {
 #[derive(Debug)]
 struct PendingSegment {
     blockList: Vec<PageBlock>,
+}
+
+fn get_level_size(i: usize) -> u64 {
+    let mut n = 1;
+    for _ in 0 .. i+1 {
+        n *= 10;
+    }
+    n
 }
 
 fn split3<T>(a: &mut [T], i: usize) -> (&mut [T], &mut [T], &mut [T]) {
@@ -734,14 +730,12 @@ pub trait ICursor {
 pub struct DbSettings {
     pub DefaultPageSize: usize,
     pub PagesPerBlock: PageNum,
-    pub RangeSplits: usize,
 }
 
 pub const DEFAULT_SETTINGS: DbSettings = 
     DbSettings {
         DefaultPageSize: 4096,
         PagesPerBlock: 256,
-        RangeSplits: 4,
     };
 
 #[derive(Debug,Clone)]
@@ -775,18 +769,6 @@ impl SegmentLocation {
         return false;
     }
 
-}
-
-#[derive(Debug,Clone)]
-pub struct SegmentInfo {
-    level: u32,
-    location: SegmentLocation,
-}
-
-impl SegmentInfo {
-    pub fn count_pages(&self) -> usize {
-        self.location.count_pages()
-    }
 }
 
 // TODO why is this pub?
@@ -1374,12 +1356,12 @@ impl ICursor for MultiCursor {
 }
 
 struct ConcatCursor { 
-    subcursors: Box<[Option<SegmentCursor>]>, 
+    subcursors: Box<[SegmentCursor]>, 
     cur: Option<usize>, 
 }
 
 impl ConcatCursor {
-    fn new(subs: Vec<Option<SegmentCursor>>) -> Self {
+    fn new(subs: Vec<SegmentCursor>) -> Self {
         let s = subs.into_boxed_slice();
         ConcatCursor { 
             subcursors: s, 
@@ -1387,90 +1369,55 @@ impl ConcatCursor {
         }
     }
 
-    fn current(&self) -> Option<&SegmentCursor> {
-        match self.cur {
-            Some(i) => {
-                self.subcursors[i].as_ref()
-            },
-            None => {
-                None
-            },
-        }
-    }
-
-    fn forward(&mut self, start: usize) -> Result<()> {
-        self.cur = None;
-        let mut i = start;
-        loop {
-            if let Some(ref mut c) = self.subcursors[i] {
-                self.cur = Some(i);
-                try!(c.First());
-                break;
-            }
-            if i + 1 < self.subcursors.len() {
-                i += 1;
-            } else {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    fn backward(&mut self, start: usize) -> Result<()> {
-        self.cur = None;
-        let mut i = start;
-        loop {
-            if let Some(ref mut c) = self.subcursors[i] {
-                self.cur = Some(i);
-                try!(c.Last());
-                break;
-            }
-            if i > 0 {
-                i -= 1;
-            } else {
-                break;
-            }
-        }
-        Ok(())
-    }
-
 }
 
 impl ICursor for ConcatCursor {
     fn IsValid(&self) -> bool {
-        match self.current() {
-            Some(c) => c.IsValid(),
+        match self.cur {
+            Some(icur) => self.subcursors[icur].IsValid(),
             None => false
         }
     }
 
     fn First(&mut self) -> Result<()> {
-        self.forward(0)
+        if self.subcursors.len() > 0 {
+            try!(self.subcursors[0].First());
+            self.cur = Some(0);
+        } else {
+            self.cur = None;
+        }
+        Ok(())
     }
 
     fn Last(&mut self) -> Result<()> {
         let len = self.subcursors.len();
-        self.backward(len - 1)
+        if len > 0 {
+            try!(self.subcursors[len - 1].Last());
+            self.cur = Some(len - 1);
+        } else {
+            self.cur = None;
+        }
+        Ok(())
     }
 
     fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
-        match self.current() {
+        match self.cur {
             None => Err(Error::CursorNotValid),
-            Some(c) => c.KeyRef(),
+            Some(icur) => self.subcursors[icur].KeyRef(),
         }
     }
 
     fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
-        match self.current() {
+        match self.cur {
             None => Err(Error::CursorNotValid),
-            Some(c) => c.ValueRef(),
+            Some(icur) => self.subcursors[icur].ValueRef(),
         }
     }
 
     fn ValueLength(&self) -> Result<Option<usize>> {
-        match self.current() {
+        match self.cur {
             None => Err(Error::CursorNotValid),
-            Some(c) => c.ValueLength(),
+            Some(icur) => self.subcursors[icur].ValueLength(),
         }
     }
 
@@ -1480,13 +1427,14 @@ impl ICursor for ConcatCursor {
             Some(icur) => {
                 if 
                     !{
-                        let c = self.subcursors[icur].as_mut().unwrap();
-                        try!(c.Next());
-                        c.IsValid()
+                        try!(self.subcursors[icur].Next());
+                        self.subcursors[icur].IsValid()
                     } 
                 {
                     if icur + 1 < self.subcursors.len() {
-                        try!(self.forward(icur + 1));
+                        let icur = icur + 1;
+                        try!(self.subcursors[icur].First());
+                        self.cur = Some(icur);
                     } else {
                         self.cur = None;
                     }
@@ -1502,13 +1450,14 @@ impl ICursor for ConcatCursor {
             Some(icur) => {
                 if
                     !{
-                        let c = self.subcursors[icur].as_mut().unwrap();
-                        try!(c.Prev());
-                        c.IsValid()
+                        try!(self.subcursors[icur].Prev());
+                        self.subcursors[icur].IsValid()
                     }
                 {
                     if icur > 0 {
-                        try!(self.backward(icur - 1));
+                        let icur = icur - 1;
+                        try!(self.subcursors[icur].Last());
+                        self.cur = Some(icur);
                     } else {
                         self.cur = None;
                     }
@@ -1519,17 +1468,10 @@ impl ICursor for ConcatCursor {
     }
 
     fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
+        // TODO figure out which subcursor
+        unimplemented!();
         self.cur = None;
-        // TODO encapsulate mapping of keys to ranges
-        let b = try!(k.u8_at(0));
-        let i = (b as usize) * self.subcursors.len() / 256;
-        if let Some(ref mut c) = self.subcursors[i] {
-            self.cur = Some(i);
-            c.SeekRef(k, sop)
-        } else {
-            self.cur = None;
-            Ok(SeekResult::Invalid)
-        }
+        Ok(SeekResult::Invalid)
     }
 
 }
@@ -1642,7 +1584,7 @@ impl ICursor for LivingCursor {
 
 pub struct FilterTombstonesCursor { 
     chain: MultiCursor,
-    behind: Vec<SegmentCursor>,
+    behind: Vec<ConcatCursor>,
 }
 
 impl FilterTombstonesCursor {
@@ -1680,7 +1622,7 @@ impl FilterTombstonesCursor {
         Ok(())
     }
 
-    fn new(ch: MultiCursor, behind: Vec<SegmentCursor>) -> FilterTombstonesCursor {
+    fn new(ch: MultiCursor, behind: Vec<ConcatCursor>) -> FilterTombstonesCursor {
         FilterTombstonesCursor { 
             chain: ch,
             behind: behind,
@@ -2031,10 +1973,10 @@ struct LeafState {
     blk: PageBlock,
 }
 
-fn create_segment<I, SeekWrite>(fs: &mut SeekWrite, 
-                                                            pageManager: &IPages, 
-                                                            source: I,
-                                                           ) -> Result<SegmentLocation> where I: Iterator<Item=Result<kvp>>, SeekWrite: Seek+Write {
+fn create_run<I, SeekWrite>(fs: &mut SeekWrite, 
+                                pageManager: &IPages, 
+                                source: I,
+                               ) -> Result<PendingRun> where I: Iterator<Item=Result<kvp>>, SeekWrite: Seek+Write {
 
     fn write_overflow<SeekWrite>(startingBlock: PageBlock, 
                                 ba: &mut Read, 
@@ -2991,7 +2933,31 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
     */
 
     let g = try!(pageManager.End(token, blk.firstPage, root_page));
-    Ok(g)
+    // TODO loop and split to make multiple segments
+
+    // maybe each "segment" should be cut off whenever 
+    // it would result in a single parent page.
+
+    // can we ignore little segments?  a merge could simply replace
+    // the part of the btree that would be affected.
+
+    // leaves would need to know even less about where the next leaf
+    // is, so that we could change that later.
+
+    // maybe segment as "a sequence of leaves with one parent node"
+    // gives us granularity we need.  still, walking the leaves
+    // would need to know how to stop at the end of the parent node.
+
+    // parent node would need to know a little more?  not just keys
+    // and page.  it needs to know full list of pages involved?  Next
+    // and Prev need to work through the parent node, not by getting
+    // special info from the root note.
+
+    // pick on "segment" from level N to merge?  
+    let run = PendingRun {
+        segments: vec![g],
+    };
+    Ok(run)
 }
 
 struct OverflowReader {
@@ -3640,6 +3606,9 @@ impl SegmentCursor {
     // of stuff in memory as we go.  and this code only causes
     // a perf difference if there are overflow pages between
     // the leaves.
+
+    // TODO consider putting overflows in a separate block of pages
+    // so that leaves will be in a row.
     fn searchForwardForLeaf(&mut self) -> Result<bool> {
         let pt = try!(self.page_type());
         if pt == PageType::LEAF_NODE { 
@@ -3892,29 +3861,36 @@ impl ICursor for SegmentCursor {
 
 }
 
-#[derive(Clone)]
-pub struct RangeState {
-    pub state: Vec<SegmentNum>,
+#[derive(Clone, Debug)]
+pub struct ActiveRun {
+    pub segments: Vec<SegmentNum>,
 }
 
-impl RangeState {
+impl ActiveRun {
     fn new() -> Self {
-        RangeState {
-            state: vec![],
+        ActiveRun {
+            segments: vec![],
         }
     }
 }
 
+pub struct PendingRun {
+    pub segments: Vec<SegmentLocation>,
+}
+
 #[derive(Clone)]
 struct HeaderData {
-    // for range splitting, each key range has its own current_state.
-    // each range can be merged independently.  
-    // cursors become more complicated, as we need to view all the segments
-    // in one horizontal row as a single segment.  ConcatCursor does this.
+    young: Vec<ActiveRun>,
+    levels: Box<[ActiveRun]>,
 
-    // TODO could be a boxed slice
-    state: Vec<RangeState>,
-    segments_info: HashMap<SegmentNum, SegmentInfo>,
+    // TODO change name to locations
+    segments: HashMap<SegmentNum, SegmentLocation>,
+
+    // TODO maybe the locations don't need to be in the
+    // header?
+
+    // TODO somewhere we need to store (cache) the first/last key of every segment.
+    // like the leveldb manifest
     next_segnum: SegmentNum,
     changeCounter: u64,
     mergeCounter: u64,
@@ -3984,7 +3960,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
     }
 
     fn parse(pr: &Box<[u8]>, cur: &mut usize) -> Result<(HeaderData, usize)> {
-        fn readSegmentList(pr: &Box<[u8]>, cur: &mut usize) -> Result<(Vec<RangeState>, HashMap<SegmentNum, SegmentInfo>)> {
+        fn readSegmentList(pr: &Box<[u8]>, cur: &mut usize) -> Result<(Vec<ActiveRun>, Vec<ActiveRun>, HashMap<SegmentNum, SegmentLocation>)> {
             fn readBlockList(prBlocks: &Box<[u8]>, cur: &mut usize) -> Vec<PageBlock> {
                 let count = varint::read(&prBlocks, cur) as usize;
                 let mut a = Vec::with_capacity(count);
@@ -3999,18 +3975,14 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
                 a
             }
 
-            let count_ranges = varint::read(&pr, cur) as usize;
-            let mut ranges = Vec::with_capacity(count_ranges);
-            let mut m = HashMap::new();
-            for _ in 0 .. count_ranges {
-                let count_segments_in_range = varint::read(&pr, cur) as usize;
-                let mut range_segments = Vec::with_capacity(count_segments_in_range);
-                for _ in 0 .. count_segments_in_range {
+            fn read_run(pr: &Box<[u8]>, cur: &mut usize, m: &mut HashMap<SegmentNum, SegmentLocation>) -> Result<ActiveRun> {
+                let count_segments = varint::read(&pr, cur) as usize;
+                let mut segments = Vec::with_capacity(count_segments);
+                for _ in 0 .. count_segments {
                     let g = varint::read(&pr, cur) as SegmentNum;
-                    range_segments.push(g);
+                    segments.push(g);
                     let root_page = varint::read(&pr, cur) as PageNum;
                     let blocks = readBlockList(pr, cur);
-                    let level = varint::read(&pr, cur) as u32;
                     if !block_list_contains_page(&blocks, root_page) {
                         return Err(Error::RootPageNotInSegmentBlockList);
                     }
@@ -4019,18 +3991,28 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
                         root_page: root_page,
                         blocks: blocks
                     };
-                    let info = SegmentInfo {
-                        location: location,
-                        level: level,
-                    };
-                    m.insert(g,info);
+                    m.insert(g, location);
                 }
-                let range = RangeState {
-                    state: range_segments,
+                let run = ActiveRun {
+                    segments: segments,
                 };
-                ranges.push(range);
+                Ok(run)
             }
-            Ok((ranges, m))
+
+            fn read_level_group(pr: &Box<[u8]>, cur: &mut usize, m: &mut HashMap<SegmentNum, SegmentLocation>) -> Result<Vec<ActiveRun>> {
+                let mut v = vec![];
+                let count_levels = varint::read(&pr, cur) as usize;
+                for _ in 0 .. count_levels {
+                    let run = try!(read_run(pr, cur, m));
+                    v.push(run);
+                }
+                Ok(v)
+            }
+
+            let mut m = HashMap::new();
+            let young = try!(read_level_group(pr, cur, &mut m));
+            let levels = try!(read_level_group(pr, cur, &mut m));
+            Ok((young, levels, m))
         }
 
         // --------
@@ -4040,12 +4022,13 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
         let mergeCounter = varint::read(&pr, cur);
         let next_segnum = varint::read(&pr, cur);
 
-        let (state, segments_info) = try!(readSegmentList(pr, cur));
+        let (young, levels, segments) = try!(readSegmentList(pr, cur));
 
         let hd = 
             HeaderData {
-                state: state,
-                segments_info: segments_info,
+                young: young,
+                levels: levels.into_boxed_slice(),
+                segments: segments,
                 changeCounter: changeCounter,
                 mergeCounter: mergeCounter,
                 next_segnum: next_segnum,
@@ -4078,13 +4061,10 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
         // TODO shouldn't this use settings passed in?
         let defaultPageSize = DEFAULT_SETTINGS.DefaultPageSize;
         let h = {
-            let mut ranges = vec![];
-            for _ in 0 .. DEFAULT_SETTINGS.RangeSplits {
-                ranges.push(RangeState::new());
-            }
             HeaderData {
-                segments_info: HashMap::new(),
-                state: ranges,
+                young: vec![],
+                levels: vec![ActiveRun::new(); NUM_LEVELS].into_boxed_slice(),
+                segments: HashMap::new(),
                 changeCounter: 0,
                 mergeCounter: 0,
                 next_segnum: 1,
@@ -4142,8 +4122,8 @@ fn listAllBlocks(h: &HeaderData, pgsz: usize) -> Vec<PageBlock> {
     let headerBlock = PageBlock::new(1, (HEADER_SIZE_IN_BYTES / pgsz) as PageNum);
     blocks.push(headerBlock);
 
-    for info in h.segments_info.values() {
-        for b in info.location.blocks.iter() {
+    for loc in h.segments.values() {
+        for b in loc.blocks.iter() {
             blocks.push(*b);
         }
     }
@@ -4165,14 +4145,30 @@ struct Space {
     // a zombie segment is one that was replaced by a merge, but
     // when the merge was done, it could not be reclaimed as free
     // blocks because there was an open cursor on it.
-    zombie_segments: HashMap<SegmentNum, SegmentInfo>,
+    zombie_segments: HashMap<SegmentNum, SegmentLocation>,
+}
+
+enum Promoting {
+    // TODO probably want the ability to merge less than all of young
+    Young,
+
+    // TODO should be one segment
+    Other(usize, ActiveRun),
+}
+
+impl Promoting {
+    fn get_dest_level(&self) -> usize {
+        match self {
+            &Promoting::Young => 0,
+            &Promoting::Other(level, _) => level + 1,
+        }
+    }
 }
 
 pub struct PendingMerge {
-    range: usize,
-    old_segments: Vec<SegmentNum>,
-    merge_level: u32,
-    new_segment: Option<SegmentInfo>,
+    old_in_prev: Promoting,
+    old_in_dest: ActiveRun,
+    new: Option<PendingRun>,
 }
 
 struct SafeMergeStuff {
@@ -4194,10 +4190,6 @@ struct InnerPart {
     pgsz: usize,
     settings: DbSettings,
 
-    // TODO count_ranges is only here so we can know how
-    // many ranges there are without locking the header.
-    count_ranges: usize,
-
     // TODO are we concerned here about readers starving the
     // writers?  In other words, so many cursors that a merge
     // cannot get committed?
@@ -4208,67 +4200,52 @@ struct InnerPart {
     pagepool: Mutex<SafePagePool>,
 }
 
+enum Level {
+    Young,
+    Other(usize),
+}
+
+enum NewRunMessage {
+    NewRun,
+    Terminate,
+}
+
 enum AutomergeMessage {
-    NewSegment(usize, SegmentNum, u32),
+    Merged(usize),
     Terminate,
 }
 
 pub struct WriteLock {
     inner: std::sync::Arc<InnerPart>,
+    notify_young: mpsc::Sender<NewRunMessage>,
     notify_automerge: Vec<mpsc::Sender<AutomergeMessage>>,
 }
 
 impl WriteLock {
-    // TODO name.  this is now multiple segments, because of range splits.  generation?
-    pub fn commit_segment(&self, set: Vec<Option<SegmentLocation>>) -> Result<()> {
-        let segnums = try!(self.inner.commit_segment(set));
-        for (rangenum, seg) in segnums.into_iter().enumerate() {
-            if let Some(segnum) = seg {
-                // TODO note that all ranges within a level share a single automerge thread
-                try!(self.notify_automerge[0].send(AutomergeMessage::NewSegment(rangenum, segnum, 0)).map_err(wrap_err));
-            }
-        }
+    pub fn commit_run(&self, pending: PendingRun) -> Result<()> {
+        let run = try!(self.inner.commit_run(pending));
+        try!(self.notify_young.send(NewRunMessage::NewRun).map_err(wrap_err));
         Ok(())
     }
 
     pub fn commit_merge(&self, pm: PendingMerge) -> Result<()> {
-        // TODO the following temp var is dorky
-        let rangenum = pm.range;
         let notify =
-            match pm.new_segment {
-                Some(ref info) => {
-                    if info.level == pm.merge_level {
-                        // we only want to notify if this was a promotion.
-                        // this merge was just cleaning up a level and
-                        // leaving the resulting segment in that same level.
-                        None
-                    } else {
-                        // this merge resulted in a segment getting promoted
-                        // to the next level.  need to notify that level,
-                        // because it might need a merge now.
-                        Some(info.level)
-                    }
+            match pm.new {
+                Some(_) => {
+                    Some(pm.old_in_prev.get_dest_level())
                 },
                 None => {
                     // this merge did not result in a segment.  this happens
                     // because tombstones.
+                    // TODO should we notify anyway?
                     None
                 },
             };
-        let new_segnum = try!(self.inner.commit_merge(pm));
+        let new_run = try!(self.inner.commit_merge(pm));
         match notify {
             Some(level) => {
-                // the unwrap in the following line is correct.
-                // if notify.is_some(), then commit_merge() has to
-                // return a segment number.
-                let new_segnum = new_segnum.unwrap();
-
-                // nothing gets "promoted" to level 0.
-                // new segments start in level 0
-                assert!(level > 0);
-                assert!((level as usize) < self.notify_automerge.len());
-                // TODO note that all ranges within a level share a single automerge thread
-                try!(self.notify_automerge[level as usize].send(AutomergeMessage::NewSegment(rangenum, new_segnum, level as u32)).map_err(wrap_err));
+                assert!(level < self.notify_automerge.len());
+                try!(self.notify_automerge[level].send(AutomergeMessage::Merged(level)).map_err(wrap_err));
             },
             None => {
             },
@@ -4327,22 +4304,22 @@ impl DatabaseFile {
         };
 
         // each merge level is handled by its own thread.  a Rust channel is used to
-        // notify that thread that there is merge work to be done.
+        // notify that thread that there may be merge work to be done.
+
+        let (tx_young, rx_young): (mpsc::Sender<NewRunMessage>, mpsc::Receiver<NewRunMessage>) = mpsc::channel();
 
         let mut senders = vec![];
         let mut receivers = vec![];
-        for _level in 0 .. LEVEL_SIZE_LIMITS_IN_KB.len() {
+        for _level in 0 .. NUM_LEVELS {
             let (tx, rx): (mpsc::Sender<AutomergeMessage>, mpsc::Receiver<AutomergeMessage>) = mpsc::channel();
             senders.push(tx);
             receivers.push(rx);
         }
 
-        let count_ranges = header.state.len();
         let inner = InnerPart {
             path: path,
             pgsz: pgsz,
             settings: settings, 
-            count_ranges: count_ranges,
             header: RwLock::new(header),
             space: Mutex::new(space),
             mergeStuff: Mutex::new(mergeStuff),
@@ -4354,6 +4331,7 @@ impl DatabaseFile {
         let lck = 
             WriteLock { 
                 inner: inner.clone(),
+                notify_young: tx_young,
                 notify_automerge: senders,
             };
 
@@ -4366,6 +4344,40 @@ impl DatabaseFile {
         // TODO so when we do send Terminate messages to these threads?
         // impl Drop for DatabaseFile ? 
 
+        {
+            let db = db.clone();
+            thread::spawn(move || {
+                loop {
+                    match rx_young.recv() {
+                        Ok(msg) => {
+                            match msg {
+                                NewRunMessage::NewRun => {
+                                    match db.automerge_level(Level::Young) {
+                                        Ok(()) => {
+                                        },
+                                        Err(e) => {
+                                            // TODO what now?
+                                            println!("{:?}", e);
+                                            panic!();
+                                        },
+                                    }
+                                },
+                                NewRunMessage::Terminate => {
+                                    break;
+                                },
+                            }
+                        },
+                        Err(e) => {
+                            // TODO what now?
+                            println!("{:?}", e);
+                            panic!();
+                        },
+                    }
+                }
+            });
+
+        }
+
         for (closure_level, rx) in receivers.into_iter().enumerate() {
             let db = db.clone();
             thread::spawn(move || {
@@ -4373,9 +4385,9 @@ impl DatabaseFile {
                     match rx.recv() {
                         Ok(msg) => {
                             match msg {
-                                AutomergeMessage::NewSegment(rangenum, new_segnum, level) => {
-                                    assert!(level == (closure_level as u32));
-                                    match db.automerge_level(rangenum, new_segnum, level) {
+                                AutomergeMessage::Merged(level) => {
+                                    assert!(level == closure_level);
+                                    match db.automerge_level(Level::Other(level)) {
                                         Ok(()) => {
                                         },
                                         Err(e) => {
@@ -4404,29 +4416,11 @@ impl DatabaseFile {
         Ok(db)
     }
 
-    fn automerge_level(&self, rangenum: usize, new_segnum: SegmentNum, level: u32) -> Result<()> {
-        assert!((level as usize) < LEVEL_SIZE_LIMITS_IN_KB.len());
-        let promotion =
-            if level == 0 {
-                // all new segments come in at level 0.
-                // we want to merge and promote them to level 1 as
-                // quickly as possible.
-                MergePromotionRule::Promote
-            } else if (level as usize) == LEVEL_SIZE_LIMITS_IN_KB.len() - 1 {
-                // nothing gets promoted out of the last level.
-                MergePromotionRule::Stay
-            } else {
-                // for all the levels in between, we promote when the
-                // level reaches a certain threshold of size.
-                let mb = LEVEL_SIZE_LIMITS_IN_KB[level as usize];
-                let bytes = mb * 1024;
-                let pages = bytes / (self.inner.pgsz as u64);
-                MergePromotionRule::Threshold(pages as usize)
-            };
-        match try!(self.merge(rangenum, level, 2, 8, promotion)) {
-            Some(seg) => {
+    fn automerge_level(&self, level: Level) -> Result<()> {
+        match try!(InnerPart::merge(&self.inner, level)) {
+            Some(pm) => {
                 let lck = try!(self.get_write_lock());
-                try!(lck.commit_merge(seg));
+                try!(lck.commit_merge(pm));
             },
             None => {
             },
@@ -4452,23 +4446,15 @@ impl DatabaseFile {
         InnerPart::open_cursor_on_active_segment(&self.inner, n)
     }
 
-    pub fn merge_pending_segments(&self, segments: Vec<SegmentLocation>) -> Result<SegmentLocation> {
-        InnerPart::merge_pending_segments(&self.inner, segments)
-    }
-
     pub fn open_cursor_on_pending_segment(&self, location: SegmentLocation) -> Result<SegmentCursor> {
         InnerPart::open_cursor_on_pending_segment(&self.inner, location)
     }
 
-    pub fn write_segment(&self, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<Vec<Option<SegmentLocation>>> {
-        self.inner.write_segment(pairs)
+    pub fn write_run(&self, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<PendingRun> {
+        self.inner.write_run(pairs)
     }
 
-    pub fn merge(&self, range: usize, level: u32, min_segs: usize, max_segs: usize, promote: MergePromotionRule) -> Result<Option<PendingMerge>> {
-        InnerPart::merge(&self.inner, range, level, min_segs, max_segs, promote)
-    }
-
-    pub fn list_segments(&self) -> Result<(Vec<RangeState>, HashMap<SegmentNum, SegmentInfo>)> {
+    pub fn list_segments(&self) -> Result<(Vec<ActiveRun>, Box<[ActiveRun]>, HashMap<SegmentNum, SegmentLocation>)> {
         InnerPart::list_segments(&self.inner)
     }
 
@@ -4532,8 +4518,8 @@ impl InnerPart {
         // that the cursor we just dropped was the only cursor on the
         // zombie segment.
         match space.zombie_segments.remove(&segnum) {
-            Some(info) => {
-                Self::addFreeBlocks(&mut space, &self.path, self.pgsz, info.location.blocks);
+            Some(loc) => {
+                Self::addFreeBlocks(&mut space, &self.path, self.pgsz, loc.blocks);
             },
             None => {
             },
@@ -4688,31 +4674,41 @@ impl InnerPart {
                   ) -> Result<()> {
 
         fn build_segment_list(h: &HeaderData) -> Vec<u8> {
-            let mut pb = vec![];
-            // TODO format version number
-            let count_ranges = h.state.len();
-            misc::push_varint(&mut pb, count_ranges as u64);
-            for range in h.state.iter() {
-                let count_segments_in_range = range.state.len();
-                misc::push_varint(&mut pb, count_segments_in_range as u64);
-                for g in range.state.iter() {
-                    misc::push_varint(&mut pb, *g);
-                    match h.segments_info.get(&g) {
-                        Some(info) => {
-                            misc::push_varint(&mut pb, info.location.root_page as u64);
-                            misc::push_varint(&mut pb, info.location.blocks.len() as u64);
+            fn add_run(pb: &mut Vec<u8>, locations: &HashMap<SegmentNum, SegmentLocation>, r: &ActiveRun) {
+                let count_segments = r.segments.len();
+                misc::push_varint(pb, count_segments as u64);
+                for g in r.segments.iter() {
+                    misc::push_varint(pb, *g);
+                    match locations.get(&g) {
+                        Some(loc) => {
+                            misc::push_varint(pb, loc.root_page as u64);
+                            misc::push_varint(pb, loc.blocks.len() as u64);
                             // we store PageBlock as first/count instead of first/last, since the
                             // count will always compress better as a varint.
-                            for t in info.location.blocks.iter() {
-                                misc::push_varint(&mut pb, t.firstPage as u64);
-                                misc::push_varint(&mut pb, t.count_pages() as u64);
+                            for t in loc.blocks.iter() {
+                                misc::push_varint(pb, t.firstPage as u64);
+                                misc::push_varint(pb, t.count_pages() as u64);
                             }
-                            misc::push_varint(&mut pb, info.level as u64);
                         },
-                        None => panic!("segment num in current state but not in segments_info")
+                        None => panic!("segment num in current state but not in segments")
                     }
                 }
             }
+
+            fn add_level_group(pb: &mut Vec<u8>, locations: &HashMap<SegmentNum, SegmentLocation>, a: &[ActiveRun]) {
+                let count = a.len();
+                misc::push_varint(pb, count as u64);
+                for run in a.iter() {
+                    add_run(pb, locations, run);
+                }
+            }
+
+            let mut pb = vec![];
+            // TODO format version number
+
+            add_level_group(&mut pb, &h.segments, &h.young);
+            add_level_group(&mut pb, &h.segments, &h.levels);
+
             pb
         }
 
@@ -4747,9 +4743,9 @@ impl InnerPart {
         f: std::rc::Rc<std::cell::RefCell<File>>,
         ) -> Result<SegmentCursor> {
 
-        match header.segments_info.get(&g) {
+        match header.segments.get(&g) {
             None => Err(Error::Misc(String::from("get_cursor_on_active_segment: segment not found"))),
-            Some(seg) => {
+            Some(loc) => {
                 let mut space = try!(inner.space.lock());
                 let csrnum = space.nextCursorNum;
                 let foo = inner.clone();
@@ -4759,7 +4755,7 @@ impl InnerPart {
                     foo.cursor_dropped(g, csrnum);
                 };
                 let page = try!(Self::get_loaner_page(inner));
-                let mut csr = try!(SegmentCursor::new(&inner.path, f, page, seg.location.clone()));
+                let mut csr = try!(SegmentCursor::new(&inner.path, f, page, loc.clone()));
 
                 space.nextCursorNum = space.nextCursorNum + 1;
                 let was = space.cursors.insert(csrnum, g);
@@ -4768,6 +4764,24 @@ impl InnerPart {
                 Ok(csr)
             }
         }
+    }
+
+    fn get_cursor_on_active_run(
+        inner: &std::sync::Arc<InnerPart>, 
+        header: &HeaderData,
+        run: &ActiveRun,
+        f: std::rc::Rc<std::cell::RefCell<File>>,
+        ) -> Result<ConcatCursor> {
+
+        // TODO should only lock inner.space once?
+        let cursors = 
+            run.segments
+            .iter()
+            .map(|g| Self::get_cursor_on_active_segment(inner, &header, *g, f.clone()))
+            .collect::<Result<Vec<_>>>();
+        let cursors = try!(cursors);
+        let c = ConcatCursor::new(cursors);
+        Ok(c)
     }
 
     fn get_loaner_page(inner: &std::sync::Arc<InnerPart>) -> Result<misc::Lend<Box<[u8]>>> {
@@ -4810,25 +4824,9 @@ impl InnerPart {
         Ok(cursor)
     }
 
-    fn merge_pending_segments(inner: &std::sync::Arc<InnerPart>, segments: Vec<SegmentLocation>) -> Result<SegmentLocation> {
-        let cursors = 
-            segments
-            .into_iter()
-            .map(|loc| Self::open_cursor_on_pending_segment(inner, loc))
-            .collect::<Result<Vec<_>>>();
-        let cursors = try!(cursors);
-        let cursors = 
-            cursors
-            .into_iter()
-            .map(|c| ConcatCursor::new(vec![Some(c)]))
-            .collect::<Vec<_>>();
-
-        let cursor = box MultiCursor::Create(cursors);
-        let location = try!(Self::write_merge_segment(inner, cursor));
-        Ok(location)
-    }
-
     fn open_cursor(inner: &std::sync::Arc<InnerPart>) -> Result<LivingCursor> {
+// TODO following comment should move to todo.txt
+
         // TODO this cursor needs to expose the changeCounter and segment list
         // on which it is based. for optimistic writes.  caller can grab a cursor,
         // do their writes, then grab the writelock, and grab another cursor, then
@@ -4837,27 +4835,10 @@ impl InnerPart {
 
         let header = try!(inner.header.read());
         let mut cursors = vec![];
-        let mut generation = 0;
         let f = try!(inner.open_file_for_cursor());
-        loop {
-            let mut cursors_for_this_generation = vec![];
-            let mut any = false;
-            for rangenum in 0 .. header.state.len() {
-                if generation < header.state[rangenum].state.len() {
-                    let segnum = header.state[rangenum].state[generation];
-                    let cursor = try!(Self::get_cursor_on_active_segment(inner, &header, segnum, f.clone()));
-                    cursors_for_this_generation.push(Some(cursor));
-                    any = true;
-                } else {
-                    cursors_for_this_generation.push(None);
-                }
-            }
-            if !any {
-                break;
-            }
-            let cc = ConcatCursor::new(cursors_for_this_generation);
+        for i in 0 .. header.levels.len() {
+            let cc = try!(Self::get_cursor_on_active_run(inner, &header, &header.levels[i], f.clone()));
             cursors.push(cc);
-            generation += 1;
         }
         let mc = MultiCursor::Create(cursors);
         let lc = LivingCursor::Create(mc);
@@ -4887,47 +4868,32 @@ impl InnerPart {
         Ok(())
     }
 
-    fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<(Vec<RangeState>, HashMap<SegmentNum, SegmentInfo>)> {
+    fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<(Vec<ActiveRun>, Box<[ActiveRun]>, HashMap<SegmentNum, SegmentLocation>)> {
         let header = try!(inner.header.read());
-        let a = header.state.clone();
-        let b = header.segments_info.clone();
-        Ok((a, b))
+        let a = header.young.clone();
+        let b = header.levels.clone();
+        let c = header.segments.clone();
+        Ok((a, b, c))
     }
 
-    // TODO name.  commit_generation?
-    fn commit_segment(&self, set: Vec<Option<SegmentLocation>>) -> Result<Vec<Option<SegmentNum>>> {
-        // TODO check that set.len() is correct
+    fn commit_run(&self, pending: PendingRun) -> Result<ActiveRun> {
         let mut header = try!(self.header.write());
 
         // TODO assert new_seg shares no pages with any seg in current state
 
         let mut newHeader = header.clone();
 
-        let segnums =
-            set
-            .into_iter()
-            .enumerate()
-            .map(
-                |(rangenum, loc)| {
-                    match loc {
-                        Some(new_seg) => {
-                            // all new segments are given level 0
-                            let new_seg = SegmentInfo {
-                                location: new_seg,
-                                level: 0,
-                            };
-                            let new_segnum = newHeader.next_segnum;
-                            newHeader.next_segnum += 1;
-                            newHeader.segments_info.insert(new_segnum, new_seg);
-                            newHeader.state[rangenum].state.insert(0, new_segnum);
-                            Some(new_segnum)
-                        },
-                        None => {
-                            None
-                        },
-                    }
-                })
-            .collect::<Vec<_>>();
+        let mut segments = vec![];
+
+        for loc in pending.segments {
+            let new_segnum = newHeader.next_segnum;
+            newHeader.next_segnum += 1;
+            newHeader.segments.insert(new_segnum, loc);
+            segments.push(new_segnum);
+        }
+
+        let run = ActiveRun { segments: segments };
+        newHeader.young.insert(0, run.clone());
 
         newHeader.changeCounter = newHeader.changeCounter + 1;
 
@@ -4938,326 +4904,241 @@ impl InnerPart {
         // you can change the segment list more than once while holding
         // the writeLock.  the writeLock gets released when you Dispose() it.
 
-        Ok(segnums)
+        Ok(run)
     }
 
-    fn write_segment(&self, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<Vec<Option<SegmentLocation>>> {
-        // TODO this is probably not the happiest way to do this.
-        // when we have a pending tx manager layer, it will probably
-        // want to accumulate changes into a group of BTreeMaps, not
-        // just one.
-
-        // TODO or maybe create_segment() should allow a filter to be
-        // specified, such that it will ignore keys outside a range?
-
-        let mut ranges = vec![];
-        // TODO using the copy of count_ranges so we don't have to lock the header
-        for _ in 0 .. self.count_ranges {
-            ranges.push(BTreeMap::new());
-        }
-        for (k, v) in pairs {
-            // TODO encapsulate mapping of key to range
-            let i = (k[0] as usize) * self.count_ranges / 256;
-            ranges[i].insert(k, v);
-        }
+    fn write_run(&self, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<PendingRun> {
         let mut fs = try!(self.OpenForWriting());
-        let mut segs = vec![];
-        for range in ranges {
-            if range.len() > 0 {
-                let source = range.into_iter().map(|t| {
-                    let (k, v) = t;
-                    Ok(kvp {Key:k, Value:v})
-                });
-                let seg = try!(create_segment(&mut fs, self, source));
-                segs.push(Some(seg));
-            } else {
-                segs.push(None);
-            }
-        }
-        //println!("segs: {:?}", segs);
-        Ok(segs)
+        let source = pairs.into_iter().map(|t| {
+            let (k, v) = t;
+            Ok(kvp {Key:k, Value:v})
+        });
+        let run = try!(create_run(&mut fs, self, source));
+        Ok(run)
     }
 
-    fn write_merge_segment(inner: &std::sync::Arc<InnerPart>, cursor: Box<ICursor>) -> Result<SegmentLocation> {
+    fn write_merge(inner: &std::sync::Arc<InnerPart>, cursor: Box<ICursor>) -> Result<PendingRun> {
         let source = CursorIterator::new(cursor);
         let mut fs = try!(inner.OpenForWriting());
-        let seg = try!(create_segment(&mut fs, &**inner, source));
-        Ok(seg)
+        let run = try!(create_run(&mut fs, &**inner, source));
+        Ok(run)
     }
 
-    fn merge(inner: &std::sync::Arc<InnerPart>, range: usize, merge_level: u32, min_segs: usize, max_segs: usize, promote: MergePromotionRule) -> Result<Option<PendingMerge>> {
-        assert!(min_segs <= max_segs);
+    fn merge(inner: &std::sync::Arc<InnerPart>, merge_level: Level) -> Result<Option<PendingMerge>> {
+        // merge_level is NOT the dest level.
+        // it is the level that might have gotten too large.
+        // the dest_level is merge_level + 1
+
         //println!("in merge: range = {}", range);
-        let step1 = {
+        let (mut cursor, old_in_prev, old_in_dest) = {
             let header = try!(inner.header.read());
 
-            if header.state[range].state.len() == 0 {
-                //println!("{}:{} no merge", file!(), line!());
-                return Ok(None)
-            }
-
             //println!("merge_level: {}", merge_level);
-            //println!("promote: {:?}", promote);
-            //println!("state: {:?}", header.state);
-            //println!("segments_info: {:?}", header.segments_info);
-            // TODO wrong?  confine this to only the current range?
-            // probably need per-range settings for promotion.
-            let mut level_sizes = HashMap::new();
-            for (_, ref info) in header.segments_info.iter() {
-                let pages = info.location.count_pages();
-                match level_sizes.entry(&info.level) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        let n = e.get_mut();
-                        *n = *n + pages;
+            //println!("levels: {:?}", header.levels);
+            //println!("segments: {:?}", header.segments);
+
+            let needs_merge =
+                match merge_level {
+                    Level::Young => {
+                        header.young.len() >= 4
                     },
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(pages);
-                    },
-                };
-            }
-            //println!("level_sizes: {:?}", level_sizes);
-
-            let level_group = 
-                header.state[range].state
-                .iter()
-                .filter(|g| {
-                    let info = header.segments_info.get(&g).unwrap();
-                    info.level == merge_level
-                })
-                .map(|g| *g)
-                .collect::<Vec<SegmentNum>>();
-
-            //println!("level_group: {:?}", level_group);
-            //println!("segment in level: {}", level_group.len());
-
-            if level_group.len() == 0 {
-                //println!("no merge");
-                //println!("{}:{} no merge", file!(), line!());
-                return Ok(None)
-            }
-
-            let pages_in_merge_level = level_sizes[&merge_level];
-            //println!("pages_in_merge_level: {:?}", pages_in_merge_level);
-
-            // make sure this is contiguous
-            assert!(slice_within(level_group.as_slice(), header.state[range].state.as_slice()).is_ok());
-
-            let mut merge_seg_nums = Vec::new();
-
-            let mut mergeStuff = try!(inner.mergeStuff.lock());
-
-            // we can merge any contiguous set of not-already-being-merged 
-            // segments at the end of the group.  if we merge something
-            // that is not at the end of the group, we could end up with
-            // level groups not being contiguous.  TODO techically, the
-            // previous statement is true only if we are promoting the level.
-
-            for g in level_group.iter().rev() {
-                if mergeStuff.merging.contains(g) {
-                    break;
-                } else {
-                    merge_seg_nums.push(*g);
-                }
-            }
-
-            if merge_seg_nums.len() >= min_segs {
-                merge_seg_nums.truncate(max_segs);
-
-                // right now the merge_seg_nums list is in reverse order because we searched with a
-                // reverse iterator just above.  reverse it again to make it right.
-                merge_seg_nums.reverse();
-
-                //println!("segments being merged: {:?}", merge_seg_nums);
-                let pages_in_merge_segments: usize = 
-                    merge_seg_nums
-                    .iter()
-                    .map(
-                        |g| {
-                            let info = header.segments_info.get(g).unwrap();
-                            info.location.count_pages()
-                        })
-                    .sum();
-                //println!("pages_in_merge_segments: {}", pages_in_merge_segments);
-                assert!(pages_in_merge_segments <= pages_in_merge_level);
-                let f = try!(inner.open_file_for_cursor());
-                let cursors = 
-                    merge_seg_nums
-                    .iter()
-                    .map(|g| Self::get_cursor_on_active_segment(inner, &header, *g, f.clone()))
-                    .collect::<Result<Vec<_>>>();
-                let cursors = try!(cursors);
-                let cursors = 
-                    cursors
-                    .into_iter()
-                    .map(|c| ConcatCursor::new(vec![Some(c)]))
-                    .collect::<Vec<_>>();
-
-                for g in merge_seg_nums.iter() {
-                    mergeStuff.merging.insert(*g);
-                }
-
-                let cursor = {
-                    let mc = MultiCursor::Create(cursors);
-                    mc
-                };
-
-                let last_seg_being_merged = merge_seg_nums[merge_seg_nums.len() - 1];
-                let pos_last_seg = header.state[range].state.iter().position(|s| *s == last_seg_being_merged).expect("gotta be there");
-                let count_segments_behind = header.state[range].state.len() - (pos_last_seg + 1);
-
-                let cursor: Box<ICursor> =
-                    if count_segments_behind == 0 {
-                        // we are merging the last segments in the current state.
-                        // there is nothing behind.
-                        // so all tombstones can be filtered.
-                        // so we just wrap in a LivingCursor.
-                        let cursor = LivingCursor::Create(cursor);
-                        box cursor
-                    } else if count_segments_behind <= 8 {
-                        // TODO arbitrary hard-coded limit in the line above
-
-                        // there are segments behind the ones we are merging.
-                        // we can only filter a tombstone if its key is not present behind.
-
-                        // TODO getting all these cursors can be really expensive.
-
-                        // TODO if we knew there were no tombstones in the segments to be merged,
-                        // we would not bother with this.
-
-                        // TODO we need a way to cache these cursors.  maybe these "behind"
-                        // cursors are special, and are stored here in the header somewhere.
-                        // the next time we do a merge, we can reuse them.  they need to get
-                        // cleaned up at some point.
-
-                        // TODO capacity
-                        let mut behind = vec![];
-                        for s in &header.state[range].state[pos_last_seg + 1 ..] {
-                            let s = *s;
-                            let cursor = try!(Self::get_cursor_on_active_segment(inner, &header, s, f.clone()));
-                            behind.push(cursor);
+                    Level::Other(merge_level) => {
+                        let merge_level = merge_level as usize;
+                        assert!(merge_level < NUM_LEVELS);
+                        if merge_level == NUM_LEVELS - 1 {
+                            // no limit on the size of the final level
+                            false
+                        } else {
+                            let level_size: u32 = header.levels[merge_level as usize].segments
+                                .iter()
+                                .map(
+                                    |segnum| {
+                                        let loc = header.segments.get(segnum).unwrap();
+                                        loc.count_pages() as u32
+                                    })
+                                .sum();
+                            let level_size: u64 = (level_size as u64) * (inner.pgsz as u64) / (1024 * 1024);
+                            level_size > get_level_size(merge_level)
                         }
-                        // TODO to allow reuse of these behind cursors, we should pass
-                        // them as references, don't transfer ownership.  but then they
-                        // will need to be owned somewhere else.
-                        let cursor = FilterTombstonesCursor::new(cursor, behind);
-                        box cursor
-                    } else {
-                        box cursor
-                    };
-
-                Some((merge_seg_nums, pages_in_merge_segments, pages_in_merge_level, cursor))
-            } else {
-                //println!("{}:{} no merge", file!(), line!());
-                //println!("no merge");
-                None
+                    },
+                };
+            if !needs_merge {
+                return Ok(None);
             }
+
+            let dest_level = 
+                match merge_level {
+                    Level::Young => 0,
+                    Level::Other(merge_level) => merge_level + 1,
+                };
+
+            let old_in_prev = {
+                match merge_level {
+                    Level::Young => {
+                        Promoting::Young
+                    },
+                    Level::Other(merge_level) => {
+                        // TODO pick a segment
+                        // TODO for now, the following hack will suffice
+                        Promoting::Other(dest_level, header.levels[merge_level as usize].clone())
+                    },
+                }
+            };
+
+
+            // TODO find all segments in the next level which overlap the chosen segment
+            // TODO for now, the following hack will suffice
+            let old_in_dest = header.levels[dest_level].clone();
+
+            let f = try!(inner.open_file_for_cursor());
+
+            let cursor = {
+                // TODO extra clones of f
+                let mut cursors = 
+                    match old_in_prev {
+                        Promoting::Young => {
+                            let mut v = vec![];
+                            for r in header.young.iter() {
+                                let cc = try!(Self::get_cursor_on_active_run(inner, &header, r, f.clone()));
+                                v.push(cc);
+                            }
+                            v
+                        },
+                        Promoting::Other(_, ref run) => {
+                            let cc = try!(Self::get_cursor_on_active_run(inner, &header, run, f.clone()));
+                            vec![cc]
+                        },
+                    };
+                let cursor_dest = try!(Self::get_cursor_on_active_run(inner, &header, &old_in_dest, f.clone()));
+                cursors.push(cursor_dest);
+                let mc = MultiCursor::Create(cursors);
+                mc
+            };
+
+            let count_levels_behind = header.levels.len() - (dest_level + 1);
+
+            let cursor: Box<ICursor> =
+                if count_levels_behind == 0 {
+                    // we are merging the last segments in the current state.
+                    // there is nothing behind.
+                    // so all tombstones can be filtered.
+                    // so we just wrap in a LivingCursor.
+                    let cursor = LivingCursor::Create(cursor);
+                    box cursor
+                } else {
+                    // there are segments behind the ones we are merging.
+                    // we can only filter a tombstone if its key is not present behind.
+
+                    // TODO if we knew there were no tombstones in the segments to be merged,
+                    // we would not bother with this.
+
+                    // TODO capacity
+                    let mut behind = vec![];
+                    for i in (dest_level + 1) .. header.levels.len() {
+                        // TODO we could just use the part that overlaps
+                        let cursor = try!(Self::get_cursor_on_active_run(inner, &header, &header.levels[i], f.clone()));
+                        behind.push(cursor);
+                    }
+                    // TODO to allow reuse of these behind cursors, we should pass
+                    // them as references, don't transfer ownership.  but then they
+                    // will need to be owned somewhere else.
+                    let cursor = FilterTombstonesCursor::new(cursor, behind);
+                    box cursor
+                };
+
+            (cursor, old_in_prev, old_in_dest)
         };
 
-        match step1 {
-            Some((merge_seg_nums, pages_in_merge_segments, pages_in_merge_level, mut cursor)) => {
-                // TODO if something goes wrong here, the function will exit with
-                // an error but mergeStuff.merging will still contain the segments we are
-                // trying to merge, which will prevent them from EVER being merged.
+        // TODO if something goes wrong here, the function will exit with
+        // an error but mergeStuff.merging will still contain the segments we are
+        // trying to merge, which will prevent them from EVER being merged.
 
-                // note that cursor.First() should NOT have already been called
-                try!(cursor.First());
-                let seg = 
-                    if cursor.IsValid() {
-                        let location = try!(Self::write_merge_segment(inner, cursor));
-                        let pages_in_new_segment = location.count_pages();
-                        //println!("pages_in_new_segment: {}", pages_in_new_segment);
-                        // TODO is the following assert always true?
-                        // TODO assert!(pages_in_new_segment <= pages_in_merge_segments);
-                        let level =
-                            match promote {
-                                MergePromotionRule::Promote => {
-                                    merge_level + 1
-                                },
-                                MergePromotionRule::Stay => {
-                                    merge_level
-                                },
-                                MergePromotionRule::Threshold(n) => {
-                                    if pages_in_merge_level >= n {
-                                        merge_level + 1
-                                    } else {
-                                        merge_level
-                                    }
-                                },
-                            };
-                        let seg =
-                            SegmentInfo {
-                                location: location,
-                                level: level,
-                            };
-                        Some(seg)
-                    } else {
-                        None
-                    };
-                let pm = 
-                    PendingMerge {
-                        range: range,
-                        old_segments: merge_seg_nums,
-                        new_segment: seg,
-                        merge_level: merge_level,
-                    };
-                Ok(Some(pm))
-            },
-            None => {
-                Ok(None)
-            },
-        }
+        // note that cursor.First() should NOT have already been called
+        try!(cursor.First());
+        let run = 
+            if cursor.IsValid() {
+                // TODO it may be worth noting that the cursor for write_merge
+                // only needs First/IsValid/Next.  it does not need to go backward,
+                // and it does not need to seek.
+                let run = try!(Self::write_merge(inner, cursor));
+                Some(run)
+            } else {
+                None
+            };
+        let pm = PendingMerge {
+            old_in_prev: old_in_prev,
+            old_in_dest: old_in_dest,
+            new: run,
+        };
+        Ok(Some(pm))
     }
 
-    fn commit_merge(&self, pm: PendingMerge) -> Result<Option<SegmentNum>> {
-        let (segmentsBeingReplaced, new_segnum) = {
+    fn commit_merge(&self, pm: PendingMerge) -> Result<Option<ActiveRun>> {
+        let (segmentsBeingReplaced, new_run) = {
             let mut header = try!(self.header.write());
-
-            // TODO assert new_seg shares no pages with any seg in current state
-
-            // we need the list of segments which were merged.  we make a copy of
-            // so that we're not keeping a reference that inhibits our ability to
-            // get other references a little later in the function.
-
-            // TODO why does this Set need to be created?
-            let oldAsSet: HashSet<SegmentNum> = pm.old_segments.iter().map(|g| *g).collect();
-            assert!(oldAsSet.len() == pm.old_segments.len());
-
-            // now we need to verify that the segments being replaced are in state
-            // and contiguous.
-
-            let ndxFirstOld = try!(slice_within(pm.old_segments.as_slice(), header.state[pm.range].state.as_slice()));
-
-            // now we construct a newHeader
 
             let mut newHeader = header.clone();
 
-            // remove the old segmentinfos, keeping them for later
+            // TODO assert new_seg shares no pages with any seg in current state
 
-            let mut segmentsBeingReplaced = HashMap::with_capacity(oldAsSet.len());
-            for g in &oldAsSet {
-                let info = newHeader.segments_info.remove(g).expect("old seg not found in header.segments_info");
-                segmentsBeingReplaced.insert(*g, info);
+            let mut segmentsBeingReplaced = HashMap::new();
+
+            let ndx_first_old_dest = {
+                for g in pm.old_in_dest.segments.iter() {
+                    let info = newHeader.segments.remove(g).expect("old seg not found in header.segments");
+                    segmentsBeingReplaced.insert(*g, info);
+                }
+
+                let dest_level = pm.old_in_prev.get_dest_level();
+
+                let ndx = try!(slice_within(pm.old_in_dest.segments.as_slice(), header.levels[dest_level].segments.as_slice()));
+
+                for _ in pm.old_in_dest.segments.iter() {
+                    newHeader.levels[dest_level].segments.remove(ndx);
+                }
+
+                ndx
+            };
+
+            match pm.old_in_prev {
+                Promoting::Young => {
+                    for r in header.young.iter() {
+                        for g in &r.segments {
+                            let info = newHeader.segments.remove(g).expect("old seg not found in header.segments");
+                            segmentsBeingReplaced.insert(*g, info);
+                        }
+                    }
+                    newHeader.young.clear();
+                },
+                Promoting::Other(level, ref r) => {
+                    let ndx_first_old_prev = try!(slice_within(r.segments.as_slice(), header.levels[level].segments.as_slice()));
+                    for g in &r.segments {
+                        newHeader.levels[level].segments.remove(ndx_first_old_prev);
+                        let info = newHeader.segments.remove(g).expect("old seg not found in header.segments");
+                        segmentsBeingReplaced.insert(*g, info);
+                    }
+                },
             }
 
-            // remove old segments from current state
-
-            for _ in &pm.old_segments {
-                newHeader.state[pm.range].state.remove(ndxFirstOld);
-            }
-
-            let new_segnum =
-                match pm.new_segment {
+            let new_run =
+                match pm.new {
                     None => {
                         None
                         // a merge resulted in what would have been an empty segment.
                         // this happens because tombstones
                     },
-                    Some(new_seg) => {
-                        let new_segnum = newHeader.next_segnum;
-                        newHeader.next_segnum += 1;
-                        newHeader.state[pm.range].state.insert(ndxFirstOld, new_segnum);
-                        newHeader.segments_info.insert(new_segnum, new_seg);
-                        Some(new_segnum)
+                    Some(run) => {
+                        let new_run = vec![];
+                        let dest_level = pm.old_in_prev.get_dest_level();
+                        let segments = run.segments.into_iter().map(|loc| {
+                            let new_segnum = newHeader.next_segnum;
+                            newHeader.next_segnum += 1;
+                            newHeader.segments.insert(new_segnum, loc);
+                            new_segnum
+                        }).collect::<Vec<_>>();
+                        misc::insert_vec_into_vec(&mut newHeader.levels[dest_level].segments, ndx_first_old_dest, segments);
+                        let new_run = ActiveRun { segments: new_run };
+                        Some(new_run)
                     },
                 };
 
@@ -5266,15 +5147,8 @@ impl InnerPart {
             let mut fs = try!(self.OpenForWriting());
             try!(self.write_header(&mut header, &mut fs, newHeader));
 
-            (segmentsBeingReplaced, new_segnum)
+            (segmentsBeingReplaced, new_run)
         };
-
-        {
-            let mut mergeStuff = try!(self.mergeStuff.lock());
-            for g in pm.old_segments {
-                mergeStuff.merging.remove(&g);
-            }
-        }
 
         let mut segmentsToBeFreed = segmentsBeingReplaced;
         {
@@ -5292,8 +5166,8 @@ impl InnerPart {
                 }
             }
             let mut blocksToBeFreed = Vec::new();
-            for info in segmentsToBeFreed.values() {
-                blocksToBeFreed.push_all(&info.location.blocks);
+            for loc in segmentsToBeFreed.values() {
+                blocksToBeFreed.push_all(&loc.blocks);
             }
             try!(Self::addFreeBlocks(&mut space, &self.path, self.pgsz, blocksToBeFreed));
         }
@@ -5301,7 +5175,7 @@ impl InnerPart {
         // note that we intentionally do not release the writeLock here.
         // you can change the segment list more than once while holding
         // the writeLock.  the writeLock gets released when you Dispose() it.
-        Ok(new_segnum)
+        Ok(new_run)
     }
 
 }

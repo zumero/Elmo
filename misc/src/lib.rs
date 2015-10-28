@@ -66,6 +66,12 @@ pub fn tempfile(base: &str) -> String {
     file
 }
 
+pub fn insert_vec_into_vec<T>(dest: &mut Vec<T>, ndx: usize, from: Vec<T>) {
+    for x in from.into_iter().rev() {
+        dest.insert(ndx, x);
+    }
+}
+
 pub mod endian {
     use std;
 
