@@ -1875,6 +1875,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                                 source: I,
                                ) -> Result<SegmentLocation> where I: Iterator<Item=Result<kvp>>, SeekWrite: Seek+Write {
 
+    // TODO we want write_overflow to return a block list.
     fn write_overflow<SeekWrite>(startingBlock: PageBlock, 
                                 ba: &mut Read, 
                                 pageManager: &IPages, 
@@ -2532,7 +2533,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                           first_child_included: usize,
                           first_child_after: usize,
                           overflows: &HashMap<usize, PageNum>,
-                          pb : &mut PageBuilder,
+                          pb: &mut PageBuilder,
                           ) -> (Box<[u8]>, Box<[u8]>) {
             pb.Reset();
             pb.PutByte(PageType::PARENT_NODE.to_u8());
@@ -2628,9 +2629,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
 
             let available = calcAvailable(&st, pgsz);
             let fitsInline = available >= neededForInline;
-            // TODO the + 4 in the next line is to account for the case where the next
-            // page might be a boundary page, thus it would need the 4 bytes in lastint32.
-            let wouldFitInlineOnNextPage = (pgsz - PARENT_PAGE_OVERHEAD + 4) >= neededForInline;
+            let wouldFitInlineOnNextPage = (pgsz - PARENT_PAGE_OVERHEAD) >= neededForInline;
             let fitsOverflow = available >= neededForOverflow;
             let writeThisPage = (!fitsInline) && (wouldFitInlineOnNextPage || (!fitsOverflow));
 
@@ -3784,6 +3783,9 @@ struct HeaderData {
 // database file.
 const HEADER_SIZE_IN_BYTES: usize = 4096;
 
+// TODO make this code a little more general.  it manages a block list,
+// which can grow by adding more blocks/pages to it.  we probably want
+// to use this in more situations.
 impl PendingSegment {
     fn new() -> PendingSegment {
         PendingSegment {
