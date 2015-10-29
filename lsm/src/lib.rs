@@ -1979,8 +1979,10 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                     if firstBlk.firstPage == firstBlk.lastPage {
                         // the first page landed on a boundary.
                         // we can just set the flag and write it now.
-                        pbFirstOverflow.SetPageFlag(PageFlag::FLAG_BOUNDARY_NODE);
                         let blk = try!(pageManager.GetBlock(&mut *token));
+                        // TODO if by chance the blk we just got is immediately after
+                        // the one we're using now, then this doesn't really need to be a boundary page.
+                        pbFirstOverflow.SetPageFlag(PageFlag::FLAG_BOUNDARY_NODE);
                         pbFirstOverflow.SetLastInt32(blk.firstPage);
                         try!(pbFirstOverflow.Write(fs));
                         try!(utils::SeekPage(fs, pgsz, blk.firstPage));
@@ -2035,6 +2037,9 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                                 // boundary pointer in it.  and we need to set
                                 // FLAG_ENDS_ON_BOUNDARY on the first
                                 // overflow page in this block.
+
+                                // note that we do not set FLAG_BOUNDARY_PAGE on this "boundary page", 
+                                // since it doesn't have page type or flags.
 
                                 let (putBoundary, finished) = try!(buildBoundaryPage(ba, pbOverflow, pgsz));
                                 if putBoundary == 0 {
@@ -3788,9 +3793,6 @@ struct HeaderData {
 // database file.
 const HEADER_SIZE_IN_BYTES: usize = 4096;
 
-// TODO make this code a little more general.  it manages a block list,
-// which can grow by adding more blocks/pages to it.  we probably want
-// to use this in more situations.
 impl PendingBlockList {
     fn new() -> PendingBlockList {
         PendingBlockList {
@@ -3802,15 +3804,9 @@ impl PendingBlockList {
     fn AddBlock(&mut self, b: PageBlock) {
         //println!("seg {:?} got block {:?}", self.segnum, b);
         let len = self.blockList.len();
-        if (! (self.blockList.is_empty())) && (b.firstPage == self.blockList[len - 1].lastPage+1) {
-            // note that by consolidating blocks here, the segment info list will
-            // not have information about the fact that the two blocks were
-            // originally separate.  that's okay, since all we care about here is
-            // keeping track of which pages are used.  but the btree code itself
-            // is still treating the last page of the first block as a boundary
-            // page, even though its pointer to the next block goes to the very
-            // next page, because its page manager happened to give it a block
-            // which immediately follows the one it had.
+        if !self.blockList.is_empty() && (b.firstPage == self.blockList[len - 1].lastPage + 1) {
+            // this consolidation just catches a common case, where the block happens to be
+            // just after the last one.  the whole list gets consolidated below on End().
             self.blockList[len - 1].lastPage = b.lastPage;
             assert!(self.blockList[len - 1].firstPage <= self.blockList[len - 1].lastPage);
         } else {
@@ -3834,6 +3830,7 @@ impl PendingBlockList {
                 Some(blk)
             }
         };
+        consolidateBlockList(&mut self.blockList);
         // consume self return blockList
         (self.blockList, leftovers)
     }
@@ -5054,8 +5051,10 @@ impl IPages for InnerPart {
     }
 
     fn GetBlock(&self, ps: &mut PendingBlockList) -> Result<PageBlock> {
+        // TODO should we make an effort to return a block which would consolidate
+        // with one of the blocks already in the pending block list?
         let mut space = try!(self.space.lock());
-        // specificSize=0 means we don't care how big of a block we get
+        // specificSize = 0 means we don't care how big of a block we get
         let blk = self.getBlock(&mut space, 0);
         ps.AddBlock(blk);
         Ok(blk)
