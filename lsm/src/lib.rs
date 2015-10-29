@@ -1866,7 +1866,6 @@ struct LeafState {
     sofarLeaf: usize,
     keys_in_this_leaf: Vec<LeafPair>,
     prefixLen: usize,
-    firstLeaf: PageNum,
     leaves: Vec<pgitem>,
     blk: PageBlock,
 }
@@ -2185,7 +2184,6 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             let (first_key, last_key) = build_leaf(st, pb);
             assert!(st.keys_in_this_leaf.is_empty());
             let thisPageNumber = st.blk.firstPage;
-            let firstLeaf = if st.leaves.is_empty() { thisPageNumber } else { st.firstLeaf };
             let nextBlk = 
                 if thisPageNumber == st.blk.lastPage {
                     // TODO we do not actually need another block
@@ -2206,7 +2204,6 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
             st.leaves.push(pg);
             st.sofarLeaf = 0;
             st.prefixLen = 0;
-            st.firstLeaf = firstLeaf;
             st.blk = nextBlk;
             Ok(())
         }
@@ -2273,12 +2270,11 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
 
         let mut st = LeafState {
             sofarLeaf: 0,
-            firstLeaf: 0,
-            keys_in_this_leaf:Vec::new(),
+            keys_in_this_leaf: Vec::new(),
             prefixLen: 0,
-            leaves:Vec::new(),
-            blk:leavesBlk,
-            };
+            leaves: Vec::new(),
+            blk: leavesBlk,
+        };
 
         //let mut prev_key: Option<Box<[u8]>> = None;
         let mut count_keys = 0;
