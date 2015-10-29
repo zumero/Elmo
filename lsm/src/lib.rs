@@ -178,7 +178,7 @@ struct kvp {
 }
 
 #[derive(Debug)]
-struct PendingSegment {
+struct PendingBlockList {
     blockList: Vec<PageBlock>,
 }
 
@@ -629,9 +629,9 @@ pub type SegmentNum = u64;
 
 trait IPages {
     fn PageSize(&self) -> usize;
-    fn Begin(&self) -> Result<PendingSegment>;
-    fn GetBlock(&self, token: &mut PendingSegment) -> Result<PageBlock>;
-    fn End(&self, token: PendingSegment, unused_page: PageNum, root_page: PageNum) -> Result<SegmentLocation>;
+    fn Begin(&self) -> Result<PendingBlockList>;
+    fn GetBlock(&self, token: &mut PendingBlockList) -> Result<PageBlock>;
+    fn End(&self, token: PendingBlockList, unused_page: PageNum) -> Result<Vec<PageBlock>>;
 }
 
 #[derive(PartialEq,Copy,Clone)]
@@ -1879,7 +1879,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
     fn write_overflow<SeekWrite>(startingBlock: PageBlock, 
                                 ba: &mut Read, 
                                 pageManager: &IPages, 
-                                token: &mut PendingSegment,
+                                token: &mut PendingBlockList,
                                 fs: &mut SeekWrite
                                ) -> Result<(usize, PageBlock)> where SeekWrite : Seek+Write {
 
@@ -1946,7 +1946,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                                     pbOverflow: &mut PageBuilder,
                                     pbFirstOverflow: &mut PageBuilder,
                                     pageManager: &IPages,
-                                    token: &mut PendingSegment
+                                    token: &mut PendingBlockList
                                    ) -> Result<(usize, PageBlock)> where SeekWrite : Seek+Write {
             // each trip through this loop will write out one
             // block, starting with the overflow first page,
@@ -2092,7 +2092,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                                 vbuf: &mut [u8],
                                 fs: &mut SeekWrite, 
                                 pb: &mut PageBuilder,
-                                token: &mut PendingSegment,
+                                token: &mut PendingBlockList,
                                 ) -> Result<(PageBlock, Vec<pgitem>, usize, usize)> where I: Iterator<Item=Result<kvp>> , SeekWrite : Seek+Write {
         // 2 for the page type and flags
         // 2 for the stored count
@@ -2180,7 +2180,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                                 fs: &mut SeekWrite, 
                                 pgsz: usize,
                                 pageManager: &IPages,
-                                token: &mut PendingSegment,
+                                token: &mut PendingBlockList,
                                ) -> Result<()> where SeekWrite : Seek+Write { 
             let (first_key, last_key) = build_leaf(st, pb);
             assert!(st.keys_in_this_leaf.is_empty());
@@ -2515,7 +2515,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                                    pgsz: usize,
                                    fs: &mut SeekWrite,
                                    pageManager: &IPages,
-                                   token: &mut PendingSegment,
+                                   token: &mut PendingBlockList,
                                    pb: &mut PageBuilder,
                                   ) -> Result<(PageBlock, Vec<pgitem>)> where SeekWrite : Seek+Write {
         // 2 for the page type and flags
@@ -2580,7 +2580,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                                       fs: &mut SeekWrite,
                                       pageManager: &IPages,
                                       pgsz: usize,
-                                      token: &mut PendingSegment,
+                                      token: &mut PendingBlockList,
                                      ) -> Result<()> where SeekWrite : Seek+Write {
             // assert st.sofar > 0
             let thisPageNumber = st.blk.firstPage;
@@ -2747,7 +2747,12 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
     }
     */
 
-    let g = try!(pageManager.End(token, blk.firstPage, root_page));
+    let blocks = try!(pageManager.End(token, blk.firstPage));
+    assert!(block_list_contains_page(&blocks, root_page));
+    let loc = SegmentLocation {
+        root_page: root_page,
+        blocks: blocks,
+    };
     // TODO loop and split to make multiple segments
 
     // maybe each "segment" should be cut off whenever 
@@ -2769,7 +2774,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
     // special info from the root note.
 
     // pick one "segment" from level N to merge?  
-    Ok(g)
+    Ok(loc)
 }
 
 struct OverflowReader {
@@ -3786,9 +3791,9 @@ const HEADER_SIZE_IN_BYTES: usize = 4096;
 // TODO make this code a little more general.  it manages a block list,
 // which can grow by adding more blocks/pages to it.  we probably want
 // to use this in more situations.
-impl PendingSegment {
-    fn new() -> PendingSegment {
-        PendingSegment {
+impl PendingBlockList {
+    fn new() -> PendingBlockList {
+        PendingBlockList {
             // TODO maybe set capacity of the blocklist vec to something low
             blockList: Vec::new(), 
         }
@@ -5043,12 +5048,12 @@ impl IPages for InnerPart {
         self.pgsz
     }
 
-    fn Begin(&self) -> Result<PendingSegment> {
-        let p = PendingSegment::new();
+    fn Begin(&self) -> Result<PendingBlockList> {
+        let p = PendingBlockList::new();
         Ok(p)
     }
 
-    fn GetBlock(&self, ps: &mut PendingSegment) -> Result<PageBlock> {
+    fn GetBlock(&self, ps: &mut PendingBlockList) -> Result<PageBlock> {
         let mut space = try!(self.space.lock());
         // specificSize=0 means we don't care how big of a block we get
         let blk = self.getBlock(&mut space, 0);
@@ -5056,11 +5061,9 @@ impl IPages for InnerPart {
         Ok(blk)
     }
 
-    fn End(&self, ps: PendingSegment, unused_page: PageNum, root_page: PageNum) -> Result<SegmentLocation> {
+    fn End(&self, ps: PendingBlockList, unused_page: PageNum) -> Result<Vec<PageBlock>> {
         let (blocks, leftovers) = ps.End(unused_page);
         assert!(!block_list_contains_page(&blocks, unused_page));
-        assert!(block_list_contains_page(&blocks, root_page));
-        let info = SegmentLocation::new(root_page, blocks);
         match leftovers {
             Some(b) => {
                 let mut space = try!(self.space.lock());
@@ -5069,7 +5072,7 @@ impl IPages for InnerPart {
             None => {
             },
         }
-        Ok(info)
+        Ok(blocks)
     }
 
 }
