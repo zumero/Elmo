@@ -806,7 +806,7 @@ pub mod utils {
     use super::Result;
 
     pub fn SeekPage(strm: &mut Seek, pgsz: usize, pageNumber: PageNum) -> Result<u64> {
-        if 0==pageNumber { 
+        if 0 == pageNumber { 
             // TODO should this panic?
             return Err(Error::InvalidPageNumber);
         }
@@ -1821,6 +1821,7 @@ mod PageFlag {
     pub const FLAG_ROOT_NODE: u8 = 1;
     pub const FLAG_BOUNDARY_NODE: u8 = 2;
     pub const FLAG_ENDS_ON_BOUNDARY: u8 = 4;
+    pub const FLAG_LAST_PARENT_IN_GROUP: u8 = 8;
 }
 
 #[derive(Debug)]
@@ -2584,7 +2585,11 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                           ) -> (Box<[u8]>, Box<[u8]>) {
             pb.Reset();
             pb.PutByte(PageType::PARENT_NODE.to_u8());
-            pb.PutByte(0u8);
+            if first_child_after == children.len() - 1 {
+                pb.PutByte(PageFlag::FLAG_LAST_PARENT_IN_GROUP);
+            } else {
+                pb.PutByte(0u8);
+            }
             pb.PutInt16((first_child_after - first_child_included) as u16);
 
             let first_key = children[first_child_included + 1].first_key.clone();
@@ -2726,7 +2731,7 @@ fn create_segment<I, SeekWrite>(fs: &mut SeekWrite,
                 None
             };
         try!(write_parent_page(&mut st, children, children.len() - 1, &overflows, pb, fs, pageManager, pgsz, &mut *token, root));
-        Ok((st.blk,st.nextGeneration))
+        Ok((st.blk, st.nextGeneration))
     }
 
     let pgsz = pageManager.PageSize();
@@ -3124,7 +3129,7 @@ impl LeafCursor {
         if pt != PageType::LEAF_NODE {
             return Err(Error::CorruptFile("leaf has invalid page type"));
         }
-        misc::buf_advance::get_byte(&self.pr, &mut cur);
+        cur = cur + 1; // skip flags
         let unused = misc::buf_advance::get_u32(&self.pr, &mut cur) as PageNum;
         let prefixLen = misc::buf_advance::get_byte(&self.pr, &mut cur) as usize;
         if prefixLen > 0 {
@@ -3232,7 +3237,7 @@ impl LeafCursor {
                 Ordering::Greater => 
                     // we could just recurse with mid-1, but that would overflow if
                     // mod is 0, so we catch that case here.
-                    if mid==0 { 
+                    if mid == 0 { 
                         match sop {
                             SeekOp::SEEK_EQ => Ok((None, false)),
                             SeekOp::SEEK_LE => Ok((le, false)),
@@ -3498,10 +3503,12 @@ impl ParentPageCursor {
         let mut children = vec![];
         try!(Self::parse_page(&buf, &mut keys, &mut children));
 
+        // TODO it's a little silly here to construct a Lend<>
         let child_buf = vec![0; buf.len()].into_boxed_slice();
-        let done_page = move |p| -> () {
+        let done_page = move |_| -> () {
         };
         let mut child_buf = misc::Lend::new(child_buf, box done_page);
+
         {
             let f = &mut *(f.borrow_mut());
             try!(utils::SeekPage(f, child_buf.len(), children[0]));
@@ -3535,9 +3542,9 @@ impl ParentPageCursor {
         let count_keys = misc::buf_advance::get_u16(pr, &mut cur) as usize;
         misc::set_vec_len(keys, 0, count_keys);
         for i in 0 .. count_keys {
-            keys.push(cur);
+            keys[i] = cur;
 
-            let klen = varint::read(&pr, &mut cur) as usize;
+            let klen = varint::read(pr, &mut cur) as usize;
             let inline = 0 == klen % 2;
             let klen = klen / 2;
 
@@ -3550,8 +3557,8 @@ impl ParentPageCursor {
         let count_children = count_keys + 1;
         misc::set_vec_len(children, 0, count_children);
         for i in 0 .. count_children {
-            let pg = varint::read(&pr, &mut cur) as PageNum;
-            children.push(pg);
+            let pg = varint::read(pr, &mut cur) as PageNum;
+            children[i] = pg;
         }
 
         Ok(())
@@ -3608,6 +3615,29 @@ impl ParentPageCursor {
         }
     }
 
+    // the last child pointer in a parent page is screwy.
+    //
+    // if the parent page is the last one in its group,
+    // then no problem.
+    //
+    // otherwise, that last child pointer is actually
+    // duplicated as the first child pointer in the next
+    // parent page.  this is because the SeekRef code
+    // works this way (for now), but we have to account
+    // for this when we use these parent pages to implement
+    // Next/Prev.
+
+    fn last_child_valid(&self) -> bool {
+        0 != self.pr[1] & PageFlag::FLAG_LAST_PARENT_IN_GROUP
+    }
+
+    fn count_valid_children(&self) -> usize {
+        if self.last_child_valid() {
+            self.children.len()
+        } else {
+            self.children.len() - 1
+        }
+    }
 }
 
 impl ICursor for ParentPageCursor {
@@ -3694,21 +3724,26 @@ impl ICursor for ParentPageCursor {
     }
 
     fn Last(&mut self) -> Result<()> {
-        let count_keys = self.keys.len();
-        try!(self.set_child(count_keys - 1));
-        self.sub.First()
+        let count_children = self.count_valid_children();
+        try!(self.set_child(count_children - 1));
+        self.sub.Last()
     }
 
     fn Next(&mut self) -> Result<()> {
         match self.cur_child {
             None => Err(Error::CursorNotValid),
             Some(i) => {
-                try!(self.sub.Next());
-                if !self.sub.IsValid() && i + 1 < self.children.len() {
-                    try!(self.set_child(i + 1));
-                    self.sub.First()
+                if !self.last_child_valid() && i == self.children.len() - 1 {
+                    Err(Error::CursorNotValid)
                 } else {
-                    Ok(())
+                    try!(self.sub.Next());
+                    let count_children = self.count_valid_children();
+                    if !self.sub.IsValid() && i + 1 < count_children {
+                        try!(self.set_child(i + 1));
+                        self.sub.First()
+                    } else {
+                        Ok(())
+                    }
                 }
             },
         }
@@ -3718,12 +3753,16 @@ impl ICursor for ParentPageCursor {
         match self.cur_child {
             None => Err(Error::CursorNotValid),
             Some(i) => {
-                try!(self.sub.Prev());
-                if !self.sub.IsValid() && i > 0 {
-                    try!(self.set_child(i - 1));
-                    self.sub.Last()
+                if !self.last_child_valid() && i == self.children.len() - 1 {
+                    Err(Error::CursorNotValid)
                 } else {
-                    Ok(())
+                    try!(self.sub.Prev());
+                    if !self.sub.IsValid() && i > 0 {
+                        try!(self.set_child(i - 1));
+                        self.sub.Last()
+                    } else {
+                        Ok(())
+                    }
                 }
             },
         }
@@ -3732,69 +3771,32 @@ impl ICursor for ParentPageCursor {
 }
 
 pub struct SegmentCursor {
-    path: String,
-    f: std::rc::Rc<std::cell::RefCell<File>>,
     done: Option<Box<Fn() -> ()>>,
     location: SegmentLocation,
-
-    pr: misc::Lend<Box<[u8]>>,
-    currentPage: PageNum,
-
-    firstLeaf: PageNum,
-    lastLeaf: PageNum,
-
-    leafKeys: Vec<usize>,
-    previousLeaf: PageNum,
-    prefix: Option<Box<[u8]>>,
-
-    currentKey: Option<usize>,
+    sub: ChildCursor,
 }
 
 impl SegmentCursor {
     fn new(path: &str, 
            f: std::rc::Rc<std::cell::RefCell<File>>,
-           page: misc::Lend<Box<[u8]>>,
+           mut buf: misc::Lend<Box<[u8]>>,
            location: SegmentLocation
           ) -> Result<SegmentCursor> {
 
-        let mut res = SegmentCursor {
-            path: String::from(path),
-            f: f,
+        {
+            let f = &mut *(f.borrow_mut());
+            try!(utils::SeekPage(f, buf.len(), location.root_page));
+            try!(misc::io::read_fully(f, &mut buf));
+        }
+
+        let sub = try!(ChildCursor::new(path, f, buf));
+
+        let res = SegmentCursor {
             location: location,
             done: None,
-            pr: page,
-            currentPage: 0,
-            leafKeys: Vec::new(),
-            previousLeaf: 0,
-            currentKey: None,
-            prefix: None,
-            firstLeaf: 0, // temporary
-            lastLeaf: 0, // temporary
+            sub: sub,
         };
 
-        // TODO consider keeping a copy of the root page around as long as this cursor is around
-        let root_page = res.location.root_page;
-        try!(res.setCurrentPage(root_page));
-
-        let pt = try!(res.page_type());
-        if pt == PageType::LEAF_NODE {
-            res.firstLeaf = res.location.root_page;
-            res.lastLeaf = res.location.root_page;
-        } else if pt == PageType::PARENT_NODE {
-            if !res.check_page_flag(PageFlag::FLAG_ROOT_NODE) { 
-                return Err(Error::CorruptFile("root page lacks flag"));
-            }
-            let len_footer = res.pr[res.pr.len()-1] as usize;
-            let footer = &res.pr[res.pr.len() - 1 - len_footer ..];
-            let mut cur = 0;
-            res.firstLeaf = varint::read(footer, &mut cur) as u32;
-            assert!(res.location.contains_page(res.firstLeaf));
-            res.lastLeaf = varint::read(footer, &mut cur) as u32;
-            assert!(res.location.contains_page(res.lastLeaf));
-        } else {
-            return Err(Error::CorruptFile("root page has invalid page type"));
-        }
-          
         Ok(res)
     }
 
@@ -3802,421 +3804,6 @@ impl SegmentCursor {
         // TODO instead of this thing have a done() hook, should we instead
         // be wrapping it in a Lend?
         self.done = Some(done);
-    }
-
-    fn readLeaf(&mut self) -> Result<()> {
-        let mut cur = 0;
-        let pt = try!(PageType::from_u8(self.get_byte(&mut cur)));
-        if pt != PageType::LEAF_NODE {
-            return Err(Error::CorruptFile("leaf has invalid page type"));
-        }
-        self.get_byte(&mut cur);
-        self.previousLeaf = self.get_u32(&mut cur) as PageNum;
-        let prefixLen = self.get_byte(&mut cur) as usize;
-        if prefixLen > 0 {
-            // TODO should we just remember prefix as a reference instead of box/copy?
-            let mut a = vec![0; prefixLen].into_boxed_slice();
-            a.clone_from_slice(&self.pr[cur .. cur + prefixLen]);
-            cur = cur + prefixLen;
-            self.prefix = Some(a);
-        } else {
-            self.prefix = None;
-        }
-        let countLeafKeys = self.get_u16(&mut cur) as usize;
-        // assert countLeafKeys>0
-        // TODO might need to extend capacity here, not just truncate
-        self.leafKeys.truncate(countLeafKeys);
-        while self.leafKeys.len() < countLeafKeys {
-            self.leafKeys.push(0);
-        }
-        for i in 0 .. countLeafKeys {
-            self.leafKeys[i] = cur;
-            self.skipKey(&mut cur);
-            self.skipValue(&mut cur);
-        }
-        Ok(())
-    }
-
-    fn page_type(&self) -> Result<PageType> {
-        PageType::from_u8(self.pr[0])
-    }
-
-    fn check_page_flag(&self, f: u8) -> bool {
-        0 != (self.pr[1] & f)
-    }
-
-    // TODO use buf_advance
-    fn get_byte(&self, cur: &mut usize) -> u8 {
-        let r = self.pr[*cur];
-        *cur = *cur + 1;
-        r
-    }
-
-    // TODO use buf_advance
-    fn get_u32(&self, cur: &mut usize) -> u32 {
-        let at = *cur;
-        // TODO just self.pr?  instead of making 4-byte slice.
-        let a = misc::bytes::extract_4(&self.pr[at .. at + SIZE_32]);
-        *cur = *cur + SIZE_32;
-        endian::u32_from_bytes_be(a)
-    }
-
-    // TODO use buf_advance
-    fn get_u16(&self, cur: &mut usize) -> u16 {
-        let at = *cur;
-        // TODO just self.pr?  instead of making 2-byte slice.
-        let a = misc::bytes::extract_2(&self.pr[at .. at + SIZE_16]);
-        let r = endian::u16_from_bytes_be(a);
-        *cur = *cur + SIZE_16;
-        r
-    }
-
-    fn get_u32_at(&self, at: usize) -> u32 {
-        // TODO just self.pr?  instead of making 4-byte slice.
-        let a = misc::bytes::extract_4(&self.pr[at .. at + SIZE_32]);
-        endian::u32_from_bytes_be(a)
-    }
-
-    fn get_u32_last(&self) -> u32 {
-        let len = self.pr.len();
-        let at = len - 1 * SIZE_32;
-        self.get_u32_at(at)
-    }
-
-    fn setCurrentPage(&mut self, pgnum: PageNum) -> Result<()> {
-        assert!(self.location.contains_page(pgnum));
-
-        if self.currentPage != pgnum {
-            self.currentPage = pgnum;
-
-            self.leafKeys.clear();
-            self.previousLeaf = 0;
-            self.currentKey = None;
-            self.prefix = None;
-
-            {
-                let f = &mut *(self.f.borrow_mut());
-                try!(utils::SeekPage(f, self.pr.len(), self.currentPage));
-                try!(misc::io::read_fully(f, &mut self.pr));
-            }
-
-            match self.page_type() {
-                Ok(PageType::LEAF_NODE) => {
-                    try!(self.readLeaf());
-                },
-                _ => {
-                },
-            }
-        }
-        Ok(())
-    }
-
-    fn nextInLeaf(&mut self) -> bool {
-        match self.currentKey {
-            Some(cur) => {
-                if (cur +1 ) < self.leafKeys.len() {
-                    self.currentKey = Some(cur + 1);
-                    true
-                } else {
-                    false
-                }
-            },
-            None => {
-                false
-            },
-        }
-    }
-
-    fn prevInLeaf(&mut self) -> bool {
-        match self.currentKey {
-            Some(cur) => {
-                if cur > 0 {
-                    self.currentKey = Some(cur - 1);
-                    true
-                } else {
-                    false
-                }
-            },
-            None => {
-                false
-            },
-        }
-    }
-
-    fn skipKey(&self, cur: &mut usize) {
-        let klen = varint::read(&self.pr, cur) as usize;
-        let inline = 0 == klen % 2;
-        let klen = klen / 2;
-
-        if inline {
-            let prefixLen = match self.prefix {
-                Some(ref a) => a.len(),
-                None => 0
-            };
-            *cur = *cur + (klen - prefixLen);
-        } else {
-            *cur = *cur + SIZE_32;
-        }
-    }
-
-    fn skipValue(&self, cur: &mut usize) {
-        let vflag = self.get_byte(cur);
-        if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) { 
-            ()
-        } else {
-            let vlen = varint::read(&self.pr, cur) as usize;
-            if 0 != (vflag & ValueFlag::FLAG_OVERFLOW) {
-                *cur = *cur + SIZE_32;
-            } else {
-                *cur = *cur + vlen;
-            }
-        }
-    }
-
-    fn keyInLeaf2<'a>(&'a self, n: usize) -> Result<KeyRef<'a>> { 
-        let mut cur = self.leafKeys[n as usize];
-        let klen = varint::read(&self.pr, &mut cur) as usize;
-        let inline = 0 == klen % 2;
-        let klen = klen / 2;
-        if inline {
-            match self.prefix {
-                Some(ref a) => {
-                    Ok(KeyRef::Prefixed(&a, &self.pr[cur .. cur + klen - a.len()]))
-                },
-                None => {
-                    Ok(KeyRef::Array(&self.pr[cur .. cur + klen]))
-                },
-            }
-        } else {
-            let pgnum = self.get_u32(&mut cur) as PageNum;
-            let mut ostrm = try!(OverflowReader::new(&self.path, self.pr.len(), pgnum, klen));
-            let mut x_k = Vec::with_capacity(klen);
-            try!(ostrm.read_to_end(&mut x_k));
-            let x_k = x_k.into_boxed_slice();
-            Ok(KeyRef::Overflowed(x_k))
-        }
-    }
-
-    fn searchLeaf(&mut self, k: &KeyRef, min:usize, max:usize, sop:SeekOp, le: Option<usize>, ge: Option<usize>) -> Result<(Option<usize>,bool)> {
-        if max < min {
-            match sop {
-                SeekOp::SEEK_EQ => Ok((None, false)),
-                SeekOp::SEEK_LE => Ok((le, false)),
-                SeekOp::SEEK_GE => Ok((ge, false)),
-            }
-        } else {
-            let mid = (max + min) / 2;
-            // assert mid >= 0
-            let cmp = {
-                let q = try!(self.keyInLeaf2(mid));
-                KeyRef::cmp(&q, k)
-            };
-            match cmp {
-                Ordering::Equal => Ok((Some(mid), true)),
-                Ordering::Less => self.searchLeaf(k, (mid+1), max, sop, Some(mid), ge),
-                Ordering::Greater => 
-                    // we could just recurse with mid-1, but that would overflow if
-                    // mod is 0, so we catch that case here.
-                    if mid==0 { 
-                        match sop {
-                            SeekOp::SEEK_EQ => Ok((None, false)),
-                            SeekOp::SEEK_LE => Ok((le, false)),
-                            SeekOp::SEEK_GE => Ok((Some(mid), false)),
-                        }
-                    } else { 
-                        self.searchLeaf(k, min, (mid-1), sop, le, Some(mid))
-                    },
-            }
-        }
-    }
-
-    fn get_next_from_parent_page(&mut self, kq: &KeyRef) -> Result<PageNum> {
-        let mut cur = 0;
-        let pt = try!(PageType::from_u8(self.get_byte(&mut cur)));
-        if  pt != PageType::PARENT_NODE {
-            return Err(Error::CorruptFile("parent page has invalid page type"));
-        }
-        cur = cur + 1; // skip the page flags
-        let count_keys = self.get_u16(&mut cur);
-        let mut found = None;
-        for i in 0 .. count_keys {
-            let klen = varint::read(&self.pr, &mut cur) as usize;
-            let inline = 0 == klen % 2;
-            let klen = klen / 2;
-            let k =
-                if inline {
-                    let k = KeyRef::Array(&self.pr[cur .. cur + klen]);
-                    cur = cur + klen;
-                    k
-                } else {
-                    let firstPage = self.get_u32(&mut cur) as PageNum;
-                    // TODO move the following line outside the loop?
-                    let pgsz = self.pr.len();
-                    let mut ostrm = try!(OverflowReader::new(&self.path, pgsz, firstPage, klen));
-                    let mut x_k = Vec::with_capacity(klen);
-                    try!(ostrm.read_to_end(&mut x_k));
-                    let x_k = x_k.into_boxed_slice();
-                    let k = KeyRef::Overflowed(x_k);
-                    k
-                };
-            let cmp = KeyRef::cmp(kq, &k);
-            if cmp == Ordering::Less {
-                found = Some(i);
-                break;
-            }
-        }
-        match found {
-            None => {
-            },
-            Some(found) => {
-                // gotta skip the rest of the keys
-                for _ in found + 1 .. count_keys {
-                    let klen = varint::read(&self.pr, &mut cur) as usize;
-                    let inline = 0 == klen % 2;
-                    let klen = klen / 2;
-                    if inline {
-                        cur = cur + klen;
-                    } else {
-                        // the page num for overflow is a u32
-                        // TODO why not a varint?
-                        cur = cur + 4;
-                    };
-                }
-            },
-        }
-        let found = found.unwrap_or(count_keys);
-        for _ in 0 .. found {
-            let b = self.get_byte(&mut cur);
-            let len = misc::varint::first_byte_to_len(b);
-            cur = cur + len - 1;
-        }
-        let pg = varint::read(&self.pr, &mut cur) as PageNum;
-        Ok(pg)
-    }
-
-    // this is used when moving forward through the leaf pages.
-    // we need to skip any overflows.  when moving backward,
-    // this is not necessary, because each leaf has a pointer to
-    // the leaf before it.
-    //
-    // TODO it's unfortunate that Next is the slower operation
-    // when it is far more common than Prev.  OTOH, the pages
-    // are written as we stream through a set of kvp objects,
-    // and we don't want to rewind, and we want to write each
-    // page only once, and we want to keep the minimum amount
-    // of stuff in memory as we go.  and this code only causes
-    // a perf difference if there are overflow pages between
-    // the leaves.
-
-    // TODO consider putting overflows in a separate block of pages
-    // so that leaves will be in a row?
-    fn searchForwardForLeaf(&mut self) -> Result<bool> {
-        let pt = try!(self.page_type());
-        if pt == PageType::LEAF_NODE { 
-            Ok(true)
-        } else if pt == PageType::PARENT_NODE { 
-            // if we bump into a parent node, that means there are
-            // no more leaves.
-            Ok(false)
-        } else {
-            assert!(pt == PageType::OVERFLOW_NODE);
-
-            let lastInt32 = self.get_u32_last() as PageNum;
-            //
-            // an overflow page has a value in its LastInt32 which
-            // is one of two things.
-            //
-            // if it's a boundary node, it's the page number of the
-            // next page in the segment.
-            //
-            // otherwise, it's the number of pages to skip ahead.
-            // this skip might take us to whatever follows this
-            // overflow (which could be a leaf or a parent or
-            // another overflow), or it might just take us to a
-            // boundary page (in the case where the overflow didn't
-            // fit).  it doesn't matter.  we just skip ahead.
-            //
-            if self.check_page_flag(PageFlag::FLAG_BOUNDARY_NODE) {
-                try!(self.setCurrentPage(lastInt32));
-                self.searchForwardForLeaf()
-            } else {
-                let lastPage = self.currentPage + lastInt32;
-                let endsOnBoundary = self.check_page_flag(PageFlag::FLAG_ENDS_ON_BOUNDARY);
-                if endsOnBoundary {
-                    try!(self.setCurrentPage(lastPage));
-                    let next = self.get_u32_last() as PageNum;
-                    try!(self.setCurrentPage(next));
-                    self.searchForwardForLeaf()
-                } else {
-                    try!(self.setCurrentPage(lastPage + 1));
-                    self.searchForwardForLeaf()
-                }
-            }
-        }
-    }
-
-    fn leafIsValid(&self) -> bool {
-        // TODO the bounds check of self.currentKey against self.leafKeys.len() could be an assert
-        let ok = (!self.leafKeys.is_empty()) && (self.currentKey.is_some()) && (self.currentKey.expect("just did is_some") as usize) < self.leafKeys.len();
-        ok
-    }
-
-    fn search(&mut self, pg: PageNum, k: &KeyRef, sop:SeekOp) -> Result<SeekResult> {
-        try!(self.setCurrentPage(pg));
-        let pt = try!(self.page_type());
-        if PageType::LEAF_NODE == pt {
-            let tmp_countLeafKeys = self.leafKeys.len();
-            let (newCur, equal) = try!(self.searchLeaf(k, 0, (tmp_countLeafKeys - 1), sop, None, None));
-            self.currentKey = newCur;
-            if SeekOp::SEEK_EQ != sop {
-                if ! self.leafIsValid() {
-                    // if LE or GE failed on a given page, we might need
-                    // to look at the next/prev leaf.
-                    if SeekOp::SEEK_GE == sop {
-                        let nextPage =
-                            if self.check_page_flag(PageFlag::FLAG_BOUNDARY_NODE) { 
-                                self.get_u32_last() as PageNum 
-                            } else if self.currentPage == self.location.root_page { 
-                                0 
-                            } else { 
-                                self.currentPage + 1 
-                            };
-                        if 0 == nextPage {
-                            self.currentKey = None;
-                        } else {
-                            try!(self.setCurrentPage(nextPage));
-                            if try!(self.searchForwardForLeaf()) {
-                                self.currentKey = Some(0);
-                            }
-                        }
-                    } else {
-                        let tmp_previousLeaf = self.previousLeaf;
-                        if 0 == self.previousLeaf {
-                            self.currentKey = None;
-                        } else {
-                            try!(self.setCurrentPage(tmp_previousLeaf));
-                            if try!(self.page_type()) != PageType::LEAF_NODE {
-                                return Err(Error::Misc(format!("must be a leaf")));
-                            }
-                            self.currentKey = Some(self.leafKeys.len() - 1);
-                        }
-                    }
-                }
-            }
-            if self.currentKey.is_none() {
-                Ok(SeekResult::Invalid)
-            } else if equal {
-                Ok(SeekResult::Equal)
-            } else {
-                Ok(SeekResult::Unequal)
-            }
-        } else if PageType::PARENT_NODE == pt {
-            let next = try!(self.get_next_from_parent_page(k));
-            assert!(next != pg);
-            self.search(next, k, sop)
-        } else {
-            unreachable!();
-        }
     }
 
 }
@@ -4235,129 +3822,39 @@ impl Drop for SegmentCursor {
 
 impl ICursor for SegmentCursor {
     fn IsValid(&self) -> bool {
-        self.leafIsValid()
+        self.sub.IsValid()
     }
 
     fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
-        let root_page = self.location.root_page;
-        self.search(root_page, k, sop)
+        self.sub.SeekRef(k, sop)
     }
 
     fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
-        match self.currentKey {
-            None => Err(Error::CursorNotValid),
-            Some(currentKey) => self.keyInLeaf2(currentKey),
-        }
+        self.sub.KeyRef()
     }
 
     fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
-        match self.currentKey {
-            None => Err(Error::CursorNotValid),
-            Some(currentKey) => {
-                let mut pos = self.leafKeys[currentKey as usize];
-
-                self.skipKey(&mut pos);
-
-                let vflag = self.get_byte(&mut pos);
-                if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) {
-                    Ok(ValueRef::Tombstone)
-                } else {
-                    let vlen = varint::read(&self.pr, &mut pos) as usize;
-                    if 0 != (vflag & ValueFlag::FLAG_OVERFLOW) {
-                        let pgnum = self.get_u32(&mut pos) as PageNum;
-                        let strm = try!(OverflowReader::new(&self.path, self.pr.len(), pgnum, vlen));
-                        Ok(ValueRef::Overflowed(vlen, box strm))
-                    } else {
-                        Ok(ValueRef::Array(&self.pr[pos .. pos + vlen]))
-                    }
-                }
-            }
-        }
+        self.sub.ValueRef()
     }
 
     fn ValueLength(&self) -> Result<Option<usize>> {
-        match self.currentKey {
-            None => Err(Error::CursorNotValid),
-            Some(currentKey) => {
-                let mut cur = self.leafKeys[currentKey as usize];
-
-                self.skipKey(&mut cur);
-
-                let vflag = self.get_byte(&mut cur);
-                if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) { 
-                    Ok(None)
-                } else {
-                    let vlen = varint::read(&self.pr, &mut cur) as usize;
-                    Ok(Some(vlen))
-                }
-            }
-        }
+        self.sub.ValueLength()
     }
 
     fn First(&mut self) -> Result<()> {
-        let firstLeaf = self.firstLeaf;
-        try!(self.setCurrentPage(firstLeaf));
-        if try!(self.page_type()) != PageType::LEAF_NODE {
-            return Err(Error::Misc(format!("must be a leaf")));
-        }
-        self.currentKey = Some(0);
-        Ok(())
+        self.sub.First()
     }
 
     fn Last(&mut self) -> Result<()> {
-        let lastLeaf = self.lastLeaf;
-        try!(self.setCurrentPage(lastLeaf));
-        if try!(self.page_type()) != PageType::LEAF_NODE {
-            return Err(Error::Misc(format!("must be a leaf")));
-        }
-        self.currentKey = Some(self.leafKeys.len() - 1);
-        Ok(())
+        self.sub.Last()
     }
 
     fn Next(&mut self) -> Result<()> {
-        if !self.nextInLeaf() {
-            let nextPage =
-                if self.check_page_flag(PageFlag::FLAG_BOUNDARY_NODE) { 
-                    self.get_u32_last() as PageNum 
-                } else if try!(self.page_type()) == PageType::LEAF_NODE {
-                    if self.currentPage == self.location.root_page { 
-                        0 
-                    } else { 
-                        self.currentPage + 1 
-                    }
-                } else { 
-                    0 
-                };
-            if 0 == nextPage {
-                self.currentKey = None;
-            } else if !self.location.contains_page(nextPage) {
-                self.currentKey = None;
-            } else {
-                try!(self.setCurrentPage(nextPage));
-                if try!(self.searchForwardForLeaf()) {
-                    self.currentKey = Some(0);
-                } else {
-                    self.currentKey = None;
-                }
-            }
-        }
-        Ok(())
+        self.sub.Next()
     }
 
     fn Prev(&mut self) -> Result<()> {
-        if !self.prevInLeaf() {
-            let previousLeaf = self.previousLeaf;
-            if 0 == previousLeaf {
-                self.currentKey = None;
-            } else {
-                try!(self.setCurrentPage(previousLeaf));
-                if try!(self.page_type()) != PageType::LEAF_NODE {
-                    return Err(Error::Misc(format!("must be a leaf")));
-                }
-                self.currentKey = Some(self.leafKeys.len() - 1);
-            }
-        }
-        Ok(())
+        self.sub.Prev()
     }
 
 }
