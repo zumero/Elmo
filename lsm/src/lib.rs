@@ -2394,33 +2394,19 @@ fn create_segment<I>(mut pw: PageWriter,
 
             let vloc = {
                 let maxValueInline = {
-                    // the max limit of an inline value is when the key is inline
-                    // on a new page.  because we don't allow the value to be
-                    // inlined if the key was not.
-                    // TODO why?
-
-                    let needed_for_key_inline_on_new_page = 
-                        LEAF_PAGE_OVERHEAD 
-                        + 1 // prefixLen
-                        + varint::space_needed_for((k.len() * 2) as u64)
-                        + k.len() 
+                    let fixed_costs_on_new_page =
+                        LEAF_PAGE_OVERHEAD
+                        + 1 // prefixlen
+                        + kLocNeed(&k, &kloc, 0)
                         + 1 // value flags
+                        + varint::space_needed_for(pgsz as u64) // vlen can't be larger than this for inline
                         ;
-
-                    if pgsz > needed_for_key_inline_on_new_page {
-                        let available = pgsz - needed_for_key_inline_on_new_page;
-                        let neededForVarintLen = varint::space_needed_for(available as u64);
-                        if available > neededForVarintLen {
-                            available - neededForVarintLen
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    }
+                    assert!(fixed_costs_on_new_page < pgsz);
+                    let available_for_inline_value_on_new_page = pgsz - fixed_costs_on_new_page;
+                    available_for_inline_value_on_new_page
                 };
 
-                // for all the write_overflow calls below, we already know how much 
+                // for the write_overflow calls below, we already know how much 
                 // we spent on the key, so we know what our actual limit is for the encoded
                 // block list for the value.  the hard limit, basically, is:  we cannot get
                 // into a state where the key and value cannot fit on the same page.
@@ -2438,87 +2424,35 @@ fn create_segment<I>(mut pw: PageWriter,
                     Blob::Tombstone => {
                         ValueLocation::Tombstone
                     },
-                    _ => match kloc {
-                         KeyLocation::Inline => {
-                            if maxValueInline == 0 {
-                                match pair.Value {
-                                    Blob::Tombstone => {
-                                        // TODO already handled above
-                                        ValueLocation::Tombstone
-                                    },
-                                    Blob::Stream(ref mut strm) => {
-                                        let (len, blocks) = try!(write_overflow(&mut *strm, pw, hard_limit_for_value_overflow));
-                                        ValueLocation::Overflowed(len, blocks)
-                                    },
-                                    Blob::Array(a) => {
-                                        if a.is_empty() {
-                                            // TODO maybe we need ValueLocation::Empty
-                                            ValueLocation::Buffer(a)
-                                        } else {
-                                            let strm = a;
-                                            let (len, blocks) = try!(write_overflow(&mut &*strm, pw, hard_limit_for_value_overflow));
-                                            ValueLocation::Overflowed(len, blocks)
-                                        }
-                                    },
-                                }
-                            } else {
-                                match pair.Value {
-                                    Blob::Tombstone => {
-                                        // TODO already handled above
-                                        ValueLocation::Tombstone
-                                    },
-                                    Blob::Stream(ref mut strm) => {
-                                        // not sure reusing vbuf is worth it.  maybe we should just
-                                        // alloc here.  ownership will get passed into the
-                                        // ValueLocation when it fits.
-                                        let vread = try!(misc::io::read_fully(&mut *strm, &mut vbuf[0 .. maxValueInline+1]));
-                                        let vbuf = &vbuf[0 .. vread];
-                                        if vread < maxValueInline {
-                                            // TODO this alloc+copy is unfortunate
-                                            let mut va = Vec::with_capacity(vbuf.len());
-                                            for i in 0 .. vbuf.len() {
-                                                va.push(vbuf[i]);
-                                            }
-                                            ValueLocation::Buffer(va.into_boxed_slice())
-                                        } else {
-                                            let (len, blocks) = try!(write_overflow(&mut (vbuf.chain(strm)), pw, hard_limit_for_value_overflow));
-                                            ValueLocation::Overflowed (len, blocks)
-                                        }
-                                    },
-                                    Blob::Array(a) => {
-                                        if a.len() < maxValueInline {
-                                            ValueLocation::Buffer(a)
-                                        } else {
-                                            let (len, blocks) = try!(write_overflow(&mut &*a, pw, hard_limit_for_value_overflow));
-                                            ValueLocation::Overflowed(len, blocks)
-                                        }
-                                    },
-                                }
+                    Blob::Stream(ref mut strm) => {
+                        // TODO
+                        // not sure reusing vbuf is worth it.  maybe we should just
+                        // alloc here.  ownership will get passed into the
+                        // ValueLocation when it fits.
+                        let vread = try!(misc::io::read_fully(&mut *strm, &mut vbuf[0 .. maxValueInline + 1]));
+                        let vbuf = &vbuf[0 .. vread];
+                        // TODO should be <= ?
+                        if vread < maxValueInline {
+                            // TODO this alloc+copy is unfortunate
+                            let mut va = Vec::with_capacity(vbuf.len());
+                            for i in 0 .. vbuf.len() {
+                                va.push(vbuf[i]);
                             }
-                         },
-
-                         KeyLocation::Overflowed(_) => {
-                            match pair.Value {
-                                Blob::Tombstone => {
-                                    // TODO already handled above
-                                    ValueLocation::Tombstone
-                                },
-                                Blob::Stream(ref mut strm) => {
-                                    let (len, blocks) = try!(write_overflow(&mut *strm, pw, hard_limit_for_value_overflow));
-                                    ValueLocation::Overflowed(len, blocks)
-                                },
-                                Blob::Array(a) => {
-                                    if a.is_empty() {
-                                        // TODO maybe we need ValueLocation::Empty
-                                        ValueLocation::Buffer(a)
-                                    } else {
-                                        let (len, blocks) = try!(write_overflow(&mut &*a, pw, hard_limit_for_value_overflow));
-                                        ValueLocation::Overflowed(len, blocks)
-                                    }
-                                }
-                            }
-                         }
-                    }
+                            ValueLocation::Buffer(va.into_boxed_slice())
+                        } else {
+                            let (len, blocks) = try!(write_overflow(&mut (vbuf.chain(strm)), pw, hard_limit_for_value_overflow));
+                            ValueLocation::Overflowed (len, blocks)
+                        }
+                    },
+                    Blob::Array(a) => {
+                        // TODO should be <= ?
+                        if a.len() < maxValueInline {
+                            ValueLocation::Buffer(a)
+                        } else {
+                            let (len, blocks) = try!(write_overflow(&mut &*a, pw, hard_limit_for_value_overflow));
+                            ValueLocation::Overflowed(len, blocks)
+                        }
+                    },
                 }
             };
 
