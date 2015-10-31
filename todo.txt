@@ -83,8 +83,6 @@ core feature:  graveyard
 
 reduce malloc
 
-prefixlen > 255
-
 looks like kvp stuff should probably stay boxed.  both the key and value
 always need to be held longer than one iteration, usually until the
 end of the leaf, and one key for each leaf gets held longer than that.

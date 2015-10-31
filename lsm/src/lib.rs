@@ -1052,7 +1052,7 @@ mod bcmp {
         let len = min(x.len(), y.len());
         let lim = min(len, max);
         let mut i = 0;
-        while i<lim && x[i]==y[i] {
+        while i < lim && x[i] == y[i] {
             i = i + 1;
         }
         i
@@ -2158,8 +2158,7 @@ fn create_segment<I>(mut pw: PageWriter,
             pb.Reset();
             pb.PutByte(PageType::LEAF_NODE.to_u8());
             pb.PutByte(0u8); // flags
-            // TODO prefixLen is one byte.  should it be two?
-            pb.PutByte(st.prefixLen as u8);
+            pb.PutVarint(st.prefixLen as u64);
             if st.prefixLen > 0 {
                 pb.PutArray(&st.keys_in_this_leaf[0].key[0 .. st.prefixLen]);
             }
@@ -2271,13 +2270,13 @@ fn create_segment<I>(mut pw: PageWriter,
             let klen = k.len();
             match *kloc {
                 KeyLocation::Inline => {
-                    0
+                    0 // no key flags
                     + varint::space_needed_for((klen * 2) as u64) 
                     + klen 
                     - prefixLen
                 },
                 KeyLocation::Overflowed(ref blocks) => {
-                    0
+                    0 // no key flags
                     + varint::space_needed_for((klen * 2 + 1) as u64) 
                     + blocks.encoded_len()
                 },
@@ -2304,11 +2303,6 @@ fn create_segment<I>(mut pw: PageWriter,
             kLocNeed(&lp.key, &lp.kLoc, prefixLen)
             +
             vLocNeed(&lp.vLoc)
-        }
-
-        fn defaultPrefixLen(k: &[u8]) -> usize {
-            // TODO max prefix.  relative to page size?  currently must fit in one byte.
-            if k.len() > 255 { 255 } else { k.len() }
         }
 
         let mut st = LeafState {
@@ -2366,7 +2360,7 @@ fn create_segment<I>(mut pw: PageWriter,
                     pgsz 
                     - 2 // page type and flags
                     - 2 // count keys
-                    - 1 // prefixLen
+                    - 1 // prefixLen of 0
                     - varint::space_needed_for((pgsz * 2) as u64) // approx worst case inline key len
                     - 1 // value flags
                     - 9 // worst case varint value len
@@ -2396,7 +2390,7 @@ fn create_segment<I>(mut pw: PageWriter,
                 let maxValueInline = {
                     let fixed_costs_on_new_page =
                         LEAF_PAGE_OVERHEAD
-                        + 1 // prefixlen
+                        + 2 // worst case prefixlen varint
                         + kLocNeed(&k, &kloc, 0)
                         + 1 // value flags
                         + varint::space_needed_for(pgsz as u64) // vlen can't be larger than this for inline
@@ -2414,7 +2408,7 @@ fn create_segment<I>(mut pw: PageWriter,
                 let hard_limit_for_value_overflow =
                     pgsz
                     - LEAF_PAGE_OVERHEAD
-                    - 1 // prefixlen
+                    - 2 // worst case prefixlen varint
                     - kLocNeed(&k, &kloc, 0)
                     - 1 // value flags
                     - 9 // worst case varint for value len
@@ -2461,25 +2455,42 @@ fn create_segment<I>(mut pw: PageWriter,
             // or not.  note that it is possible to overflow these and then have them not
             // fit into the current leaf and end up landing in the next leaf.
 
-            // TODO ignore prefixLen for overflowed keys?
-            let newPrefixLen = 
+            fn calc_prefix_len(st: &LeafState, k: &[u8], kloc: &KeyLocation) -> usize {
                 if st.keys_in_this_leaf.is_empty() {
-                    defaultPrefixLen(&k)
+                    0
                 } else {
-                    bcmp::PrefixMatch(&*st.keys_in_this_leaf[0].key, &k, st.prefixLen)
-                };
-            let sofar = 
-                if newPrefixLen < st.prefixLen {
-                    // the prefixLen would change with the addition of this key,
-                    // so we need to recalc sofar
-                    let sum = st.keys_in_this_leaf.iter().map(|lp| leafPairSize(newPrefixLen, lp)).sum();;
-                    sum
-                } else {
-                    st.sofarLeaf
-                };
+                    match kloc {
+                        &KeyLocation::Inline => {
+                            let max_prefix =
+                                if st.prefixLen > 0 {
+                                    st.prefixLen
+                                } else {
+                                    k.len()
+                                };
+                            bcmp::PrefixMatch(&*st.keys_in_this_leaf[0].key, &k, max_prefix)
+                        },
+                        &KeyLocation::Overflowed(ref blocks) => {
+                            // an overflowed key does not change the prefix
+                            st.prefixLen
+                        },
+                    }
+                }
+            }
+
             let fit = {
+                let newPrefixLen = calc_prefix_len(&st, &k, &kloc);
+                let sofar = 
+                    if newPrefixLen != st.prefixLen {
+                        assert!(st.prefixLen == 0 || newPrefixLen < st.prefixLen);
+                        // the prefixLen would change with the addition of this key,
+                        // so we need to recalc sofar
+                        let sum = st.keys_in_this_leaf.iter().map(|lp| leafPairSize(newPrefixLen, lp)).sum();;
+                        sum
+                    } else {
+                        st.sofarLeaf
+                    };
                 let needed = kLocNeed(&k, &kloc, newPrefixLen) + vLocNeed(&vloc);
-                let used = sofar + LEAF_PAGE_OVERHEAD + 1 + newPrefixLen;
+                let used = sofar + LEAF_PAGE_OVERHEAD + varint::space_needed_for(newPrefixLen as u64) + newPrefixLen;
                 if pgsz > used {
                     let available = pgsz - used;
                     (available >= needed)
@@ -2493,15 +2504,10 @@ fn create_segment<I>(mut pw: PageWriter,
                 try!(write_leaf(&mut st, pb, pw));
             }
 
-            // TODO ignore prefixLen for overflowed keys?
-            let newPrefixLen = 
-                if st.keys_in_this_leaf.is_empty() {
-                    defaultPrefixLen(&k)
-                } else {
-                    bcmp::PrefixMatch(&*st.keys_in_this_leaf[0].key, &k, st.prefixLen)
-                };
+            let newPrefixLen = calc_prefix_len(&st, &k, &kloc);
             let sofar = 
-                if newPrefixLen < st.prefixLen {
+                if newPrefixLen != st.prefixLen {
+                    assert!(st.prefixLen == 0 || newPrefixLen < st.prefixLen);
                     // the prefixLen will change with the addition of this key,
                     // so we need to recalc sofar
                     let sum = st.keys_in_this_leaf.iter().map(|lp| leafPairSize(newPrefixLen, lp)).sum();;
@@ -2517,9 +2523,9 @@ fn create_segment<I>(mut pw: PageWriter,
                         vLoc: vloc,
                         };
 
-            st.sofarLeaf=sofar + leafPairSize(newPrefixLen, &lp);
+            st.sofarLeaf = sofar + leafPairSize(newPrefixLen, &lp);
             st.keys_in_this_leaf.push(lp);
-            st.prefixLen=newPrefixLen;
+            st.prefixLen = newPrefixLen;
         }
 
         if !st.keys_in_this_leaf.is_empty() {
@@ -2954,7 +2960,7 @@ impl LeafCursor {
             return Err(Error::CorruptFile("leaf has invalid page type"));
         }
         cur = cur + 1; // skip flags
-        let prefixLen = misc::buf_advance::get_byte(&self.pr, &mut cur) as usize;
+        let prefixLen = varint::read(&self.pr, &mut cur) as usize;
         if prefixLen > 0 {
             // TODO should we just remember prefix as a reference instead of box/copy?
             let mut a = vec![0; prefixLen].into_boxed_slice();
