@@ -231,7 +231,7 @@ impl BlockList {
         self.blocks.len()
     }
 
-    fn count_pages(&self) -> PageCount {
+    pub fn count_pages(&self) -> PageCount {
         self.blocks.iter().map(|pb| pb.count_pages()).sum()
     }
 
@@ -245,6 +245,10 @@ impl BlockList {
         // TODO assume it is sorted
         // TODO assuming self.blocks is not empty
         self.blocks[0].firstPage
+    }
+
+    fn remove_block(&mut self, i: usize) -> PageBlock {
+        self.blocks.remove(i)
     }
 
     fn contains_page(&self, pgnum: PageNum) -> bool {
@@ -269,48 +273,73 @@ impl BlockList {
         for i in 0 .. self.blocks.len() {
             if self.blocks[i].lastPage + 1 == pg {
                 self.blocks[i].lastPage = pg;
-                return false;
+                return true;
             }
         }
 
         let b = PageBlock::new(pg, pg);
         self.blocks.push(b);
-        return true;
+        return false;
     }
 
-    fn add_block_no_reorder(&mut self, blk: PageBlock) {
-        self.blocks.push(blk);
-    }
-
-    // TODO should this return a BlockList
-    // TODO should this invert in place?
-    fn invert(&self) -> Vec<PageBlock> {
-        let len = self.blocks.len();
-        let mut result = Vec::with_capacity(len);
-        for i in 0 .. len {
-            result.push(self.blocks[i]);
+    fn add_block_no_reorder(&mut self, blk: PageBlock) -> bool {
+        for i in 0 .. self.blocks.len() {
+            if self.blocks[i].lastPage + 1 == blk.firstPage {
+                self.blocks[i].lastPage = blk.lastPage;
+                return true;
+            }
         }
-        result.sort_by(|a,b| a.firstPage.cmp(&b.firstPage));
+
+        self.blocks.push(blk);
+        return false;
+    }
+
+    fn invert(&mut self) {
+        let len = self.blocks.len();
+        self.blocks.sort_by(|a,b| a.firstPage.cmp(&b.firstPage));
         for i in 0 .. len - 1 {
-            result[i].firstPage = result[i].lastPage+1;
-            result[i].lastPage = result[i+1].firstPage-1;
-            assert!(result[i].firstPage <= result[i].lastPage);
+            self.blocks[i].firstPage = self.blocks[i].lastPage + 1;
+            self.blocks[i].lastPage = self.blocks[i + 1].firstPage - 1;
+            assert!(self.blocks[i].firstPage <= self.blocks[i].lastPage);
         }
         // this function finds the space between the blocks.
         // the last block didn't get touched, and is still a block in use.
         // so remove it.
-        result.remove(len - 1);
-        result
-}
+        self.blocks.remove(len - 1);
+    }
 
     fn add_blocklist_no_reorder(&mut self, other: &BlockList) {
+        // TODO call add_block_no_reorder, and return a bool
         for blk in other.blocks.iter() {
             self.blocks.push(blk.clone());
         }
     }
 
     fn sort_and_consolidate(&mut self) {
-        consolidateBlockList(&mut self.blocks);
+        self.blocks.sort_by(|a,b| a.firstPage.cmp(&b.firstPage));
+        if cfg!(expensive_check) {
+            for i in 1 .. self.blocks.len() {
+                assert!(self.blocks[i].firstPage > self.blocks[i - 1].lastPage);
+            }
+        }
+        loop {
+            if self.blocks.len()==1 {
+                break;
+            }
+            let mut did = false;
+            for i in 1 .. self.blocks.len() {
+                if self.blocks[i - 1].lastPage + 1 == self.blocks[i].firstPage {
+                    self.blocks[i - 1].lastPage = self.blocks[i].lastPage;
+                    self.blocks.remove(i);
+                    did = true;
+                    break;
+                }
+            }
+            if !did {
+                break;
+            }
+        }
+        // TODO the list is still sorted, right?
     }
 
     fn sort_by_size_desc_page_asc(&mut self) {
@@ -377,6 +406,14 @@ impl BlockList {
     fn skip(pr: &[u8], cur: &mut usize) {
         // TODO do this without mem alloc
         let unused = Self::read(pr, cur);
+    }
+}
+
+impl std::ops::Index<usize> for BlockList {
+    type Output = PageBlock;
+
+    fn index<'a>(&'a self, i: usize) -> &'a PageBlock {
+        &self.blocks[i]
     }
 }
 
@@ -2281,28 +2318,28 @@ fn create_segment<I>(mut pw: PageWriter,
             leaves: Vec::new(),
         };
 
-        //let mut prev_key: Option<Box<[u8]>> = None;
+        let mut prev_key: Option<Box<[u8]>> = None;
 
         for result_pair in source {
             let mut pair = try!(result_pair);
 
             let k = pair.Key;
-            /*
+            if cfg!(expensive_check) {
                // this code can be used to verify that we are being given kvps in order
-            match prev_key {
-                None => {
-                },
-                Some(prev_key) => {
-                    let c = k.cmp(&prev_key);
-                    if c != Ordering::Greater {
-                        println!("prev_key: {:?}", prev_key);
-                        println!("k: {:?}", k);
-                        panic!("unsorted keys");
-                    }
-                },
+                match prev_key {
+                    None => {
+                    },
+                    Some(prev_key) => {
+                        let c = k.cmp(&prev_key);
+                        if c != Ordering::Greater {
+                            println!("prev_key: {:?}", prev_key);
+                            println!("k: {:?}", k);
+                            panic!("unsorted keys");
+                        }
+                    },
+                }
+                prev_key = Some(k.clone());
             }
-            prev_key = Some(k.clone());
-            */
 
             let kloc = {
                 // the max limit of an inline key is when that key is the only
@@ -2795,12 +2832,9 @@ fn create_segment<I>(mut pw: PageWriter,
         };
 
     let blocks = try!(pw.end());
-    {
-        // TODO if we add the root page to the calculated block list 
+    if cfg!(expensive_check) {
+        // if we add the root page to the calculated block list 
         // it should be the same as the one from pw
-        //println!("pw blocks: {:?}", blocks);
-        //println!("calc blocks: {:?}", root_page.blocks);
-        //println!("");
 
         let mut tmp = root_page.blocks.clone();
         tmp.add_page_no_reorder(root_page.page);
@@ -2826,7 +2860,7 @@ fn create_segment<I>(mut pw: PageWriter,
 struct OverflowReader {
     fs: File,
     len: usize, // same type as ValueLength(), max len of a single value
-    firstPage: PageNum, // TODO will be needed later for Seek trait
+    firstPage: PageNum, // TODO this will be needed later for Seek trait
     buf: Box<[u8]>,
     currentPage: PageNum,
     sofarOverall: usize,
@@ -3834,31 +3868,6 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
 
 }
 
-fn consolidateBlockList(blocks: &mut Vec<PageBlock>) {
-    blocks.sort_by(|a,b| a.firstPage.cmp(&b.firstPage));
-    for i in 1 .. blocks.len() {
-        assert!(blocks[i].firstPage > blocks[i - 1].lastPage);
-    }
-    loop {
-        if blocks.len()==1 {
-            break;
-        }
-        let mut did = false;
-        for i in 1 .. blocks.len() {
-            if blocks[i - 1].lastPage + 1 == blocks[i].firstPage {
-                blocks[i - 1].lastPage = blocks[i].lastPage;
-                blocks.remove(i);
-                did = true;
-                break;
-            }
-        }
-        if !did {
-            break;
-        }
-    }
-    // TODO the list is still sorted, right?
-}
-
 fn list_all_blocks(h: &HeaderData, pgsz: usize) -> BlockList {
     let mut blocks = BlockList::new();
 
@@ -3881,8 +3890,7 @@ use std::sync::RwLock;
 struct Space {
     nextPage: PageNum,
 
-    // TODO should this be a BlockList?
-    freeBlocks: Vec<PageBlock>,
+    freeBlocks: BlockList,
 
     nextCursorNum: u64,
     cursors: HashMap<u64, SegmentNum>,
@@ -4006,10 +4014,10 @@ impl DatabaseFile {
         let mut blocks = list_all_blocks(&header, pgsz);
         //println!("blocks in use: {:?}", blocks);
         let last_page_used = blocks.last_page();
-        let mut freeBlocks = blocks.invert();
+        blocks.invert();
         if first_available_page > (last_page_used + 1) {
             let blk = PageBlock::new(last_page_used + 1, first_available_page - 1);
-            freeBlocks.push(blk);
+            blocks.add_block_no_reorder(blk);
             // TODO it is tempting to truncate the file here.  but this might not
             // be the right place.  we should preserve the ability to open a file
             // read-only.
@@ -4017,19 +4025,13 @@ impl DatabaseFile {
 
         // we want the largest blocks at the front of the list
         // two blocks of the same size?  sort earlier block first.
-        freeBlocks.sort_by(
-            |a,b| 
-                match b.count_pages().cmp(&a.count_pages()) {
-                    Ordering::Equal => a.firstPage.cmp(&b.firstPage),
-                    c => c,
-                }
-                );
+        blocks.sort_by_size_desc_page_asc();
 
         let space = Space {
             // TODO maybe we should just ignore the actual end of the file
             // and set nextPage to last_page_used + 1, and not add the block above
             nextPage: first_available_page, 
-            freeBlocks: freeBlocks,
+            freeBlocks: blocks,
             nextCursorNum: 1,
             cursors: HashMap::new(),
             zombie_segments: HashMap::new(),
@@ -4187,7 +4189,7 @@ impl DatabaseFile {
         InnerPart::release_pending_segment(&self.inner, location)
     }
 
-    pub fn list_free_blocks(&self) -> Result<Vec<PageBlock>> {
+    pub fn list_free_blocks(&self) -> Result<BlockList> {
         InnerPart::list_free_blocks(&self.inner)
     }
 
@@ -4341,10 +4343,10 @@ impl InnerPart {
 
         match from {
             FromWhere::FirstFree => {
-                space.freeBlocks.remove(0)
+                space.freeBlocks.remove_block(0)
             },
             FromWhere::SpecificFree(i) => {
-                space.freeBlocks.remove(i)
+                space.freeBlocks.remove_block(i)
             },
             FromWhere::End(size) => {
                 let newBlk = PageBlock::new(space.nextPage, space.nextPage + size - 1) ;
@@ -4409,21 +4411,14 @@ impl InnerPart {
 
         //println!("adding free blocks: {:?}", blocks);
         for b in blocks {
-            space.freeBlocks.push(b);
+            space.freeBlocks.add_block_no_reorder(b);
         }
-        consolidateBlockList(&mut space.freeBlocks);
-        let mut free_at_end = None;
-        for (i, b) in space.freeBlocks.iter().enumerate() {
-            if b.lastPage == space.nextPage - 1 {
-                // this block can simply be removed and nextPage moved back
-                free_at_end = Some(i);
-                break;
-            }
-        }
-        if let Some(i) = free_at_end {
-            //println!("    killing free_at_end: {:?}", space.freeBlocks[i]);
-            space.nextPage = space.freeBlocks[i].firstPage;
-            space.freeBlocks.remove(i);
+        space.freeBlocks.sort_and_consolidate();
+        if space.freeBlocks.len() > 0 && space.freeBlocks.last_page() == space.nextPage - 1 {
+            let i_last_block = space.freeBlocks.len() - 1;
+            let blk = space.freeBlocks.remove_block(i_last_block);
+            //println!("    killing free_at_end: {:?}", blk);
+            space.nextPage = blk.firstPage;
         }
 
         let file_length = try!(std::fs::metadata(path)).len();
@@ -4440,13 +4435,7 @@ impl InnerPart {
 
         // we want the largest blocks at the front of the list
         // two blocks of the same size?  sort earlier block first.
-        space.freeBlocks.sort_by(
-            |a,b| 
-                match b.count_pages().cmp(&a.count_pages()) {
-                    Ordering::Equal => a.firstPage.cmp(&b.firstPage),
-                    c => c,
-                }
-                );
+        space.freeBlocks.sort_by_size_desc_page_asc();
 
         //println!("    space now: {:?}", space);
         Ok(())
@@ -4604,7 +4593,7 @@ impl InnerPart {
         Ok(buf)
     }
 
-    fn list_free_blocks(inner: &std::sync::Arc<InnerPart>) -> Result<Vec<PageBlock>> {
+    fn list_free_blocks(inner: &std::sync::Arc<InnerPart>) -> Result<BlockList> {
         let space = try!(inner.space.lock());
         Ok(space.freeBlocks.clone())
     }
@@ -5192,8 +5181,8 @@ impl PageWriter {
             let first = group.blocks[0].firstPage;
             assert!(pg > first);
         }
-        group.add_page_no_reorder(pg);
-        // TODO only consol if above true?
+        let extended = group.add_page_no_reorder(pg);
+        // TODO only consol if above false?
         group.sort_and_consolidate();
         assert!(group.encoded_len() < limit);
         Ok(pg)
@@ -5221,8 +5210,8 @@ impl PageWriter {
     }
 
     fn add_page_to_list(&mut self, pg: PageNum) {
-        self.list.add_page_no_reorder(pg);
-        // TODO only consol if above true?
+        let extended = self.list.add_page_no_reorder(pg);
+        // TODO only consol if above false?
         self.list.sort_and_consolidate();
     }
 

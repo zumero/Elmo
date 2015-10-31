@@ -47,8 +47,7 @@ fn list_free_blocks(name: &str) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let blocks = try!(db.list_free_blocks());
     println!("{:?}", blocks);
-    let total_pages: usize = blocks.iter().map(|pb: &lsm::PageBlock| pb.count_pages() as usize).sum();
-    println!("total pages: {}", total_pages);
+    println!("total pages: {}", blocks.count_pages());
     Ok(())
 }
 
