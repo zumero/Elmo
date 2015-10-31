@@ -324,14 +324,25 @@ impl BlockList {
     }
 
     fn encode(&self, pb: &mut Vec<u8>) {
+        // we store each PageBlock as first/offset instead of first/last, since the
+        // offset will always compress better as a varint.
+        
+        // if there are multiple blocks, we store the firstPage field
+        // of all blocks after the first one as offsets from th first one.
+        // this requires that the list was sorted before this func was called.
+
         misc::push_varint(pb, self.blocks.len() as u64);
-        // we store PageBlock as first/count instead of first/last, since the
-        // count will always compress better as a varint.
-// TODO store as offset instead of count
-        // TODO store subsequent firstPage values as offsets?
-        for t in self.blocks.iter() {
-            misc::push_varint(pb, t.firstPage as u64);
-            misc::push_varint(pb, t.count_pages() as u64);
+        if self.blocks.len() > 0 {
+            let first_page = self.blocks[0].firstPage;
+            misc::push_varint(pb, self.blocks[0].firstPage as u64);
+            misc::push_varint(pb, (self.blocks[0].lastPage - self.blocks[0].firstPage) as u64);
+            if self.blocks.len() > 1 {
+                for i in 1 .. self.blocks.len() {
+                    assert!(self.blocks[i].firstPage > first_page);
+                    misc::push_varint(pb, (self.blocks[i].firstPage - first_page) as u64);
+                    misc::push_varint(pb, (self.blocks[i].lastPage - self.blocks[i].firstPage) as u64);
+                }
+            }
         }
     }
 
@@ -349,12 +360,15 @@ impl BlockList {
             blocks: Vec::with_capacity(count_blocks),
         };
         for i in 0 .. count_blocks {
-// TODO for i>0, use offset instead of full page num
-            let first_page = varint::read(pr, cur) as PageNum;
-// TODO offset instead of count
-            let count_pages = varint::read(pr, cur) as PageNum;
-            assert!(count_pages > 0);
-            let b = PageBlock::new(first_page, first_page + count_pages - 1);
+            let first_page = varint::read(pr, cur) as PageNum
+                +
+                if i > 0 {
+                    list.blocks[0].firstPage
+                } else {
+                    0
+                };
+            let offset = varint::read(pr, cur) as PageNum;
+            let b = PageBlock::new(first_page, first_page + offset);
             list.blocks.push(b);
         }
         list
@@ -2198,7 +2212,7 @@ fn create_segment<I>(mut pw: PageWriter,
                        ) -> Result<()> {
             let (first_key, last_key, blocks) = build_leaf(st, pb);
             //println!("leaf blocklist: {:?}", blocks);
-            //println!("leaf blocklist encoded_len: {:?}", blocks.encoded_len());
+            //println!("leaf blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
             assert!(st.keys_in_this_leaf.is_empty());
             let thisPageNumber = try!(pw.write_page(pb.buf()));
             let pg = pgitem {
@@ -2299,6 +2313,8 @@ fn create_segment<I>(mut pw: PageWriter,
 
                 // TODO the following code still needs tuning
 
+                // TODO the following code is even more pessimistic now that we do
+                // offsets in encoded blocklists
                 const PESSIMISTIC_OVERFLOW_INFO_SIZE: usize = 
                     1 // number of blocks
                     +
@@ -2628,7 +2644,7 @@ fn create_segment<I>(mut pw: PageWriter,
             // assert st.sofar > 0
             let (first_key, last_key, blocks) = build_parent_page(children, st.start, first_child_after, &overflows, pb);
             //println!("parent blocklist: {:?}", blocks);
-            //println!("parent blocklist encoded_len: {:?}", blocks.encoded_len());
+            //println!("parent blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
             let thisPageNumber = try!(pw.write_page(pb.buf()));
             st.sofar = 0;
             let pg = pgitem {
