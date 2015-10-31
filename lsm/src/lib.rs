@@ -60,6 +60,7 @@ const SIZE_16: usize = 2; // like std::mem::size_of::<u16>()
 const LEVEL_SIZE_LIMITS_IN_KB: [u64; 4] = [0, 400, 40000, 0];
 
 pub type PageNum = u32;
+pub type PageCount = u32;
 // type PageSize = u32;
 
 // TODO also perhaps the type representing size of a value, u32
@@ -75,6 +76,9 @@ pub enum Blob {
     Array(Box<[u8]>),
     Tombstone,
     // TODO Graveyard?  (considered a delete of anything with the prefix?)
+
+    // TODO consider having a way here to represent an overflow so 
+    // that it can be moved without copying it during a merge
 }
 
 impl Blob {
@@ -164,10 +168,40 @@ impl<T> From<std::sync::PoisonError<T>> for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
+pub enum BlockRequest {
+    Any,
+    MinimumSize(PageCount),
+    StartOrAfterMinimumSize(Vec<PageNum>, PageNum, PageCount),
+    StartOrAny(Vec<PageNum>),
+}
+
+impl BlockRequest {
+    fn start_is(&self, pg: PageNum) -> bool {
+        match self {
+            &BlockRequest::Any => false,
+            &BlockRequest::MinimumSize(_) => false,
+
+            &BlockRequest::StartOrAny(ref v) => v.iter().any(|n| *n == pg),
+            &BlockRequest::StartOrAfterMinimumSize(ref v, _, _) => v.iter().any(|n| *n == pg),
+        }
+    }
+
+    fn get_after(&self) -> Option<PageNum> {
+        match self {
+            &BlockRequest::Any => None,
+            &BlockRequest::MinimumSize(_) => None,
+
+            &BlockRequest::StartOrAny(_) => None,
+            &BlockRequest::StartOrAfterMinimumSize(_, after, _) => Some(after),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum MergePromotionRule {
     Promote,
     Stay,
-    Threshold(usize),
+    Threshold(PageCount),
 }
 
 // kvp is the struct used to provide key-value pairs downward,
@@ -177,8 +211,8 @@ struct kvp {
     Value: Blob,
 }
 
-#[derive(Debug)]
-struct BlockList {
+#[derive(Debug,Clone)]
+pub struct BlockList {
     blocks: Vec<PageBlock>,
 }
 
@@ -189,11 +223,146 @@ impl BlockList {
         }
     }
 
-    fn add_page(&mut self, pg: PageNum) {
-        // TODO slow
+    fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    fn count_pages(&self) -> PageCount {
+        self.blocks.iter().map(|pb| pb.count_pages()).sum()
+    }
+
+    fn last_page(&self) -> PageNum {
+        // TODO assume it is sorted
+        // TODO assuming self.blocks is not empty
+        self.blocks[self.blocks.len() - 1].lastPage
+    }
+
+    fn first_page(&self) -> PageNum {
+        // TODO assume it is sorted
+        // TODO assuming self.blocks is not empty
+        self.blocks[0].firstPage
+    }
+
+    fn contains_page(&self, pgnum: PageNum) -> bool {
+        for blk in self.blocks.iter() {
+            if blk.contains_page(pgnum) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn would_extend_an_existing_block(&self, pg: PageNum) -> bool {
+        for i in 0 .. self.blocks.len() {
+            if self.blocks[i].lastPage + 1 == pg {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn add_page_no_reorder(&mut self, pg: PageNum) -> bool {
+        for i in 0 .. self.blocks.len() {
+            if self.blocks[i].lastPage + 1 == pg {
+                self.blocks[i].lastPage = pg;
+                return false;
+            }
+        }
+
         let b = PageBlock::new(pg, pg);
         self.blocks.push(b);
+        return true;
+    }
+
+    fn add_block_no_reorder(&mut self, blk: PageBlock) {
+        self.blocks.push(blk);
+    }
+
+    // TODO should this return a BlockList
+    // TODO should this invert in place?
+    fn invert(&self) -> Vec<PageBlock> {
+        let len = self.blocks.len();
+        let mut result = Vec::with_capacity(len);
+        for i in 0 .. len {
+            result.push(self.blocks[i]);
+        }
+        result.sort_by(|a,b| a.firstPage.cmp(&b.firstPage));
+        for i in 0 .. len - 1 {
+            result[i].firstPage = result[i].lastPage+1;
+            result[i].lastPage = result[i+1].firstPage-1;
+            assert!(result[i].firstPage <= result[i].lastPage);
+        }
+        // this function finds the space between the blocks.
+        // the last block didn't get touched, and is still a block in use.
+        // so remove it.
+        result.remove(len - 1);
+        result
+}
+
+    fn add_blocklist_no_reorder(&mut self, other: &BlockList) {
+        for blk in other.blocks.iter() {
+            self.blocks.push(blk.clone());
+        }
+    }
+
+    fn sort_and_consolidate(&mut self) {
         consolidateBlockList(&mut self.blocks);
+    }
+
+    fn sort_by_size_desc_page_asc(&mut self) {
+        self.blocks.sort_by(
+            |a,b| 
+                match b.count_pages().cmp(&a.count_pages()) {
+                    Ordering::Equal => a.firstPage.cmp(&b.firstPage),
+                    c => c,
+                }
+                );
+    }
+
+    fn encode(&self, pb: &mut Vec<u8>) {
+        misc::push_varint(pb, self.blocks.len() as u64);
+        // we store PageBlock as first/count instead of first/last, since the
+        // count will always compress better as a varint.
+// TODO store as offset instead of count
+        // TODO store subsequent firstPage values as offsets?
+        for t in self.blocks.iter() {
+            misc::push_varint(pb, t.firstPage as u64);
+            misc::push_varint(pb, t.count_pages() as u64);
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        // TODO do this without mem alloc
+        let mut v = vec![];
+        self.encode(&mut v);
+        v.len()
+    }
+
+    fn read(pr: &[u8], cur: &mut usize) -> Self {
+        let count_blocks = varint::read(pr, cur) as usize;
+        assert!(count_blocks > 0);
+        let mut list = BlockList {
+            blocks: Vec::with_capacity(count_blocks),
+        };
+        for i in 0 .. count_blocks {
+// TODO for i>0, use offset instead of full page num
+            let first_page = varint::read(pr, cur) as PageNum;
+// TODO offset instead of count
+            let count_pages = varint::read(pr, cur) as PageNum;
+            assert!(count_pages > 0);
+            let b = PageBlock::new(first_page, first_page + count_pages - 1);
+            list.blocks.push(b);
+        }
+        list
+    }
+
+    fn skip(pr: &[u8], cur: &mut usize) {
+        // TODO do this without mem alloc
+        let unused = Self::read(pr, cur);
     }
 }
 
@@ -212,8 +381,8 @@ fn split3<T>(a: &mut [T], i: usize) -> (&mut [T], &mut [T], &mut [T]) {
 }
 
 pub enum KeyRef<'a> {
-    // for an overflowed key, we just punt and read it into memory
-    Overflowed(Box<[u8]>),
+    Boxed(Box<[u8]>),
+    // TODO consider a type representing an overflow reference?
 
     // the other two are references into the page
     Prefixed(&'a [u8],&'a [u8]),
@@ -223,7 +392,7 @@ pub enum KeyRef<'a> {
 impl<'a> std::fmt::Debug for KeyRef<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         match *self {
-            KeyRef::Overflowed(ref a) => write!(f, "Overflowed, a={:?}", a),
+            KeyRef::Boxed(ref a) => write!(f, "Boxed, a={:?}", a),
             KeyRef::Prefixed(front,back) => write!(f, "Prefixed, front={:?}, back={:?}", front, back),
             KeyRef::Array(a) => write!(f, "Array, val={:?}", a),
         }
@@ -233,7 +402,7 @@ impl<'a> std::fmt::Debug for KeyRef<'a> {
 impl<'a> KeyRef<'a> {
     pub fn len(&self) -> usize {
         match *self {
-            KeyRef::Overflowed(ref a) => a.len(),
+            KeyRef::Boxed(ref a) => a.len(),
             KeyRef::Array(a) => a.len(),
             KeyRef::Prefixed(front, back) => front.len() + back.len(),
         }
@@ -241,7 +410,7 @@ impl<'a> KeyRef<'a> {
 
     pub fn u8_at(&self, i: usize) -> Result<u8> {
         match self {
-            &KeyRef::Overflowed(ref a) => {
+            &KeyRef::Boxed(ref a) => {
                 if i < a.len() {
                     Ok(a[i])
                 } else {
@@ -272,7 +441,7 @@ impl<'a> KeyRef<'a> {
 
     pub fn compare_with(&self, k: &[u8]) -> Ordering {
         match self {
-            &KeyRef::Overflowed(ref a) => {
+            &KeyRef::Boxed(ref a) => {
                 bcmp::Compare(&a, &k)
             },
             &KeyRef::Array(a) => {
@@ -289,7 +458,7 @@ impl<'a> KeyRef<'a> {
             return false;
         } else {
             match self {
-                &KeyRef::Overflowed(ref a) => {
+                &KeyRef::Boxed(ref a) => {
                     k == &a[0 .. k.len()]
                 },
                 &KeyRef::Array(a) => {
@@ -327,7 +496,7 @@ impl<'a> KeyRef<'a> {
                     Err(Error::Misc(String::from("map_range: out of range 1")))
                 }
             },
-            &KeyRef::Overflowed(ref a) => {
+            &KeyRef::Boxed(ref a) => {
                 if end <= a.len() {
                     let t = try!(func(&a[begin .. end]));
                     Ok(t)
@@ -367,7 +536,7 @@ impl<'a> KeyRef<'a> {
     }
 
     pub fn from_boxed_slice(k: Box<[u8]>) -> KeyRef<'a> {
-        KeyRef::Overflowed(k)
+        KeyRef::Boxed(k)
     }
 
     pub fn for_slice(k: &[u8]) -> KeyRef {
@@ -376,7 +545,7 @@ impl<'a> KeyRef<'a> {
 
     pub fn into_boxed_slice(self) -> Box<[u8]> {
         match self {
-            KeyRef::Overflowed(a) => {
+            KeyRef::Boxed(a) => {
                 a
             },
             KeyRef::Array(a) => {
@@ -463,19 +632,19 @@ impl<'a> KeyRef<'a> {
 
     pub fn cmp(x: &KeyRef, y: &KeyRef) -> Ordering {
         match (x,y) {
-            (&KeyRef::Overflowed(ref x_k), &KeyRef::Overflowed(ref y_k)) => {
+            (&KeyRef::Boxed(ref x_k), &KeyRef::Boxed(ref y_k)) => {
                 bcmp::Compare(&x_k, &y_k)
             },
-            (&KeyRef::Overflowed(ref x_k), &KeyRef::Prefixed(ref y_p, ref y_k)) => {
+            (&KeyRef::Boxed(ref x_k), &KeyRef::Prefixed(ref y_p, ref y_k)) => {
                 Self::compare_x_py(&x_k, y_p, y_k)
             },
-            (&KeyRef::Overflowed(ref x_k), &KeyRef::Array(ref y_k)) => {
+            (&KeyRef::Boxed(ref x_k), &KeyRef::Array(ref y_k)) => {
                 bcmp::Compare(&x_k, &y_k)
             },
-            (&KeyRef::Prefixed(ref x_p, ref x_k), &KeyRef::Overflowed(ref y_k)) => {
+            (&KeyRef::Prefixed(ref x_p, ref x_k), &KeyRef::Boxed(ref y_k)) => {
                 Self::compare_px_y(x_p, x_k, &y_k)
             },
-            (&KeyRef::Array(ref x_k), &KeyRef::Overflowed(ref y_k)) => {
+            (&KeyRef::Array(ref x_k), &KeyRef::Boxed(ref y_k)) => {
                 bcmp::Compare(&x_k, &y_k)
             },
             (&KeyRef::Prefixed(ref x_p, ref x_k), &KeyRef::Prefixed(ref y_p, ref y_k)) => {
@@ -499,6 +668,9 @@ impl<'a> KeyRef<'a> {
 /// only from a LivingCursor.
 pub enum LiveValueRef<'a> {
     Array(&'a [u8]),
+    // TODO return the information about the overflow, but don't
+    // open the stream yet.  for the merge case, we want to allow
+    // for the overflow to be moved without copying it.
     Overflowed(usize, Box<Read>),
 }
 
@@ -570,6 +742,9 @@ impl<'a> std::fmt::Debug for LiveValueRef<'a> {
 
 pub enum ValueRef<'a> {
     Array(&'a [u8]),
+    // TODO return the information about the overflow, but don't
+    // open the stream yet.  for the merge case, we want to allow
+    // for the overflow to be moved without copying it.
     Overflowed(usize, Box<Read>),
     Tombstone,
 }
@@ -629,15 +804,6 @@ impl PageBlock {
     fn contains_page(&self, pgnum: PageNum) -> bool {
         (pgnum >= self.firstPage) && (pgnum <= self.lastPage)
     }
-}
-
-fn block_list_contains_page(blocks: &Vec<PageBlock>, pgnum: PageNum) -> bool {
-    for blk in blocks.iter() {
-        if blk.contains_page(pgnum) {
-            return true;
-        }
-    }
-    return false;
 }
 
 pub type SegmentNum = u64;
@@ -761,32 +927,24 @@ pub const DEFAULT_SETTINGS: DbSettings =
 #[derive(Debug,Clone)]
 pub struct SegmentLocation {
     root_page: PageNum,
-    // TODO does this grow?  shouldn't it be a boxed array?
-    // yes, but then derive clone complains.
-    // ideally we could just stop cloning this struct.
-    blocks: Vec<PageBlock> 
+    blocks: BlockList,
 }
 
 impl SegmentLocation {
-    pub fn new(root_page: PageNum, blocks: Vec<PageBlock>) -> Self {
-        assert!(block_list_contains_page(&blocks, root_page));
+    pub fn new(root_page: PageNum, blocks: BlockList) -> Self {
+        assert!(blocks.contains_page(root_page));
         SegmentLocation {
             root_page: root_page,
             blocks: blocks,
         }
     }
 
-    pub fn count_pages(&self) -> usize {
-        self.blocks.iter().map(|pb| pb.count_pages() as usize).sum()
+    pub fn count_pages(&self) -> PageCount {
+        self.blocks.count_pages()
     }
 
     fn contains_page(&self, pgnum: PageNum) -> bool {
-        for blk in self.blocks.iter() {
-            if blk.contains_page(pgnum) {
-                return true;
-            }
-        }
-        return false;
+        self.blocks.contains_page(pgnum)
     }
 
 }
@@ -799,7 +957,7 @@ pub struct SegmentInfo {
 }
 
 impl SegmentInfo {
-    pub fn count_pages(&self) -> usize {
+    pub fn count_pages(&self) -> PageCount {
         self.location.count_pages()
     }
 }
@@ -1815,7 +1973,7 @@ impl PageType {
             1 => Ok(PageType::LEAF_NODE),
             2 => Ok(PageType::PARENT_NODE),
             3 => Ok(PageType::OVERFLOW_NODE),
-            _ => Err(Error::InvalidPageType(v)),
+            _ => panic!(), // TODO Err(Error::InvalidPageType(v)),
         }
     }
 }
@@ -1834,6 +1992,9 @@ mod PageFlag {
 // this struct is used to remember pages we have written.
 struct pgitem {
     page: PageNum,
+    blocks: BlockList,
+    // blocks does NOT contains page
+
     first_key: Box<[u8]>,
     last_key: Box<[u8]>,
 }
@@ -1850,7 +2011,7 @@ struct ParentState {
 #[derive(Debug)]
 enum KeyLocation {
     Inline,
-    Overflowed(PageNum),
+    Overflowed(BlockList),
 }
 
 // this enum keeps track of what happened to a value as we
@@ -1862,7 +2023,7 @@ enum ValueLocation {
     Tombstone,
     // when this is a Buffer, this gets ownership of kvp.Value
     Buffer(Box<[u8]>),
-    Overflowed(usize, PageNum),
+    Overflowed(usize, BlockList),
 }
 
 struct LeafPair {
@@ -1879,20 +2040,20 @@ struct LeafState {
     leaves: Vec<pgitem>,
 }
 
-fn create_segment<I>(pw: &mut PageWriter, 
+fn create_segment<I>(mut pw: PageWriter, 
                                 source: I,
                                ) -> Result<SegmentLocation> where I: Iterator<Item=Result<kvp>> {
 
-    // TODO we want write_overflow to return a block list.
     fn write_overflow(
                         ba: &mut Read, 
                         pw: &mut PageWriter,
-                       ) -> Result<(usize, PageNum)> {
+                        limit : usize,
+                       ) -> Result<(usize, BlockList)> {
 
-        fn write_page(ba: &mut Read, pb: &mut PageBuilder, pgsz: usize, pw: &mut PageWriter) -> Result<(usize, bool)> {
+        fn write_page(ba: &mut Read, pb: &mut PageBuilder, pgsz: usize, pw: &mut PageWriter, blocks: &mut BlockList, limit: usize) -> Result<(usize, bool)> {
             pb.Reset();
             pb.PutByte(PageType::OVERFLOW_NODE.to_u8());
-            let boundary = try!(pw.is_on_block_boundary());
+            let boundary = try!(pw.is_group_on_block_boundary(blocks, limit));
             let room = 
                 if boundary.is_some() {
                     pb.PutByte(PageFlag::FLAG_BOUNDARY_NODE);
@@ -1906,8 +2067,7 @@ fn create_segment<I>(pw: &mut PageWriter,
                 if let Some(next_page) = boundary {
                     pb.SetLastInt32(next_page);
                 }
-                let pg = try!(pw.write_page(pb.buf()));
-                // TODO weird that we don't need this page num to go anywhere
+                try!(pw.write_group_page(pb.buf(), blocks, limit));
             } else {
                 // there was nothing to write
             }
@@ -1917,16 +2077,17 @@ fn create_segment<I>(pw: &mut PageWriter,
         let pgsz = pw.page_size();
         let mut pb = PageBuilder::new(pgsz);
 
-        let first_page = try!(pw.peek());
+        let mut blocks = BlockList::new();
         let mut sofar = 0;
         loop {
-            let (put, finished) = try!(write_page(ba, &mut pb, pgsz, pw));
+            let (put, finished) = try!(write_page(ba, &mut pb, pgsz, pw, &mut blocks, limit));
             sofar += put;
             if finished {
                 break;
             }
         }
-        Ok((sofar, first_page))
+        //println!("overflow: len = {}  blocks.len = {}  encoded_len: {}", sofar, blocks.len(), blocks.encoded_len());
+        Ok((sofar, blocks))
     }
 
     fn write_leaves<I>(
@@ -1942,7 +2103,7 @@ fn create_segment<I>(pw: &mut PageWriter,
         // returns the first and last key in the leaf.  if there is only one key
         // in the leaf, it will return two copies of it, which is sad, but that
         // case should be considered pathological.
-        fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (Box<[u8]>, Box<[u8]>) {
+        fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (Box<[u8]>, Box<[u8]>, BlockList) {
             pb.Reset();
             pb.PutByte(PageType::LEAF_NODE.to_u8());
             pb.PutByte(0u8); // flags
@@ -1956,17 +2117,21 @@ fn create_segment<I>(pw: &mut PageWriter,
             // either way, overflow-check this cast.
             pb.PutInt16(count_keys_in_this_leaf as u16);
 
-            fn f(pb: &mut PageBuilder, prefixLen: usize, lp: &LeafPair) {
+            fn f(pb: &mut PageBuilder, prefixLen: usize, lp: &LeafPair, list: &mut BlockList) {
                 match lp.kLoc {
                     KeyLocation::Inline => {
                         // inline key len is stored * 2, always an even number
                         pb.PutVarint((lp.key.len() * 2) as u64);
                         pb.PutArray(&lp.key[prefixLen .. lp.key.len()]);
                     },
-                    KeyLocation::Overflowed(kpage) => {
+                    KeyLocation::Overflowed(ref blocks) => {
                         // overflowed key len is stored * 2 + 1, always odd
                         pb.PutVarint((lp.key.len() * 2 + 1) as u64);
-                        pb.PutInt32(kpage);
+                        // TODO capacity, no temp vec
+                        let mut v = vec![];
+                        blocks.encode(&mut v);
+                        pb.PutArray(&v);
+                        list.add_blocklist_no_reorder(blocks);
                     },
                 }
                 match lp.vLoc {
@@ -1978,29 +2143,40 @@ fn create_segment<I>(pw: &mut PageWriter,
                         pb.PutVarint(vbuf.len() as u64);
                         pb.PutArray(&vbuf);
                     },
-                    ValueLocation::Overflowed(vlen, vpage) => {
+                    ValueLocation::Overflowed(vlen, ref blocks) => {
                         pb.PutByte(ValueFlag::FLAG_OVERFLOW);
                         pb.PutVarint(vlen as u64);
-                        pb.PutInt32(vpage);
+                        // TODO capacity, no temp vec
+                        let mut v = vec![];
+                        blocks.encode(&mut v);
+                        pb.PutArray(&v);
+                        list.add_blocklist_no_reorder(blocks);
                     },
                 }
             }
 
+            // TODO if the keys were overflowed, shouldn't we return them
+            // that way?  might as well have the parent page reference the
+            // same overflow, right?
+
+            let mut blocks = BlockList::new();
+
             // deal with the first key separately
             let lp = st.keys_in_this_leaf.remove(0); 
             assert!(st.keys_in_this_leaf.len() == count_keys_in_this_leaf - 1);
-            f(pb, st.prefixLen, &lp);
+            f(pb, st.prefixLen, &lp, &mut blocks);
             let first_key = lp.key;
 
             if st.keys_in_this_leaf.len() == 0 {
                 // there was only one key in this leaf.
                 let last_key = first_key.clone();
-                (first_key, last_key)
+                blocks.sort_and_consolidate();
+                (first_key, last_key, blocks)
             } else {
                 if st.keys_in_this_leaf.len() > 1 {
                     // deal with all the remaining keys except the last one
                     for lp in st.keys_in_this_leaf.drain(0 .. count_keys_in_this_leaf - 2) {
-                        f(pb, st.prefixLen, &lp);
+                        f(pb, st.prefixLen, &lp, &mut blocks);
                     }
                 }
                 assert!(st.keys_in_this_leaf.len() == 1);
@@ -2008,10 +2184,11 @@ fn create_segment<I>(pw: &mut PageWriter,
                 // now the last key
                 let lp = st.keys_in_this_leaf.remove(0); 
                 assert!(st.keys_in_this_leaf.is_empty());
-                f(pb, st.prefixLen, &lp);
+                f(pb, st.prefixLen, &lp, &mut blocks);
 
                 let last_key = lp.key;
-                (first_key, last_key)
+                blocks.sort_and_consolidate();
+                (first_key, last_key, blocks)
             }
         }
 
@@ -2019,11 +2196,14 @@ fn create_segment<I>(pw: &mut PageWriter,
                         pb: &mut PageBuilder, 
                         pw: &mut PageWriter,
                        ) -> Result<()> {
-            let (first_key, last_key) = build_leaf(st, pb);
+            let (first_key, last_key, blocks) = build_leaf(st, pb);
+            //println!("leaf blocklist: {:?}", blocks);
+            //println!("leaf blocklist encoded_len: {:?}", blocks.encoded_len());
             assert!(st.keys_in_this_leaf.is_empty());
             let thisPageNumber = try!(pw.write_page(pb.buf()));
             let pg = pgitem {
                 page: thisPageNumber, 
+                blocks: blocks,
                 first_key: first_key,
                 last_key: last_key
             };
@@ -2033,22 +2213,9 @@ fn create_segment<I>(pw: &mut PageWriter,
             Ok(())
         }
 
-        // TODO can the overflow page number become a varint?
-        const NEEDED_FOR_OVERFLOW_PAGE_NUMBER: usize = 4;
-
-        // the max limit of an inline key is when that key is the only
-        // one in the leaf, and its value is overflowed.
-
         let pgsz = pw.page_size();
-        let maxKeyInline = 
-            pgsz 
-            - LEAF_PAGE_OVERHEAD 
-            - 1 // prefixLen
-            - varint::space_needed_for((pgsz * 2) as u64) // approx worst case inline key len
-            - 1 // value flags
-            - 9 // worst case varint value len
-            - NEEDED_FOR_OVERFLOW_PAGE_NUMBER; // overflowed value page
 
+        // TODO this could be a method on KeyLocation
         fn kLocNeed(k: &[u8], kloc: &KeyLocation, prefixLen: usize) -> usize {
             let klen = k.len();
             match *kloc {
@@ -2058,10 +2225,10 @@ fn create_segment<I>(pw: &mut PageWriter,
                     + klen 
                     - prefixLen
                 },
-                KeyLocation::Overflowed(_) => {
+                KeyLocation::Overflowed(ref blocks) => {
                     0
                     + varint::space_needed_for((klen * 2 + 1) as u64) 
-                    + NEEDED_FOR_OVERFLOW_PAGE_NUMBER
+                    + blocks.encoded_len()
                 },
             }
         }
@@ -2076,8 +2243,8 @@ fn create_segment<I>(pw: &mut PageWriter,
                     let vlen = vbuf.len();
                     1 + varint::space_needed_for(vlen as u64) + vlen
                 },
-                ValueLocation::Overflowed(vlen,_) => {
-                    1 + varint::space_needed_for(vlen as u64) + NEEDED_FOR_OVERFLOW_PAGE_NUMBER
+                ValueLocation::Overflowed(vlen, ref blocks) => {
+                    1 + varint::space_needed_for(vlen as u64) + blocks.encoded_len()
                 },
             }
         }
@@ -2123,43 +2290,97 @@ fn create_segment<I>(pw: &mut PageWriter,
             prev_key = Some(k.clone());
             */
 
-            // TODO is it possible for this to conclude that the key must be overflowed
-            // when it would actually fit because of prefixing?
+            let kloc = {
+                // the max limit of an inline key is when that key is the only
+                // one in the leaf, and its value is overflowed.  well actually,
+                // the reference to an overflowed value can take up a few dozen bytes 
+                // in pathological cases, whereas a really short value could be smaller.
+                // nevermind that.
 
-            let kloc = 
+                // TODO the following code still needs tuning
+
+                const PESSIMISTIC_OVERFLOW_INFO_SIZE: usize = 
+                    1 // number of blocks
+                    +
+                    (
+                    5 // varint, block start page num, worst case
+                    + 4 // varint, num pages in block, pathological
+                    )
+                    * 8 // crazy case
+                    ;
+
+                let maxKeyInline = 
+                    pgsz 
+                    - 2 // page type and flags
+                    - 2 // count keys
+                    - 1 // prefixLen
+                    - varint::space_needed_for((pgsz * 2) as u64) // approx worst case inline key len
+                    - 1 // value flags
+                    - 9 // worst case varint value len
+                    - PESSIMISTIC_OVERFLOW_INFO_SIZE; // overflowed value page
+
                 if k.len() <= maxKeyInline {
                     KeyLocation::Inline
                 } else {
-                    let (len, vPage) = try!(write_overflow(&mut &*k, pw));
-                    KeyLocation::Overflowed(vPage)
-                };
-
-            let maxValueInline = {
-                // the max limit of an inline value is when the key is inline
-                // on a new page.
-
-                let needed_for_key_inline_on_new_page = 
-                    LEAF_PAGE_OVERHEAD 
-                    + 1 // prefixLen
-                    + varint::space_needed_for((k.len() * 2) as u64)
-                    + k.len() 
-                    + 1 // value flags
-                    ;
-
-                if pgsz > needed_for_key_inline_on_new_page {
-                    let available = pgsz - needed_for_key_inline_on_new_page;
-                    let neededForVarintLen = varint::space_needed_for(available as u64);
-                    if available > neededForVarintLen {
-                        available - neededForVarintLen
-                    } else {
-                        0
-                    }
-                } else {
-                    0
+                    // for an overflowed key, there is probably no practical hard limit on the size
+                    // of the encoded block list.  we want things to be as contiguous as
+                    // possible, but if the block list won't fit on the usable part of a
+                    // fresh page, something is seriously wrong.
+                    // rather than calculate the actual hard limit, we provide an arbitrary
+                    // fraction of the page which would still be pathological.
+                    let hard_limit = pgsz / 4;
+                    let (len, blocks) = try!(write_overflow(&mut &*k, pw, hard_limit));
+                    assert!(len == k.len());
+                    KeyLocation::Overflowed(blocks)
                 }
             };
 
-            let vloc = 
+            // we have decided whether the key is going to be inlined or overflowed.  but
+            // we have NOT yet decided which page the key is going on.  will it fit on the
+            // current page or does it have to bump to the next one?  we don't know yet.
+
+            let vloc = {
+                let maxValueInline = {
+                    // the max limit of an inline value is when the key is inline
+                    // on a new page.  because we don't allow the value to be
+                    // inlined if the key was not.
+                    // TODO why?
+
+                    let needed_for_key_inline_on_new_page = 
+                        LEAF_PAGE_OVERHEAD 
+                        + 1 // prefixLen
+                        + varint::space_needed_for((k.len() * 2) as u64)
+                        + k.len() 
+                        + 1 // value flags
+                        ;
+
+                    if pgsz > needed_for_key_inline_on_new_page {
+                        let available = pgsz - needed_for_key_inline_on_new_page;
+                        let neededForVarintLen = varint::space_needed_for(available as u64);
+                        if available > neededForVarintLen {
+                            available - neededForVarintLen
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    }
+                };
+
+                // for all the write_overflow calls below, we already know how much 
+                // we spent on the key, so we know what our actual limit is for the encoded
+                // block list for the value.  the hard limit, basically, is:  we cannot get
+                // into a state where the key and value cannot fit on the same page.
+
+                let hard_limit_for_value_overflow =
+                    pgsz
+                    - LEAF_PAGE_OVERHEAD
+                    - 1 // prefixlen
+                    - kLocNeed(&k, &kloc, 0)
+                    - 1 // value flags
+                    - 9 // worst case varint for value len
+                    ;
+
                 match pair.Value {
                     Blob::Tombstone => {
                         ValueLocation::Tombstone
@@ -2169,11 +2390,12 @@ fn create_segment<I>(pw: &mut PageWriter,
                             if maxValueInline == 0 {
                                 match pair.Value {
                                     Blob::Tombstone => {
+                                        // TODO already handled above
                                         ValueLocation::Tombstone
                                     },
                                     Blob::Stream(ref mut strm) => {
-                                        let (len, valuePage) = try!(write_overflow(&mut *strm, pw));
-                                        ValueLocation::Overflowed(len, valuePage)
+                                        let (len, blocks) = try!(write_overflow(&mut *strm, pw, hard_limit_for_value_overflow));
+                                        ValueLocation::Overflowed(len, blocks)
                                     },
                                     Blob::Array(a) => {
                                         if a.is_empty() {
@@ -2181,14 +2403,15 @@ fn create_segment<I>(pw: &mut PageWriter,
                                             ValueLocation::Buffer(a)
                                         } else {
                                             let strm = a;
-                                            let (len, valuePage) = try!(write_overflow(&mut &*strm, pw));
-                                            ValueLocation::Overflowed(len, valuePage)
+                                            let (len, blocks) = try!(write_overflow(&mut &*strm, pw, hard_limit_for_value_overflow));
+                                            ValueLocation::Overflowed(len, blocks)
                                         }
                                     },
                                 }
                             } else {
                                 match pair.Value {
                                     Blob::Tombstone => {
+                                        // TODO already handled above
                                         ValueLocation::Tombstone
                                     },
                                     Blob::Stream(ref mut strm) => {
@@ -2205,16 +2428,16 @@ fn create_segment<I>(pw: &mut PageWriter,
                                             }
                                             ValueLocation::Buffer(va.into_boxed_slice())
                                         } else {
-                                            let (len, valuePage) = try!(write_overflow(&mut (vbuf.chain(strm)), pw));
-                                            ValueLocation::Overflowed (len, valuePage)
+                                            let (len, blocks) = try!(write_overflow(&mut (vbuf.chain(strm)), pw, hard_limit_for_value_overflow));
+                                            ValueLocation::Overflowed (len, blocks)
                                         }
                                     },
                                     Blob::Array(a) => {
                                         if a.len() < maxValueInline {
                                             ValueLocation::Buffer(a)
                                         } else {
-                                            let (len, valuePage) = try!(write_overflow(&mut &*a, pw));
-                                            ValueLocation::Overflowed(len, valuePage)
+                                            let (len, blocks) = try!(write_overflow(&mut &*a, pw, hard_limit_for_value_overflow));
+                                            ValueLocation::Overflowed(len, blocks)
                                         }
                                     },
                                 }
@@ -2224,24 +2447,26 @@ fn create_segment<I>(pw: &mut PageWriter,
                          KeyLocation::Overflowed(_) => {
                             match pair.Value {
                                 Blob::Tombstone => {
+                                    // TODO already handled above
                                     ValueLocation::Tombstone
                                 },
                                 Blob::Stream(ref mut strm) => {
-                                    let (len, valuePage) = try!(write_overflow(&mut *strm, pw));
-                                    ValueLocation::Overflowed(len, valuePage)
+                                    let (len, blocks) = try!(write_overflow(&mut *strm, pw, hard_limit_for_value_overflow));
+                                    ValueLocation::Overflowed(len, blocks)
                                 },
                                 Blob::Array(a) => {
                                     if a.is_empty() {
                                         // TODO maybe we need ValueLocation::Empty
                                         ValueLocation::Buffer(a)
                                     } else {
-                                        let (len, valuePage) = try!(write_overflow(&mut &*a, pw));
-                                        ValueLocation::Overflowed(len, valuePage)
+                                        let (len, blocks) = try!(write_overflow(&mut &*a, pw, hard_limit_for_value_overflow));
+                                        ValueLocation::Overflowed(len, blocks)
                                     }
                                 }
                             }
                          }
                     }
+                }
             };
 
             // whether/not the key/value are to be overflowed is now already decided.
@@ -2336,9 +2561,9 @@ fn create_segment<I>(pw: &mut PageWriter,
                           children: &Vec<pgitem>,
                           first_child_included: usize,
                           first_child_after: usize,
-                          overflows: &HashMap<usize, PageNum>,
+                          overflows: &HashMap<usize, BlockList>,
                           pb: &mut PageBuilder,
-                          ) -> (Box<[u8]>, Box<[u8]>) {
+                          ) -> (Box<[u8]>, Box<[u8]>, BlockList) {
             pb.Reset();
             pb.PutByte(PageType::PARENT_NODE.to_u8());
             if first_child_after == children.len() - 1 {
@@ -2351,15 +2576,21 @@ fn create_segment<I>(pw: &mut PageWriter,
             let first_key = children[first_child_included + 1].first_key.clone();
             let last_key = children[first_child_after].first_key.clone();
 
+            let mut list = BlockList::new();
+
             // store all the keys, n of them
             for i in first_child_included .. first_child_after {
                 let i_next = i + 1;
                 let key = &children[i_next].first_key;
                 match overflows.get(&i_next) {
-                    Some(pg) => {
+                    Some(blocks) => {
                         // overflowed key len is stored * 2 + 1, always an odd number
                         pb.PutVarint((key.len() * 2 + 1) as u64);
-                        pb.PutInt32(*pg as PageNum);
+                        // TODO capacity, no temp vec
+                        let mut v = vec![];
+                        blocks.encode(&mut v);
+                        pb.PutArray(&v);
+                        list.add_blocklist_no_reorder(blocks);
                     },
                     None => {
                         // inline key len is stored * 2, always an even number
@@ -2371,24 +2602,38 @@ fn create_segment<I>(pw: &mut PageWriter,
             // store all the ptrs, n+1 of them
             for i in first_child_included .. first_child_after + 1 {
                 pb.PutVarint(children[i].page as u64);
+                let keep =
+                    if i == first_child_after {
+                        first_child_after == children.len() - 1
+                    } else {
+                        true
+                    };
+                if keep {
+                    list.add_blocklist_no_reorder(&children[i].blocks);
+                    list.add_page_no_reorder(children[i].page);
+                }
             }
 
-            (first_key, last_key)
+            list.sort_and_consolidate();
+            (first_key, last_key, list)
         }
 
         fn write_parent_page(st: &mut ParentState, 
                               children: &Vec<pgitem>,
                               first_child_after: usize,
-                              overflows: &HashMap<usize,PageNum>,
+                              overflows: &HashMap<usize, BlockList>,
                               pb: &mut PageBuilder, 
                               pw: &mut PageWriter,
                              ) -> Result<()> {
             // assert st.sofar > 0
-            let (first_key, last_key) = build_parent_page(children, st.start, first_child_after, &overflows, pb);
+            let (first_key, last_key, blocks) = build_parent_page(children, st.start, first_child_after, &overflows, pb);
+            //println!("parent blocklist: {:?}", blocks);
+            //println!("parent blocklist encoded_len: {:?}", blocks.encoded_len());
             let thisPageNumber = try!(pw.write_page(pb.buf()));
             st.sofar = 0;
             let pg = pgitem {
                 page: thisPageNumber, 
+                blocks: blocks,
                 first_key: first_key,
                 last_key: last_key,
             };
@@ -2413,15 +2658,37 @@ fn create_segment<I>(pw: &mut PageWriter,
 
             let neededEitherWay = varint::space_needed_for(this_child.page as u64);
             let neededForInline = neededEitherWay + varint::space_needed_for((key.len() * 2) as u64) + key.len();
-            let neededForOverflow = neededEitherWay + varint::space_needed_for((key.len() * 2 + 1) as u64) + SIZE_32;
-
+            let wouldFitInlineOnNextPage = (pgsz - PARENT_PAGE_OVERHEAD) >= neededForInline;
             let available = calcAvailable(&st, pgsz);
             let fitsInline = available >= neededForInline;
-            let wouldFitInlineOnNextPage = (pgsz - PARENT_PAGE_OVERHEAD) >= neededForInline;
-            let fitsOverflow = available >= neededForOverflow;
-            let writeThisPage = (!fitsInline) && (wouldFitInlineOnNextPage || (!fitsOverflow));
 
-            if writeThisPage {
+            let needed = 
+                if fitsInline || wouldFitInlineOnNextPage {
+                    neededForInline
+                } else {
+                    // for an overflowed key, there is probably no practical hard limit on the size
+                    // of the encoded block list.  we want things to be as contiguous as
+                    // possible, but if the block list won't fit on the usable part of a
+                    // fresh page, something is seriously wrong.
+                    // rather than calculate the actual hard limit, we provide an arbitrary
+                    // fraction of the page which would still be pathological.
+                    let hard_limit = pgsz / 4;
+                    let (len, blocks) = try!(write_overflow(&mut &**key, pw, hard_limit));
+                    assert!(len == key.len());
+                    let needed =
+                        neededEitherWay
+                        + varint::space_needed_for((key.len() * 2 + 1) as u64) 
+                        + blocks.encoded_len();
+                    overflows.insert(i_child, blocks);
+                    needed
+                };
+
+            // TODO once we do full keys:  if the key was overflowed on the leaf, shouldn't
+            // we just reference the same overflow here?
+
+            let fits = available >= needed;
+
+            if !fits {
                 assert!(st.sofar > 0);
                 assert!(i_child > st.start);
                 try!(write_parent_page(&mut st, children, i_child, &overflows, pb, pw));
@@ -2432,13 +2699,7 @@ fn create_segment<I>(pw: &mut PageWriter,
                 st.start = i_child;
             }
 
-            if calcAvailable(&st, pgsz) >= neededForInline {
-                st.sofar = st.sofar + neededForInline;
-            } else {
-                let (len, keyOverflowFirstPage) = try!(write_overflow(&mut &**key, pw));
-                st.sofar = st.sofar + neededForOverflow;
-                overflows.insert(i_child, keyOverflowFirstPage);
-            }
+            st.sofar += needed;
         }
 
         try!(write_parent_page(&mut st, children, children.len() - 1, &overflows, pb, pw));
@@ -2446,7 +2707,8 @@ fn create_segment<I>(pw: &mut PageWriter,
     }
 
     let pgsz = pw.page_size();
-    pw.open_list();
+    // TODO pw.reset_list() ?
+    // or are we promised that the PageWriter we are given is empty?
     let mut pb = PageBuilder::new(pgsz);
 
     // TODO this is a buffer just for the purpose of being reused
@@ -2455,7 +2717,7 @@ fn create_segment<I>(pw: &mut PageWriter,
     // than overflow.
     let mut vbuf = vec![0; pgsz].into_boxed_slice(); 
 
-    let leaves = try!(write_leaves(pw, source, &mut vbuf, &mut pb));
+    let leaves = try!(write_leaves(&mut pw, source, &mut vbuf, &mut pb));
 
     // we expect there to be at least one leaf.  if the source iterator
     // is empty, we expect the caller to catch and handle that case.
@@ -2507,18 +2769,39 @@ fn create_segment<I>(pw: &mut PageWriter,
                     }
                 }
 
-                let newChildren = try!(write_parent_nodes(&children, pgsz, pw, &mut pb));
+                let newChildren = try!(write_parent_nodes(&children, pgsz, &mut pw, &mut pb));
                 children = newChildren;
             }
-            children[0].page
+            children.remove(0)
         } else {
-            leaves[0].page
+            let mut leaves = leaves;
+            leaves.remove(0)
         };
 
-    let blocks = pw.close_list();
-    assert!(block_list_contains_page(&blocks, root_page));
+    let blocks = try!(pw.end());
+    {
+        // TODO if we add the root page to the calculated block list 
+        // it should be the same as the one from pw
+        //println!("pw blocks: {:?}", blocks);
+        //println!("calc blocks: {:?}", root_page.blocks);
+        //println!("");
+
+        let mut tmp = root_page.blocks.clone();
+        tmp.add_page_no_reorder(root_page.page);
+        tmp.sort_and_consolidate();
+        let mut v1 = vec![];
+        tmp.encode(&mut v1);
+        let mut v2 = vec![];
+        blocks.encode(&mut v2);
+        if v1 != v2 {
+            println!("pw blocks: {:?}", blocks);
+            println!("calc blocks: {:?}", tmp);
+            assert!(v1 == v2);
+        }
+    }
+    assert!(blocks.contains_page(root_page.page));
     let loc = SegmentLocation {
-        root_page: root_page,
+        root_page: root_page.page,
         blocks: blocks,
     };
     Ok(loc)
@@ -2583,7 +2866,7 @@ impl OverflowReader {
     fn GetLastInt32(&self) -> u32 {
         let at = self.buf.len() - SIZE_32;
         // TODO just self.buf?  instead of making 4-byte slice.
-        let a = misc::bytes::extract_4(&self.buf[at .. at+4]);
+        let a = misc::bytes::extract_4(&self.buf[at .. at + 4]);
         endian::u32_from_bytes_be(a)
     }
 
@@ -2731,7 +3014,7 @@ impl LeafCursor {
             };
             *cur = *cur + (klen - prefixLen);
         } else {
-            *cur = *cur + SIZE_32;
+            BlockList::skip(&self.pr, cur);
         }
     }
 
@@ -2742,7 +3025,7 @@ impl LeafCursor {
         } else {
             let vlen = varint::read(&self.pr, cur) as usize;
             if 0 != (vflag & ValueFlag::FLAG_OVERFLOW) {
-                *cur = *cur + SIZE_32;
+                BlockList::skip(&self.pr, cur);
             } else {
                 *cur = *cur + vlen;
             }
@@ -2764,12 +3047,13 @@ impl LeafCursor {
                 },
             }
         } else {
-            let pgnum = misc::buf_advance::get_u32(&self.pr, &mut cur) as PageNum;
-            let mut ostrm = try!(OverflowReader::new(&self.path, self.pr.len(), pgnum, klen));
+            let blocks = BlockList::read(&self.pr, &mut cur);
+// TODO return blocks instead of opening the stream
+            let mut ostrm = try!(OverflowReader::new(&self.path, self.pr.len(), blocks.blocks[0].firstPage, klen));
             let mut x_k = Vec::with_capacity(klen);
             try!(ostrm.read_to_end(&mut x_k));
             let x_k = x_k.into_boxed_slice();
-            Ok(KeyRef::Overflowed(x_k))
+            Ok(KeyRef::Boxed(x_k))
         }
     }
 
@@ -2857,8 +3141,9 @@ impl ICursor for LeafCursor {
                 } else {
                     let vlen = varint::read(&self.pr, &mut pos) as usize;
                     if 0 != (vflag & ValueFlag::FLAG_OVERFLOW) {
-                        let pgnum = misc::buf_advance::get_u32(&self.pr, &mut pos) as PageNum;
-                        let strm = try!(OverflowReader::new(&self.path, self.pr.len(), pgnum, vlen));
+                        let blocks = BlockList::read(&self.pr, &mut pos);
+// TODO return blocks instead of opening the stream
+                        let strm = try!(OverflowReader::new(&self.path, self.pr.len(), blocks.blocks[0].firstPage, vlen));
                         Ok(ValueRef::Overflowed(vlen, box strm))
                     } else {
                         Ok(ValueRef::Array(&self.pr[pos .. pos + vlen]))
@@ -3107,7 +3392,7 @@ impl ParentPageCursor {
             if inline {
                 cur = cur + klen;
             } else {
-                cur = cur + SIZE_32;
+                BlockList::skip(pr, &mut cur);
             }
         }
         let count_children = count_keys + 1;
@@ -3146,12 +3431,13 @@ impl ParentPageCursor {
         if inline {
             Ok(KeyRef::Array(&self.pr[cur .. cur + klen]))
         } else {
-            let pgnum = misc::buf_advance::get_u32(&self.pr, &mut cur) as PageNum;
-            let mut ostrm = try!(OverflowReader::new(&self.path, self.pr.len(), pgnum, klen));
+            let blocks = BlockList::read(&self.pr, &mut cur);
+// TODO return blocks instead of opening the stream
+            let mut ostrm = try!(OverflowReader::new(&self.path, self.pr.len(), blocks.blocks[0].firstPage, klen));
             let mut x_k = Vec::with_capacity(klen);
             try!(ostrm.read_to_end(&mut x_k));
             let x_k = x_k.into_boxed_slice();
-            Ok(KeyRef::Overflowed(x_k))
+            Ok(KeyRef::Boxed(x_k))
         }
     }
 
@@ -3447,20 +3733,6 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
 
     fn parse(pr: &Box<[u8]>, cur: &mut usize) -> Result<(HeaderData, usize)> {
         fn readSegmentList(pr: &Box<[u8]>, cur: &mut usize) -> Result<(Vec<SegmentNum>, HashMap<SegmentNum, SegmentInfo>)> {
-            fn readBlockList(prBlocks: &Box<[u8]>, cur: &mut usize) -> Vec<PageBlock> {
-                let count = varint::read(&prBlocks, cur) as usize;
-                let mut a = Vec::with_capacity(count);
-                for _ in 0 .. count {
-                    let firstPage = varint::read(&prBlocks, cur) as PageNum;
-                    let countPages = varint::read(&prBlocks, cur) as PageNum;
-                    // blocks are stored as firstPage/count rather than as
-                    // firstPage/lastPage, because the count will always be
-                    // smaller as a varint
-                    a.push(PageBlock::new(firstPage, firstPage + countPages - 1));
-                }
-                a
-            }
-
             let count = varint::read(&pr, cur) as usize;
             let mut a = Vec::with_capacity(count);
             let mut m = HashMap::with_capacity(count);
@@ -3468,9 +3740,9 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
                 let g = varint::read(&pr, cur) as SegmentNum;
                 a.push(g);
                 let root_page = varint::read(&pr, cur) as PageNum;
-                let blocks = readBlockList(pr, cur);
+                let blocks = BlockList::read(pr, cur);
                 let level = varint::read(&pr, cur) as u32;
-                if !block_list_contains_page(&blocks, root_page) {
+                if !blocks.contains_page(root_page) {
                     return Err(Error::RootPageNotInSegmentBlockList);
                 }
 
@@ -3548,13 +3820,16 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
 
 fn consolidateBlockList(blocks: &mut Vec<PageBlock>) {
     blocks.sort_by(|a,b| a.firstPage.cmp(&b.firstPage));
+    for i in 1 .. blocks.len() {
+        assert!(blocks[i].firstPage > blocks[i - 1].lastPage);
+    }
     loop {
         if blocks.len()==1 {
             break;
         }
         let mut did = false;
         for i in 1 .. blocks.len() {
-            if blocks[i - 1].lastPage+1 == blocks[i].firstPage {
+            if blocks[i - 1].lastPage + 1 == blocks[i].firstPage {
                 blocks[i - 1].lastPage = blocks[i].lastPage;
                 blocks.remove(i);
                 did = true;
@@ -3565,38 +3840,20 @@ fn consolidateBlockList(blocks: &mut Vec<PageBlock>) {
             break;
         }
     }
+    // TODO the list is still sorted, right?
 }
 
-fn invertBlockList(blocks: &Vec<PageBlock>) -> Vec<PageBlock> {
-    let len = blocks.len();
-    let mut result = Vec::with_capacity(len);
-    for i in 0 .. len {
-        result.push(blocks[i]);
-    }
-    result.sort_by(|a,b| a.firstPage.cmp(&b.firstPage));
-    for i in 0 .. len - 1 {
-        result[i].firstPage = result[i].lastPage+1;
-        result[i].lastPage = result[i+1].firstPage-1;
-        assert!(result[i].firstPage <= result[i].lastPage);
-    }
-    // this function finds the space between the blocks.
-    // the last block didn't get touched, and is still a block in use.
-    // so remove it.
-    result.remove(len - 1);
-    result
-}
-
-fn listAllBlocks(h: &HeaderData, pgsz: usize) -> Vec<PageBlock> {
-    let mut blocks = Vec::new();
+fn list_all_blocks(h: &HeaderData, pgsz: usize) -> BlockList {
+    let mut blocks = BlockList::new();
 
     let headerBlock = PageBlock::new(1, (HEADER_SIZE_IN_BYTES / pgsz) as PageNum);
-    blocks.push(headerBlock);
+    blocks.add_block_no_reorder(headerBlock);
 
     for info in h.segments_info.values() {
-        for b in info.location.blocks.iter() {
-            blocks.push(*b);
-        }
+        blocks.add_blocklist_no_reorder(&info.location.blocks);
     }
+
+    blocks.sort_and_consolidate();
 
     blocks
 }
@@ -3607,6 +3864,8 @@ use std::sync::RwLock;
 #[derive(Debug)]
 struct Space {
     nextPage: PageNum,
+
+    // TODO should this be a BlockList?
     freeBlocks: Vec<PageBlock>,
 
     nextCursorNum: u64,
@@ -3728,11 +3987,10 @@ impl DatabaseFile {
 
         // when we first open the file, we find all the blocks that are in use by
         // an active segment.  all OTHER blocks are considered free.
-        let mut blocks = listAllBlocks(&header, pgsz);
-        consolidateBlockList(&mut blocks);
+        let mut blocks = list_all_blocks(&header, pgsz);
         //println!("blocks in use: {:?}", blocks);
-        let last_page_used = blocks[blocks.len() - 1].lastPage;
-        let mut freeBlocks = invertBlockList(&blocks);
+        let last_page_used = blocks.last_page();
+        let mut freeBlocks = blocks.invert();
         if first_available_page > (last_page_used + 1) {
             let blk = PageBlock::new(last_page_used + 1, first_available_page - 1);
             freeBlocks.push(blk);
@@ -3740,9 +3998,16 @@ impl DatabaseFile {
             // be the right place.  we should preserve the ability to open a file
             // read-only.
         }
-        //println!("free blocks: {:?}", freeBlocks);
+
         // we want the largest blocks at the front of the list
-        freeBlocks.sort_by(|a,b| b.count_pages().cmp(&a.count_pages()));
+        // two blocks of the same size?  sort earlier block first.
+        freeBlocks.sort_by(
+            |a,b| 
+                match b.count_pages().cmp(&a.count_pages()) {
+                    Ordering::Equal => a.firstPage.cmp(&b.firstPage),
+                    c => c,
+                }
+                );
 
         let space = Space {
             // TODO maybe we should just ignore the actual end of the file
@@ -3854,8 +4119,8 @@ impl DatabaseFile {
                 // level reaches a certain threshold of size.
                 let mb = LEVEL_SIZE_LIMITS_IN_KB[level as usize];
                 let bytes = mb * 1024;
-                let pages = bytes / (self.inner.pgsz as u64);
-                MergePromotionRule::Threshold(pages as usize)
+                let pages = (bytes / (self.inner.pgsz as u64)) as PageCount;
+                MergePromotionRule::Threshold(pages)
             };
         match try!(self.merge(level, 2, 8, promotion)) {
             Some(seg) => {
@@ -3963,38 +4228,113 @@ impl InnerPart {
         // zombie segment.
         match space.zombie_segments.remove(&segnum) {
             Some(info) => {
-                Self::addFreeBlocks(&mut space, &self.path, self.pgsz, info.location.blocks);
+                Self::addFreeBlocks(&mut space, &self.path, self.pgsz, info.location.blocks.blocks);
             },
             None => {
             },
         }
     }
 
-    fn getBlock(&self, space: &mut Space, start: PageNum) -> PageBlock {
-        if space.freeBlocks.is_empty() || start == space.nextPage {
-            let size = self.settings.PagesPerBlock;
-            let newBlk = PageBlock::new(space.nextPage, space.nextPage + size - 1) ;
-            space.nextPage = space.nextPage + size;
-            newBlk
-        } else {
-            let which =
-                if start == 0 {
-                    0
-                } else {
-                    let mut found = None;
-                    for i in 0 .. space.freeBlocks.len() {
-                        if space.freeBlocks[i].firstPage == start {
-                            found = Some(i);
-                            break;
-                        }
+    fn getBlock(&self, space: &mut Space, req: BlockRequest) -> PageBlock {
+        fn find_block_starting_at(space: &mut Space, start: Vec<PageNum>) -> Option<usize> {
+// TODO which way should we nest these two loops?
+            for i in 0 .. space.freeBlocks.len() {
+                for j in 0 .. start.len() {
+                    if space.freeBlocks[i].firstPage == start[j] {
+                        return Some(i);
                     }
-                    if let Some(i) = found {
-                        i
+                }
+            }
+            None
+        }
+
+        fn find_block_minimum_size(space: &mut Space, size: PageCount) -> Option<usize> {
+            // space.freeBlocks is sorted by size desc, so we only
+            // need to check the first block.
+            if space.freeBlocks[0].count_pages() >= size {
+                return Some(0);
+            } else {
+                // if this block isn't big enough, none of the ones after it will be
+                return None;
+            }
+        }
+
+        fn find_block_after_minimum_size(space: &mut Space, after: PageNum, size: PageCount) -> Option<usize> {
+            for i in 0 .. space.freeBlocks.len() {
+                if space.freeBlocks[i].count_pages() >= size {
+                    if space.freeBlocks[i].firstPage > after {
+                        return Some(i);
                     } else {
-                        0
+                        // big enough, but not "after".  keep looking.
                     }
-                };
-            space.freeBlocks.remove(which)
+                } else {
+                    // if this block isn't big enough, none of the ones after it will be
+                    return None;
+                }
+            }
+            None
+        }
+
+        enum FromWhere {
+            End(PageCount),
+            FirstFree,
+            SpecificFree(usize),
+        }
+
+        if let Some(after) = req.get_after() {
+            assert!(space.nextPage > after);
+        }
+
+        let from =
+            if space.freeBlocks.is_empty() {
+                FromWhere::End(self.settings.PagesPerBlock)
+            } else if req.start_is(space.nextPage) {
+                FromWhere::End(self.settings.PagesPerBlock)
+            } else {
+                match req {
+                    BlockRequest::Any => {
+                        FromWhere::FirstFree
+                    },
+                    BlockRequest::StartOrAfterMinimumSize(start, after, size) => {
+                        assert!(start.iter().all(|start| *start > after));
+                        if let Some(i) = find_block_starting_at(space, start) {
+                            FromWhere::SpecificFree(i)
+                        } else if let Some(i) = find_block_after_minimum_size(space, after, size) {
+                            FromWhere::SpecificFree(i)
+                        } else {
+                            FromWhere::End(std::cmp::max(size, self.settings.PagesPerBlock))
+                        }
+                    },
+                    BlockRequest::MinimumSize(size) => {
+                        if let Some(i) = find_block_minimum_size(space, size) {
+                            FromWhere::SpecificFree(i)
+                        } else {
+                            FromWhere::End(std::cmp::max(size, self.settings.PagesPerBlock))
+                        }
+                    },
+                    BlockRequest::StartOrAny(start) => {
+                        if let Some(i) = find_block_starting_at(space, start) {
+                            FromWhere::SpecificFree(i)
+                        } else {
+                            FromWhere::FirstFree
+                        }
+                    },
+
+                }
+            };
+
+        match from {
+            FromWhere::FirstFree => {
+                space.freeBlocks.remove(0)
+            },
+            FromWhere::SpecificFree(i) => {
+                space.freeBlocks.remove(i)
+            },
+            FromWhere::End(size) => {
+                let newBlk = PageBlock::new(space.nextPage, space.nextPage + size - 1) ;
+                space.nextPage = space.nextPage + size;
+                newBlk
+            },
         }
     }
 
@@ -4037,7 +4377,8 @@ impl InnerPart {
         Ok(())
     }
 
-    fn addFreeBlocks(space: &mut Space, path: &str, page_size: usize, blocks:Vec<PageBlock>) -> Result<()> {
+    // TODO should this accept a BlockList instead of a Vec<>
+    fn addFreeBlocks(space: &mut Space, path: &str, page_size: usize, blocks: Vec<PageBlock>) -> Result<()> {
 
         // all additions to the freeBlocks list should happen here
         // by calling this function.
@@ -4047,15 +4388,8 @@ impl InnerPart {
         // inside a critical section.  but the benefit is considered
         // worth the trouble.
         
-        // TODO should we instead prefer to give out blocks earlier in
-        // the file, rather than giving out the largest blocks?
-
         // TODO it is important that freeBlocks contains no overlaps.
         // add debug-only checks to verify?
-
-        // TODO is there such a thing as a block that is so small we
-        // don't want to bother with it?  what about a single-page block?
-        // should this be a configurable setting?
 
         //println!("adding free blocks: {:?}", blocks);
         for b in blocks {
@@ -4088,7 +4422,16 @@ impl InnerPart {
             try!(fs.set_len(((space.nextPage - 1) as u64) * page_size));
         }
 
-        space.freeBlocks.sort_by(|a,b| b.count_pages().cmp(&a.count_pages()));
+        // we want the largest blocks at the front of the list
+        // two blocks of the same size?  sort earlier block first.
+        space.freeBlocks.sort_by(
+            |a,b| 
+                match b.count_pages().cmp(&a.count_pages()) {
+                    Ordering::Equal => a.firstPage.cmp(&b.firstPage),
+                    c => c,
+                }
+                );
+
         //println!("    space now: {:?}", space);
         Ok(())
     }
@@ -4114,13 +4457,7 @@ impl InnerPart {
                 match h.segments_info.get(&g) {
                     Some(info) => {
                         misc::push_varint(&mut pb, info.location.root_page as u64);
-                        misc::push_varint(&mut pb, info.location.blocks.len() as u64);
-                        // we store PageBlock as first/count instead of first/last, since the
-                        // count will always compress better as a varint.
-                        for t in info.location.blocks.iter() {
-                            misc::push_varint(&mut pb, t.firstPage as u64);
-                            misc::push_varint(&mut pb, t.count_pages() as u64);
-                        }
+                        info.location.blocks.encode(&mut pb);
                         misc::push_varint(&mut pb, info.level as u64);
                     },
                     None => panic!("segment num in current_state but not in segments_info")
@@ -4258,7 +4595,7 @@ impl InnerPart {
 
     fn release_pending_segment(inner: &std::sync::Arc<InnerPart>, location: SegmentLocation) -> Result<()> {
         let mut space = try!(inner.space.lock());
-        try!(Self::addFreeBlocks(&mut space, &inner.path, inner.pgsz, location.blocks));
+        try!(Self::addFreeBlocks(&mut space, &inner.path, inner.pgsz, location.blocks.blocks));
         Ok(())
     }
 
@@ -4303,17 +4640,15 @@ impl InnerPart {
             let (k, v) = t;
             Ok(kvp {Key:k, Value:v})
         });
-        let mut pw = try!(PageWriter::new(inner.clone()));
-        let seg = try!(create_segment(&mut pw, source));
-        try!(pw.end());
+        let pw = try!(PageWriter::new(inner.clone()));
+        let seg = try!(create_segment(pw, source));
         Ok(seg)
     }
 
     fn write_merge_segment(inner: &std::sync::Arc<InnerPart>, cursor: Box<ICursor>) -> Result<SegmentLocation> {
         let source = CursorIterator::new(cursor);
-        let mut pw = try!(PageWriter::new(inner.clone()));
-        let seg = try!(create_segment(&mut pw, source));
-        try!(pw.end());
+        let pw = try!(PageWriter::new(inner.clone()));
+        let seg = try!(create_segment(pw, source));
         Ok(seg)
     }
 
@@ -4395,7 +4730,7 @@ impl InnerPart {
                 merge_seg_nums.reverse();
 
                 //println!("segments being merged: {:?}", merge_seg_nums);
-                let pages_in_merge_segments: usize = 
+                let pages_in_merge_segments: PageCount = 
                     merge_seg_nums
                     .iter()
                     .map(
@@ -4616,7 +4951,7 @@ impl InnerPart {
             }
             let mut blocksToBeFreed = Vec::new();
             for info in segmentsToBeFreed.values() {
-                blocksToBeFreed.push_all(&info.location.blocks);
+                blocksToBeFreed.push_all(&info.location.blocks.blocks);
             }
             try!(Self::addFreeBlocks(&mut space, &self.path, self.pgsz, blocksToBeFreed));
         }
@@ -4632,46 +4967,45 @@ impl InnerPart {
 struct PageWriter {
     inner: std::sync::Arc<InnerPart>,
     f: File,
-    lists: Vec<BlockList>,
+    list: BlockList,
+
+    // TODO the following two could be BlockLists if we didn't have to worry about it reordering the list
     blocks: Vec<PageBlock>,
+    group_blocks: Vec<PageBlock>,
+
     last_page: PageNum,
 }
 
 impl PageWriter {
-    fn new(
-            inner: std::sync::Arc<InnerPart>,
-          ) -> Result<Self> {
+    fn new(inner: std::sync::Arc<InnerPart>) -> Result<Self> {
         let f = try!(inner.OpenForWriting());
         let pw = PageWriter {
             inner: inner,
             f: f,
-            lists: vec![BlockList::new()],
+            list: BlockList::new(),
             blocks: vec![],
+            group_blocks: vec![],
             last_page: 0,
         };
         Ok(pw)
     }
 
-    fn request_block(&self, start: PageNum) -> Result<PageBlock> {
+    fn request_block(&self, req: BlockRequest) -> Result<PageBlock> {
         let mut space = try!(self.inner.space.lock());
-        let blk = self.inner.getBlock(&mut space, start);
+        let blk = self.inner.getBlock(&mut space, req);
         Ok(blk)
     }
 
     fn ensure_inventory(&mut self) -> Result<()> {
         assert!(self.blocks.len() <= 2);
         if self.blocks.is_empty() {
-            let blk = try!(self.request_block(0));
-            let need_more = blk.count_pages() == 1;
+            let blk = try!(self.request_block(BlockRequest::MinimumSize(2)));
             self.blocks.push(blk);
-            if need_more {
-                try!(self.ensure_inventory());
-            }
             Ok(())
         } else if self.blocks.len() == 1 {
             if self.blocks[0].count_pages() == 1 {
                 let want = self.blocks[0].lastPage + 1;
-                let blk2 = try!(self.request_block(want));
+                let blk2 = try!(self.request_block(BlockRequest::StartOrAny(vec![want])));
                 if blk2.firstPage == want {
                     self.blocks[0].lastPage = blk2.lastPage;
                 } else {
@@ -4686,74 +5020,228 @@ impl PageWriter {
         }
     }
 
-    fn get_page(&mut self) -> Result<PageNum> {
-        try!(self.ensure_inventory());
-        if self.blocks[0].count_pages() == 1 {
-            assert!(self.blocks.len() > 1);
-            let blk = self.blocks.remove(0);
+    fn get_page_from(blocks: &mut Vec<PageBlock>) -> Result<PageNum> {
+        assert!(!blocks.is_empty());
+        if blocks[0].count_pages() == 1 {
+            assert!(blocks.len() > 1);
+            let blk = blocks.remove(0);
             assert!(blk.firstPage == blk.lastPage);
-            self.add_page_to_all_lists(blk.firstPage);
             Ok(blk.firstPage)
         } else {
-            let pg = self.blocks[0].firstPage;
-            self.blocks[0].firstPage += 1;
-            self.add_page_to_all_lists(pg);
+            let pg = blocks[0].firstPage;
+            blocks[0].firstPage += 1;
             Ok(pg)
         }
     }
 
-    fn peek(&mut self) -> Result<PageNum> {
+    fn get_page(&mut self) -> Result<PageNum> {
         try!(self.ensure_inventory());
-        Ok(self.blocks[0].firstPage)
+        let pg = try!(Self::get_page_from(&mut self.blocks));
+        self.add_page_to_list(pg);
+        Ok(pg)
+    }
+
+    fn ensure_group_inventory(&mut self, group: &BlockList, limit: usize) -> Result<()> {
+        // TODO the limit parameter is the hard limit on the size of the
+        // encoded blocklist for the group.  We can use this information,
+        // in cases where we are getting close to the limit, to get more
+        // desperate and request a large block at the end of the file.
+
+        // TODO not sure what minimum size we should request.
+        // we want overflows to be contiguous, but we also want to
+        // avoid putting them at the end of the file.
+        const MINIMUM_SIZE_FIRST_BLOCK_IN_GROUP: PageCount = 16;
+
+        assert!(self.group_blocks.len() <= 2);
+        if self.group_blocks.is_empty() {
+            // if there is no inventory, then the group has gotta be empty,
+            // because we don't allow the inventory to be completely depleted
+            // during the processing of a group.
+            assert!(group.is_empty());
+
+            // TODO we might want to prefer a very early block, since all the other blocks
+            // in this group are going to have to be after it.  
+
+            // note that the free block list 
+            // is secondary sorted by firstPage ASC.
+
+            // suppose the min size is 10.  
+            
+            // Would we prefer a 500 page block late in the file?  making it less likely
+            // that we will need another block at all?  but if we do need another block,
+            // we will have ruled out all the free blocks before it.
+
+            // or would we prefer a 10 page block early in the file?  this makes it more
+            // likely we will need another block, but more of the free block list is
+            // available for choosing.
+
+            let blk = try!(self.request_block(BlockRequest::MinimumSize(MINIMUM_SIZE_FIRST_BLOCK_IN_GROUP)));
+            self.group_blocks.push(blk);
+            Ok(())
+        } else if self.group_blocks.len() == 1 {
+            if !group.is_empty() {
+                assert!(self.group_blocks[0].firstPage > group.blocks[0].firstPage);
+            }
+            if self.group_blocks[0].count_pages() == 1 {
+                // we always prefer a block which extends the one we've got in inventory
+                let want = self.group_blocks[0].lastPage + 1;
+
+                let req =
+                    match group.len() {
+                        0 => {
+                            // group hasn't started yet.  so it doesn't care where the block is,
+                            // but it soon will, because it will be given the currently available
+                            // page, so we need to make sure we get something after that one.
+                            let after = self.group_blocks[0].firstPage;
+
+                            BlockRequest::StartOrAfterMinimumSize(vec![want], after, MINIMUM_SIZE_FIRST_BLOCK_IN_GROUP)
+                        },
+                        _ => {
+                            // the one available page must fit on one of the blocks already
+                            // in the group
+                            assert!(group.would_extend_an_existing_block(self.group_blocks[0].firstPage));
+
+                            // we would also prefer any block which would extend any of the
+                            // blocks already in the group
+
+                            let mut wants = Vec::with_capacity(4);
+                            for i in 0 .. group.len() {
+                                let pg = group.blocks[i].lastPage + 1;
+                                if want != pg {
+                                    wants.push(pg);
+                                }
+                            }
+                            wants.insert(0, want);
+
+                            // the group is running, so we cannnot accept any block before the
+                            // first page of the group.
+                            let after = group.blocks[0].firstPage;
+
+                            // TODO use the limit provided for close cases
+                            // TODO tune the numbers below
+                            // TODO maybe the request size should be a formula instead of match cases
+
+                            match group.len() {
+                                0 => {
+                                    // already handled above
+                                    unreachable!();
+                                },
+                                1 => {
+                                    BlockRequest::StartOrAfterMinimumSize(wants, after, 8)
+                                },
+                                2 => {
+                                    BlockRequest::StartOrAfterMinimumSize(wants, after, 32)
+                                },
+                                3 => {
+                                    BlockRequest::StartOrAfterMinimumSize(wants, after, 128)
+                                },
+                                4 => {
+                                    BlockRequest::StartOrAfterMinimumSize(wants, after, 256)
+                                },
+                                5 => {
+                                    BlockRequest::StartOrAfterMinimumSize(wants, after, 256)
+                                },
+                                _ => {
+                                    BlockRequest::StartOrAfterMinimumSize(wants, after, 1024)
+                                },
+                            }
+                        },
+                    };
+                let blk2 = try!(self.request_block(req));
+                if !group.is_empty() {
+                    assert!(blk2.firstPage > group.blocks[0].firstPage);
+                }
+                if blk2.firstPage == self.group_blocks[0].lastPage + 1 {
+                    self.group_blocks[0].lastPage = blk2.lastPage;
+                } else {
+                    self.group_blocks.push(blk2);
+                }
+            }
+            Ok(())
+        } else if self.group_blocks.len() == 2 {
+            if !group.is_empty() {
+                assert!(self.group_blocks[0].firstPage > group.blocks[0].firstPage);
+            }
+            Ok(())
+        } else {
+            unreachable!();
+        }
+    }
+
+    fn get_group_page(&mut self, group: &mut BlockList, limit: usize) -> Result<PageNum> {
+        try!(self.ensure_group_inventory(group, limit));
+        let pg = try!(Self::get_page_from(&mut self.group_blocks));
+        self.add_page_to_list(pg);
+        if group.blocks.len() > 0 {
+            let first = group.blocks[0].firstPage;
+            assert!(pg > first);
+        }
+        group.add_page_no_reorder(pg);
+        // TODO only consol if above true?
+        group.sort_and_consolidate();
+        assert!(group.encoded_len() < limit);
+        Ok(pg)
     }
 
     fn page_size(&self) -> usize {
         self.inner.pgsz
     }
 
-    fn is_on_block_boundary(&mut self) -> Result<Option<PageNum>> {
-        try!(self.ensure_inventory());
-        if self.blocks[0].count_pages() > 1 {
+    fn is_group_on_block_boundary(&mut self, group: &BlockList, limit: usize) -> Result<Option<PageNum>> {
+        try!(self.ensure_group_inventory(group, limit));
+        // at this point, the caller must be able to request 
+        // two pages without change in the group inventory
+        // don't reorder the inventory.
+        // make sure we always take from the first block in inventory.
+
+        if self.group_blocks[0].count_pages() > 1 {
             Ok(None)
         } else {
-            assert!(self.blocks[0].count_pages() == 1);
-            assert!(self.blocks.len() > 1);
-            assert!(self.blocks[0].lastPage + 1 != self.blocks[1].firstPage);
-            Ok(Some(self.blocks[1].firstPage))
+            assert!(self.group_blocks[0].count_pages() == 1);
+            assert!(self.group_blocks.len() > 1);
+            assert!(self.group_blocks[0].lastPage + 1 != self.group_blocks[1].firstPage);
+            Ok(Some(self.group_blocks[1].firstPage))
         }
     }
 
-    fn add_page_to_all_lists(&mut self, pg: PageNum) {
-        for b in self.lists.iter_mut() {
-            b.add_page(pg);
-        }
+    fn add_page_to_list(&mut self, pg: PageNum) {
+        self.list.add_page_no_reorder(pg);
+        // TODO only consol if above true?
+        self.list.sort_and_consolidate();
     }
 
-    fn open_list(&mut self) {
-        self.lists.push(BlockList::new());
-    }
-
-    fn close_list(&mut self) -> Vec<PageBlock> {
-        let b = self.lists.pop().unwrap();
-        b.blocks
-    }
-
-    fn write_page(&mut self, buf: &[u8]) -> Result<PageNum> {
-        let pg = try!(self.get_page());
+    fn do_write(&mut self, buf: &[u8], pg: PageNum) -> Result<()> {
         if pg != self.last_page + 1 {
             try!(utils::SeekPage(&mut self.f, self.inner.pgsz, pg));
         }
         try!(self.f.write_all(buf));
         self.last_page = pg;
+        Ok(())
+    }
+
+    fn write_group_page(&mut self, buf: &[u8], group: &mut BlockList, limit: usize) -> Result<()> {
+        let pg = try!(self.get_group_page(group, limit));
+        try!(self.do_write(buf, pg));
+        Ok(())
+    }
+
+    fn write_page(&mut self, buf: &[u8]) -> Result<PageNum> {
+        let pg = try!(self.get_page());
+        try!(self.do_write(buf, pg));
         Ok(pg)
     }
 
-    fn end(self) -> Result<()> {
-        if !self.blocks.is_empty() {
+    fn end(self) -> Result<BlockList> {
+        if !self.blocks.is_empty() || !self.group_blocks.is_empty() {
             let mut space = try!(self.inner.space.lock());
-            try!(InnerPart::addFreeBlocks(&mut space, &self.inner.path, self.inner.pgsz, self.blocks));
+            if !self.blocks.is_empty() {
+                try!(InnerPart::addFreeBlocks(&mut space, &self.inner.path, self.inner.pgsz, self.blocks));
+            }
+            if !self.group_blocks.is_empty() {
+                try!(InnerPart::addFreeBlocks(&mut space, &self.inner.path, self.inner.pgsz, self.group_blocks));
+            }
         }
-        Ok(())
+        Ok(self.list)
     }
 
 }
