@@ -317,7 +317,8 @@ impl BlockList {
 
     fn sort_and_consolidate(&mut self) {
         self.blocks.sort_by(|a,b| a.firstPage.cmp(&b.firstPage));
-        if cfg!(expensive_check) {
+        if cfg!(expensive_check) 
+        {
             for i in 1 .. self.blocks.len() {
                 assert!(self.blocks[i].firstPage > self.blocks[i - 1].lastPage);
             }
@@ -384,7 +385,6 @@ impl BlockList {
 
     fn read(pr: &[u8], cur: &mut usize) -> Self {
         let count_blocks = varint::read(pr, cur) as usize;
-        assert!(count_blocks > 0);
         let mut list = BlockList {
             blocks: Vec::with_capacity(count_blocks),
         };
@@ -859,7 +859,7 @@ impl PageBlock {
 
 pub type SegmentNum = u64;
 
-#[derive(PartialEq,Copy,Clone)]
+#[derive(PartialEq,Copy,Clone,Debug)]
 pub enum SeekOp {
     SEEK_EQ = 0,
     SEEK_LE = 1,
@@ -915,6 +915,30 @@ pub enum SeekResult {
 }
 
 impl SeekResult {
+    fn verify(&self, k: &KeyRef, sop: SeekOp, csr: &ICursor) -> Result<()> {
+        match self {
+            &SeekResult::Invalid => {
+                assert!(!csr.IsValid());
+            },
+            _ => {
+                let q = try!(csr.KeyRef());
+                let cmp = KeyRef::cmp(&q, k);
+                match sop {
+                    SeekOp::SEEK_LE => {
+                        assert!(cmp == Ordering::Less || cmp == Ordering::Equal);
+                    },
+                    SeekOp::SEEK_GE => {
+                        assert!(cmp == Ordering::Greater || cmp == Ordering::Equal);
+                    },
+                    SeekOp::SEEK_EQ => {
+                        assert!(cmp == Ordering::Equal || cmp == Ordering::Equal);
+                    },
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn from_cursor(csr: &ICursor, k: &KeyRef) -> Result<SeekResult> {
         if csr.IsValid() {
             let kc = try!(csr.KeyRef());
@@ -1319,6 +1343,45 @@ impl MultiCursor {
         }
     }
 
+    fn seek(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
+        self.cur = None;
+        self.dir = Direction::Wandering;
+        for j in 0 .. self.subcursors.len() {
+            let sr = try!(self.subcursors[j].SeekRef(k, sop));
+            if sr.is_valid_and_equal() { 
+                self.cur = Some(j);
+                return Ok(sr);
+            }
+        }
+        match sop {
+            SeekOp::SEEK_GE => {
+                self.cur = try!(self.findMin());
+                match self.cur {
+                    Some(i) => {
+                        SeekResult::from_cursor(&self.subcursors[i], k)
+                    },
+                    None => {
+                        Ok(SeekResult::Invalid)
+                    },
+                }
+            },
+            SeekOp::SEEK_LE => {
+                self.cur = try!(self.findMax());
+                match self.cur {
+                    Some(i) => {
+                        SeekResult::from_cursor(&self.subcursors[i], k)
+                    },
+                    None => {
+                        Ok(SeekResult::Invalid)
+                    },
+                }
+            },
+            SeekOp::SEEK_EQ => {
+                Ok(SeekResult::Invalid)
+            },
+        }
+    }
+
 }
 
 impl ICursor for MultiCursor {
@@ -1578,42 +1641,13 @@ impl ICursor for MultiCursor {
     }
 
     fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
-        self.cur = None;
-        self.dir = Direction::Wandering;
-        for j in 0 .. self.subcursors.len() {
-            let sr = try!(self.subcursors[j].SeekRef(k, sop));
-            if sr.is_valid_and_equal() { 
-                self.cur = Some(j);
-                return Ok(sr);
-            }
+        //println!("MC SeekRef  k={:?}  sop={:?}", k, sop);
+        let sr = try!(self.seek(k, sop));
+        if cfg!(expensive_check) 
+        {
+            try!(sr.verify(k, sop, self));
         }
-        match sop {
-            SeekOp::SEEK_GE => {
-                self.cur = try!(self.findMin());
-                match self.cur {
-                    Some(i) => {
-                        SeekResult::from_cursor(&self.subcursors[i], k)
-                    },
-                    None => {
-                        Ok(SeekResult::Invalid)
-                    },
-                }
-            },
-            SeekOp::SEEK_LE => {
-                self.cur = try!(self.findMax());
-                match self.cur {
-                    Some(i) => {
-                        SeekResult::from_cursor(&self.subcursors[i], k)
-                    },
-                    None => {
-                        Ok(SeekResult::Invalid)
-                    },
-                }
-            },
-            SeekOp::SEEK_EQ => {
-                Ok(SeekResult::Invalid)
-            },
-        }
+        Ok(sr)
     }
 
 }
@@ -1700,7 +1734,12 @@ impl ICursor for LivingCursor {
     }
 
     fn SeekRef(&mut self, k: &KeyRef, sop:SeekOp) -> Result<SeekResult> {
+        //println!("Living SeekRef  k={:?}  sop={:?}", k, sop);
         let sr = try!(self.chain.SeekRef(k, sop));
+        if cfg!(expensive_check) 
+        {
+            try!(sr.verify(k, sop, self));
+        }
         match sop {
             SeekOp::SEEK_GE => {
                 if sr.is_valid() && self.chain.ValueLength().unwrap().is_none() {
@@ -1979,6 +2018,7 @@ pub struct PrefixCursor<'c> {
 
 impl<'c> PrefixCursor<'c> {
     pub fn new(ch: &'c mut LivingCursor, prefix: Box<[u8]>) -> PrefixCursor<'c> {
+        //println!("PrefixCursor new: {:?}", prefix);
         PrefixCursor { 
             chain : ch,
             prefix: prefix,
@@ -1988,7 +2028,10 @@ impl<'c> PrefixCursor<'c> {
     // TODO lifetimes below should be 'c ?
     pub fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
         if self.IsValid() {
-            self.chain.KeyRef()
+            let k = try!(self.chain.KeyRef());
+            //println!("PrefixCursor yielding: {:?}", k);
+            //assert!(k.starts_with(&self.prefix));
+            Ok(k)
         } else {
             panic!();
             Err(Error::CursorNotValid)
@@ -2008,16 +2051,22 @@ impl<'c> PrefixCursor<'c> {
     pub fn IsValid(&self) -> bool {
         self.chain.IsValid() 
             && 
-            self.chain.KeyRef().unwrap().starts_with(&self.prefix)
+            {
+                let k = self.chain.KeyRef().unwrap();
+                //println!("PrefixCursor chain is valid, its k={:?}", k);
+                k.starts_with(&self.prefix)
+            }
     }
 
     pub fn First(&mut self) -> Result<SeekResult> {
-        self.chain.SeekRef(&KeyRef::for_slice(&self.prefix), SeekOp::SEEK_GE)
+        let sr = try!(self.chain.SeekRef(&KeyRef::for_slice(&self.prefix), SeekOp::SEEK_GE));
+        Ok(sr)
     }
 
     pub fn Next(&mut self) -> Result<()> {
         if self.IsValid() {
-            self.chain.Next()
+            try!(self.chain.Next());
+            Ok(())
         } else {
             panic!();
             Err(Error::CursorNotValid)
@@ -2028,7 +2077,7 @@ impl<'c> PrefixCursor<'c> {
 
 #[derive(Hash,PartialEq,Eq,Copy,Clone,Debug)]
 #[repr(u8)]
-enum PageType {
+pub enum PageType {
     LEAF_NODE,
     PARENT_NODE,
     OVERFLOW_NODE,
@@ -2063,7 +2112,6 @@ mod ValueFlag {
 
 mod PageFlag {
     pub const FLAG_BOUNDARY_NODE: u8 = 2;
-    pub const FLAG_LAST_PARENT_IN_GROUP: u8 = 8;
 }
 
 #[derive(Debug)]
@@ -2071,15 +2119,21 @@ mod PageFlag {
 struct pgitem {
     page: PageNum,
     blocks: BlockList,
-    // blocks does NOT contains page
+    // blocks does NOT contain page
 
-    first_key: Box<[u8]>,
-    last_key: Box<[u8]>,
+    first_key: KeyWithLocation,
+    last_key: Option<KeyWithLocation>,
+}
+
+#[derive(Debug)]
+struct ParentItem {
+    child: pgitem,
+    prefix_len: Option<usize>,
 }
 
 struct ParentState {
     sofar: usize,
-    start: usize,
+    items: Vec<ParentItem>,
     nextGeneration: Vec<pgitem>,
 }
 
@@ -2090,6 +2144,83 @@ struct ParentState {
 enum KeyLocation {
     Inline,
     Overflowed(BlockList),
+}
+
+impl ValueLocation {
+    fn need(&self) -> usize {
+        match self {
+            &ValueLocation::Tombstone => {
+                1
+            },
+            &ValueLocation::Buffer(ref vbuf) => {
+                let vlen = vbuf.len();
+                1 + varint::space_needed_for(vlen as u64) + vlen
+            },
+            &ValueLocation::Overflowed(vlen, ref blocks) => {
+                1 + varint::space_needed_for(vlen as u64) + blocks.encoded_len()
+            },
+        }
+    }
+
+}
+
+impl KeyLocation {
+    fn is_inline(&self) -> bool {
+        match *self {
+            KeyLocation::Inline => {
+                true
+            },
+            KeyLocation::Overflowed(ref blocks) => {
+                false
+            },
+        }
+    }
+
+    fn need(&self, k: &[u8], prefixLen: usize) -> usize {
+        let klen = k.len();
+        match *self {
+            KeyLocation::Inline => {
+                0 // no key flags
+                + varint::space_needed_for((klen * 2) as u64) 
+                + klen 
+                - prefixLen
+            },
+            KeyLocation::Overflowed(ref blocks) => {
+                0 // no key flags
+                + varint::space_needed_for((klen * 2 + 1) as u64) 
+                + blocks.encoded_len()
+            },
+        }
+    }
+}
+
+impl KeyWithLocation {
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    fn len_with_overflow_flag(&self) -> u64 {
+        // inline key len is stored * 2, always an even number
+        // overflowed key len is stored * 2 + 1, always odd
+        match self.location {
+            KeyLocation::Inline => {
+                (self.key.len() * 2) as u64
+            },
+            KeyLocation::Overflowed(_) => {
+                (self.key.len() * 2 + 1) as u64
+            },
+        }
+    }
+
+    fn need(&self, prefix_len: usize) -> usize {
+        self.location.need(&self.key, prefix_len)
+    }
+}
+
+#[derive(Debug)]
+pub struct KeyWithLocation {
+    key: Box<[u8]>,
+    location: KeyLocation,
 }
 
 // this enum keeps track of what happened to a value as we
@@ -2105,10 +2236,14 @@ enum ValueLocation {
 }
 
 struct LeafPair {
-    // key gets ownership of kvp.Key
-    key: Box<[u8]>,
-    kLoc: KeyLocation,
-    vLoc: ValueLocation,
+    key: KeyWithLocation,
+    value: ValueLocation,
+}
+
+impl LeafPair {
+    fn need(&self, prefix_len: usize) -> usize {
+        self.key.need(prefix_len) + self.value.need()
+    }
 }
 
 struct LeafState {
@@ -2178,16 +2313,13 @@ fn create_segment<I>(mut pw: PageWriter,
         // 2 for the stored count
         const LEAF_PAGE_OVERHEAD: usize = 2 + 2;
 
-        // returns the first and last key in the leaf.  if there is only one key
-        // in the leaf, it will return two copies of it, which is sad, but that
-        // case should be considered pathological.
-        fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (Box<[u8]>, Box<[u8]>, BlockList) {
+        fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (KeyWithLocation, Option<KeyWithLocation>, BlockList) {
             pb.Reset();
             pb.PutByte(PageType::LEAF_NODE.to_u8());
             pb.PutByte(0u8); // flags
             pb.PutVarint(st.prefixLen as u64);
             if st.prefixLen > 0 {
-                pb.PutArray(&st.keys_in_this_leaf[0].key[0 .. st.prefixLen]);
+                pb.PutArray(&st.keys_in_this_leaf[0].key.key[0 .. st.prefixLen]);
             }
             let count_keys_in_this_leaf = st.keys_in_this_leaf.len();
             // TODO should we support more than 64k keys in a leaf?
@@ -2195,15 +2327,13 @@ fn create_segment<I>(mut pw: PageWriter,
             pb.PutInt16(count_keys_in_this_leaf as u16);
 
             fn f(pb: &mut PageBuilder, prefixLen: usize, lp: &LeafPair, list: &mut BlockList) {
-                match lp.kLoc {
+                match lp.key.location {
                     KeyLocation::Inline => {
-                        // inline key len is stored * 2, always an even number
-                        pb.PutVarint((lp.key.len() * 2) as u64);
-                        pb.PutArray(&lp.key[prefixLen .. lp.key.len()]);
+                        pb.PutVarint(lp.key.len_with_overflow_flag());
+                        pb.PutArray(&lp.key.key[prefixLen .. ]);
                     },
                     KeyLocation::Overflowed(ref blocks) => {
-                        // overflowed key len is stored * 2 + 1, always odd
-                        pb.PutVarint((lp.key.len() * 2 + 1) as u64);
+                        pb.PutVarint(lp.key.len_with_overflow_flag());
                         // TODO capacity, no temp vec
                         let mut v = vec![];
                         blocks.encode(&mut v);
@@ -2211,7 +2341,7 @@ fn create_segment<I>(mut pw: PageWriter,
                         list.add_blocklist_no_reorder(blocks);
                     },
                 }
-                match lp.vLoc {
+                match lp.value {
                     ValueLocation::Tombstone => {
                         pb.PutByte(ValueFlag::FLAG_TOMBSTONE);
                     },
@@ -2232,23 +2362,20 @@ fn create_segment<I>(mut pw: PageWriter,
                 }
             }
 
-            // TODO if the keys were overflowed, shouldn't we return them
-            // that way?  might as well have the parent page reference the
-            // same overflow, right?
-
             let mut blocks = BlockList::new();
 
             // deal with the first key separately
-            let lp = st.keys_in_this_leaf.remove(0); 
-            assert!(st.keys_in_this_leaf.len() == count_keys_in_this_leaf - 1);
-            f(pb, st.prefixLen, &lp, &mut blocks);
-            let first_key = lp.key;
+            let first_key = {
+                let lp = st.keys_in_this_leaf.remove(0); 
+                assert!(st.keys_in_this_leaf.len() == count_keys_in_this_leaf - 1);
+                f(pb, st.prefixLen, &lp, &mut blocks);
+                lp.key
+            };
 
             if st.keys_in_this_leaf.len() == 0 {
                 // there was only one key in this leaf.
-                let last_key = first_key.clone();
                 blocks.sort_and_consolidate();
-                (first_key, last_key, blocks)
+                (first_key, None, blocks)
             } else {
                 if st.keys_in_this_leaf.len() > 1 {
                     // deal with all the remaining keys except the last one
@@ -2259,13 +2386,14 @@ fn create_segment<I>(mut pw: PageWriter,
                 assert!(st.keys_in_this_leaf.len() == 1);
 
                 // now the last key
-                let lp = st.keys_in_this_leaf.remove(0); 
-                assert!(st.keys_in_this_leaf.is_empty());
-                f(pb, st.prefixLen, &lp, &mut blocks);
-
-                let last_key = lp.key;
+                let last_key = {
+                    let lp = st.keys_in_this_leaf.remove(0); 
+                    assert!(st.keys_in_this_leaf.is_empty());
+                    f(pb, st.prefixLen, &lp, &mut blocks);
+                    lp.key
+                };
                 blocks.sort_and_consolidate();
-                (first_key, last_key, blocks)
+                (first_key, Some(last_key), blocks)
             }
         }
 
@@ -2292,46 +2420,6 @@ fn create_segment<I>(mut pw: PageWriter,
 
         let pgsz = pw.page_size();
 
-        // TODO this could be a method on KeyLocation
-        fn kLocNeed(k: &[u8], kloc: &KeyLocation, prefixLen: usize) -> usize {
-            let klen = k.len();
-            match *kloc {
-                KeyLocation::Inline => {
-                    0 // no key flags
-                    + varint::space_needed_for((klen * 2) as u64) 
-                    + klen 
-                    - prefixLen
-                },
-                KeyLocation::Overflowed(ref blocks) => {
-                    0 // no key flags
-                    + varint::space_needed_for((klen * 2 + 1) as u64) 
-                    + blocks.encoded_len()
-                },
-            }
-        }
-
-        // TODO this could be a method on ValueLocation
-        fn vLocNeed (vloc: &ValueLocation) -> usize {
-            match *vloc {
-                ValueLocation::Tombstone => {
-                    1
-                },
-                ValueLocation::Buffer(ref vbuf) => {
-                    let vlen = vbuf.len();
-                    1 + varint::space_needed_for(vlen as u64) + vlen
-                },
-                ValueLocation::Overflowed(vlen, ref blocks) => {
-                    1 + varint::space_needed_for(vlen as u64) + blocks.encoded_len()
-                },
-            }
-        }
-
-        fn leafPairSize(prefixLen: usize, lp: &LeafPair) -> usize {
-            kLocNeed(&lp.key, &lp.kLoc, prefixLen)
-            +
-            vLocNeed(&lp.vLoc)
-        }
-
         let mut st = LeafState {
             sofarLeaf: 0,
             keys_in_this_leaf: Vec::new(),
@@ -2345,7 +2433,8 @@ fn create_segment<I>(mut pw: PageWriter,
             let mut pair = try!(result_pair);
 
             let k = pair.Key;
-            if cfg!(expensive_check) {
+            if cfg!(expensive_check) 
+            {
                // this code can be used to verify that we are being given kvps in order
                 match prev_key {
                     None => {
@@ -2418,7 +2507,7 @@ fn create_segment<I>(mut pw: PageWriter,
                     let fixed_costs_on_new_page =
                         LEAF_PAGE_OVERHEAD
                         + 2 // worst case prefixlen varint
-                        + kLocNeed(&k, &kloc, 0)
+                        + kloc.need(&k, 0)
                         + 1 // value flags
                         + varint::space_needed_for(pgsz as u64) // vlen can't be larger than this for inline
                         ;
@@ -2436,7 +2525,7 @@ fn create_segment<I>(mut pw: PageWriter,
                     pgsz
                     - LEAF_PAGE_OVERHEAD
                     - 2 // worst case prefixlen varint
-                    - kLocNeed(&k, &kloc, 0)
+                    - kloc.need(&k, 0)
                     - 1 // value flags
                     - 9 // worst case varint for value len
                     ;
@@ -2494,7 +2583,7 @@ fn create_segment<I>(mut pw: PageWriter,
                                 } else {
                                     k.len()
                                 };
-                            bcmp::PrefixMatch(&*st.keys_in_this_leaf[0].key, &k, max_prefix)
+                            bcmp::PrefixMatch(&*st.keys_in_this_leaf[0].key.key, &k, max_prefix)
                         },
                         &KeyLocation::Overflowed(ref blocks) => {
                             // an overflowed key does not change the prefix
@@ -2511,12 +2600,12 @@ fn create_segment<I>(mut pw: PageWriter,
                         assert!(st.prefixLen == 0 || newPrefixLen < st.prefixLen);
                         // the prefixLen would change with the addition of this key,
                         // so we need to recalc sofar
-                        let sum = st.keys_in_this_leaf.iter().map(|lp| leafPairSize(newPrefixLen, lp)).sum();;
+                        let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(newPrefixLen) ).sum();;
                         sum
                     } else {
                         st.sofarLeaf
                     };
-                let needed = kLocNeed(&k, &kloc, newPrefixLen) + vLocNeed(&vloc);
+                let needed = kloc.need(&k, newPrefixLen) + vloc.need();
                 let used = sofar + LEAF_PAGE_OVERHEAD + varint::space_needed_for(newPrefixLen as u64) + newPrefixLen;
                 if pgsz > used {
                     let available = pgsz - used;
@@ -2537,20 +2626,23 @@ fn create_segment<I>(mut pw: PageWriter,
                     assert!(st.prefixLen == 0 || newPrefixLen < st.prefixLen);
                     // the prefixLen will change with the addition of this key,
                     // so we need to recalc sofar
-                    let sum = st.keys_in_this_leaf.iter().map(|lp| leafPairSize(newPrefixLen, lp)).sum();;
+                    let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(newPrefixLen) ).sum();;
                     sum
                 } else {
                     st.sofarLeaf
                 };
             // note that the LeafPair struct gets ownership of the key provided
             // from above.
+            let kwloc = KeyWithLocation {
+                key: k,
+                location: kloc,
+            };
             let lp = LeafPair {
-                        key: k,
-                        kLoc: kloc,
-                        vLoc: vloc,
+                        key: kwloc,
+                        value: vloc,
                         };
 
-            st.sofarLeaf = sofar + leafPairSize(newPrefixLen, &lp);
+            st.sofarLeaf = sofar + lp.need(newPrefixLen);
             st.keys_in_this_leaf.push(lp);
             st.prefixLen = newPrefixLen;
         }
@@ -2562,91 +2654,138 @@ fn create_segment<I>(mut pw: PageWriter,
     }
 
     fn write_parent_nodes(
-                           children: &Vec<pgitem>,
+                           children: Vec<pgitem>,
                            pgsz: usize,
                            pw: &mut PageWriter,
                            pb: &mut PageBuilder,
                           ) -> Result<Vec<pgitem>> {
         // 2 for the page type and flags
         // 2 for the stored count
-        // 5 for the extra ptr we will add at the end, a varint, 5 is worst case (page num < 4294967295L)
-        const PARENT_PAGE_OVERHEAD: usize = 2 + 2 + 5;
+        const PARENT_PAGE_OVERHEAD: usize = 2 + 2;
 
         fn calcAvailable(st: &ParentState, pgsz: usize) -> usize {
             let basicSize = pgsz - st.sofar;
             basicSize
         }
 
-        fn build_parent_page(
-                          children: &Vec<pgitem>,
-                          first_child_included: usize,
-                          first_child_after: usize,
-                          overflows: &HashMap<usize, BlockList>,
+        fn build_parent_page(st: &mut ParentState, 
                           pb: &mut PageBuilder,
-                          ) -> (Box<[u8]>, Box<[u8]>, BlockList) {
+                          ) -> (KeyWithLocation, Option<KeyWithLocation>, BlockList) {
+            // TODO? assert!(st.items.len() > 1);
+            //println!("build_parent_page, items: {:?}", st.items);
             pb.Reset();
             pb.PutByte(PageType::PARENT_NODE.to_u8());
-            if first_child_after == children.len() - 1 {
-                pb.PutByte(PageFlag::FLAG_LAST_PARENT_IN_GROUP);
-            } else {
-                pb.PutByte(0u8);
-            }
-            pb.PutInt16((first_child_after - first_child_included) as u16);
-
-            let first_key = children[first_child_included + 1].first_key.clone();
-            let last_key = children[first_child_after].first_key.clone();
+            pb.PutByte(0u8);
+            pb.PutInt16(st.items.len() as u16);
+            //println!("st.items.len(): {}", st.items.len());
 
             let mut list = BlockList::new();
 
-            // store all the keys, n of them
-            for i in first_child_included .. first_child_after {
-                let i_next = i + 1;
-                let key = &children[i_next].first_key;
-                match overflows.get(&i_next) {
-                    Some(blocks) => {
-                        // overflowed key len is stored * 2 + 1, always an odd number
-                        pb.PutVarint((key.len() * 2 + 1) as u64);
+            fn put_key(pb: &mut PageBuilder, k: &KeyWithLocation, prefix_len: usize) {
+                match k.location {
+                    KeyLocation::Inline => {
+                        pb.PutArray(&k.key[prefix_len .. ]);
+                    },
+                    KeyLocation::Overflowed(ref blocks) => {
                         // TODO capacity, no temp vec
                         let mut v = vec![];
                         blocks.encode(&mut v);
                         pb.PutArray(&v);
-                        list.add_blocklist_no_reorder(blocks);
                     },
-                    None => {
-                        // inline key len is stored * 2, always an even number
-                        pb.PutVarint((key.len() * 2) as u64);
-                        pb.PutArray(key);
-                    },
-                }
-            }
-            // store all the ptrs, n+1 of them
-            for i in first_child_included .. first_child_after + 1 {
-                pb.PutVarint(children[i].page as u64);
-                let keep =
-                    if i == first_child_after {
-                        first_child_after == children.len() - 1
-                    } else {
-                        true
-                    };
-                if keep {
-                    list.add_blocklist_no_reorder(&children[i].blocks);
-                    list.add_page_no_reorder(children[i].page);
                 }
             }
 
-            list.sort_and_consolidate();
-            (first_key, last_key, list)
+            fn put_item(pb: &mut PageBuilder, list: &mut BlockList, item: &ParentItem) {
+                //println!("item: {:?}", item);
+                pb.PutVarint(item.child.page as u64);
+                list.add_page_no_reorder(item.child.page);
+                //if cfg!(child_block_list) 
+                {
+                    // TODO capacity, no temp vec
+                    let mut v = vec![];
+                    item.child.blocks.encode(&mut v);
+                    pb.PutArray(&v);
+                }
+                list.add_blocklist_no_reorder(&item.child.blocks);
+
+                pb.PutVarint(item.child.first_key.len_with_overflow_flag());
+                match item.child.last_key {
+                    Some(ref last_key) => {
+                        pb.PutVarint(last_key.len_with_overflow_flag());
+                    },
+                    None => {
+                        pb.PutVarint(0);
+                    },
+                }
+// TODO iff both keys are inline, there should be a prefix len, even if it is 0
+                let prefix_len =
+                    match item.prefix_len {
+                        Some(prefix_len) => {
+                            pb.PutVarint(prefix_len as u64);
+                            if prefix_len > 0 {
+                                pb.PutArray(&item.child.first_key.key[ .. prefix_len]);
+                            }
+                            prefix_len
+                        },
+                        None => {
+                            // write nothing to the page
+                            0
+                        },
+                    };
+                put_key(pb, &item.child.first_key, prefix_len);
+                match item.child.last_key {
+                    Some(ref last_key) => {
+                        put_key(pb, &last_key, prefix_len);
+                    },
+                    None => {
+                    },
+                }
+            }
+
+            // deal with the first item separately
+            let (first_key, last_key_from_first_item) = {
+                let item = st.items.remove(0); 
+                put_item(pb, &mut list, &item);
+                (item.child.first_key, item.child.last_key)
+            };
+
+            if st.items.len() == 0 {
+                // there was only one item in this page
+                list.sort_and_consolidate();
+                (first_key, last_key_from_first_item, list)
+            } else {
+                if st.items.len() > 1 {
+                    // deal with all the remaining items except the last one
+                    let tmp_count = st.items.len() - 1;
+                    for item in st.items.drain(0 .. tmp_count) {
+                        put_item(pb, &mut list, &item);
+                    }
+                }
+                assert!(st.items.len() == 1);
+
+                // now the last item
+                let last_key = {
+                    let item = st.items.remove(0); 
+                    put_item(pb, &mut list, &item);
+                    match item.child.last_key {
+                        Some(last_key) => last_key,
+                        None => item.child.first_key,
+                    }
+                };
+                assert!(st.items.is_empty());
+
+                list.sort_and_consolidate();
+                (first_key, Some(last_key), list)
+            }
         }
 
         fn write_parent_page(st: &mut ParentState, 
-                              children: &Vec<pgitem>,
-                              first_child_after: usize,
-                              overflows: &HashMap<usize, BlockList>,
                               pb: &mut PageBuilder, 
                               pw: &mut PageWriter,
                              ) -> Result<()> {
             // assert st.sofar > 0
-            let (first_key, last_key, blocks) = build_parent_page(children, st.start, first_child_after, &overflows, pb);
+            let (first_key, last_key, blocks) = build_parent_page(st, pb);
+            assert!(st.items.is_empty());
             //println!("parent blocklist: {:?}", blocks);
             //println!("parent blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
             let thisPageNumber = try!(pw.write_page(pb.buf()));
@@ -2664,65 +2803,96 @@ fn create_segment<I>(mut pw: PageWriter,
         let mut st = ParentState {
             nextGeneration: Vec::new(),
             sofar: 0,
-            start: 0,
+            items: vec![],
         };
-        let mut overflows = HashMap::new();
+
         // deal with all the children except the last one
-        for i_child in 0 .. children.len() - 1 {
-            let this_child = &children[i_child];
-            let next_child = &children[i_child + 1];
-            let key = &next_child.first_key;
+        for child in children {
+            // to fit this child into this parent page, we need room for
+            // the root page
+            // the block list
+            // key len 1, varint, shifted for overflow flag
+            // key len 2, varint, shifted for overflow flag, 0 if absent
+            // prefixLen, varint, present iff 2 keys and both inlined, even if prefix_len is 0
+            // (prefix)
+            // key 1
+            //     if inline, the key, minus prefix
+            //     if overflow, the blocklist (borrowed from child)
+            // key 2
+            //     if inline, the key, minus prefix
+            //     if overflow, the blocklist (borrowed from child)
 
-            // to fit this child into this parent page, we need room for the
-            // the child's page num, and for the first_key of the next child.
+            // each key is stored just as it was in the child, inline or overflow.
+            // if it is overflowed, we just store the same blocklist reference.
 
-            let neededEitherWay = varint::space_needed_for(this_child.page as u64);
-            let neededForInline = neededEitherWay + varint::space_needed_for((key.len() * 2) as u64) + key.len();
-            let wouldFitInlineOnNextPage = (pgsz - PARENT_PAGE_OVERHEAD) >= neededForInline;
-            let available = calcAvailable(&st, pgsz);
-            let fitsInline = available >= neededForInline;
+            // claim:  if both keys fit inlined in the child, they can both
+            // fit inlined here in the parent page.
 
-            let needed = 
-                if fitsInline || wouldFitInlineOnNextPage {
-                    neededForInline
-                } else {
-                    // for an overflowed key, there is probably no practical hard limit on the size
-                    // of the encoded block list.  we want things to be as contiguous as
-                    // possible, but if the block list won't fit on the usable part of a
-                    // fresh page, something is seriously wrong.
-                    // rather than calculate the actual hard limit, we provide an arbitrary
-                    // fraction of the page which would still be pathological.
-                    let hard_limit = pgsz / 4;
-                    let (len, blocks) = try!(write_overflow(&mut &**key, pw, hard_limit));
-                    assert!(len == key.len());
-                    let needed =
-                        neededEitherWay
-                        + varint::space_needed_for((key.len() * 2 + 1) as u64) 
-                        + blocks.encoded_len();
-                    overflows.insert(i_child, blocks);
-                    needed
+            let base_need = 
+                varint::space_needed_for(child.page as u64) 
+                //if cfg!(child_block_list) 
+                + child.blocks.encoded_len()
+                + varint::space_needed_for(child.first_key.key.len() as u64) 
+                ;
+
+            let (keys_need, prefix_len) =
+                match child.last_key {
+                    Some(ref last_key) => {
+                        let other_len = varint::space_needed_for(last_key.key.len() as u64);
+                        if child.first_key.location.is_inline() && last_key.location.is_inline() {
+                            // prefix
+                            let prefix_len = bcmp::PrefixMatch(&child.first_key.key, &last_key.key, last_key.key.len());
+                            let need = 
+                                other_len
+                                + varint::space_needed_for(prefix_len as u64)
+                                + prefix_len
+                                + child.first_key.need(prefix_len)
+                                + last_key.need(prefix_len)
+                                ;
+                            (need, Some(prefix_len))
+                        } else {
+                            let need =
+                                other_len
+                                + child.first_key.need(0)
+                                + last_key.need(0)
+                                ;
+                            (need, None)
+                        }
+                    },
+                    None => {
+                        let need = child.first_key.need(0);
+                        (need, None)
+                    },
                 };
 
-            // TODO once we do full keys:  if the key was overflowed on the leaf, shouldn't
-            // we just reference the same overflow here?
-
+            let needed = base_need + keys_need;
+            let available = calcAvailable(&st, pgsz);
             let fits = available >= needed;
 
             if !fits {
                 assert!(st.sofar > 0);
-                assert!(i_child > st.start);
-                try!(write_parent_page(&mut st, children, i_child, &overflows, pb, pw));
+                assert!(st.items.len() > 1);
+                try!(write_parent_page(&mut st, pb, pw));
+                assert!(st.items.is_empty());
             }
+
+            let item = ParentItem {
+                child: child,
+                prefix_len: prefix_len,
+            };
+            st.items.push(item);
 
             if st.sofar == 0 {
                 st.sofar = PARENT_PAGE_OVERHEAD;
-                st.start = i_child;
             }
 
             st.sofar += needed;
         }
 
-        try!(write_parent_page(&mut st, children, children.len() - 1, &overflows, pb, pw));
+        assert!(st.items.len() > 0);
+        try!(write_parent_page(&mut st, pb, pw));
+        assert!(st.items.is_empty());
+
         Ok(st.nextGeneration)
     }
 
@@ -2754,42 +2924,11 @@ fn create_segment<I>(mut pw: PageWriter,
         if leaves.len() > 1 {
             let mut children = leaves;
             while children.len() > 1 {
+                // TODO FWIW, this is where we used to:
                 // before we write this layer of parent nodes, we trim all the
                 // keys to the shortest prefix that will suffice.
 
-                for i in 1 .. children.len() {
-                    let shorter = {
-                        let mut shorter = None;
-                        let k = &children[i].first_key;
-                        let prev = &children[i - 1].last_key;
-
-                        let mut len = k.len();
-                        loop {
-                            if len == 0 || Ordering::Greater != bcmp::Compare(&k[ .. len], prev) {
-                                assert!(len < k.len());
-                                shorter = Some(len + 1);
-                                break;
-                            }
-                            if len > 0 {
-                                len -= 1;
-                            } else {
-                                break;
-                            }
-                        }
-                        shorter
-                    };
-
-                    if let Some(len) = shorter {
-                        if len < children[i].first_key.len() {
-                            //println!("can shorten key from {} to {}", children[i].first_key.len(), len);
-                            let mut v = Vec::with_capacity(len);
-                            v.push_all(&children[i].first_key[ .. len]);
-                            children[i].first_key = v.into_boxed_slice();
-                        }
-                    }
-                }
-
-                let newChildren = try!(write_parent_nodes(&children, pgsz, &mut pw, &mut pb));
+                let newChildren = try!(write_parent_nodes(children, pgsz, &mut pw, &mut pb));
                 children = newChildren;
             }
             children.remove(0)
@@ -2799,7 +2938,8 @@ fn create_segment<I>(mut pw: PageWriter,
         };
 
     let blocks = try!(pw.end());
-    if cfg!(expensive_check) {
+    if cfg!(expensive_check) 
+    {
         // if we add the root page to the calculated block list 
         // it should be the same as the one from pw
 
@@ -2950,6 +3090,7 @@ pub struct LeafCursor {
     path: String,
     f: std::rc::Rc<std::cell::RefCell<File>>,
     pr: misc::Lend<Box<[u8]>>,
+    pagenum: PageNum, // TODO diag only?
 
     prefix: Option<Box<[u8]>>,
     keys: Vec<usize>,
@@ -2960,12 +3101,14 @@ pub struct LeafCursor {
 impl LeafCursor {
     fn new(path: &str, 
            f: std::rc::Rc<std::cell::RefCell<File>>,
+           pagenum: PageNum,
            buf: misc::Lend<Box<[u8]>>
           ) -> Result<LeafCursor> {
 
         let mut res = LeafCursor {
             path: String::from(path),
             f: f,
+            pagenum: pagenum,
             pr: buf,
             keys: Vec::new(),
             currentKey: None,
@@ -3014,6 +3157,7 @@ impl LeafCursor {
             let f = &mut *(self.f.borrow_mut());
             try!(utils::SeekPage(f, self.pr.len(), pgnum));
             try!(misc::io::read_fully(f, &mut self.pr));
+            self.pagenum = pgnum;
         }
         try!(self.parse_page());
         Ok(())
@@ -3113,7 +3257,7 @@ impl LeafCursor {
         ok
     }
 
-    fn search(&mut self, k: &KeyRef, sop:SeekOp) -> Result<SeekResult> {
+    fn search(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
         let tmp_countLeafKeys = self.keys.len();
         let (newCur, equal) = try!(self.searchLeaf(k, 0, (tmp_countLeafKeys - 1), sop, None, None));
         self.currentKey = newCur;
@@ -3134,7 +3278,13 @@ impl ICursor for LeafCursor {
     }
 
     fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
-        self.search(k, sop)
+        //println!("Leaf SeekRef {}  k={:?}  sop={:?}", self.pagenum, k, sop);
+        let sr = try!(self.search(k, sop));
+        if cfg!(expensive_check) 
+        {
+            try!(sr.verify(k, sop, self));
+        }
+        Ok(sr)
     }
 
     fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
@@ -3242,6 +3392,7 @@ impl ICursor for LeafCursor {
 
 }
 
+// TODO PageCursor?
 pub enum ChildCursor {
     Leaf(LeafCursor),
     Parent(ParentPageCursor),
@@ -3250,17 +3401,19 @@ pub enum ChildCursor {
 impl ChildCursor {
     fn new(path: &str, 
            f: std::rc::Rc<std::cell::RefCell<File>>,
+           pagenum: PageNum,
            buf: misc::Lend<Box<[u8]>>
           ) -> Result<ChildCursor> {
+// TODO maybe ChildCursor should do the page read here?
         let pt = try!(PageType::from_u8(buf[0]));
         let sub = 
             match pt {
                 PageType::LEAF_NODE => {
-                    let sub = try!(LeafCursor::new(path, f, buf));
+                    let sub = try!(LeafCursor::new(path, f, pagenum, buf));
                     ChildCursor::Leaf(sub)
                 },
                 PageType::PARENT_NODE => {
-                    let sub = try!(ParentPageCursor::new(path, f, buf));
+                    let sub = try!(ParentPageCursor::new(path, f, pagenum, buf));
                     ChildCursor::Parent(sub)
                 },
                 PageType::OVERFLOW_NODE => {
@@ -3269,6 +3422,17 @@ impl ChildCursor {
             };
 
         Ok(sub)
+    }
+
+    pub fn page_type(&self) -> PageType {
+        match self {
+            &ChildCursor::Leaf(_) => {
+                PageType::LEAF_NODE
+            },
+            &ChildCursor::Parent(_) => {
+                PageType::PARENT_NODE
+            },
+        }
     }
 
     fn read_page(&mut self, pg: PageNum) -> Result<()> {
@@ -3293,10 +3457,18 @@ impl ICursor for ChildCursor {
     }
 
     fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
-        match self {
-            &mut ChildCursor::Leaf(ref mut c) => c.SeekRef(k, sop),
-            &mut ChildCursor::Parent(ref mut c) => c.SeekRef(k, sop),
+        //println!("ChildCursor SeekRef  k={:?}  sop={:?}", k, sop);
+        let sr = 
+            match self {
+                &mut ChildCursor::Leaf(ref mut c) => c.SeekRef(k, sop),
+                &mut ChildCursor::Parent(ref mut c) => c.SeekRef(k, sop),
+            };
+        let sr = try!(sr);
+        if cfg!(expensive_check) 
+        {
+            try!(sr.verify(k, sop, self));
         }
+        Ok(sr)
     }
 
     fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
@@ -3350,13 +3522,85 @@ impl ICursor for ChildCursor {
 
 }
 
+// TODO basically exactly the same as pgitem
+#[derive(Debug)]
+pub struct ParentPageItem {
+    page: PageNum,
+
+    //if cfg!(child_block_list) 
+    blocks: BlockList,
+
+    // blocks does NOT contain page
+
+    // TODO why do we need Location if we're going to read the key in?
+    first_key: KeyWithLocation,
+    last_key: Option<KeyWithLocation>,
+}
+
+#[derive(Debug)]
+enum KeyInRange {
+    Less,
+    Greater,
+    EqualFirst,
+    EqualLast,
+    Within,
+}
+
+impl ParentPageItem {
+    pub fn page(&self) -> PageNum {
+        self.page
+    }
+
+    pub fn first_key(&self) -> &KeyWithLocation {
+        &self.first_key
+    }
+
+    pub fn last_key(&self) -> &Option<KeyWithLocation> {
+        &self.last_key
+    }
+
+    fn key_in_range(&self, kq: &KeyRef) -> KeyInRange {
+        match self.last_key {
+            Some(ref last_key) => {
+                match kq.compare_with(&last_key.key) {
+                    Ordering::Less => {
+                    },
+                    Ordering::Equal => {
+                        return KeyInRange::EqualLast;
+                    },
+                    Ordering::Greater => {
+                        return KeyInRange::Greater;
+                    },
+                }
+            },
+            None => {
+            },
+        }
+        match kq.compare_with(&self.first_key.key) {
+            Ordering::Less => {
+                KeyInRange::Less
+            },
+            Ordering::Equal => {
+                KeyInRange::EqualFirst
+            },
+            Ordering::Greater => {
+                if self.last_key.is_some() {
+                    KeyInRange::Within
+                } else {
+                    KeyInRange::Greater
+                }
+            },
+        }
+    }
+}
+
 pub struct ParentPageCursor {
     path: String,
     f: std::rc::Rc<std::cell::RefCell<File>>,
     pr: misc::Lend<Box<[u8]>>,
+    pagenum: PageNum, // TODO diag only?
 
-    keys: Vec<usize>,
-    children: Vec<PageNum>,
+    children: Vec<ParentPageItem>,
 
     cur_child: Option<usize>,
     sub: Box<ChildCursor>,
@@ -3365,12 +3609,69 @@ pub struct ParentPageCursor {
 impl ParentPageCursor {
     fn new(path: &str, 
            f: std::rc::Rc<std::cell::RefCell<File>>,
+           pagenum: PageNum,
            buf: misc::Lend<Box<[u8]>>
           ) -> Result<ParentPageCursor> {
 
-        let mut keys = vec![];
-        let mut children = vec![];
-        try!(Self::parse_page(&buf, &mut keys, &mut children));
+        let children = try!(Self::parse_page(&buf, path));
+        assert!(children.len() > 0);
+
+        if cfg!(expensive_check) 
+        {
+            let f = f.clone();
+            for i in 0 .. children.len() {
+                match &children[i].last_key {
+                    &Some(ref last_key) => {
+                        let c = bcmp::Compare(&last_key.key, &children[i].first_key.key);
+                        assert!(c == Ordering::Greater);
+                    },
+                    &None => {
+                    },
+                };
+
+                // TODO it's a little silly here to construct a Lend<>
+                let child_buf = vec![0; buf.len()].into_boxed_slice();
+                let done_page = move |_| -> () {
+                };
+                let mut child_buf = misc::Lend::new(child_buf, box done_page);
+                {
+                    let f = &mut *(f.borrow_mut());
+                    try!(utils::SeekPage(f, child_buf.len(), children[i].page));
+                    try!(misc::io::read_fully(f, &mut child_buf));
+                }
+                let mut sub = try!(ChildCursor::new(path, f.clone(), children[i].page, child_buf));
+                try!(sub.First());
+                assert!(sub.IsValid());
+                {
+                    let k = try!(sub.KeyRef());
+                    let cmp = k.compare_with(&children[i].first_key.key);
+                    assert!(cmp == Ordering::Equal);
+                }
+                try!(sub.Last());
+                assert!(sub.IsValid());
+                let last_key =
+                    match &children[i].last_key {
+                        &Some(ref last_key) => {
+                            last_key
+                        },
+                        &None => {
+                            &children[i].first_key
+                        },
+                    };
+                {
+                    let k = try!(sub.KeyRef());
+                    let cmp = k.compare_with(&last_key.key);
+                    if cmp != Ordering::Equal {
+                        println!("my page: {}", pagenum);
+                        println!("child page: {}", children[i].page);
+                        println!("child {} of {}", i, children.len());
+                        println!("k: {:?}", k);
+                        println!("last_key: {:?}", last_key.key);
+                        assert!(cmp == Ordering::Equal);
+                    }
+                }
+            }
+        }
 
         // TODO it's a little silly here to construct a Lend<>
         let child_buf = vec![0; buf.len()].into_boxed_slice();
@@ -3380,18 +3681,18 @@ impl ParentPageCursor {
 
         {
             let f = &mut *(f.borrow_mut());
-            try!(utils::SeekPage(f, child_buf.len(), children[0]));
+            try!(utils::SeekPage(f, child_buf.len(), children[0].page));
             try!(misc::io::read_fully(f, &mut child_buf));
         }
 
-        let sub = try!(ChildCursor::new(path, f.clone(), child_buf));
+        let sub = try!(ChildCursor::new(path, f.clone(), children[0].page, child_buf));
 
         let res = ParentPageCursor {
             path: String::from(path),
             f: f,
             pr: buf,
+            pagenum: pagenum,
 
-            keys: keys,
             children: children,
 
             cur_child: Some(0),
@@ -3401,41 +3702,136 @@ impl ParentPageCursor {
         Ok(res)
     }
 
-    fn parse_page(pr: &[u8], keys: &mut Vec<usize>, children: &mut Vec<PageNum>) -> Result<()> {
+    pub fn child_page_type(&self) -> PageType {
+        self.sub.page_type()
+    }
+
+    pub fn items(&self) -> &Vec<ParentPageItem> {
+        &self.children
+    }
+
+    fn parse_page(pr: &[u8], path: &str) -> Result<Vec<ParentPageItem>> {
         let mut cur = 0;
         let pt = try!(PageType::from_u8(misc::buf_advance::get_byte(pr, &mut cur)));
         if  pt != PageType::PARENT_NODE {
             return Err(Error::CorruptFile("parent page has invalid page type"));
         }
         cur = cur + 1; // skip the page flags
-        let count_keys = misc::buf_advance::get_u16(pr, &mut cur) as usize;
-        misc::set_vec_len(keys, 0, count_keys);
-        for i in 0 .. count_keys {
-            keys[i] = cur;
+        let count_items = misc::buf_advance::get_u16(pr, &mut cur) as usize;
+        // TODO count_items has gotta be > 1, right?  or does it?
+        //println!("count_items: {}", count_items);
+        let mut children = Vec::with_capacity(count_items);
 
-            let klen = varint::read(pr, &mut cur) as usize;
-            let inline = 0 == klen % 2;
-            let klen = klen / 2;
-
+        fn read_key(pr: &[u8], cur: &mut usize, prefix: &Option<Box<[u8]>>, path: &str, inline: bool, klen: usize) -> Result<KeyWithLocation> {
             if inline {
-                cur = cur + klen;
+                let mut v = Vec::with_capacity(klen);
+                match prefix {
+                    &Some(ref a) => {
+                        v.push_all(&a);
+                        v.push_all(&pr[*cur .. *cur + klen - a.len()]);
+                        *cur += klen - a.len();
+                    },
+                    &None => {
+                        v.push_all(&pr[*cur .. *cur + klen]);
+                        *cur += klen;
+                    },
+                }
+                let v = v.into_boxed_slice();
+                let k =
+                    KeyWithLocation {
+                        key: v,
+                        location: KeyLocation::Inline
+                    };
+                Ok(k)
             } else {
-                BlockList::skip(pr, &mut cur);
+                let blocks = BlockList::read(&pr, cur);
+                let v = {
+                    let mut ostrm = try!(OverflowReader::new(path, pr.len(), blocks.blocks[0].firstPage, klen));
+                    let mut x_k = Vec::with_capacity(klen);
+                    try!(ostrm.read_to_end(&mut x_k));
+                    let x_k = x_k.into_boxed_slice();
+                    x_k
+                };
+                let k = 
+                    KeyWithLocation {
+                        key: v,
+                        location: KeyLocation::Overflowed(blocks)
+                    };
+                Ok(k)
             }
         }
-        let count_children = count_keys + 1;
-        misc::set_vec_len(children, 0, count_children);
-        for i in 0 .. count_children {
-            let pg = varint::read(pr, &mut cur) as PageNum;
-            children[i] = pg;
+
+        assert!(cur == 4);
+        for i in 0 .. count_items {
+            let page = varint::read(pr, &mut cur) as PageNum;
+            //println!("page: {}", page);
+
+            //if cfg!(child_block_list) 
+            let blocks = BlockList::read(pr, &mut cur);
+
+            let klen_1 = varint::read(pr, &mut cur) as usize;
+            let inline_1 = 0 == klen_1 % 2;
+            let klen_1 = klen_1 / 2;
+            //println!("klen_1: {}", klen_1);
+
+            let klen_2 = varint::read(pr, &mut cur) as usize;
+            //println!("raw klen_2: {}", klen_2);
+            // klen_2 == 0 means no second key
+
+            let prefix = 
+                if inline_1 && klen_2 != 0 {
+                    let inline_2 = 0 == klen_2 % 2;
+
+                    if inline_2 {
+                        let prefix_len = varint::read(pr, &mut cur) as usize;
+                        //println!("prefix_len: {}", prefix_len);
+                        if prefix_len > 0 {
+                            // TODO should we just remember prefix as a reference instead of box/copy?
+                            let mut a = vec![0; prefix_len].into_boxed_slice();
+                            a.clone_from_slice(&pr[cur .. cur + prefix_len]);
+                            cur = cur + prefix_len;
+                            Some(a)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+            let key_1 = try!(read_key(pr, &mut cur, &prefix, path, inline_1, klen_1));
+
+            let key_2 =
+                if klen_2 != 0 {
+                    let inline_2 = 0 == klen_2 % 2;
+                    let klen_2 = klen_2 / 2;
+                    //println!("actual klen_2: {}", klen_2);
+                    let key_2 = try!(read_key(pr, &mut cur, &prefix, path, inline_2, klen_2));
+                    Some(key_2)
+                } else {
+                    None
+                };
+
+            let pg = ParentPageItem {
+                page: page, 
+                //if cfg!(child_block_list) 
+                blocks: blocks,
+                first_key: key_1,
+                last_key: key_2,
+            };
+            children.push(pg);
         }
 
-        Ok(())
+        //println!("children parsed: {:?}", children);
+
+        Ok(children)
     }
 
     fn set_child(&mut self, i: usize) -> Result<()> {
-        let pg = self.children[i];
-        try!(self.sub.read_page(pg));
+        let pg = &self.children[i];
+        try!(self.sub.read_page(pg.page));
         self.cur_child = Some(i);
         Ok(())
     }
@@ -3445,69 +3841,106 @@ impl ParentPageCursor {
             let f = &mut *(self.f.borrow_mut());
             try!(utils::SeekPage(f, self.pr.len(), pgnum));
             try!(misc::io::read_fully(f, &mut self.pr));
+            self.pagenum = pgnum;
         }
-        try!(Self::parse_page(&self.pr, &mut self.keys, &mut self.children));
+        self.children = try!(Self::parse_page(&self.pr, &self.path));
 
         Ok(())
     }
 
-    fn key<'a>(&'a self, n: usize) -> Result<KeyRef<'a>> { 
-        let mut cur = self.keys[n as usize];
-        let klen = varint::read(&self.pr, &mut cur) as usize;
-        let inline = 0 == klen % 2;
-        let klen = klen / 2;
-        if inline {
-            Ok(KeyRef::Array(&self.pr[cur .. cur + klen]))
-        } else {
-            let blocks = BlockList::read(&self.pr, &mut cur);
-// TODO return blocks instead of opening the stream
-            let mut ostrm = try!(OverflowReader::new(&self.path, self.pr.len(), blocks.blocks[0].firstPage, klen));
-            let mut x_k = Vec::with_capacity(klen);
-            try!(ostrm.read_to_end(&mut x_k));
-            let x_k = x_k.into_boxed_slice();
-            Ok(KeyRef::Boxed(x_k))
-        }
-    }
+    fn seek(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
+        //println!("parent page: {}  search: kq = {:?},  sop = {:?}", self.pagenum, k, sop);
 
-    fn search(&mut self, kq: &KeyRef) -> Result<usize> {
-        let mut found = None;
-        for i in 0 .. self.keys.len() {
-            let k = try!(self.key(i));
-            let cmp = KeyRef::cmp(kq, &k);
-            if cmp == Ordering::Less {
-                found = Some(i);
-                break;
+        for i in 0 .. self.children.len() {
+            let look = self.children[i].key_in_range(k);
+            //println!("    in page {:?} : {:?}", self.children[i].page, look);
+            match look {
+                KeyInRange::EqualFirst => {
+                    try!(self.set_child(i));
+                    try!(self.sub.First());
+                    // TODO assert something?
+                    return Ok(SeekResult::Equal);
+                },
+                KeyInRange::EqualLast => {
+                    try!(self.set_child(i));
+                    try!(self.sub.Last());
+                    // TODO assert something?
+                    return Ok(SeekResult::Equal);
+                },
+                KeyInRange::Within => {
+                    try!(self.set_child(i));
+                    let sr = try!(self.sub.SeekRef(k, sop));
+                    return Ok(sr)
+                },
+                KeyInRange::Less => {
+                    // there should be no case here where the loop continues.
+                    // the children are sorted ascending.  if the key is
+                    // less than this one, it will be less than all the others
+                    // as well.
+                    if i == 0 {
+                        // k is less than the first one
+                        match sop {
+                            SeekOp::SEEK_LE => {
+                                self.cur_child = None;
+                                return Ok(SeekResult::Invalid);
+                            },
+                            SeekOp::SEEK_GE => {
+                                try!(self.set_child(0));
+                                try!(self.sub.First());
+                                return Ok(SeekResult::Unequal);
+                            },
+                            SeekOp::SEEK_EQ => {
+                                self.cur_child = None;
+                                return Ok(SeekResult::Invalid);
+                            },
+                        }
+                    } else {
+                        // had to be greater than the last one
+                        // in between
+                        match sop {
+                            SeekOp::SEEK_LE => {
+                                try!(self.set_child(i - 1));
+                                try!(self.sub.Last());
+                                return Ok(SeekResult::Unequal);
+                            },
+                            SeekOp::SEEK_GE => {
+                                try!(self.set_child(i));
+                                try!(self.sub.First());
+                                return Ok(SeekResult::Unequal);
+                            },
+                            SeekOp::SEEK_EQ => {
+                                self.cur_child = None;
+                                return Ok(SeekResult::Invalid);
+                            },
+                        }
+                    }
+                },
+                KeyInRange::Greater => {
+                    // keep looking
+                },
             }
         }
-        match found {
-            None => Ok(self.children.len() - 1),
-            Some(found) => Ok(found),
+        //println!("after loop");
+        // the only way to exit the loop is for the key to be
+        // greater than the last item.
+        match sop {
+            SeekOp::SEEK_LE => {
+                let last_child = self.children.len() - 1;
+                try!(self.set_child(last_child));
+                try!(self.sub.Last());
+                return Ok(SeekResult::Unequal);
+            },
+            SeekOp::SEEK_GE => {
+                self.cur_child = None;
+                return Ok(SeekResult::Invalid);
+            },
+            SeekOp::SEEK_EQ => {
+                self.cur_child = None;
+                return Ok(SeekResult::Invalid);
+            },
         }
     }
 
-    // the last child pointer in a parent page is screwy.
-    //
-    // if the parent page is the last one in its group,
-    // then no problem.
-    //
-    // otherwise, that last child pointer is actually
-    // duplicated as the first child pointer in the next
-    // parent page.  this is because the SeekRef code
-    // works this way (for now), but we have to account
-    // for this when we use these parent pages to implement
-    // Next/Prev.
-
-    fn last_child_valid(&self) -> bool {
-        0 != self.pr[1] & PageFlag::FLAG_LAST_PARENT_IN_GROUP
-    }
-
-    fn count_valid_children(&self) -> usize {
-        if self.last_child_valid() {
-            self.children.len()
-        } else {
-            self.children.len() - 1
-        }
-    }
 }
 
 impl ICursor for ParentPageCursor {
@@ -3521,43 +3954,11 @@ impl ICursor for ParentPageCursor {
     }
 
     fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
-        let child = try!(self.search(k));
-        try!(self.set_child(child));
-        let sr = try!(self.sub.SeekRef(k, sop));
-        let sr = 
-            match sr {
-                SeekResult::Equal => {
-                    sr
-                },
-                SeekResult::Unequal => {
-                    sr
-                },
-                SeekResult::Invalid => {
-                    match sop {
-                        SeekOp::SEEK_EQ => {
-                            sr
-                        },
-                        SeekOp::SEEK_GE => {
-                            if child + 1 < self.children.len() {
-                                try!(self.set_child(child + 1));
-                                try!(self.sub.First());
-                                SeekResult::Unequal
-                            } else {
-                                sr
-                            }
-                        },
-                        SeekOp::SEEK_LE => {
-                            if child > 0 {
-                                try!(self.set_child(child - 1));
-                                try!(self.sub.Last());
-                                SeekResult::Unequal
-                            } else {
-                                sr
-                            }
-                        },
-                    }
-                },
-            };
+        let sr = try!(self.seek(k, sop));
+        if cfg!(expensive_check) 
+        {
+            try!(sr.verify(k, sop, self));
+        }
         Ok(sr)
     }
 
@@ -3598,15 +3999,13 @@ impl ICursor for ParentPageCursor {
     }
 
     fn First(&mut self) -> Result<()> {
-        assert!(self.count_valid_children() > 0);
         try!(self.set_child(0));
         self.sub.First()
     }
 
     fn Last(&mut self) -> Result<()> {
-        let count_children = self.count_valid_children();
-        assert!(count_children > 0);
-        try!(self.set_child(count_children - 1));
+        let last_child = self.children.len() - 1;
+        try!(self.set_child(last_child));
         self.sub.Last()
     }
 
@@ -3617,18 +4016,12 @@ impl ICursor for ParentPageCursor {
                 Err(Error::CursorNotValid)
             },
             Some(i) => {
-                if !self.last_child_valid() && i == self.children.len() - 1 {
-                    panic!();
-                    Err(Error::CursorNotValid)
+                try!(self.sub.Next());
+                if !self.sub.IsValid() && i + 1 < self.children.len() {
+                    try!(self.set_child(i + 1));
+                    self.sub.First()
                 } else {
-                    try!(self.sub.Next());
-                    let count_children = self.count_valid_children();
-                    if !self.sub.IsValid() && i + 1 < count_children {
-                        try!(self.set_child(i + 1));
-                        self.sub.First()
-                    } else {
-                        Ok(())
-                    }
+                    Ok(())
                 }
             },
         }
@@ -3641,17 +4034,12 @@ impl ICursor for ParentPageCursor {
                 Err(Error::CursorNotValid)
             },
             Some(i) => {
-                if !self.last_child_valid() && i == self.children.len() - 1 {
-                    panic!();
-                    Err(Error::CursorNotValid)
+                try!(self.sub.Prev());
+                if !self.sub.IsValid() && i > 0 {
+                    try!(self.set_child(i - 1));
+                    self.sub.Last()
                 } else {
-                    try!(self.sub.Prev());
-                    if !self.sub.IsValid() && i > 0 {
-                        try!(self.set_child(i - 1));
-                        self.sub.Last()
-                    } else {
-                        Ok(())
-                    }
+                    Ok(())
                 }
             },
         }
@@ -3678,7 +4066,7 @@ impl SegmentCursor {
             try!(misc::io::read_fully(f, &mut buf));
         }
 
-        let sub = try!(ChildCursor::new(path, f, buf));
+        let sub = try!(ChildCursor::new(path, f, location.root_page, buf));
 
         let res = SegmentCursor {
             location: location,
@@ -3715,7 +4103,13 @@ impl ICursor for SegmentCursor {
     }
 
     fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
-        self.sub.SeekRef(k, sop)
+        //println!("SegmentCursor page {} SeekRef, k: {:?}", self.location.root_page, k);
+        let sr = try!(self.sub.SeekRef(k, sop));
+        if cfg!(expensive_check) 
+        {
+            try!(sr.verify(k, sop, self));
+        }
+        Ok(sr)
     }
 
     fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
@@ -4166,6 +4560,18 @@ impl DatabaseFile {
         InnerPart::open_cursor_on_active_segment(&self.inner, n)
     }
 
+    pub fn open_cursor_on_page(&self, pg: PageNum) -> Result<ChildCursor> {
+        InnerPart::open_cursor_on_page(&self.inner, pg)
+    }
+
+    pub fn open_cursor_on_leaf_page(&self, pg: PageNum) -> Result<LeafCursor> {
+        InnerPart::open_cursor_on_leaf_page(&self.inner, pg)
+    }
+
+    pub fn open_cursor_on_parent_page(&self, pg: PageNum) -> Result<ParentPageCursor> {
+        InnerPart::open_cursor_on_parent_page(&self.inner, pg)
+    }
+
     pub fn open_cursor_on_pending_segment(&self, location: SegmentLocation) -> Result<SegmentCursor> {
         InnerPart::open_cursor_on_pending_segment(&self.inner, location)
     }
@@ -4553,6 +4959,45 @@ impl InnerPart {
         let st = try!(inner.header.read());
         let f = try!(inner.open_file_for_cursor());
         let cursor = try!(Self::get_cursor_on_active_segment(inner, &*st, g, f));
+        Ok(cursor)
+    }
+
+    fn open_cursor_on_page(inner: &std::sync::Arc<InnerPart>, pg: PageNum) -> Result<ChildCursor> {
+        let mut buf = try!(Self::get_loaner_page(inner));
+        let f = try!(inner.open_file_for_cursor());
+        {
+            let f = &mut *(f.borrow_mut());
+            try!(utils::SeekPage(f, buf.len(), pg));
+            try!(misc::io::read_fully(f, &mut buf));
+        }
+
+        let cursor = try!(ChildCursor::new(&inner.path, f, pg, buf));
+        Ok(cursor)
+    }
+
+    fn open_cursor_on_leaf_page(inner: &std::sync::Arc<InnerPart>, pg: PageNum) -> Result<LeafCursor> {
+        let mut buf = try!(Self::get_loaner_page(inner));
+        let f = try!(inner.open_file_for_cursor());
+        {
+            let f = &mut *(f.borrow_mut());
+            try!(utils::SeekPage(f, buf.len(), pg));
+            try!(misc::io::read_fully(f, &mut buf));
+        }
+
+        let cursor = try!(LeafCursor::new(&inner.path, f, pg, buf));
+        Ok(cursor)
+    }
+
+    fn open_cursor_on_parent_page(inner: &std::sync::Arc<InnerPart>, pg: PageNum) -> Result<ParentPageCursor> {
+        let mut buf = try!(Self::get_loaner_page(inner));
+        let f = try!(inner.open_file_for_cursor());
+        {
+            let f = &mut *(f.borrow_mut());
+            try!(utils::SeekPage(f, buf.len(), pg));
+            try!(misc::io::read_fully(f, &mut buf));
+        }
+
+        let cursor = try!(ParentPageCursor::new(&inner.path, f, pg, buf));
         Ok(cursor)
     }
 

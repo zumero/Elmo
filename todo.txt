@@ -1,13 +1,20 @@
 
+perf problem with storing locations of each page in parent pages?
+    seek doesn't need them.
+    next/prev doesn't need them.
+    so most of the time, they're not needed.
+    but they take up space, so lots fewer things fit in a parent page
+    which means the btree gets deeper
+    store locations elsewhere?
+    sidecar page for every parent page, just to store locations?
+
+any way to represent/store keys as deltas?
+
 need more tests of large overflows, especially with block allocation
 issues, fragmentation, etc.
 
 drop db needs to wait until threads end?  need a way to wait until
 threads end?
-
-if we need lots of blocks for a given segment, do we really want
-to use a little blocks of 1-2 pages just because they are on the
-free list?
 
 it might be nice for merges to pass a hint down to create_segment()
 which estimates how many pages will be needed so that it can

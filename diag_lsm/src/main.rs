@@ -33,6 +33,56 @@ fn dump_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     Ok(())
 }
 
+fn show_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let cursor = try!(db.open_cursor_on_page(pgnum));
+    let pt = cursor.page_type();
+    println!("page type: {:?}", pt);
+    // TODO
+    Ok(())
+}
+
+fn show_leaf_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let mut cursor = try!(db.open_cursor_on_leaf_page(pgnum));
+    try!(cursor.First());
+    while cursor.IsValid() {
+        {
+            let k = try!(cursor.KeyRef());
+            println!("k: {:?}", k);
+            let v = try!(cursor.ValueRef());
+            //println!("v: {:?}", v);
+            //let q = try!(v.into_boxed_slice());
+        }
+        try!(cursor.Next());
+    }
+    Ok(())
+}
+
+fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let cursor = try!(db.open_cursor_on_parent_page(pgnum));
+    let pt = cursor.child_page_type();
+    println!("child page type: {:?}", pt);
+    let items = cursor.items();
+    println!("item count: {}", items.len());
+    for i in 0 .. items.len() {
+        println!("    page: {}", items[i].page());
+        let first_key = items[i].first_key();
+        println!("        first_key: {:?}", first_key.key());
+        let last_key = items[i].last_key();
+        match last_key {
+            &Some(ref last_key) => {
+                println!("        last_key: {:?}", last_key.key());
+            },
+            &None => {
+                println!("        last_key: None");
+            },
+        }
+    }
+    Ok(())
+}
+
 fn list_segments(name: &str) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let (segments, infos) = try!(db.list_segments());
@@ -64,6 +114,66 @@ fn list_keys(name: &str) -> Result<(),lsm::Error> {
             //let q = try!(v.into_boxed_slice());
         }
         try!(cursor.Next());
+    }
+    Ok(())
+}
+
+fn seek_string(name: &str, key: String, sop: String) -> Result<(),lsm::Error> {
+    let sop = 
+        match sop.as_str() {
+            "eq" => lsm::SeekOp::SEEK_EQ,
+            "le" => lsm::SeekOp::SEEK_LE,
+            "ge" => lsm::SeekOp::SEEK_GE,
+            _ => return Err(lsm::Error::Misc(String::from("invalid sop"))),
+        };
+    let k = key.into_bytes().into_boxed_slice();
+    let k = lsm::KeyRef::from_boxed_slice(k);
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let mut cursor = try!(db.open_cursor());
+    let sr = try!(cursor.SeekRef(&k, sop));
+    println!("sr: {:?}", sr);
+    if cursor.IsValid() {
+        {
+            let k = try!(cursor.KeyRef());
+            println!("k: {:?}", k);
+            let v = try!(cursor.LiveValueRef());
+            println!("v: {:?}", v);
+        }
+    }
+    Ok(())
+}
+
+fn seek_bytes(name: &str, k: Box<[u8]>, sop: String) -> Result<(),lsm::Error> {
+    let sop = 
+        match sop.as_str() {
+            "eq" => lsm::SeekOp::SEEK_EQ,
+            "le" => lsm::SeekOp::SEEK_LE,
+            "ge" => lsm::SeekOp::SEEK_GE,
+            _ => return Err(lsm::Error::Misc(String::from("invalid sop"))),
+        };
+    let k = lsm::KeyRef::from_boxed_slice(k);
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let mut cursor = try!(db.open_cursor());
+    let sr = try!(cursor.SeekRef(&k, sop));
+    println!("RESULT sr: {:?}", sr);
+    if cursor.IsValid() {
+        {
+            let k = try!(cursor.KeyRef());
+            println!("k: {:?}", k);
+            let v = try!(cursor.LiveValueRef());
+            println!("v: {:?}", v);
+        }
+        for x in 0 .. 20 {
+            try!(cursor.Next());
+            if cursor.IsValid() {
+                let k = try!(cursor.KeyRef());
+                println!("    k: {:?}", k);
+                let v = try!(cursor.LiveValueRef());
+                println!("    v: {:?}", v);
+            } else {
+                break;
+            }
+        }
     }
     Ok(())
 }
@@ -152,6 +262,7 @@ fn result_main() -> Result<(),lsm::Error> {
     let cmd = args[2].as_str();
     match cmd {
         "add_random" => {
+            println!("add_numbers count seed klen vlen");
             if args.len() < 7 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
@@ -162,6 +273,7 @@ fn result_main() -> Result<(),lsm::Error> {
             add_random(name, count, seed, klen, vlen)
         },
         "add_numbers" => {
+            println!("add_numbers count start step");
             if args.len() < 6 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
@@ -169,6 +281,59 @@ fn result_main() -> Result<(),lsm::Error> {
             let start = args[4].parse::<u64>().unwrap();
             let step = args[5].parse::<u64>().unwrap();
             add_numbers(name, count, start, step)
+        },
+        "show_page" => {
+            println!("show_page pagenum");
+            if args.len() < 4 {
+                return Err(lsm::Error::Misc(String::from("too few args")));
+            }
+            let pgnum = args[3].parse::<u32>().unwrap();
+            show_page(name, pgnum)
+        },
+        "show_leaf_page" => {
+            println!("show_leaf_page pagenum");
+            if args.len() < 4 {
+                return Err(lsm::Error::Misc(String::from("too few args")));
+            }
+            let pgnum = args[3].parse::<u32>().unwrap();
+            show_leaf_page(name, pgnum)
+        },
+        "show_parent_page" => {
+            println!("show_parent_page pagenum");
+            if args.len() < 4 {
+                return Err(lsm::Error::Misc(String::from("too few args")));
+            }
+            let pgnum = args[3].parse::<u32>().unwrap();
+            show_parent_page(name, pgnum)
+        },
+        "seek_string" => {
+            println!("seek_string key sop");
+            if args.len() < 5 {
+                return Err(lsm::Error::Misc(String::from("too few args")));
+            }
+            let key = args[3].clone();
+            let sop = args[4].clone();
+            seek_string(name, key, sop)
+        },
+        "seek_bytes" => {
+            println!("usage: seek_bytes sop numbytes b1 b2 b3 ... ");
+            if args.len() < 5 {
+                return Err(lsm::Error::Misc(String::from("too few args")));
+            }
+            let sop = args[3].clone();
+            let count = args[4].parse::<usize>().unwrap();
+            if count == 0 {
+                return Err(lsm::Error::Misc(String::from("count cannot be 0")));
+            }
+            if args.len() < 5 + count {
+                return Err(lsm::Error::Misc(String::from("too few args")));
+            }
+            let mut k = Vec::with_capacity(count);
+            for i in 0 .. count {
+                let b = args[5 + i].parse::<u8>().unwrap();
+                k.push(b);
+            }
+            seek_bytes(name, k.into_boxed_slice(), sop)
         },
         "merge" => {
             if args.len() < 6 {
