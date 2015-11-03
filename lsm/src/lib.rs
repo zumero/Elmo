@@ -3450,7 +3450,8 @@ impl PageCursor {
                     PageCursor::Leaf(sub)
                 },
                 PageType::PARENT_NODE => {
-                    let sub = try!(ParentCursor::new_already_read_page(path, f, pagenum, buf));
+                    let page = try!(ParentPage::new_already_read_page(path, f, pagenum, buf));
+                    let sub = try!(ParentCursor::new(page));
                     PageCursor::Parent(sub)
                 },
                 PageType::OVERFLOW_NODE => {
@@ -3692,7 +3693,7 @@ impl ParentPageItem {
 
 }
 
-pub struct ParentCursor {
+pub struct ParentPage {
     path: String,
     f: std::rc::Rc<std::cell::RefCell<File>>,
     pr: misc::Lend<Box<[u8]>>,
@@ -3701,29 +3702,19 @@ pub struct ParentCursor {
     prefix: Option<Box<[u8]>>,
     children: Vec<ParentPageItem>,
 
-    cur: Option<usize>,
-    sub: Box<PageCursor>,
 }
 
-impl ParentCursor {
+impl ParentPage {
     fn new_already_read_page(path: &str, 
            f: std::rc::Rc<std::cell::RefCell<File>>,
            pagenum: PageNum,
            buf: misc::Lend<Box<[u8]>>
-          ) -> Result<ParentCursor> {
+          ) -> Result<ParentPage> {
 
         let (prefix, children) = try!(Self::parse_page(&buf));
         assert!(children.len() > 0);
 
-        // TODO it's a little silly here to construct a Lend<>
-        let child_buf = vec![0; buf.len()].into_boxed_slice();
-        let done_page = move |_| -> () {
-        };
-        let mut child_buf = misc::Lend::new(child_buf, box done_page);
-
-        let sub = try!(PageCursor::new(path, f.clone(), children[0].page, child_buf));
-
-        let res = ParentCursor {
+        let res = ParentPage {
             path: String::from(path),
             f: f,
             pr: buf,
@@ -3732,8 +3723,6 @@ impl ParentCursor {
             prefix: prefix,
             children: children,
 
-            cur: Some(0),
-            sub: box sub,
         };
 
         if cfg!(expensive_check) 
@@ -3744,12 +3733,12 @@ impl ParentCursor {
         Ok(res)
     }
 
-    pub fn child_page_type(&self) -> PageType {
-        self.sub.page_type()
-    }
-
     pub fn items(&self) -> &Vec<ParentPageItem> {
         &self.children
+    }
+
+    fn count_items(&self) -> usize {
+        self.children.len()
     }
 
     fn verify_child_keys(&self) -> Result<()> {
@@ -3864,13 +3853,6 @@ impl ParentCursor {
         Ok((prefix, children))
     }
 
-    fn set_child(&mut self, i: usize) -> Result<()> {
-        let pg = &self.children[i];
-        try!(self.sub.read_page(pg.page));
-        self.cur = Some(i);
-        Ok(())
-    }
-
     fn read_page(&mut self, pgnum: PageNum) -> Result<()> {
         {
             let f = &mut *(self.f.borrow_mut());
@@ -3921,11 +3903,62 @@ impl ParentCursor {
         }
     }
 
+    fn get_child_cursor(&self, i: usize) -> Result<PageCursor> {
+        // TODO it's a little silly here to construct a Lend<>
+        let child_buf = vec![0; self.pr.len()].into_boxed_slice();
+        let done_page = move |_| -> () {
+        };
+        let mut child_buf = misc::Lend::new(child_buf, box done_page);
+
+        let sub = try!(PageCursor::new(&self.path, self.f.clone(), self.children[i].page, child_buf));
+        Ok(sub)
+    }
+
+    fn get_child_pagenum(&self, i:usize) -> PageNum {
+        self.children[i].page
+    }
+}
+
+pub struct ParentCursor {
+    page: ParentPage,
+    cur: Option<usize>,
+    sub: Box<PageCursor>,
+}
+
+impl ParentCursor {
+    fn new(page: ParentPage,) -> Result<ParentCursor> {
+
+        let sub = try!(page.get_child_cursor(0));
+
+        let res = ParentCursor {
+            page: page,
+            cur: Some(0),
+            sub: box sub,
+        };
+
+        Ok(res)
+    }
+
+    pub fn child_page_type(&self) -> PageType {
+        self.sub.page_type()
+    }
+
+    fn set_child(&mut self, i: usize) -> Result<()> {
+        let pagenum = self.page.get_child_pagenum(i);
+        try!(self.sub.read_page(pagenum));
+        self.cur = Some(i);
+        Ok(())
+    }
+
+    fn read_page(&mut self, pgnum: PageNum) -> Result<()> {
+        self.page.read_page(pgnum)
+    }
+
     fn seek(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
         //println!("parent page: {}  search: kq = {:?},  sop = {:?}", self.pagenum, k, sop);
 
-        for i in 0 .. self.children.len() {
-            let look = try!(self.key_in_child_range(i, k));
+        for i in 0 .. self.page.count_items() {
+            let look = try!(self.page.key_in_child_range(i, k));
             //println!("    in page {:?} : {:?}", self.children[i].page, look);
             match look {
                 KeyInRange::EqualFirst => {
@@ -3998,7 +4031,7 @@ impl ParentCursor {
         // greater than the last item.
         match sop {
             SeekOp::SEEK_LE => {
-                let last_child = self.children.len() - 1;
+                let last_child = self.page.count_items() - 1;
                 try!(self.set_child(last_child));
                 try!(self.sub.Last());
                 return Ok(SeekResult::Unequal);
@@ -4074,7 +4107,7 @@ impl ICursor for ParentCursor {
     }
 
     fn Last(&mut self) -> Result<()> {
-        let last_child = self.children.len() - 1;
+        let last_child = self.page.count_items() - 1;
         try!(self.set_child(last_child));
         self.sub.Last()
     }
@@ -4086,7 +4119,7 @@ impl ICursor for ParentCursor {
             },
             Some(i) => {
                 try!(self.sub.Next());
-                if !self.sub.IsValid() && i + 1 < self.children.len() {
+                if !self.sub.IsValid() && i + 1 < self.page.count_items() {
                     try!(self.set_child(i + 1));
                     self.sub.First()
                 } else {
@@ -5056,7 +5089,8 @@ impl InnerPart {
             try!(misc::io::read_fully(f, &mut buf));
         }
 
-        let cursor = try!(ParentCursor::new_already_read_page(&inner.path, f, pg, buf));
+        let page = try!(ParentPage::new_already_read_page(&inner.path, f, pg, buf));
+        let cursor = try!(ParentCursor::new(page));
         Ok(cursor)
     }
 
