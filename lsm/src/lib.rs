@@ -3130,7 +3130,7 @@ pub struct LeafPage {
 }
 
 impl LeafPage {
-    fn new(path: &str, 
+    fn new_already_read_page(path: &str, 
            f: std::rc::Rc<std::cell::RefCell<File>>,
            pagenum: PageNum,
            buf: misc::Lend<Box<[u8]>>
@@ -3445,12 +3445,12 @@ impl PageCursor {
         let sub = 
             match pt {
                 PageType::LEAF_NODE => {
-                    let page = try!(LeafPage::new(path, f, pagenum, buf));
+                    let page = try!(LeafPage::new_already_read_page(path, f, pagenum, buf));
                     let sub = LeafCursor::new(page);
                     PageCursor::Leaf(sub)
                 },
                 PageType::PARENT_NODE => {
-                    let sub = try!(ParentCursor::new(path, f, pagenum, buf));
+                    let sub = try!(ParentCursor::new_already_read_page(path, f, pagenum, buf));
                     PageCursor::Parent(sub)
                 },
                 PageType::OVERFLOW_NODE => {
@@ -3706,7 +3706,7 @@ pub struct ParentCursor {
 }
 
 impl ParentCursor {
-    fn new(path: &str, 
+    fn new_already_read_page(path: &str, 
            f: std::rc::Rc<std::cell::RefCell<File>>,
            pagenum: PageNum,
            buf: misc::Lend<Box<[u8]>>
@@ -5034,13 +5034,14 @@ impl InnerPart {
     fn open_cursor_on_leaf_page(inner: &std::sync::Arc<InnerPart>, pg: PageNum) -> Result<LeafCursor> {
         let mut buf = try!(Self::get_loaner_page(inner));
         let f = try!(inner.open_file_for_cursor());
+
         {
             let f = &mut *(f.borrow_mut());
             try!(utils::SeekPage(f, buf.len(), pg));
             try!(misc::io::read_fully(f, &mut buf));
         }
 
-        let page = try!(LeafPage::new(&inner.path, f, pg, buf));
+        let page = try!(LeafPage::new_already_read_page(&inner.path, f, pg, buf));
         let cursor = LeafCursor::new(page);
         Ok(cursor)
     }
@@ -5048,13 +5049,14 @@ impl InnerPart {
     fn open_cursor_on_parent_page(inner: &std::sync::Arc<InnerPart>, pg: PageNum) -> Result<ParentCursor> {
         let mut buf = try!(Self::get_loaner_page(inner));
         let f = try!(inner.open_file_for_cursor());
+
         {
             let f = &mut *(f.borrow_mut());
             try!(utils::SeekPage(f, buf.len(), pg));
             try!(misc::io::read_fully(f, &mut buf));
         }
 
-        let cursor = try!(ParentCursor::new(&inner.path, f, pg, buf));
+        let cursor = try!(ParentCursor::new_already_read_page(&inner.path, f, pg, buf));
         Ok(cursor)
     }
 
