@@ -3404,9 +3404,15 @@ impl PageCursor {
     fn new(path: &str, 
            f: std::rc::Rc<std::cell::RefCell<File>>,
            pagenum: PageNum,
-           buf: misc::Lend<Box<[u8]>>
+           mut buf: misc::Lend<Box<[u8]>>
           ) -> Result<PageCursor> {
-// TODO maybe PageCursor should do the page read here?
+
+        {
+            let f = &mut *(f.borrow_mut());
+            try!(utils::SeekPage(f, buf.len(), pagenum));
+            try!(misc::io::read_fully(f, &mut buf));
+        }
+
         let pt = try!(PageType::from_u8(buf[0]));
         let sub = 
             match pt {
@@ -3686,12 +3692,6 @@ impl ParentPageCursor {
         };
         let mut child_buf = misc::Lend::new(child_buf, box done_page);
 
-        {
-            let f = &mut *(f.borrow_mut());
-            try!(utils::SeekPage(f, child_buf.len(), children[0].page));
-            try!(misc::io::read_fully(f, &mut child_buf));
-        }
-
         let sub = try!(PageCursor::new(path, f.clone(), children[0].page, child_buf));
 
         let res = ParentPageCursor {
@@ -3745,11 +3745,6 @@ impl ParentPageCursor {
             let done_page = move |_| -> () {
             };
             let mut child_buf = misc::Lend::new(child_buf, box done_page);
-            {
-                let f = &mut *(self.f.borrow_mut());
-                try!(utils::SeekPage(f, child_buf.len(), self.children[i].page));
-                try!(misc::io::read_fully(f, &mut child_buf));
-            }
             let mut sub = try!(PageCursor::new(&self.path, self.f.clone(), self.children[i].page, child_buf));
             try!(sub.First());
             assert!(sub.IsValid());
@@ -4103,12 +4098,6 @@ impl SegmentCursor {
            mut buf: misc::Lend<Box<[u8]>>,
            location: SegmentLocation
           ) -> Result<SegmentCursor> {
-
-        {
-            let f = &mut *(f.borrow_mut());
-            try!(utils::SeekPage(f, buf.len(), location.root_page));
-            try!(misc::io::read_fully(f, &mut buf));
-        }
 
         let sub = try!(PageCursor::new(path, f, location.root_page, buf));
 
@@ -5009,12 +4998,6 @@ impl InnerPart {
     fn open_cursor_on_page(inner: &std::sync::Arc<InnerPart>, pg: PageNum) -> Result<PageCursor> {
         let mut buf = try!(Self::get_loaner_page(inner));
         let f = try!(inner.open_file_for_cursor());
-        {
-            let f = &mut *(f.borrow_mut());
-            try!(utils::SeekPage(f, buf.len(), pg));
-            try!(misc::io::read_fully(f, &mut buf));
-        }
-
         let cursor = try!(PageCursor::new(&inner.path, f, pg, buf));
         Ok(cursor)
     }
