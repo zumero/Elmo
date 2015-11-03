@@ -3218,6 +3218,7 @@ impl LeafPage {
         Ok(())
     }
 
+    // TODO shouldn't we have a method that returns the KeyInLeaf?
     #[inline]
     fn key<'a>(&'a self, n: usize) -> Result<KeyRef<'a>> { 
         let prefix: Option<&[u8]> = 
@@ -3229,6 +3230,7 @@ impl LeafPage {
         Ok(k)
     }
 
+    // TODO shouldn't we have a method that returns the ValueInLeaf?
     fn value<'a>(&'a self, n: usize) -> Result<ValueRef<'a>> {
         match &self.pairs[n].value {
             &ValueInLeaf::Tombstone => {
@@ -3245,6 +3247,7 @@ impl LeafPage {
         }
     }
 
+    // TODO shouldn't we have a method that returns the ValueInLeaf?
     fn value_len<'a>(&'a self, n: usize) -> Result<Option<usize>> {
         match &self.pairs[n].value {
             &ValueInLeaf::Tombstone => {
@@ -3296,23 +3299,22 @@ impl LeafPage {
 
 pub struct LeafCursor {
     page: LeafPage,
-    // TODO rename this
-    currentKey: Option<usize>,
+    cur: Option<usize>,
 }
 
 impl LeafCursor {
     fn new(page: LeafPage) -> LeafCursor {
         LeafCursor {
             page: page,
-            currentKey: None,
+            cur: None,
         }
     }
 
     fn seek(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
         let tmp_countLeafKeys = self.page.count_keys();
         let (newCur, equal) = try!(self.page.search(k, 0, (tmp_countLeafKeys - 1), sop, None, None));
-        self.currentKey = newCur;
-        if self.currentKey.is_none() {
+        self.cur = newCur;
+        if self.cur.is_none() {
             Ok(SeekResult::Invalid)
         } else if equal {
             Ok(SeekResult::Equal)
@@ -3328,7 +3330,7 @@ impl LeafCursor {
 
 impl ICursor for LeafCursor {
     fn IsValid(&self) -> bool {
-        if let Some(i) = self.currentKey {
+        if let Some(i) = self.cur {
             assert!(i < self.page.count_keys());
             true
         } else {
@@ -3347,55 +3349,55 @@ impl ICursor for LeafCursor {
     }
 
     fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
-        match self.currentKey {
+        match self.cur {
             None => {
                 Err(Error::CursorNotValid)
             },
-            Some(currentKey) => {
-                self.page.key(currentKey)
+            Some(cur) => {
+                self.page.key(cur)
             },
         }
     }
 
     fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
-        match self.currentKey {
+        match self.cur {
             None => {
                 Err(Error::CursorNotValid)
             },
-            Some(currentKey) => {
-                self.page.value(currentKey)
+            Some(cur) => {
+                self.page.value(cur)
             }
         }
     }
 
     fn ValueLength(&self) -> Result<Option<usize>> {
-        match self.currentKey {
+        match self.cur {
             None => {
                 Err(Error::CursorNotValid)
             },
-            Some(currentKey) => {
-                self.page.value_len(currentKey)
+            Some(cur) => {
+                self.page.value_len(cur)
             }
         }
     }
 
     fn First(&mut self) -> Result<()> {
-        self.currentKey = Some(0);
+        self.cur = Some(0);
         Ok(())
     }
 
     fn Last(&mut self) -> Result<()> {
-        self.currentKey = Some(self.page.count_keys() - 1);
+        self.cur = Some(self.page.count_keys() - 1);
         Ok(())
     }
 
     fn Next(&mut self) -> Result<()> {
-        match self.currentKey {
+        match self.cur {
             Some(cur) => {
                 if (cur + 1) < self.page.count_keys() {
-                    self.currentKey = Some(cur + 1);
+                    self.cur = Some(cur + 1);
                 } else {
-                    self.currentKey = None;
+                    self.cur = None;
                 }
             },
             None => {
@@ -3405,12 +3407,12 @@ impl ICursor for LeafCursor {
     }
 
     fn Prev(&mut self) -> Result<()> {
-        match self.currentKey {
+        match self.cur {
             Some(cur) => {
                 if cur > 0 {
-                    self.currentKey = Some(cur - 1);
+                    self.cur = Some(cur - 1);
                 } else {
-                    self.currentKey = None;
+                    self.cur = None;
                 }
             },
             None => {
