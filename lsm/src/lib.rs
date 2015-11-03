@@ -3425,7 +3425,7 @@ impl ICursor for LeafCursor {
 
 pub enum PageCursor {
     Leaf(LeafCursor),
-    Parent(ParentPageCursor),
+    Parent(ParentCursor),
 }
 
 impl PageCursor {
@@ -3450,7 +3450,7 @@ impl PageCursor {
                     PageCursor::Leaf(sub)
                 },
                 PageType::PARENT_NODE => {
-                    let sub = try!(ParentPageCursor::new(path, f, pagenum, buf));
+                    let sub = try!(ParentCursor::new(path, f, pagenum, buf));
                     PageCursor::Parent(sub)
                 },
                 PageType::OVERFLOW_NODE => {
@@ -3692,7 +3692,7 @@ impl ParentPageItem {
 
 }
 
-pub struct ParentPageCursor {
+pub struct ParentCursor {
     path: String,
     f: std::rc::Rc<std::cell::RefCell<File>>,
     pr: misc::Lend<Box<[u8]>>,
@@ -3701,16 +3701,16 @@ pub struct ParentPageCursor {
     prefix: Option<Box<[u8]>>,
     children: Vec<ParentPageItem>,
 
-    cur_child: Option<usize>,
+    cur: Option<usize>,
     sub: Box<PageCursor>,
 }
 
-impl ParentPageCursor {
+impl ParentCursor {
     fn new(path: &str, 
            f: std::rc::Rc<std::cell::RefCell<File>>,
            pagenum: PageNum,
            buf: misc::Lend<Box<[u8]>>
-          ) -> Result<ParentPageCursor> {
+          ) -> Result<ParentCursor> {
 
         let (prefix, children) = try!(Self::parse_page(&buf));
         assert!(children.len() > 0);
@@ -3723,7 +3723,7 @@ impl ParentPageCursor {
 
         let sub = try!(PageCursor::new(path, f.clone(), children[0].page, child_buf));
 
-        let res = ParentPageCursor {
+        let res = ParentCursor {
             path: String::from(path),
             f: f,
             pr: buf,
@@ -3732,7 +3732,7 @@ impl ParentPageCursor {
             prefix: prefix,
             children: children,
 
-            cur_child: Some(0),
+            cur: Some(0),
             sub: box sub,
         };
 
@@ -3867,7 +3867,7 @@ impl ParentPageCursor {
     fn set_child(&mut self, i: usize) -> Result<()> {
         let pg = &self.children[i];
         try!(self.sub.read_page(pg.page));
-        self.cur_child = Some(i);
+        self.cur = Some(i);
         Ok(())
     }
 
@@ -3954,7 +3954,7 @@ impl ParentPageCursor {
                         // k is less than the first one
                         match sop {
                             SeekOp::SEEK_LE => {
-                                self.cur_child = None;
+                                self.cur = None;
                                 return Ok(SeekResult::Invalid);
                             },
                             SeekOp::SEEK_GE => {
@@ -3963,7 +3963,7 @@ impl ParentPageCursor {
                                 return Ok(SeekResult::Unequal);
                             },
                             SeekOp::SEEK_EQ => {
-                                self.cur_child = None;
+                                self.cur = None;
                                 return Ok(SeekResult::Invalid);
                             },
                         }
@@ -3982,7 +3982,7 @@ impl ParentPageCursor {
                                 return Ok(SeekResult::Unequal);
                             },
                             SeekOp::SEEK_EQ => {
-                                self.cur_child = None;
+                                self.cur = None;
                                 return Ok(SeekResult::Invalid);
                             },
                         }
@@ -4004,11 +4004,11 @@ impl ParentPageCursor {
                 return Ok(SeekResult::Unequal);
             },
             SeekOp::SEEK_GE => {
-                self.cur_child = None;
+                self.cur = None;
                 return Ok(SeekResult::Invalid);
             },
             SeekOp::SEEK_EQ => {
-                self.cur_child = None;
+                self.cur = None;
                 return Ok(SeekResult::Invalid);
             },
         }
@@ -4016,9 +4016,9 @@ impl ParentPageCursor {
 
 }
 
-impl ICursor for ParentPageCursor {
+impl ICursor for ParentCursor {
     fn IsValid(&self) -> bool {
-        match self.cur_child {
+        match self.cur {
             None => false,
             Some(_) => {
                 self.sub.IsValid()
@@ -4036,7 +4036,7 @@ impl ICursor for ParentPageCursor {
     }
 
     fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
-        match self.cur_child {
+        match self.cur {
             None => {
                 Err(Error::CursorNotValid)
             },
@@ -4047,7 +4047,7 @@ impl ICursor for ParentPageCursor {
     }
 
     fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
-        match self.cur_child {
+        match self.cur {
             None => {
                 Err(Error::CursorNotValid)
             },
@@ -4058,7 +4058,7 @@ impl ICursor for ParentPageCursor {
     }
 
     fn ValueLength(&self) -> Result<Option<usize>> {
-        match self.cur_child {
+        match self.cur {
             None => {
                 Err(Error::CursorNotValid)
             },
@@ -4080,7 +4080,7 @@ impl ICursor for ParentPageCursor {
     }
 
     fn Next(&mut self) -> Result<()> {
-        match self.cur_child {
+        match self.cur {
             None => {
                 Err(Error::CursorNotValid)
             },
@@ -4097,7 +4097,7 @@ impl ICursor for ParentPageCursor {
     }
 
     fn Prev(&mut self) -> Result<()> {
-        match self.cur_child {
+        match self.cur {
             None => {
                 Err(Error::CursorNotValid)
             },
@@ -4630,7 +4630,7 @@ impl DatabaseFile {
         InnerPart::open_cursor_on_leaf_page(&self.inner, pg)
     }
 
-    pub fn open_cursor_on_parent_page(&self, pg: PageNum) -> Result<ParentPageCursor> {
+    pub fn open_cursor_on_parent_page(&self, pg: PageNum) -> Result<ParentCursor> {
         InnerPart::open_cursor_on_parent_page(&self.inner, pg)
     }
 
@@ -5045,7 +5045,7 @@ impl InnerPart {
         Ok(cursor)
     }
 
-    fn open_cursor_on_parent_page(inner: &std::sync::Arc<InnerPart>, pg: PageNum) -> Result<ParentPageCursor> {
+    fn open_cursor_on_parent_page(inner: &std::sync::Arc<InnerPart>, pg: PageNum) -> Result<ParentCursor> {
         let mut buf = try!(Self::get_loaner_page(inner));
         let f = try!(inner.open_file_for_cursor());
         {
@@ -5054,7 +5054,7 @@ impl InnerPart {
             try!(misc::io::read_fully(f, &mut buf));
         }
 
-        let cursor = try!(ParentPageCursor::new(&inner.path, f, pg, buf));
+        let cursor = try!(ParentCursor::new(&inner.path, f, pg, buf));
         Ok(cursor)
     }
 
