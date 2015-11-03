@@ -1119,6 +1119,10 @@ impl PageBuilder {
         self.cur = 0;
     }
 
+    fn sofar(&self) -> usize {
+        self.cur
+    }
+
     fn Write(&self, strm: &mut Write) -> io::Result<()> {
         strm.write_all(&*self.buf)
     }
@@ -2131,13 +2135,11 @@ impl pgitem {
             varint::space_needed_for(self.page as u64) 
             //if cfg!(child_block_list) 
             + self.blocks.encoded_len()
-            + varint::space_needed_for(self.first_key.len_with_overflow_flag() as u64) 
             + self.first_key.need(prefix_len)
             + 
             match self.last_key {
                 Some(ref last_key) => {
-                    varint::space_needed_for(last_key.len_with_overflow_flag() as u64)
-                    + last_key.need(prefix_len)
+                    last_key.need(prefix_len)
                 },
                 None => {
                     varint::space_needed_for(0)
@@ -2330,7 +2332,15 @@ fn create_segment<I>(mut pw: PageWriter,
         // 2 for the stored count
         const LEAF_PAGE_OVERHEAD: usize = 2 + 2;
 
-        fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (KeyWithLocation, Option<KeyWithLocation>, BlockList) {
+        fn calc_page_len(prefix_len: usize, sofar: usize) -> usize {
+            2 // page type and flags
+            + 2 // stored count
+            + varint::space_needed_for(prefix_len as u64)
+            + prefix_len
+            + sofar // sum of size of all the actual items
+        }
+
+        fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (KeyWithLocation, Option<KeyWithLocation>, BlockList, usize) {
             pb.Reset();
             pb.PutByte(PageType::LEAF_NODE.to_u8());
             pb.PutByte(0u8); // flags
@@ -2392,7 +2402,7 @@ fn create_segment<I>(mut pw: PageWriter,
             if st.keys_in_this_leaf.len() == 0 {
                 // there was only one key in this leaf.
                 blocks.sort_and_consolidate();
-                (first_key, None, blocks)
+                (first_key, None, blocks, pb.sofar())
             } else {
                 if st.keys_in_this_leaf.len() > 1 {
                     // deal with all the remaining keys except the last one
@@ -2410,15 +2420,15 @@ fn create_segment<I>(mut pw: PageWriter,
                     lp.key
                 };
                 blocks.sort_and_consolidate();
-                (first_key, Some(last_key), blocks)
+                (first_key, Some(last_key), blocks, pb.sofar())
             }
         }
 
         fn write_leaf(st: &mut LeafState, 
                         pb: &mut PageBuilder, 
                         pw: &mut PageWriter,
-                       ) -> Result<()> {
-            let (first_key, last_key, blocks) = build_leaf(st, pb);
+                       ) -> Result<usize> {
+            let (first_key, last_key, blocks, len_page) = build_leaf(st, pb);
             //println!("leaf blocklist: {:?}", blocks);
             //println!("leaf blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
             assert!(st.keys_in_this_leaf.is_empty());
@@ -2432,7 +2442,7 @@ fn create_segment<I>(mut pw: PageWriter,
             st.leaves.push(pg);
             st.sofarLeaf = 0;
             st.prefixLen = 0;
-            Ok(())
+            Ok(len_page)
         }
 
         let pgsz = pw.page_size();
@@ -2521,6 +2531,7 @@ fn create_segment<I>(mut pw: PageWriter,
 
             let vloc = {
                 let maxValueInline = {
+                    // TODO use calc_page_len
                     let fixed_costs_on_new_page =
                         LEAF_PAGE_OVERHEAD
                         + 2 // worst case prefixlen varint
@@ -2538,6 +2549,7 @@ fn create_segment<I>(mut pw: PageWriter,
                 // block list for the value.  the hard limit, basically, is:  we cannot get
                 // into a state where the key and value cannot fit on the same page.
 
+                // TODO use calc_page_len
                 let hard_limit_for_value_overflow =
                     pgsz
                     - LEAF_PAGE_OVERHEAD
@@ -2610,42 +2622,44 @@ fn create_segment<I>(mut pw: PageWriter,
                 }
             }
 
-            let fit = {
-                let newPrefixLen = calc_prefix_len(&st, &k, &kloc);
-                let sofar = 
-                    if newPrefixLen != st.prefixLen {
-                        assert!(st.prefixLen == 0 || newPrefixLen < st.prefixLen);
+            let fits = {
+                let would_be_prefix_len = calc_prefix_len(&st, &k, &kloc);
+                let would_be_sofar = 
+                    if would_be_prefix_len != st.prefixLen {
+                        assert!(st.prefixLen == 0 || would_be_prefix_len < st.prefixLen);
                         // the prefixLen would change with the addition of this key,
                         // so we need to recalc sofar
-                        let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(newPrefixLen) ).sum();;
+                        let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(would_be_prefix_len) ).sum();;
                         sum
                     } else {
                         st.sofarLeaf
                     };
-                let needed = kloc.need(&k, newPrefixLen) + vloc.need();
-                let used = sofar + LEAF_PAGE_OVERHEAD + varint::space_needed_for(newPrefixLen as u64) + newPrefixLen;
-                if pgsz > used {
-                    let available = pgsz - used;
-                    (available >= needed)
+                let would_be_len_page = calc_page_len(would_be_prefix_len, would_be_sofar);
+                if pgsz > would_be_len_page {
+                    let available = pgsz - would_be_len_page;
+                    let needed = kloc.need(&k, would_be_prefix_len) + vloc.need();
+                    available >= needed
                 } else {
                     false
                 }
             };
-            let writeThisPage = (!st.keys_in_this_leaf.is_empty()) && (!fit);
 
-            if writeThisPage {
-                try!(write_leaf(&mut st, pb, pw));
+            if !fits {
+                assert!(st.keys_in_this_leaf.len() > 0);
+                let should_be = calc_page_len(st.prefixLen, st.sofarLeaf);
+                let len_page = try!(write_leaf(&mut st, pb, pw));
+                //println!("should_be = {}   len_page = {}", should_be, len_page);
+                assert!(should_be == len_page);
             }
 
-            // TODO dorky that we calc the prefix len twice here.
-            // explain why.
-            let newPrefixLen = calc_prefix_len(&st, &k, &kloc);
+            // see if the prefix len actually did change
+            let new_prefix_len = calc_prefix_len(&st, &k, &kloc);
             let sofar = 
-                if newPrefixLen != st.prefixLen {
-                    assert!(st.prefixLen == 0 || newPrefixLen < st.prefixLen);
+                if new_prefix_len != st.prefixLen {
+                    assert!(st.prefixLen == 0 || new_prefix_len < st.prefixLen);
                     // the prefixLen will change with the addition of this key,
                     // so we need to recalc sofar
-                    let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(newPrefixLen) ).sum();;
+                    let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(new_prefix_len) ).sum();;
                     sum
                 } else {
                     st.sofarLeaf
@@ -2661,13 +2675,17 @@ fn create_segment<I>(mut pw: PageWriter,
                         value: vloc,
                         };
 
-            st.sofarLeaf = sofar + lp.need(newPrefixLen);
+            st.sofarLeaf = sofar + lp.need(new_prefix_len);
+            st.prefixLen = new_prefix_len;
             st.keys_in_this_leaf.push(lp);
-            st.prefixLen = newPrefixLen;
         }
 
         if !st.keys_in_this_leaf.is_empty() {
-            try!(write_leaf(&mut st, pb, pw));
+            assert!(st.keys_in_this_leaf.len() > 0);
+            let should_be = calc_page_len(st.prefixLen, st.sofarLeaf);
+            let len_page = try!(write_leaf(&mut st, pb, pw));
+            //println!("should_be = {}   len_page = {}", should_be, len_page);
+            assert!(should_be == len_page);
         }
         Ok(st.leaves)
     }
@@ -2678,13 +2696,18 @@ fn create_segment<I>(mut pw: PageWriter,
                            pw: &mut PageWriter,
                            pb: &mut PageBuilder,
                           ) -> Result<Vec<pgitem>> {
-        // 2 for the page type and flags
-        // 2 for the stored count
-        const PARENT_PAGE_OVERHEAD: usize = 2 + 2;
+
+        fn calc_page_len(prefix_len: usize, sofar: usize) -> usize {
+            2 // page type and flags
+            + 2 // stored count
+            + varint::space_needed_for(prefix_len as u64) 
+            + prefix_len 
+            + sofar // sum of size of all the actual items
+        }
 
         fn build_parent_page(st: &mut ParentState, 
                           pb: &mut PageBuilder,
-                          ) -> (KeyWithLocation, Option<KeyWithLocation>, BlockList) {
+                          ) -> (KeyWithLocation, Option<KeyWithLocation>, BlockList, usize) {
             // TODO? assert!(st.items.len() > 1);
             //println!("build_parent_page, prefixLen: {:?}", st.prefixLen);
             //println!("build_parent_page, items: {:?}", st.items);
@@ -2715,7 +2738,6 @@ fn create_segment<I>(mut pw: PageWriter,
             }
 
             fn put_item(pb: &mut PageBuilder, list: &mut BlockList, item: &pgitem, prefix_len: usize) {
-                //println!("item: {:?}", item);
                 pb.PutVarint(item.page as u64);
                 list.add_page_no_reorder(item.page);
                 //if cfg!(child_block_list) 
@@ -2728,20 +2750,15 @@ fn create_segment<I>(mut pw: PageWriter,
                 list.add_blocklist_no_reorder(&item.blocks);
 
                 pb.PutVarint(item.first_key.len_with_overflow_flag());
+                put_key(pb, &item.first_key, prefix_len);
+
                 match item.last_key {
                     Some(ref last_key) => {
                         pb.PutVarint(last_key.len_with_overflow_flag());
-                    },
-                    None => {
-                        pb.PutVarint(0);
-                    },
-                }
-                put_key(pb, &item.first_key, prefix_len);
-                match item.last_key {
-                    Some(ref last_key) => {
                         put_key(pb, &last_key, prefix_len);
                     },
                     None => {
+                        pb.PutVarint(0);
                     },
                 }
             }
@@ -2756,7 +2773,7 @@ fn create_segment<I>(mut pw: PageWriter,
             if st.items.len() == 0 {
                 // there was only one item in this page
                 list.sort_and_consolidate();
-                (first_key, last_key_from_first_item, list)
+                (first_key, last_key_from_first_item, list, pb.sofar())
             } else {
                 if st.items.len() > 1 {
                     // deal with all the remaining items except the last one
@@ -2779,21 +2796,20 @@ fn create_segment<I>(mut pw: PageWriter,
                 assert!(st.items.is_empty());
 
                 list.sort_and_consolidate();
-                (first_key, Some(last_key), list)
+                (first_key, Some(last_key), list, pb.sofar())
             }
         }
 
         fn write_parent_page(st: &mut ParentState, 
                               pb: &mut PageBuilder, 
                               pw: &mut PageWriter,
-                             ) -> Result<()> {
+                             ) -> Result<usize> {
             // assert st.sofar > 0
-            let (first_key, last_key, blocks) = build_parent_page(st, pb);
+            let (first_key, last_key, blocks, len_page) = build_parent_page(st, pb);
             assert!(st.items.is_empty());
             //println!("parent blocklist: {:?}", blocks);
             //println!("parent blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
             let thisPageNumber = try!(pw.write_page(pb.buf()));
-            st.sofar = 0;
             let pg = pgitem {
                 page: thisPageNumber, 
                 blocks: blocks,
@@ -2801,8 +2817,9 @@ fn create_segment<I>(mut pw: PageWriter,
                 last_key: last_key,
             };
             st.nextGeneration.push(pg);
+            st.sofar = 0;
             st.prefixLen = 0;
-            Ok(())
+            Ok(len_page)
         }
 
         let mut st = ParentState {
@@ -2866,11 +2883,11 @@ fn create_segment<I>(mut pw: PageWriter,
             // prefixLen, varint
             // (prefix)
             // key len 1, varint, shifted for overflow flag
-            // key len 2, varint, shifted for overflow flag, 0 if absent
             // key 1
             //     if inline, the key, minus prefix
             //     if overflow, the blocklist (borrowed from child)
-            // key 2
+            // key len 2, varint, shifted for overflow flag, 0 if absent
+            // key 2, if present
             //     if inline, the key, minus prefix
             //     if overflow, the blocklist (borrowed from child)
 
@@ -2881,62 +2898,60 @@ fn create_segment<I>(mut pw: PageWriter,
             // fit inlined here in the parent page.
 
             let fits = {
-                let newPrefixLen = calc_prefix_len(&st, &child);
-                //println!("new prefixLen: {}", newPrefixLen);
-                let needed = child.need(newPrefixLen);
-                let sofar = 
-                    if newPrefixLen != st.prefixLen {
-                        assert!(st.prefixLen == 0 || newPrefixLen < st.prefixLen);
+                let would_be_prefix_len = calc_prefix_len(&st, &child);
+                let would_be_sofar = 
+                    if would_be_prefix_len != st.prefixLen {
+                        assert!(st.prefixLen == 0 || would_be_prefix_len < st.prefixLen);
                         // the prefixLen would change with the addition of this key,
                         // so we need to recalc sofar
-                        let sum = st.items.iter().map(|lp| lp.need(newPrefixLen) ).sum();;
+                        let sum = st.items.iter().map(|lp| lp.need(would_be_prefix_len) ).sum();;
                         sum
                     } else {
                         st.sofar
                     };
-                let used = sofar + PARENT_PAGE_OVERHEAD + varint::space_needed_for(newPrefixLen as u64) + newPrefixLen;
-                if pgsz > used {
-                    let available = pgsz - used;
-                    if available >= needed {
-                        st.prefixLen = newPrefixLen;
-                        true
-                    } else {
-                        false
-                    }
+                let would_be_len_page = calc_page_len(would_be_prefix_len, would_be_sofar);
+                if pgsz > would_be_len_page {
+                    let available = pgsz - would_be_len_page;
+                    available >= child.need(would_be_prefix_len)
                 } else {
                     false
                 }
             };
 
             if !fits {
-                assert!(st.items.len() > 1);
-                try!(write_parent_page(&mut st, pb, pw));
+                assert!(st.items.len() > 0);
+                let should_be = calc_page_len(st.prefixLen, st.sofar);
+                let len_page = try!(write_parent_page(&mut st, pb, pw));
+                //println!("should_be = {}   len_page = {}", should_be, len_page);
+                assert!(should_be == len_page);
                 assert!(st.items.is_empty());
             }
 
-            // TODO dorky that we calc the prefix len twice here.
-            // explain why.
-            let newPrefixLen = calc_prefix_len(&st, &child);
-            //println!("new prefixLen: {}", newPrefixLen);
-            let needed = child.need(newPrefixLen);
+            // see if the prefix len actually did change
+            let new_prefix_len = calc_prefix_len(&st, &child);
             let sofar = 
-                if newPrefixLen != st.prefixLen {
-                    assert!(st.prefixLen == 0 || newPrefixLen < st.prefixLen);
-                    // the prefixLen would change with the addition of this key,
+                if new_prefix_len != st.prefixLen {
+                    assert!(st.prefixLen == 0 || new_prefix_len < st.prefixLen);
+                    // the prefixLen changed with the addition of this item,
                     // so we need to recalc sofar
-                    let sum = st.items.iter().map(|lp| lp.need(newPrefixLen) ).sum();;
+                    let sum = st.items.iter().map(|lp| lp.need(new_prefix_len) ).sum();;
                     sum
                 } else {
                     st.sofar
                 };
-            st.sofar = sofar + needed;
-            st.prefixLen = calc_prefix_len(&st, &child);
+            st.sofar = sofar + child.need(new_prefix_len);
+            st.prefixLen = new_prefix_len;
             st.items.push(child);
         }
 
-        assert!(st.items.len() > 0);
-        try!(write_parent_page(&mut st, pb, pw));
-        assert!(st.items.is_empty());
+        {
+            assert!(st.items.len() > 0);
+            let should_be = calc_page_len(st.prefixLen, st.sofar);
+            let len_page = try!(write_parent_page(&mut st, pb, pw));
+            //println!("should_be = {}   len_page = {}", should_be, len_page);
+            assert!(should_be == len_page);
+            assert!(st.items.is_empty());
+        }
 
         Ok(st.nextGeneration)
     }
@@ -3645,6 +3660,7 @@ pub struct ParentPageCursor {
     pr: misc::Lend<Box<[u8]>>,
     pagenum: PageNum, // TODO diag only?
 
+    prefix: Option<Box<[u8]>>,
     children: Vec<ParentPageItem>,
 
     cur_child: Option<usize>,
@@ -3658,7 +3674,7 @@ impl ParentPageCursor {
            buf: misc::Lend<Box<[u8]>>
           ) -> Result<ParentPageCursor> {
 
-        let children = try!(Self::parse_page(&buf, path));
+        let (prefix, children) = try!(Self::parse_page(&buf, path));
         assert!(children.len() > 0);
 
         if cfg!(expensive_check) 
@@ -3738,6 +3754,7 @@ impl ParentPageCursor {
             pr: buf,
             pagenum: pagenum,
 
+            prefix: prefix,
             children: children,
 
             cur_child: Some(0),
@@ -3755,7 +3772,32 @@ impl ParentPageCursor {
         &self.children
     }
 
-    fn parse_page(pr: &[u8], path: &str) -> Result<Vec<ParentPageItem>> {
+    fn key_at<'a>(&'a self, at: usize) -> Result<KeyRef<'a>> { 
+        let mut cur = at;
+        let klen = varint::read(&self.pr, &mut cur) as usize;
+        let inline = 0 == klen % 2;
+        let klen = klen / 2;
+        if inline {
+            match self.prefix {
+                Some(ref a) => {
+                    Ok(KeyRef::Prefixed(&a, &self.pr[cur .. cur + klen - a.len()]))
+                },
+                None => {
+                    Ok(KeyRef::Array(&self.pr[cur .. cur + klen]))
+                },
+            }
+        } else {
+            let blocks = BlockList::read(&self.pr, &mut cur);
+            // TODO return blocks instead of opening the stream
+            let mut ostrm = try!(OverflowReader::new(&self.path, self.pr.len(), blocks.blocks[0].firstPage, klen));
+            let mut x_k = Vec::with_capacity(klen);
+            try!(ostrm.read_to_end(&mut x_k));
+            let x_k = x_k.into_boxed_slice();
+            Ok(KeyRef::Boxed(x_k))
+        }
+    }
+
+    fn parse_page(pr: &[u8], path: &str) -> Result<(Option<Box<[u8]>>, Vec<ParentPageItem>)> {
         let mut cur = 0;
         let pt = try!(PageType::from_u8(misc::buf_advance::get_byte(pr, &mut cur)));
         if  pt != PageType::PARENT_NODE {
@@ -3825,27 +3867,29 @@ impl ParentPageCursor {
             //if cfg!(child_block_list) 
             let blocks = BlockList::read(pr, &mut cur);
 
-            let klen_1 = varint::read(pr, &mut cur) as usize;
-            let inline_1 = 0 == klen_1 % 2;
-            let klen_1 = klen_1 / 2;
-            //println!("klen_1: {}", klen_1);
+            let key_1 = {
+                let klen = varint::read(pr, &mut cur) as usize;
+                let inline = 0 == klen % 2;
+                let klen = klen / 2;
+                //println!("klen 1: {}", klen);
+                let k = try!(read_key(pr, &mut cur, &prefix, path, inline, klen));
+                k
+            };
 
-            let klen_2 = varint::read(pr, &mut cur) as usize;
-            //println!("raw klen_2: {}", klen_2);
-            // klen_2 == 0 means no second key
-
-            let key_1 = try!(read_key(pr, &mut cur, &prefix, path, inline_1, klen_1));
-
-            let key_2 =
-                if klen_2 != 0 {
-                    let inline_2 = 0 == klen_2 % 2;
-                    let klen_2 = klen_2 / 2;
-                    //println!("actual klen_2: {}", klen_2);
-                    let key_2 = try!(read_key(pr, &mut cur, &prefix, path, inline_2, klen_2));
-                    Some(key_2)
+            let key_2 = {
+                let klen = varint::read(pr, &mut cur) as usize;
+                //println!("raw klen 2: {}", klen);
+                // klen == 0 means no second key
+                if klen != 0 {
+                    let inline = 0 == klen % 2;
+                    let klen = klen / 2;
+                    //println!("actual klen 2: {}", klen);
+                    let k = try!(read_key(pr, &mut cur, &prefix, path, inline, klen));
+                    Some(k)
                 } else {
                     None
-                };
+                }
+            };
 
             let pg = ParentPageItem {
                 page: page, 
@@ -3859,7 +3903,7 @@ impl ParentPageCursor {
 
         //println!("children parsed: {:?}", children);
 
-        Ok(children)
+        Ok((prefix, children))
     }
 
     fn set_child(&mut self, i: usize) -> Result<()> {
@@ -3876,7 +3920,9 @@ impl ParentPageCursor {
             try!(misc::io::read_fully(f, &mut self.pr));
             self.pagenum = pgnum;
         }
-        self.children = try!(Self::parse_page(&self.pr, &self.path));
+        let (prefix, children) = try!(Self::parse_page(&self.pr, &self.path));
+        self.prefix = prefix;
+        self.children = children;
 
         Ok(())
     }

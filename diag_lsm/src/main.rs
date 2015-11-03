@@ -262,7 +262,7 @@ fn result_main() -> Result<(),lsm::Error> {
     let cmd = args[2].as_str();
     match cmd {
         "add_random" => {
-            println!("add_numbers count seed klen vlen");
+            println!("usage: add_random count seed klen vlen");
             if args.len() < 7 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
@@ -273,7 +273,7 @@ fn result_main() -> Result<(),lsm::Error> {
             add_random(name, count, seed, klen, vlen)
         },
         "add_numbers" => {
-            println!("add_numbers count start step");
+            println!("usage: add_numbers count start step");
             if args.len() < 6 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
@@ -283,7 +283,7 @@ fn result_main() -> Result<(),lsm::Error> {
             add_numbers(name, count, start, step)
         },
         "show_page" => {
-            println!("show_page pagenum");
+            println!("usage: show_page pagenum");
             if args.len() < 4 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
@@ -291,7 +291,7 @@ fn result_main() -> Result<(),lsm::Error> {
             show_page(name, pgnum)
         },
         "show_leaf_page" => {
-            println!("show_leaf_page pagenum");
+            println!("usage: show_leaf_page pagenum");
             if args.len() < 4 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
@@ -299,7 +299,7 @@ fn result_main() -> Result<(),lsm::Error> {
             show_leaf_page(name, pgnum)
         },
         "show_parent_page" => {
-            println!("show_parent_page pagenum");
+            println!("usage: show_parent_page pagenum");
             if args.len() < 4 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
@@ -307,7 +307,7 @@ fn result_main() -> Result<(),lsm::Error> {
             show_parent_page(name, pgnum)
         },
         "seek_string" => {
-            println!("seek_string key sop");
+            println!("usage: seek_string key sop");
             if args.len() < 5 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
