@@ -3229,26 +3229,15 @@ impl LeafCursor {
         Ok(())
     }
 
+    #[inline]
     fn keyInLeaf2<'a>(&'a self, n: usize) -> Result<KeyRef<'a>> { 
-        match &self.pairs[n].key {
-            &KeyInPage::Inline(klen, at) => {
-                match self.prefix {
-                    Some(ref a) => {
-                        Ok(KeyRef::Prefixed(&a, &self.pr[at .. at + klen - a.len()]))
-                    },
-                    None => {
-                        Ok(KeyRef::Array(&self.pr[at .. at + klen]))
-                    },
-                }
-            },
-            &KeyInPage::Overflowed(klen, ref blocks) => {
-                let mut ostrm = try!(OverflowReader::new(&self.path, self.pr.len(), blocks.blocks[0].firstPage, klen));
-                let mut x_k = Vec::with_capacity(klen);
-                try!(ostrm.read_to_end(&mut x_k));
-                let x_k = x_k.into_boxed_slice();
-                Ok(KeyRef::Boxed(x_k))
-            },
-        }
+        let prefix: Option<&[u8]> = 
+            match self.prefix {
+                Some(ref b) => Some(b),
+                None => None,
+            };
+        let k = try!(self.pairs[n].key.keyref(&self.pr, prefix, &self.path));
+        Ok(k)
     }
 
     fn searchLeaf(&mut self, k: &KeyRef, min: usize, max: usize, sop: SeekOp, le: Option<usize>, ge: Option<usize>) -> Result<(Option<usize>, bool)> {
@@ -3557,6 +3546,7 @@ pub enum KeyInPage {
 }
 
 impl KeyInPage {
+    #[inline]
     fn read(pr: &[u8], cur: &mut usize, prefix_len: usize) -> Result<Self> {
         let k = try!(Self::read_optional(pr, cur, prefix_len));
         match k {
@@ -3565,6 +3555,7 @@ impl KeyInPage {
         }
     }
 
+    #[inline]
     fn read_optional(pr: &[u8], cur: &mut usize, prefix_len: usize) -> Result<Option<Self>> {
         let klen = varint::read(pr, cur) as usize;
         if klen == 0 {
@@ -3583,6 +3574,29 @@ impl KeyInPage {
                 k
             };
         Ok(Some(k))
+    }
+
+    #[inline]
+    fn keyref<'a>(&self, pr: &'a [u8], prefix: Option<&'a [u8]>, path: &str) -> Result<KeyRef<'a>> { 
+        match self {
+            &KeyInPage::Inline(klen, at) => {
+                match prefix {
+                    Some(a) => {
+                        Ok(KeyRef::Prefixed(&a, &pr[at .. at + klen - a.len()]))
+                    },
+                    None => {
+                        Ok(KeyRef::Array(&pr[at .. at + klen]))
+                    },
+                }
+            },
+            &KeyInPage::Overflowed(klen, ref blocks) => {
+                let mut ostrm = try!(OverflowReader::new(path, pr.len(), blocks.blocks[0].firstPage, klen));
+                let mut x_k = Vec::with_capacity(klen);
+                try!(ostrm.read_to_end(&mut x_k));
+                let x_k = x_k.into_boxed_slice();
+                Ok(KeyRef::Boxed(x_k))
+            },
+        }
     }
 
 }
@@ -3781,27 +3795,15 @@ impl ParentPageCursor {
         Ok(())
     }
 
-    // TODO this is the same as keyInLeaf2?
+    #[inline]
     fn key<'a>(&'a self, k: &KeyInPage) -> Result<KeyRef<'a>> { 
-        match k {
-            &KeyInPage::Inline(klen, at) => {
-                match self.prefix {
-                    Some(ref a) => {
-                        Ok(KeyRef::Prefixed(&a, &self.pr[at .. at + klen - a.len()]))
-                    },
-                    None => {
-                        Ok(KeyRef::Array(&self.pr[at .. at + klen]))
-                    },
-                }
-            },
-            &KeyInPage::Overflowed(klen, ref blocks) => {
-                let mut ostrm = try!(OverflowReader::new(&self.path, self.pr.len(), blocks.blocks[0].firstPage, klen));
-                let mut x_k = Vec::with_capacity(klen);
-                try!(ostrm.read_to_end(&mut x_k));
-                let x_k = x_k.into_boxed_slice();
-                Ok(KeyRef::Boxed(x_k))
-            },
-        }
+        let prefix: Option<&[u8]> = 
+            match self.prefix {
+                Some(ref b) => Some(b),
+                None => None,
+            };
+        let k = try!(k.keyref(&self.pr, prefix, &self.path));
+        Ok(k)
     }
 
     fn parse_page(pr: &[u8]) -> Result<(Option<Box<[u8]>>, Vec<ParentPageItem>)> {
