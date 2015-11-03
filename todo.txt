@@ -1,4 +1,82 @@
 
+get rid of segments_info?  blocks for a page can be gotten from the page.
+
+get rid of SegmentNum?
+
+header can get really small.  so small that we no longer want to 
+waste 4096 bytes or an entire page on it.  it needs to live on
+a portion of the first page, with the rest available as a short
+page for use by segments.  which means the PageWriter stuff needs
+to know that not all pages are the same size (in terms of their
+usable space).  and create_segment() needs to know how big its
+next page is going to be.
+
+can track open cursors (as read locks to prevent replaced segments
+for being freed yet) by page now.  but we can't drop those read
+locks on read_page(), letting each one go as we walk through
+a full segment with Next(), because somebody might call Prev()
+or First().  and we probably don't want to add thousands of
+little locks.  rather, we need the notion of "I have a lock on
+this page and all the pages it uses."  Kind of like what we
+have now, but works on the page number.
+
+merge:
+
+pick the lowest single page in dest level that entirely
+contains the stuff being merged from younger levels.  
+that page is X.  parent is Y.
+
+what if X is a leaf?  it can be, right?
+
+if X doesn't exist?
+
+if X is the root, and so Y is none?
+
+put all those things in a multicursor, and write a segment
+for that cursor.  that is Z.
+
+Z can be a leaf or a parent, regardless of what X was.
+actually, no.  Y is a parent page that can only accept
+Leaf or Parents, not both.  (why is that?)  so X must be
+a parent page, not a leaf, and if Z ends up being a leaf,
+it needs a parent wrapper around it so it can go into Y.
+alternatively, parent page can learn how to have mixed
+children, some leaf, some parent.
+
+if X did not exist, maybe Z is a new sibling of the root, 
+so we need a new parent/root.
+
+otherwise, rewrite Y, replacing X with Z.  and then rewrite
+Y's parent, and so on, up to the root.
+
+X and all its pages, except ones that got reused in Z,
+become free pages.
+
+what if "new Y" is not one page but two?  no problem,
+just insert both of them into Y's parent where Y used to
+be.  actually, this can't happen.  if Y becomes two pages,
+it will get a new root and be one again.
+
+any given parent set might be less efficient since, for
+example, "new Y" might have pages that are kind of empty.
+
+any page cursor now knows its entire block list without
+reading any deeper.
+
+ParentPageCursor will need an API to iterate over page information.
+
+these types need a way to deal with pages without necessarily
+opening cursors on them.  maybe we need a way to separate out
+types for LeafPage and ParentPage, and then have LeafPageCursor
+and ParentPageCursor as types which wrap them.  LeafPage::into_cursor().
+
+it is true that any given page (leaf or parent) can only have one
+parent at a time?  but the page (on disk) does not know its parent,
+because the parent can change, and we don't want to rewrite it when
+that happens.
+
+--------
+
 do binary search of keys in the parent page like in the leaf?
 
 not sure a parent page with only one item in it makes much sense
