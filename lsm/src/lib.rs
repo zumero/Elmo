@@ -3154,6 +3154,40 @@ impl LeafPage {
         self.pairs.len()
     }
 
+    // TODO not sure if we need to provide funcs: key_overflows() and value_overflows()
+
+    pub fn overflows(&self) -> Vec<&BlockList> {
+        let mut list = vec![];
+        for i in 0 .. self.pairs.len() {
+            match &self.pairs[i].key {
+                &KeyInPage::Inline(_, _) => {
+                },
+                &KeyInPage::Overflowed(_, ref blocks) => {
+                    list.push(blocks);
+                },
+            }
+            match &self.pairs[i].value {
+                &ValueInLeaf::Tombstone => {
+                },
+                &ValueInLeaf::Inline(_, _) => {
+                },
+                &ValueInLeaf::Overflowed(_, ref blocks) => {
+                    list.push(blocks);
+                },
+            }
+        }
+        list
+    }
+
+    pub fn complete_blocklist(&self) -> BlockList {
+        let mut list = BlockList::new();
+        for blist in self.overflows() {
+            list.add_blocklist_no_reorder(blist);
+        }
+        list.sort_and_consolidate();
+        list
+    }
+
     fn parse_page(&mut self) -> Result<()> {
         self.prefix = None;
 
@@ -3733,11 +3767,21 @@ impl ParentPage {
         Ok(res)
     }
 
-    pub fn items(&self) -> &Vec<ParentPageItem> {
-        &self.children
+    pub fn complete_blocklist(&self) -> BlockList {
+        let mut list = BlockList::new();
+        for i in 0 .. self.children.len() {
+            // we do not add the blocklist for any overflow keys,
+            // because we don't own that blocklist.  it is simply a reference
+            // to the blocklist for an overflow key when it was written into
+            // its leaf.
+            list.add_page_no_reorder(self.children[i].page);
+            list.add_blocklist_no_reorder(&self.children[i].blocks);
+        }
+        list.sort_and_consolidate();
+        list
     }
 
-    fn count_items(&self) -> usize {
+    pub fn count_items(&self) -> usize {
         self.children.len()
     }
 
@@ -4659,12 +4703,17 @@ impl DatabaseFile {
         InnerPart::open_cursor_on_page(&self.inner, pg)
     }
 
+    // TODO this might want to be just LeafPage
     pub fn open_cursor_on_leaf_page(&self, pg: PageNum) -> Result<LeafCursor> {
         InnerPart::open_cursor_on_leaf_page(&self.inner, pg)
     }
 
     pub fn open_cursor_on_parent_page(&self, pg: PageNum) -> Result<ParentCursor> {
         InnerPart::open_cursor_on_parent_page(&self.inner, pg)
+    }
+
+    pub fn read_parent_page(&self, pg: PageNum) -> Result<ParentPage> {
+        InnerPart::read_parent_page(&self.inner, pg)
     }
 
     pub fn open_cursor_on_pending_segment(&self, location: SegmentLocation) -> Result<SegmentCursor> {
@@ -5092,6 +5141,20 @@ impl InnerPart {
         let page = try!(ParentPage::new_already_read_page(&inner.path, f, pg, buf));
         let cursor = try!(ParentCursor::new(page));
         Ok(cursor)
+    }
+
+    fn read_parent_page(inner: &std::sync::Arc<InnerPart>, pg: PageNum) -> Result<ParentPage> {
+        let mut buf = try!(Self::get_loaner_page(inner));
+        let f = try!(inner.open_file_for_cursor());
+
+        {
+            let f = &mut *(f.borrow_mut());
+            try!(utils::SeekPage(f, buf.len(), pg));
+            try!(misc::io::read_fully(f, &mut buf));
+        }
+
+        let page = try!(ParentPage::new_already_read_page(&inner.path, f, pg, buf));
+        Ok(page)
     }
 
     fn open_cursor_on_pending_segment(inner: &std::sync::Arc<InnerPart>, location: SegmentLocation) -> Result<SegmentCursor> {

@@ -1,4 +1,10 @@
 
+do we need a Page class like PageCursor which can represent either
+LeafPage or ParentPage, with a common set of methods?
+
+LeafPage and ParentPage now need methods to return the key range and
+the complete block list.
+
 get rid of segments_info?  blocks for a page can be gotten from the page.
 
 get rid of SegmentNum?
@@ -64,11 +70,6 @@ any page cursor now knows its entire block list without
 reading any deeper.
 
 ParentPageCursor will need an API to iterate over page information.
-
-these types need a way to deal with pages without necessarily
-opening cursors on them.  maybe we need a way to separate out
-types for LeafPage and ParentPage, and then have LeafPageCursor
-and ParentPageCursor as types which wrap them.  LeafPage::into_cursor().
 
 it is true that any given page (leaf or parent) can only have one
 parent at a time?  but the page (on disk) does not know its parent,

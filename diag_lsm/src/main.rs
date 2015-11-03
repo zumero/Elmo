@@ -61,25 +61,11 @@ fn show_leaf_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
 
 fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
-    let cursor = try!(db.open_cursor_on_parent_page(pgnum));
-    let pt = cursor.child_page_type();
-    println!("child page type: {:?}", pt);
-    let items = cursor.items();
-    println!("item count: {}", items.len());
-    for i in 0 .. items.len() {
-        println!("    page: {}", items[i].page());
-        let first_key = items[i].first_key();
-        println!("        first_key: {:?}", first_key.key());
-        let last_key = items[i].last_key();
-        match last_key {
-            &Some(ref last_key) => {
-                println!("        last_key: {:?}", last_key.key());
-            },
-            &None => {
-                println!("        last_key: None");
-            },
-        }
-    }
+    let page = try!(db.read_parent_page(pgnum));
+    //let pt = cursor.child_page_type();
+    //println!("child page type: {:?}", pt);
+    println!("count_items: {}", page.count_items());
+    println!("blocks: {:?}", page.complete_blocklist());
     Ok(())
 }
 
