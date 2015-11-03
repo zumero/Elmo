@@ -3128,13 +3128,6 @@ impl Read for OverflowReader {
     }
 }
 
-#[cfg(remove_me)]
-fn readOverflow(path: &str, pgsz: usize, firstPage: PageNum, buf: &mut [u8]) -> Result<usize> {
-    let mut ostrm = try!(OverflowReader::new(path, pgsz, firstPage, buf.len()));
-    let res = try!(misc::io::read_fully(&mut ostrm, buf));
-    Ok(res)
-}
-
 pub struct LeafCursor {
     path: String,
     f: std::rc::Rc<std::cell::RefCell<File>>,
@@ -3143,9 +3136,9 @@ pub struct LeafCursor {
 
     prefix: Option<Box<[u8]>>,
 
-    // TODO why not pre-read a couple of things here, like the len and overflow blocks
-    keys: Vec<usize>,
+    pairs: Vec<PairInLeaf>,
 
+    // TODO rename this
     currentKey: Option<usize>,
 }
 
@@ -3161,7 +3154,7 @@ impl LeafCursor {
             f: f,
             pagenum: pagenum,
             pr: buf,
-            keys: Vec::new(),
+            pairs: Vec::new(),
             currentKey: None,
             prefix: None,
         };
@@ -3181,24 +3174,45 @@ impl LeafCursor {
             return Err(Error::CorruptFile("leaf has invalid page type"));
         }
         cur = cur + 1; // skip flags
-        let prefixLen = varint::read(&self.pr, &mut cur) as usize;
-        if prefixLen > 0 {
+
+        // TODO fn read_prefix_from_page()
+        let prefix_len = varint::read(&self.pr, &mut cur) as usize;
+        if prefix_len > 0 {
             // TODO should we just remember prefix as a reference instead of box/copy?
-            let mut a = vec![0; prefixLen].into_boxed_slice();
-            a.clone_from_slice(&self.pr[cur .. cur + prefixLen]);
-            cur = cur + prefixLen;
+            let mut a = vec![0; prefix_len].into_boxed_slice();
+            a.clone_from_slice(&self.pr[cur .. cur + prefix_len]);
+            cur = cur + prefix_len;
             self.prefix = Some(a);
         } else {
             self.prefix = None;
         }
         let count_keys = misc::buf_advance::get_u16(&self.pr, &mut cur) as usize;
         // assert count_keys>0
-        misc::set_vec_len(&mut self.keys, 0, count_keys);
+
+        match self.pairs.len().cmp(&count_keys) {
+            Ordering::Equal => {
+            },
+            Ordering::Less => {
+                self.pairs.reserve(count_keys);
+            },
+            Ordering::Greater => {
+                self.pairs.truncate(count_keys);
+            },
+        }
+
         for i in 0 .. count_keys {
-            // TODO consider reading a little more of the key info
-            self.keys[i] = cur;
-            self.skipKey(&mut cur);
-            self.skipValue(&mut cur);
+            let k = try!(KeyInPage::read(&self.pr, &mut cur, prefix_len));
+            let v = try!(ValueInLeaf::read(&self.pr, &mut cur));
+            let pair = PairInLeaf {
+                key: k,
+                value: v,
+            };
+
+            if i < self.pairs.len() {
+                self.pairs[i] = pair;
+            } else {
+                self.pairs.push(pair);
+            }
         }
 
         Ok(())
@@ -3215,58 +3229,25 @@ impl LeafCursor {
         Ok(())
     }
 
-    fn skipKey(&self, cur: &mut usize) {
-        let klen = varint::read(&self.pr, cur) as usize;
-        let inline = 0 == klen % 2;
-        let klen = klen / 2;
-
-        if inline {
-            let prefixLen = match self.prefix {
-                Some(ref a) => a.len(),
-                None => 0
-            };
-            *cur = *cur + (klen - prefixLen);
-        } else {
-            BlockList::skip(&self.pr, cur);
-        }
-    }
-
-    fn skipValue(&self, cur: &mut usize) {
-        let vflag = misc::buf_advance::get_byte(&self.pr, cur);
-        if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) { 
-            ()
-        } else {
-            let vlen = varint::read(&self.pr, cur) as usize;
-            if 0 != (vflag & ValueFlag::FLAG_OVERFLOW) {
-                BlockList::skip(&self.pr, cur);
-            } else {
-                *cur = *cur + vlen;
-            }
-        }
-    }
-
     fn keyInLeaf2<'a>(&'a self, n: usize) -> Result<KeyRef<'a>> { 
-        let mut cur = self.keys[n as usize];
-        let klen = varint::read(&self.pr, &mut cur) as usize;
-        let inline = 0 == klen % 2;
-        let klen = klen / 2;
-        if inline {
-            match self.prefix {
-                Some(ref a) => {
-                    Ok(KeyRef::Prefixed(&a, &self.pr[cur .. cur + klen - a.len()]))
-                },
-                None => {
-                    Ok(KeyRef::Array(&self.pr[cur .. cur + klen]))
-                },
-            }
-        } else {
-            let blocks = BlockList::read(&self.pr, &mut cur);
-// TODO return blocks instead of opening the stream
-            let mut ostrm = try!(OverflowReader::new(&self.path, self.pr.len(), blocks.blocks[0].firstPage, klen));
-            let mut x_k = Vec::with_capacity(klen);
-            try!(ostrm.read_to_end(&mut x_k));
-            let x_k = x_k.into_boxed_slice();
-            Ok(KeyRef::Boxed(x_k))
+        match &self.pairs[n].key {
+            &KeyInPage::Inline(klen, at) => {
+                match self.prefix {
+                    Some(ref a) => {
+                        Ok(KeyRef::Prefixed(&a, &self.pr[at .. at + klen - a.len()]))
+                    },
+                    None => {
+                        Ok(KeyRef::Array(&self.pr[at .. at + klen]))
+                    },
+                }
+            },
+            &KeyInPage::Overflowed(klen, ref blocks) => {
+                let mut ostrm = try!(OverflowReader::new(&self.path, self.pr.len(), blocks.blocks[0].firstPage, klen));
+                let mut x_k = Vec::with_capacity(klen);
+                try!(ostrm.read_to_end(&mut x_k));
+                let x_k = x_k.into_boxed_slice();
+                Ok(KeyRef::Boxed(x_k))
+            },
         }
     }
 
@@ -3305,12 +3286,12 @@ impl LeafCursor {
 
     fn leafIsValid(&self) -> bool {
         // TODO the bounds check of self.currentKey against self.keys.len() could be an assert
-        let ok = (!self.keys.is_empty()) && (self.currentKey.is_some()) && (self.currentKey.expect("just did is_some") as usize) < self.keys.len();
+        let ok = (!self.pairs.is_empty()) && (self.currentKey.is_some()) && (self.currentKey.expect("just did is_some") as usize) < self.pairs.len();
         ok
     }
 
     fn search(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
-        let tmp_countLeafKeys = self.keys.len();
+        let tmp_countLeafKeys = self.pairs.len();
         let (newCur, equal) = try!(self.searchLeaf(k, 0, (tmp_countLeafKeys - 1), sop, None, None));
         self.currentKey = newCur;
         if self.currentKey.is_none() {
@@ -3358,23 +3339,18 @@ impl ICursor for LeafCursor {
                 Err(Error::CursorNotValid)
             },
             Some(currentKey) => {
-                let mut pos = self.keys[currentKey as usize];
-
-                self.skipKey(&mut pos);
-
-                let vflag = misc::buf_advance::get_byte(&self.pr, &mut pos);
-                if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) {
-                    Ok(ValueRef::Tombstone)
-                } else {
-                    let vlen = varint::read(&self.pr, &mut pos) as usize;
-                    if 0 != (vflag & ValueFlag::FLAG_OVERFLOW) {
-                        let blocks = BlockList::read(&self.pr, &mut pos);
-// TODO return blocks instead of opening the stream
+                match &self.pairs[currentKey].value {
+                    &ValueInLeaf::Tombstone => {
+                        Ok(ValueRef::Tombstone)
+                    },
+                    &ValueInLeaf::Inline(vlen, pos) => {
+                        Ok(ValueRef::Array(&self.pr[pos .. pos + vlen]))
+                    },
+                    &ValueInLeaf::Overflowed(vlen, ref blocks) => {
+                        // TODO return blocks instead of opening the stream
                         let strm = try!(OverflowReader::new(&self.path, self.pr.len(), blocks.blocks[0].firstPage, vlen));
                         Ok(ValueRef::Overflowed(vlen, box strm))
-                    } else {
-                        Ok(ValueRef::Array(&self.pr[pos .. pos + vlen]))
-                    }
+                    },
                 }
             }
         }
@@ -3387,16 +3363,16 @@ impl ICursor for LeafCursor {
                 Err(Error::CursorNotValid)
             },
             Some(currentKey) => {
-                let mut cur = self.keys[currentKey as usize];
-
-                self.skipKey(&mut cur);
-
-                let vflag = misc::buf_advance::get_byte(&self.pr, &mut cur);
-                if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) { 
-                    Ok(None)
-                } else {
-                    let vlen = varint::read(&self.pr, &mut cur) as usize;
-                    Ok(Some(vlen))
+                match &self.pairs[currentKey].value {
+                    &ValueInLeaf::Tombstone => {
+                        Ok(None)
+                    },
+                    &ValueInLeaf::Inline(vlen, _) => {
+                        Ok(Some(vlen))
+                    },
+                    &ValueInLeaf::Overflowed(vlen, _) => {
+                        Ok(Some(vlen))
+                    },
                 }
             }
         }
@@ -3408,14 +3384,14 @@ impl ICursor for LeafCursor {
     }
 
     fn Last(&mut self) -> Result<()> {
-        self.currentKey = Some(self.keys.len() - 1);
+        self.currentKey = Some(self.pairs.len() - 1);
         Ok(())
     }
 
     fn Next(&mut self) -> Result<()> {
         match self.currentKey {
             Some(cur) => {
-                if (cur + 1) < self.keys.len() {
+                if (cur + 1) < self.pairs.len() {
                     self.currentKey = Some(cur + 1);
                 } else {
                     self.currentKey = None;
@@ -3575,9 +3551,74 @@ impl ICursor for ChildCursor {
 }
 
 #[derive(Debug)]
-pub enum ParentPageKey {
+pub enum KeyInPage {
     Inline(usize, usize),
     Overflowed(usize, BlockList),
+}
+
+impl KeyInPage {
+    fn read(pr: &[u8], cur: &mut usize, prefix_len: usize) -> Result<Self> {
+        let k = try!(Self::read_optional(pr, cur, prefix_len));
+        match k {
+            Some(k) => Ok(k),
+            None => Err(Error::CorruptFile("key cannot be zero length")),
+        }
+    }
+
+    fn read_optional(pr: &[u8], cur: &mut usize, prefix_len: usize) -> Result<Option<Self>> {
+        let klen = varint::read(pr, cur) as usize;
+        if klen == 0 {
+            return Ok(None);
+        }
+        let inline = 0 == klen % 2;
+        let klen = klen / 2;
+        let k = 
+            if inline {
+                let k = KeyInPage::Inline(klen, *cur);
+                *cur += klen - prefix_len;
+                k
+            } else {
+                let blocks = BlockList::read(&pr, cur);
+                let k = KeyInPage::Overflowed(klen, blocks);
+                k
+            };
+        Ok(Some(k))
+    }
+
+}
+
+#[derive(Debug)]
+enum ValueInLeaf {
+    Tombstone,
+    Inline(usize, usize),
+    Overflowed(usize, BlockList),
+}
+
+impl ValueInLeaf {
+    fn read(pr: &[u8], cur: &mut usize) -> Result<Self> {
+        let vflag = misc::buf_advance::get_byte(pr, cur);
+        let v = 
+            if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) { 
+                ValueInLeaf::Tombstone
+            } else {
+                let vlen = varint::read(pr, cur) as usize;
+                if 0 != (vflag & ValueFlag::FLAG_OVERFLOW) {
+                    let blocks = BlockList::read(&pr, cur);
+                    ValueInLeaf::Overflowed(vlen, blocks)
+                } else {
+                    let v = ValueInLeaf::Inline(vlen, *cur);
+                    *cur = *cur + vlen;
+                    v
+                }
+            };
+        Ok(v)
+    }
+}
+
+#[derive(Debug)]
+struct PairInLeaf {
+    key: KeyInPage,
+    value: ValueInLeaf,
 }
 
 #[derive(Debug)]
@@ -3589,8 +3630,8 @@ pub struct ParentPageItem {
 
     // blocks does NOT contain page
 
-    first_key: ParentPageKey,
-    last_key: Option<ParentPageKey>,
+    first_key: KeyInPage,
+    last_key: Option<KeyInPage>,
 }
 
 #[derive(Debug)]
@@ -3607,11 +3648,11 @@ impl ParentPageItem {
         self.page
     }
 
-    pub fn first_key(&self) -> &ParentPageKey {
+    pub fn first_key(&self) -> &KeyInPage {
         &self.first_key
     }
 
-    pub fn last_key(&self) -> &Option<ParentPageKey> {
+    pub fn last_key(&self) -> &Option<KeyInPage> {
         &self.last_key
     }
 
@@ -3740,9 +3781,10 @@ impl ParentPageCursor {
         Ok(())
     }
 
-    fn key<'a>(&'a self, k: &ParentPageKey) -> Result<KeyRef<'a>> { 
+    // TODO this is the same as keyInLeaf2?
+    fn key<'a>(&'a self, k: &KeyInPage) -> Result<KeyRef<'a>> { 
         match k {
-            &ParentPageKey::Inline(klen, at) => {
+            &KeyInPage::Inline(klen, at) => {
                 match self.prefix {
                     Some(ref a) => {
                         Ok(KeyRef::Prefixed(&a, &self.pr[at .. at + klen - a.len()]))
@@ -3752,7 +3794,7 @@ impl ParentPageCursor {
                     },
                 }
             },
-            &ParentPageKey::Overflowed(klen, ref blocks) => {
+            &KeyInPage::Overflowed(klen, ref blocks) => {
                 let mut ostrm = try!(OverflowReader::new(&self.path, self.pr.len(), blocks.blocks[0].firstPage, klen));
                 let mut x_k = Vec::with_capacity(klen);
                 try!(ostrm.read_to_end(&mut x_k));
@@ -3786,19 +3828,6 @@ impl ParentPageCursor {
         //println!("count_items: {}", count_items);
         let mut children = Vec::with_capacity(count_items);
 
-        fn read_key(pr: &[u8], cur: &mut usize, prefix_len: usize, inline: bool, klen: usize) -> Result<ParentPageKey> {
-            if inline {
-                let at = *cur;
-                *cur += klen - prefix_len;
-                let k = ParentPageKey::Inline(klen, at);
-                Ok(k)
-            } else {
-                let blocks = BlockList::read(&pr, cur);
-                let k = ParentPageKey::Overflowed(klen, blocks);
-                Ok(k)
-            }
-        }
-
         for i in 0 .. count_items {
             let page = varint::read(pr, &mut cur) as PageNum;
             //println!("page: {}", page);
@@ -3806,29 +3835,8 @@ impl ParentPageCursor {
             //if cfg!(child_block_list) 
             let blocks = BlockList::read(pr, &mut cur);
 
-            let key_1 = {
-                let klen = varint::read(pr, &mut cur) as usize;
-                let inline = 0 == klen % 2;
-                let klen = klen / 2;
-                //println!("klen 1: {}", klen);
-                let k = try!(read_key(pr, &mut cur, prefix_len, inline, klen));
-                k
-            };
-
-            let key_2 = {
-                let klen = varint::read(pr, &mut cur) as usize;
-                //println!("raw klen 2: {}", klen);
-                // klen == 0 means no second key
-                if klen != 0 {
-                    let inline = 0 == klen % 2;
-                    let klen = klen / 2;
-                    //println!("actual klen 2: {}", klen);
-                    let k = try!(read_key(pr, &mut cur, prefix_len, inline, klen));
-                    Some(k)
-                } else {
-                    None
-                }
-            };
+            let key_1 = try!(KeyInPage::read(pr, &mut cur, prefix_len));
+            let key_2 = try!(KeyInPage::read_optional(pr, &mut cur, prefix_len));
 
             let pg = ParentPageItem {
                 page: page, 
