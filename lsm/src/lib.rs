@@ -2125,15 +2125,32 @@ struct pgitem {
     last_key: Option<KeyWithLocation>,
 }
 
-#[derive(Debug)]
-struct ParentItem {
-    child: pgitem,
-    prefix_len: Option<usize>,
+impl pgitem {
+    fn need(&self, prefix_len: usize) -> usize {
+        let needed = 
+            varint::space_needed_for(self.page as u64) 
+            //if cfg!(child_block_list) 
+            + self.blocks.encoded_len()
+            + varint::space_needed_for(self.first_key.len_with_overflow_flag() as u64) 
+            + self.first_key.need(prefix_len)
+            + 
+            match self.last_key {
+                Some(ref last_key) => {
+                    varint::space_needed_for(last_key.len_with_overflow_flag() as u64)
+                    + last_key.need(prefix_len)
+                },
+                None => {
+                    varint::space_needed_for(0)
+                },
+            };
+        needed
+    }
 }
 
 struct ParentState {
+    prefixLen: usize,
     sofar: usize,
-    items: Vec<ParentItem>,
+    items: Vec<pgitem>,
     nextGeneration: Vec<pgitem>,
 }
 
@@ -2620,6 +2637,8 @@ fn create_segment<I>(mut pw: PageWriter,
                 try!(write_leaf(&mut st, pb, pw));
             }
 
+            // TODO dorky that we calc the prefix len twice here.
+            // explain why.
             let newPrefixLen = calc_prefix_len(&st, &k, &kloc);
             let sofar = 
                 if newPrefixLen != st.prefixLen {
@@ -2663,19 +2682,19 @@ fn create_segment<I>(mut pw: PageWriter,
         // 2 for the stored count
         const PARENT_PAGE_OVERHEAD: usize = 2 + 2;
 
-        fn calcAvailable(st: &ParentState, pgsz: usize) -> usize {
-            let basicSize = pgsz - st.sofar;
-            basicSize
-        }
-
         fn build_parent_page(st: &mut ParentState, 
                           pb: &mut PageBuilder,
                           ) -> (KeyWithLocation, Option<KeyWithLocation>, BlockList) {
             // TODO? assert!(st.items.len() > 1);
+            //println!("build_parent_page, prefixLen: {:?}", st.prefixLen);
             //println!("build_parent_page, items: {:?}", st.items);
             pb.Reset();
             pb.PutByte(PageType::PARENT_NODE.to_u8());
             pb.PutByte(0u8);
+            pb.PutVarint(st.prefixLen as u64);
+            if st.prefixLen > 0 {
+                pb.PutArray(&st.items[0].first_key.key[0 .. st.prefixLen]);
+            }
             pb.PutInt16(st.items.len() as u16);
             //println!("st.items.len(): {}", st.items.len());
 
@@ -2695,21 +2714,21 @@ fn create_segment<I>(mut pw: PageWriter,
                 }
             }
 
-            fn put_item(pb: &mut PageBuilder, list: &mut BlockList, item: &ParentItem) {
+            fn put_item(pb: &mut PageBuilder, list: &mut BlockList, item: &pgitem, prefix_len: usize) {
                 //println!("item: {:?}", item);
-                pb.PutVarint(item.child.page as u64);
-                list.add_page_no_reorder(item.child.page);
+                pb.PutVarint(item.page as u64);
+                list.add_page_no_reorder(item.page);
                 //if cfg!(child_block_list) 
                 {
                     // TODO capacity, no temp vec
                     let mut v = vec![];
-                    item.child.blocks.encode(&mut v);
+                    item.blocks.encode(&mut v);
                     pb.PutArray(&v);
                 }
-                list.add_blocklist_no_reorder(&item.child.blocks);
+                list.add_blocklist_no_reorder(&item.blocks);
 
-                pb.PutVarint(item.child.first_key.len_with_overflow_flag());
-                match item.child.last_key {
+                pb.PutVarint(item.first_key.len_with_overflow_flag());
+                match item.last_key {
                     Some(ref last_key) => {
                         pb.PutVarint(last_key.len_with_overflow_flag());
                     },
@@ -2717,23 +2736,8 @@ fn create_segment<I>(mut pw: PageWriter,
                         pb.PutVarint(0);
                     },
                 }
-// TODO iff both keys are inline, there should be a prefix len, even if it is 0
-                let prefix_len =
-                    match item.prefix_len {
-                        Some(prefix_len) => {
-                            pb.PutVarint(prefix_len as u64);
-                            if prefix_len > 0 {
-                                pb.PutArray(&item.child.first_key.key[ .. prefix_len]);
-                            }
-                            prefix_len
-                        },
-                        None => {
-                            // write nothing to the page
-                            0
-                        },
-                    };
-                put_key(pb, &item.child.first_key, prefix_len);
-                match item.child.last_key {
+                put_key(pb, &item.first_key, prefix_len);
+                match item.last_key {
                     Some(ref last_key) => {
                         put_key(pb, &last_key, prefix_len);
                     },
@@ -2745,8 +2749,8 @@ fn create_segment<I>(mut pw: PageWriter,
             // deal with the first item separately
             let (first_key, last_key_from_first_item) = {
                 let item = st.items.remove(0); 
-                put_item(pb, &mut list, &item);
-                (item.child.first_key, item.child.last_key)
+                put_item(pb, &mut list, &item, st.prefixLen);
+                (item.first_key, item.last_key)
             };
 
             if st.items.len() == 0 {
@@ -2758,7 +2762,7 @@ fn create_segment<I>(mut pw: PageWriter,
                     // deal with all the remaining items except the last one
                     let tmp_count = st.items.len() - 1;
                     for item in st.items.drain(0 .. tmp_count) {
-                        put_item(pb, &mut list, &item);
+                        put_item(pb, &mut list, &item, st.prefixLen);
                     }
                 }
                 assert!(st.items.len() == 1);
@@ -2766,10 +2770,10 @@ fn create_segment<I>(mut pw: PageWriter,
                 // now the last item
                 let last_key = {
                     let item = st.items.remove(0); 
-                    put_item(pb, &mut list, &item);
-                    match item.child.last_key {
+                    put_item(pb, &mut list, &item, st.prefixLen);
+                    match item.last_key {
                         Some(last_key) => last_key,
-                        None => item.child.first_key,
+                        None => item.first_key,
                     }
                 };
                 assert!(st.items.is_empty());
@@ -2797,24 +2801,72 @@ fn create_segment<I>(mut pw: PageWriter,
                 last_key: last_key,
             };
             st.nextGeneration.push(pg);
+            st.prefixLen = 0;
             Ok(())
         }
 
         let mut st = ParentState {
             nextGeneration: Vec::new(),
+            prefixLen: 0,
             sofar: 0,
             items: vec![],
         };
+
+        fn calc_prefix_len(st: &ParentState, item: &pgitem) -> usize {
+            if st.items.is_empty() {
+                match item.last_key {
+                    Some(ref last_key) => {
+                        bcmp::PrefixMatch(&*item.first_key.key, &last_key.key, last_key.key.len())
+                    },
+                    None => {
+                        item.first_key.key.len()
+                    },
+                }
+            } else {
+                if st.prefixLen > 0 {
+                    let a =
+                        match &item.first_key.location {
+                            &KeyLocation::Inline => {
+                                bcmp::PrefixMatch(&*st.items[0].first_key.key, &item.first_key.key, st.prefixLen)
+                            },
+                            &KeyLocation::Overflowed(_) => {
+                                // an overflowed key does not change the prefix
+                                st.prefixLen
+                            },
+                        };
+                    let b = 
+                        match item.last_key {
+                            Some(ref last_key) => {
+                                match &last_key.location {
+                                    &KeyLocation::Inline => {
+                                        bcmp::PrefixMatch(&*st.items[0].first_key.key, &last_key.key, a)
+                                    },
+                                    &KeyLocation::Overflowed(_) => {
+                                        // an overflowed key does not change the prefix
+                                        a
+                                    },
+                                }
+                            },
+                            None => {
+                                a
+                            },
+                        };
+                    b
+                } else {
+                    0
+                }
+            }
+        }
 
         // deal with all the children except the last one
         for child in children {
             // to fit this child into this parent page, we need room for
             // the root page
             // the block list
+            // prefixLen, varint
+            // (prefix)
             // key len 1, varint, shifted for overflow flag
             // key len 2, varint, shifted for overflow flag, 0 if absent
-            // prefixLen, varint, present iff 2 keys and both inlined, even if prefix_len is 0
-            // (prefix)
             // key 1
             //     if inline, the key, minus prefix
             //     if overflow, the blocklist (borrowed from child)
@@ -2828,65 +2880,58 @@ fn create_segment<I>(mut pw: PageWriter,
             // claim:  if both keys fit inlined in the child, they can both
             // fit inlined here in the parent page.
 
-            let base_need = 
-                varint::space_needed_for(child.page as u64) 
-                //if cfg!(child_block_list) 
-                + child.blocks.encoded_len()
-                + varint::space_needed_for(child.first_key.key.len() as u64) 
-                ;
-
-            let (keys_need, prefix_len) =
-                match child.last_key {
-                    Some(ref last_key) => {
-                        let other_len = varint::space_needed_for(last_key.key.len() as u64);
-                        if child.first_key.location.is_inline() && last_key.location.is_inline() {
-                            // prefix
-                            let prefix_len = bcmp::PrefixMatch(&child.first_key.key, &last_key.key, last_key.key.len());
-                            let need = 
-                                other_len
-                                + varint::space_needed_for(prefix_len as u64)
-                                + prefix_len
-                                + child.first_key.need(prefix_len)
-                                + last_key.need(prefix_len)
-                                ;
-                            (need, Some(prefix_len))
-                        } else {
-                            let need =
-                                other_len
-                                + child.first_key.need(0)
-                                + last_key.need(0)
-                                ;
-                            (need, None)
-                        }
-                    },
-                    None => {
-                        let need = child.first_key.need(0);
-                        (need, None)
-                    },
-                };
-
-            let needed = base_need + keys_need;
-            let available = calcAvailable(&st, pgsz);
-            let fits = available >= needed;
+            let fits = {
+                let newPrefixLen = calc_prefix_len(&st, &child);
+                //println!("new prefixLen: {}", newPrefixLen);
+                let needed = child.need(newPrefixLen);
+                let sofar = 
+                    if newPrefixLen != st.prefixLen {
+                        assert!(st.prefixLen == 0 || newPrefixLen < st.prefixLen);
+                        // the prefixLen would change with the addition of this key,
+                        // so we need to recalc sofar
+                        let sum = st.items.iter().map(|lp| lp.need(newPrefixLen) ).sum();;
+                        sum
+                    } else {
+                        st.sofar
+                    };
+                let used = sofar + PARENT_PAGE_OVERHEAD + varint::space_needed_for(newPrefixLen as u64) + newPrefixLen;
+                if pgsz > used {
+                    let available = pgsz - used;
+                    if available >= needed {
+                        st.prefixLen = newPrefixLen;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
 
             if !fits {
-                assert!(st.sofar > 0);
                 assert!(st.items.len() > 1);
                 try!(write_parent_page(&mut st, pb, pw));
                 assert!(st.items.is_empty());
             }
 
-            let item = ParentItem {
-                child: child,
-                prefix_len: prefix_len,
-            };
-            st.items.push(item);
-
-            if st.sofar == 0 {
-                st.sofar = PARENT_PAGE_OVERHEAD;
-            }
-
-            st.sofar += needed;
+            // TODO dorky that we calc the prefix len twice here.
+            // explain why.
+            let newPrefixLen = calc_prefix_len(&st, &child);
+            //println!("new prefixLen: {}", newPrefixLen);
+            let needed = child.need(newPrefixLen);
+            let sofar = 
+                if newPrefixLen != st.prefixLen {
+                    assert!(st.prefixLen == 0 || newPrefixLen < st.prefixLen);
+                    // the prefixLen would change with the addition of this key,
+                    // so we need to recalc sofar
+                    let sum = st.items.iter().map(|lp| lp.need(newPrefixLen) ).sum();;
+                    sum
+                } else {
+                    st.sofar
+                };
+            st.sofar = sofar + needed;
+            st.prefixLen = calc_prefix_len(&st, &child);
+            st.items.push(child);
         }
 
         assert!(st.items.len() > 0);
@@ -3717,6 +3762,18 @@ impl ParentPageCursor {
             return Err(Error::CorruptFile("parent page has invalid page type"));
         }
         cur = cur + 1; // skip the page flags
+        let prefix = {
+            let prefixLen = varint::read(pr, &mut cur) as usize;
+            if prefixLen > 0 {
+                // TODO should we just remember prefix as a reference instead of box/copy?
+                let mut a = vec![0; prefixLen].into_boxed_slice();
+                a.clone_from_slice(&pr[cur .. cur + prefixLen]);
+                cur = cur + prefixLen;
+                Some(a)
+            } else {
+                None
+            }
+        };
         let count_items = misc::buf_advance::get_u16(pr, &mut cur) as usize;
         // TODO count_items has gotta be > 1, right?  or does it?
         //println!("count_items: {}", count_items);
@@ -3761,7 +3818,6 @@ impl ParentPageCursor {
             }
         }
 
-        assert!(cur == 4);
         for i in 0 .. count_items {
             let page = varint::read(pr, &mut cur) as PageNum;
             //println!("page: {}", page);
@@ -3777,29 +3833,6 @@ impl ParentPageCursor {
             let klen_2 = varint::read(pr, &mut cur) as usize;
             //println!("raw klen_2: {}", klen_2);
             // klen_2 == 0 means no second key
-
-            let prefix = 
-                if inline_1 && klen_2 != 0 {
-                    let inline_2 = 0 == klen_2 % 2;
-
-                    if inline_2 {
-                        let prefix_len = varint::read(pr, &mut cur) as usize;
-                        //println!("prefix_len: {}", prefix_len);
-                        if prefix_len > 0 {
-                            // TODO should we just remember prefix as a reference instead of box/copy?
-                            let mut a = vec![0; prefix_len].into_boxed_slice();
-                            a.clone_from_slice(&pr[cur .. cur + prefix_len]);
-                            cur = cur + prefix_len;
-                            Some(a)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
 
             let key_1 = try!(read_key(pr, &mut cur, &prefix, path, inline_1, klen_1));
 
