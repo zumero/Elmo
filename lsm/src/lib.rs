@@ -1415,7 +1415,6 @@ impl ICursor for MultiCursor {
     fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
         match self.cur {
             None => {
-                panic!();
                 Err(Error::CursorNotValid)
             },
             Some(icur) => {
@@ -1427,7 +1426,6 @@ impl ICursor for MultiCursor {
     fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
         match self.cur {
             None => {
-                panic!();
                 Err(Error::CursorNotValid)
             },
             Some(icur) => {
@@ -1439,7 +1437,6 @@ impl ICursor for MultiCursor {
     fn ValueLength(&self) -> Result<Option<usize>> {
         match self.cur {
             None => {
-                panic!();
                 Err(Error::CursorNotValid)
             },
             Some(icur) => {
@@ -1451,7 +1448,6 @@ impl ICursor for MultiCursor {
     fn Next(&mut self) -> Result<()> {
         match self.cur {
             None => {
-                panic!();
                 Err(Error::CursorNotValid)
             },
             Some(icur) => {
@@ -1613,7 +1609,6 @@ impl ICursor for MultiCursor {
     fn Prev(&mut self) -> Result<()> {
         match self.cur {
             None => {
-                panic!();
                 Err(Error::CursorNotValid)
             },
             Some(icur) => {
@@ -1968,7 +1963,6 @@ impl RangeCursor {
         if self.IsValid() {
             self.chain.KeyRef()
         } else {
-            panic!();
             Err(Error::CursorNotValid)
         }
     }
@@ -1977,7 +1971,6 @@ impl RangeCursor {
         if self.IsValid() {
             self.chain.LiveValueRef()
         } else {
-            panic!();
             Err(Error::CursorNotValid)
         }
     }
@@ -2007,7 +2000,6 @@ impl RangeCursor {
         if self.IsValid() {
             self.chain.Next()
         } else {
-            panic!();
             Err(Error::CursorNotValid)
         }
     }
@@ -2037,7 +2029,6 @@ impl<'c> PrefixCursor<'c> {
             //assert!(k.starts_with(&self.prefix));
             Ok(k)
         } else {
-            panic!();
             Err(Error::CursorNotValid)
         }
     }
@@ -2047,7 +2038,6 @@ impl<'c> PrefixCursor<'c> {
         if self.IsValid() {
             self.chain.LiveValueRef()
         } else {
-            panic!();
             Err(Error::CursorNotValid)
         }
     }
@@ -2072,7 +2062,6 @@ impl<'c> PrefixCursor<'c> {
             try!(self.chain.Next());
             Ok(())
         } else {
-            panic!();
             Err(Error::CursorNotValid)
         }
     }
@@ -3312,7 +3301,6 @@ impl ICursor for LeafCursor {
     fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
         match self.currentKey {
             None => {
-                panic!();
                 Err(Error::CursorNotValid)
             },
             Some(currentKey) => {
@@ -3324,7 +3312,6 @@ impl ICursor for LeafCursor {
     fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
         match self.currentKey {
             None => {
-                panic!();
                 Err(Error::CursorNotValid)
             },
             Some(currentKey) => {
@@ -3348,7 +3335,6 @@ impl ICursor for LeafCursor {
     fn ValueLength(&self) -> Result<Option<usize>> {
         match self.currentKey {
             None => {
-                panic!();
                 Err(Error::CursorNotValid)
             },
             Some(currentKey) => {
@@ -4029,7 +4015,6 @@ impl ICursor for ParentPageCursor {
     fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
         match self.cur_child {
             None => {
-                panic!();
                 Err(Error::CursorNotValid)
             },
             Some(_) => {
@@ -4041,7 +4026,6 @@ impl ICursor for ParentPageCursor {
     fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
         match self.cur_child {
             None => {
-                panic!();
                 Err(Error::CursorNotValid)
             },
             Some(_) => {
@@ -4053,7 +4037,6 @@ impl ICursor for ParentPageCursor {
     fn ValueLength(&self) -> Result<Option<usize>> {
         match self.cur_child {
             None => {
-                panic!();
                 Err(Error::CursorNotValid)
             },
             Some(_) => {
@@ -4076,7 +4059,6 @@ impl ICursor for ParentPageCursor {
     fn Next(&mut self) -> Result<()> {
         match self.cur_child {
             None => {
-                panic!();
                 Err(Error::CursorNotValid)
             },
             Some(i) => {
@@ -4094,7 +4076,6 @@ impl ICursor for ParentPageCursor {
     fn Prev(&mut self) -> Result<()> {
         match self.cur_child {
             None => {
-                panic!();
                 Err(Error::CursorNotValid)
             },
             Some(i) => {

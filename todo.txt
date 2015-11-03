@@ -1,9 +1,11 @@
 
+do binary search of keys in the parent page like in the leaf?
+
 not sure a parent page with only one item in it makes much sense
 
 code for calc/build/write leaf and parent has gotten awfully similar
 
-go back to only one key?  just keep the last key of each item.
+go back to only one key?  just keep the last key of each item?
 
 multiple prefixes?
 
@@ -19,12 +21,6 @@ perf problem with storing locations of each page in parent pages?
     sidecar page for every parent page, just to store locations?
 
 any way to represent/store keys as deltas?  vcdiff?
-
-don't pre-read the overflow keys?  or any of the keys?  just keep
-usize offsets like the leaf cursor does?
-
-should verify that build_*_page size always matches the calculated
-size
 
 get rid of pagenum in leaf/parent cursor?  diag only?
 
