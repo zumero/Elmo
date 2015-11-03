@@ -984,6 +984,7 @@ pub trait ICursor {
     // TODO maybe rm ValueLength.  but LivingCursor uses it as a fast
     // way to detect whether a value is a tombstone or not.
     fn ValueLength(&self) -> Result<Option<usize>>; // tombstone is None
+    // TODO ValueLength type should be u64
 
 }
 
@@ -3117,7 +3118,7 @@ impl Read for OverflowReader {
     }
 }
 
-pub struct LeafCursor {
+pub struct LeafPage {
     path: String,
     f: std::rc::Rc<std::cell::RefCell<File>>,
     pr: misc::Lend<Box<[u8]>>,
@@ -3126,25 +3127,21 @@ pub struct LeafCursor {
     prefix: Option<Box<[u8]>>,
 
     pairs: Vec<PairInLeaf>,
-
-    // TODO rename this
-    currentKey: Option<usize>,
 }
 
-impl LeafCursor {
+impl LeafPage {
     fn new(path: &str, 
            f: std::rc::Rc<std::cell::RefCell<File>>,
            pagenum: PageNum,
            buf: misc::Lend<Box<[u8]>>
-          ) -> Result<LeafCursor> {
+          ) -> Result<LeafPage> {
 
-        let mut res = LeafCursor {
+        let mut res = LeafPage {
             path: String::from(path),
             f: f,
             pagenum: pagenum,
             pr: buf,
             pairs: Vec::new(),
-            currentKey: None,
             prefix: None,
         };
 
@@ -3153,8 +3150,11 @@ impl LeafCursor {
         Ok(res)
     }
 
+    fn count_keys(&self) -> usize {
+        self.pairs.len()
+    }
+
     fn parse_page(&mut self) -> Result<()> {
-        self.currentKey = None;
         self.prefix = None;
 
         let mut cur = 0;
@@ -3219,7 +3219,7 @@ impl LeafCursor {
     }
 
     #[inline]
-    fn keyInLeaf2<'a>(&'a self, n: usize) -> Result<KeyRef<'a>> { 
+    fn key<'a>(&'a self, n: usize) -> Result<KeyRef<'a>> { 
         let prefix: Option<&[u8]> = 
             match self.prefix {
                 Some(ref b) => Some(b),
@@ -3229,7 +3229,37 @@ impl LeafCursor {
         Ok(k)
     }
 
-    fn searchLeaf(&mut self, k: &KeyRef, min: usize, max: usize, sop: SeekOp, le: Option<usize>, ge: Option<usize>) -> Result<(Option<usize>, bool)> {
+    fn value<'a>(&'a self, n: usize) -> Result<ValueRef<'a>> {
+        match &self.pairs[n].value {
+            &ValueInLeaf::Tombstone => {
+                Ok(ValueRef::Tombstone)
+            },
+            &ValueInLeaf::Inline(vlen, pos) => {
+                Ok(ValueRef::Array(&self.pr[pos .. pos + vlen]))
+            },
+            &ValueInLeaf::Overflowed(vlen, ref blocks) => {
+                // TODO return blocks instead of opening the stream
+                let strm = try!(OverflowReader::new(&self.path, self.pr.len(), blocks.blocks[0].firstPage, vlen));
+                Ok(ValueRef::Overflowed(vlen, box strm))
+            },
+        }
+    }
+
+    fn value_len<'a>(&'a self, n: usize) -> Result<Option<usize>> {
+        match &self.pairs[n].value {
+            &ValueInLeaf::Tombstone => {
+                Ok(None)
+            },
+            &ValueInLeaf::Inline(vlen, _) => {
+                Ok(Some(vlen))
+            },
+            &ValueInLeaf::Overflowed(vlen, _) => {
+                Ok(Some(vlen))
+            },
+        }
+    }
+
+    fn search(&self, k: &KeyRef, min: usize, max: usize, sop: SeekOp, le: Option<usize>, ge: Option<usize>) -> Result<(Option<usize>, bool)> {
         if max < min {
             match sop {
                 SeekOp::SEEK_EQ => Ok((None, false)),
@@ -3240,12 +3270,12 @@ impl LeafCursor {
             let mid = (max + min) / 2;
             // assert mid >= 0
             let cmp = {
-                let q = try!(self.keyInLeaf2(mid));
+                let q = try!(self.key(mid));
                 KeyRef::cmp(&q, k)
             };
             match cmp {
                 Ordering::Equal => Ok((Some(mid), true)),
-                Ordering::Less => self.searchLeaf(k, (mid+1), max, sop, Some(mid), ge),
+                Ordering::Less => self.search(k, (mid+1), max, sop, Some(mid), ge),
                 Ordering::Greater => 
                     // we could just recurse with mid-1, but that would overflow if
                     // mod is 0, so we catch that case here.
@@ -3256,21 +3286,31 @@ impl LeafCursor {
                             SeekOp::SEEK_GE => Ok((Some(mid), false)),
                         }
                     } else { 
-                        self.searchLeaf(k, min, (mid-1), sop, le, Some(mid))
+                        self.search(k, min, (mid-1), sop, le, Some(mid))
                     },
             }
         }
     }
 
-    fn leafIsValid(&self) -> bool {
-        // TODO the bounds check of self.currentKey against self.keys.len() could be an assert
-        let ok = (!self.pairs.is_empty()) && (self.currentKey.is_some()) && (self.currentKey.expect("just did is_some") as usize) < self.pairs.len();
-        ok
+}
+
+pub struct LeafCursor {
+    page: LeafPage,
+    // TODO rename this
+    currentKey: Option<usize>,
+}
+
+impl LeafCursor {
+    fn new(page: LeafPage) -> LeafCursor {
+        LeafCursor {
+            page: page,
+            currentKey: None,
+        }
     }
 
-    fn search(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
-        let tmp_countLeafKeys = self.pairs.len();
-        let (newCur, equal) = try!(self.searchLeaf(k, 0, (tmp_countLeafKeys - 1), sop, None, None));
+    fn seek(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
+        let tmp_countLeafKeys = self.page.count_keys();
+        let (newCur, equal) = try!(self.page.search(k, 0, (tmp_countLeafKeys - 1), sop, None, None));
         self.currentKey = newCur;
         if self.currentKey.is_none() {
             Ok(SeekResult::Invalid)
@@ -3281,16 +3321,24 @@ impl LeafCursor {
         }
     }
 
+    fn read_page(&mut self, pgnum: PageNum) -> Result<()> {
+        self.page.read_page(pgnum)
+    }
 }
 
 impl ICursor for LeafCursor {
     fn IsValid(&self) -> bool {
-        self.leafIsValid()
+        if let Some(i) = self.currentKey {
+            assert!(i < self.page.count_keys());
+            true
+        } else {
+            false
+        }
     }
 
     fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
         //println!("Leaf SeekRef {}  k={:?}  sop={:?}", self.pagenum, k, sop);
-        let sr = try!(self.search(k, sop));
+        let sr = try!(self.seek(k, sop));
         if cfg!(expensive_check) 
         {
             try!(sr.verify(k, sop, self));
@@ -3304,7 +3352,7 @@ impl ICursor for LeafCursor {
                 Err(Error::CursorNotValid)
             },
             Some(currentKey) => {
-                self.keyInLeaf2(currentKey)
+                self.page.key(currentKey)
             },
         }
     }
@@ -3315,19 +3363,7 @@ impl ICursor for LeafCursor {
                 Err(Error::CursorNotValid)
             },
             Some(currentKey) => {
-                match &self.pairs[currentKey].value {
-                    &ValueInLeaf::Tombstone => {
-                        Ok(ValueRef::Tombstone)
-                    },
-                    &ValueInLeaf::Inline(vlen, pos) => {
-                        Ok(ValueRef::Array(&self.pr[pos .. pos + vlen]))
-                    },
-                    &ValueInLeaf::Overflowed(vlen, ref blocks) => {
-                        // TODO return blocks instead of opening the stream
-                        let strm = try!(OverflowReader::new(&self.path, self.pr.len(), blocks.blocks[0].firstPage, vlen));
-                        Ok(ValueRef::Overflowed(vlen, box strm))
-                    },
-                }
+                self.page.value(currentKey)
             }
         }
     }
@@ -3338,17 +3374,7 @@ impl ICursor for LeafCursor {
                 Err(Error::CursorNotValid)
             },
             Some(currentKey) => {
-                match &self.pairs[currentKey].value {
-                    &ValueInLeaf::Tombstone => {
-                        Ok(None)
-                    },
-                    &ValueInLeaf::Inline(vlen, _) => {
-                        Ok(Some(vlen))
-                    },
-                    &ValueInLeaf::Overflowed(vlen, _) => {
-                        Ok(Some(vlen))
-                    },
-                }
+                self.page.value_len(currentKey)
             }
         }
     }
@@ -3359,14 +3385,14 @@ impl ICursor for LeafCursor {
     }
 
     fn Last(&mut self) -> Result<()> {
-        self.currentKey = Some(self.pairs.len() - 1);
+        self.currentKey = Some(self.page.count_keys() - 1);
         Ok(())
     }
 
     fn Next(&mut self) -> Result<()> {
         match self.currentKey {
             Some(cur) => {
-                if (cur + 1) < self.pairs.len() {
+                if (cur + 1) < self.page.count_keys() {
                     self.currentKey = Some(cur + 1);
                 } else {
                     self.currentKey = None;
@@ -3417,7 +3443,8 @@ impl PageCursor {
         let sub = 
             match pt {
                 PageType::LEAF_NODE => {
-                    let sub = try!(LeafCursor::new(path, f, pagenum, buf));
+                    let page = try!(LeafPage::new(path, f, pagenum, buf));
+                    let sub = LeafCursor::new(page);
                     PageCursor::Leaf(sub)
                 },
                 PageType::PARENT_NODE => {
@@ -5011,7 +5038,8 @@ impl InnerPart {
             try!(misc::io::read_fully(f, &mut buf));
         }
 
-        let cursor = try!(LeafCursor::new(&inner.path, f, pg, buf));
+        let page = try!(LeafPage::new(&inner.path, f, pg, buf));
+        let cursor = LeafCursor::new(page);
         Ok(cursor)
     }
 
