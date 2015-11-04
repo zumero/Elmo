@@ -2251,427 +2251,434 @@ struct LeafState {
     leaves: Vec<pgitem>,
 }
 
-fn create_segment<I>(mut pw: PageWriter, 
-                                source: I,
-                               ) -> Result<SegmentLocation> where I: Iterator<Item=Result<kvp>> {
+fn write_overflow(
+                    ba: &mut Read, 
+                    pw: &mut PageWriter,
+                    limit : usize,
+                   ) -> Result<(usize, BlockList)> {
 
-    fn write_overflow(
-                        ba: &mut Read, 
-                        pw: &mut PageWriter,
-                        limit : usize,
-                       ) -> Result<(usize, BlockList)> {
-
-        fn write_page(ba: &mut Read, pb: &mut PageBuilder, pgsz: usize, pw: &mut PageWriter, blocks: &mut BlockList, limit: usize) -> Result<(usize, bool)> {
-            pb.Reset();
-            pb.PutByte(PageType::OVERFLOW_NODE.to_u8());
-            let boundary = try!(pw.is_group_on_block_boundary(blocks, limit));
-            let room = 
-                if boundary.is_some() {
-                    pb.PutByte(PageFlag::FLAG_BOUNDARY_NODE);
-                    pgsz - 2 - SIZE_32
-                } else {
-                    pb.PutByte(0u8);
-                    pgsz - 2
-                };
-            let put = try!(pb.PutStream2(ba, room));
-            if put > 0 {
-                if let Some(next_page) = boundary {
-                    pb.SetLastInt32(next_page);
-                }
-                try!(pw.write_group_page(pb.buf(), blocks, limit));
+    fn write_page(ba: &mut Read, pb: &mut PageBuilder, pgsz: usize, pw: &mut PageWriter, blocks: &mut BlockList, limit: usize) -> Result<(usize, bool)> {
+        pb.Reset();
+        pb.PutByte(PageType::OVERFLOW_NODE.to_u8());
+        let boundary = try!(pw.is_group_on_block_boundary(blocks, limit));
+        let room = 
+            if boundary.is_some() {
+                pb.PutByte(PageFlag::FLAG_BOUNDARY_NODE);
+                pgsz - 2 - SIZE_32
             } else {
-                // there was nothing to write
+                pb.PutByte(0u8);
+                pgsz - 2
+            };
+        let put = try!(pb.PutStream2(ba, room));
+        if put > 0 {
+            if let Some(next_page) = boundary {
+                pb.SetLastInt32(next_page);
             }
-            Ok((put, put < room))
-        };
-
-        let pgsz = pw.page_size();
-        let mut pb = PageBuilder::new(pgsz);
-
-        let mut blocks = BlockList::new();
-        let mut sofar = 0;
-        loop {
-            let (put, finished) = try!(write_page(ba, &mut pb, pgsz, pw, &mut blocks, limit));
-            sofar += put;
-            if finished {
-                break;
-            }
+            try!(pw.write_group_page(pb.buf(), blocks, limit));
+        } else {
+            // there was nothing to write
         }
-        //println!("overflow: len = {}  blocks.len = {}  encoded_len: {}", sofar, blocks.len(), blocks.encoded_len());
-        Ok((sofar, blocks))
+        Ok((put, put < room))
+    };
+
+    let pgsz = pw.page_size();
+    let mut pb = PageBuilder::new(pgsz);
+
+    let mut blocks = BlockList::new();
+    let mut sofar = 0;
+    loop {
+        let (put, finished) = try!(write_page(ba, &mut pb, pgsz, pw, &mut blocks, limit));
+        sofar += put;
+        if finished {
+            break;
+        }
+    }
+    //println!("overflow: len = {}  blocks.len = {}  encoded_len: {}", sofar, blocks.len(), blocks.encoded_len());
+    Ok((sofar, blocks))
+}
+
+fn write_leaves<I>(
+                    pw: &mut PageWriter,
+                    source: I,
+                    ) -> Result<Vec<pgitem>> where I: Iterator<Item=Result<kvp>> {
+
+    let mut pb = PageBuilder::new(pw.page_size());
+
+    // TODO this is a buffer just for the purpose of being reused
+    // in cases where the blob is provided as a stream, and we need
+    // read a bit of it to figure out if it might fit inline rather
+    // than overflow.
+    let mut vbuf = vec![0; pw.page_size()].into_boxed_slice(); 
+
+    // 2 for the page type and flags
+    // 2 for the stored count
+    const LEAF_PAGE_OVERHEAD: usize = 2 + 2;
+
+    fn calc_page_len(prefix_len: usize, sofar: usize) -> usize {
+        2 // page type and flags
+        + 2 // stored count
+        + varint::space_needed_for(prefix_len as u64)
+        + prefix_len
+        + sofar // sum of size of all the actual items
     }
 
-    fn write_leaves<I>(
-                        pw: &mut PageWriter,
-                        source: I,
-                        vbuf: &mut [u8],
-                        pb: &mut PageBuilder,
-                        ) -> Result<Vec<pgitem>> where I: Iterator<Item=Result<kvp>> {
-        // 2 for the page type and flags
-        // 2 for the stored count
-        const LEAF_PAGE_OVERHEAD: usize = 2 + 2;
+    fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (KeyWithLocation, Option<KeyWithLocation>, BlockList, usize) {
+        pb.Reset();
+        pb.PutByte(PageType::LEAF_NODE.to_u8());
+        pb.PutByte(0u8); // flags
+        pb.PutVarint(st.prefixLen as u64);
+        if st.prefixLen > 0 {
+            pb.PutArray(&st.keys_in_this_leaf[0].key.key[0 .. st.prefixLen]);
+        }
+        let count_keys_in_this_leaf = st.keys_in_this_leaf.len();
+        // TODO should we support more than 64k keys in a leaf?
+        // either way, overflow-check this cast.
+        pb.PutInt16(count_keys_in_this_leaf as u16);
 
-        fn calc_page_len(prefix_len: usize, sofar: usize) -> usize {
-            2 // page type and flags
-            + 2 // stored count
-            + varint::space_needed_for(prefix_len as u64)
-            + prefix_len
-            + sofar // sum of size of all the actual items
+        fn f(pb: &mut PageBuilder, prefixLen: usize, lp: &LeafPair, list: &mut BlockList) {
+            match lp.key.location {
+                KeyLocation::Inline => {
+                    pb.PutVarint(lp.key.len_with_overflow_flag());
+                    pb.PutArray(&lp.key.key[prefixLen .. ]);
+                },
+                KeyLocation::Overflowed(ref blocks) => {
+                    pb.PutVarint(lp.key.len_with_overflow_flag());
+                    // TODO capacity, no temp vec
+                    let mut v = vec![];
+                    blocks.encode(&mut v);
+                    pb.PutArray(&v);
+                    list.add_blocklist_no_reorder(blocks);
+                },
+            }
+            match lp.value {
+                ValueLocation::Tombstone => {
+                    pb.PutByte(ValueFlag::FLAG_TOMBSTONE);
+                },
+                ValueLocation::Buffer(ref vbuf) => {
+                    pb.PutByte(0u8);
+                    pb.PutVarint(vbuf.len() as u64);
+                    pb.PutArray(&vbuf);
+                },
+                ValueLocation::Overflowed(vlen, ref blocks) => {
+                    pb.PutByte(ValueFlag::FLAG_OVERFLOW);
+                    pb.PutVarint(vlen as u64);
+                    // TODO capacity, no temp vec
+                    let mut v = vec![];
+                    blocks.encode(&mut v);
+                    pb.PutArray(&v);
+                    list.add_blocklist_no_reorder(blocks);
+                },
+            }
         }
 
-        fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (KeyWithLocation, Option<KeyWithLocation>, BlockList, usize) {
-            pb.Reset();
-            pb.PutByte(PageType::LEAF_NODE.to_u8());
-            pb.PutByte(0u8); // flags
-            pb.PutVarint(st.prefixLen as u64);
-            if st.prefixLen > 0 {
-                pb.PutArray(&st.keys_in_this_leaf[0].key.key[0 .. st.prefixLen]);
-            }
-            let count_keys_in_this_leaf = st.keys_in_this_leaf.len();
-            // TODO should we support more than 64k keys in a leaf?
-            // either way, overflow-check this cast.
-            pb.PutInt16(count_keys_in_this_leaf as u16);
+        let mut blocks = BlockList::new();
 
-            fn f(pb: &mut PageBuilder, prefixLen: usize, lp: &LeafPair, list: &mut BlockList) {
-                match lp.key.location {
-                    KeyLocation::Inline => {
-                        pb.PutVarint(lp.key.len_with_overflow_flag());
-                        pb.PutArray(&lp.key.key[prefixLen .. ]);
-                    },
-                    KeyLocation::Overflowed(ref blocks) => {
-                        pb.PutVarint(lp.key.len_with_overflow_flag());
-                        // TODO capacity, no temp vec
-                        let mut v = vec![];
-                        blocks.encode(&mut v);
-                        pb.PutArray(&v);
-                        list.add_blocklist_no_reorder(blocks);
-                    },
-                }
-                match lp.value {
-                    ValueLocation::Tombstone => {
-                        pb.PutByte(ValueFlag::FLAG_TOMBSTONE);
-                    },
-                    ValueLocation::Buffer(ref vbuf) => {
-                        pb.PutByte(0u8);
-                        pb.PutVarint(vbuf.len() as u64);
-                        pb.PutArray(&vbuf);
-                    },
-                    ValueLocation::Overflowed(vlen, ref blocks) => {
-                        pb.PutByte(ValueFlag::FLAG_OVERFLOW);
-                        pb.PutVarint(vlen as u64);
-                        // TODO capacity, no temp vec
-                        let mut v = vec![];
-                        blocks.encode(&mut v);
-                        pb.PutArray(&v);
-                        list.add_blocklist_no_reorder(blocks);
-                    },
+        // deal with the first key separately
+        let first_key = {
+            let lp = st.keys_in_this_leaf.remove(0); 
+            assert!(st.keys_in_this_leaf.len() == count_keys_in_this_leaf - 1);
+            f(pb, st.prefixLen, &lp, &mut blocks);
+            lp.key
+        };
+
+        if st.keys_in_this_leaf.len() == 0 {
+            // there was only one key in this leaf.
+            blocks.sort_and_consolidate();
+            (first_key, None, blocks, pb.sofar())
+        } else {
+            if st.keys_in_this_leaf.len() > 1 {
+                // deal with all the remaining keys except the last one
+                for lp in st.keys_in_this_leaf.drain(0 .. count_keys_in_this_leaf - 2) {
+                    f(pb, st.prefixLen, &lp, &mut blocks);
                 }
             }
+            assert!(st.keys_in_this_leaf.len() == 1);
 
-            let mut blocks = BlockList::new();
-
-            // deal with the first key separately
-            let first_key = {
+            // now the last key
+            let last_key = {
                 let lp = st.keys_in_this_leaf.remove(0); 
-                assert!(st.keys_in_this_leaf.len() == count_keys_in_this_leaf - 1);
+                assert!(st.keys_in_this_leaf.is_empty());
                 f(pb, st.prefixLen, &lp, &mut blocks);
                 lp.key
             };
+            blocks.sort_and_consolidate();
+            (first_key, Some(last_key), blocks, pb.sofar())
+        }
+    }
 
-            if st.keys_in_this_leaf.len() == 0 {
-                // there was only one key in this leaf.
-                blocks.sort_and_consolidate();
-                (first_key, None, blocks, pb.sofar())
-            } else {
-                if st.keys_in_this_leaf.len() > 1 {
-                    // deal with all the remaining keys except the last one
-                    for lp in st.keys_in_this_leaf.drain(0 .. count_keys_in_this_leaf - 2) {
-                        f(pb, st.prefixLen, &lp, &mut blocks);
+    fn write_leaf(st: &mut LeafState, 
+                    pb: &mut PageBuilder, 
+                    pw: &mut PageWriter,
+                   ) -> Result<usize> {
+        let (first_key, last_key, blocks, len_page) = build_leaf(st, pb);
+        //println!("leaf blocklist: {:?}", blocks);
+        //println!("leaf blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
+        assert!(st.keys_in_this_leaf.is_empty());
+        let thisPageNumber = try!(pw.write_page(pb.buf()));
+        let pg = pgitem {
+            page: thisPageNumber, 
+            blocks: blocks,
+            first_key: first_key,
+            last_key: last_key
+        };
+        st.leaves.push(pg);
+        st.sofarLeaf = 0;
+        st.prefixLen = 0;
+        Ok(len_page)
+    }
+
+    let pgsz = pw.page_size();
+
+    let mut st = LeafState {
+        sofarLeaf: 0,
+        keys_in_this_leaf: Vec::new(),
+        prefixLen: 0,
+        leaves: Vec::new(),
+    };
+
+    let mut prev_key: Option<Box<[u8]>> = None;
+
+    for result_pair in source {
+        let mut pair = try!(result_pair);
+
+        let k = pair.Key;
+        if cfg!(expensive_check) 
+        {
+           // this code can be used to verify that we are being given kvps in order
+            match prev_key {
+                None => {
+                },
+                Some(prev_key) => {
+                    let c = k.cmp(&prev_key);
+                    if c != Ordering::Greater {
+                        println!("prev_key: {:?}", prev_key);
+                        println!("k: {:?}", k);
+                        panic!("unsorted keys");
                     }
-                }
-                assert!(st.keys_in_this_leaf.len() == 1);
-
-                // now the last key
-                let last_key = {
-                    let lp = st.keys_in_this_leaf.remove(0); 
-                    assert!(st.keys_in_this_leaf.is_empty());
-                    f(pb, st.prefixLen, &lp, &mut blocks);
-                    lp.key
-                };
-                blocks.sort_and_consolidate();
-                (first_key, Some(last_key), blocks, pb.sofar())
+                },
             }
+            prev_key = Some(k.clone());
         }
 
-        fn write_leaf(st: &mut LeafState, 
-                        pb: &mut PageBuilder, 
-                        pw: &mut PageWriter,
-                       ) -> Result<usize> {
-            let (first_key, last_key, blocks, len_page) = build_leaf(st, pb);
-            //println!("leaf blocklist: {:?}", blocks);
-            //println!("leaf blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
-            assert!(st.keys_in_this_leaf.is_empty());
-            let thisPageNumber = try!(pw.write_page(pb.buf()));
-            let pg = pgitem {
-                page: thisPageNumber, 
-                blocks: blocks,
-                first_key: first_key,
-                last_key: last_key
-            };
-            st.leaves.push(pg);
-            st.sofarLeaf = 0;
-            st.prefixLen = 0;
-            Ok(len_page)
-        }
+        let kloc = {
+            // the max limit of an inline key is when that key is the only
+            // one in the leaf, and its value is overflowed.  well actually,
+            // the reference to an overflowed value can take up a few dozen bytes 
+            // in pathological cases, whereas a really short value could be smaller.
+            // nevermind that.
 
-        let pgsz = pw.page_size();
+            // TODO the following code still needs tuning
 
-        let mut st = LeafState {
-            sofarLeaf: 0,
-            keys_in_this_leaf: Vec::new(),
-            prefixLen: 0,
-            leaves: Vec::new(),
+            // TODO the following code is even more pessimistic now that we do
+            // offsets in encoded blocklists
+            const PESSIMISTIC_OVERFLOW_INFO_SIZE: usize = 
+                1 // number of blocks
+                +
+                (
+                5 // varint, block start page num, worst case
+                + 4 // varint, num pages in block, pathological
+                )
+                * 8 // crazy case
+                ;
+
+            let maxKeyInline = 
+                pgsz 
+                - 2 // page type and flags
+                - 2 // count keys
+                - 1 // prefixLen of 0
+                - varint::space_needed_for((pgsz * 2) as u64) // approx worst case inline key len
+                - 1 // value flags
+                - 9 // worst case varint value len
+                - PESSIMISTIC_OVERFLOW_INFO_SIZE; // overflowed value page
+
+            if k.len() <= maxKeyInline {
+                KeyLocation::Inline
+            } else {
+                // for an overflowed key, there is probably no practical hard limit on the size
+                // of the encoded block list.  we want things to be as contiguous as
+                // possible, but if the block list won't fit on the usable part of a
+                // fresh page, something is seriously wrong.
+                // rather than calculate the actual hard limit, we provide an arbitrary
+                // fraction of the page which would still be pathological.
+                let hard_limit = pgsz / 4;
+                let (len, blocks) = try!(write_overflow(&mut &*k, pw, hard_limit));
+                assert!(len == k.len());
+                KeyLocation::Overflowed(blocks)
+            }
         };
 
-        let mut prev_key: Option<Box<[u8]>> = None;
+        // we have decided whether the key is going to be inlined or overflowed.  but
+        // we have NOT yet decided which page the key is going on.  will it fit on the
+        // current page or does it have to bump to the next one?  we don't know yet.
 
-        for result_pair in source {
-            let mut pair = try!(result_pair);
-
-            let k = pair.Key;
-            if cfg!(expensive_check) 
-            {
-               // this code can be used to verify that we are being given kvps in order
-                match prev_key {
-                    None => {
-                    },
-                    Some(prev_key) => {
-                        let c = k.cmp(&prev_key);
-                        if c != Ordering::Greater {
-                            println!("prev_key: {:?}", prev_key);
-                            println!("k: {:?}", k);
-                            panic!("unsorted keys");
-                        }
-                    },
-                }
-                prev_key = Some(k.clone());
-            }
-
-            let kloc = {
-                // the max limit of an inline key is when that key is the only
-                // one in the leaf, and its value is overflowed.  well actually,
-                // the reference to an overflowed value can take up a few dozen bytes 
-                // in pathological cases, whereas a really short value could be smaller.
-                // nevermind that.
-
-                // TODO the following code still needs tuning
-
-                // TODO the following code is even more pessimistic now that we do
-                // offsets in encoded blocklists
-                const PESSIMISTIC_OVERFLOW_INFO_SIZE: usize = 
-                    1 // number of blocks
-                    +
-                    (
-                    5 // varint, block start page num, worst case
-                    + 4 // varint, num pages in block, pathological
-                    )
-                    * 8 // crazy case
-                    ;
-
-                let maxKeyInline = 
-                    pgsz 
-                    - 2 // page type and flags
-                    - 2 // count keys
-                    - 1 // prefixLen of 0
-                    - varint::space_needed_for((pgsz * 2) as u64) // approx worst case inline key len
-                    - 1 // value flags
-                    - 9 // worst case varint value len
-                    - PESSIMISTIC_OVERFLOW_INFO_SIZE; // overflowed value page
-
-                if k.len() <= maxKeyInline {
-                    KeyLocation::Inline
-                } else {
-                    // for an overflowed key, there is probably no practical hard limit on the size
-                    // of the encoded block list.  we want things to be as contiguous as
-                    // possible, but if the block list won't fit on the usable part of a
-                    // fresh page, something is seriously wrong.
-                    // rather than calculate the actual hard limit, we provide an arbitrary
-                    // fraction of the page which would still be pathological.
-                    let hard_limit = pgsz / 4;
-                    let (len, blocks) = try!(write_overflow(&mut &*k, pw, hard_limit));
-                    assert!(len == k.len());
-                    KeyLocation::Overflowed(blocks)
-                }
-            };
-
-            // we have decided whether the key is going to be inlined or overflowed.  but
-            // we have NOT yet decided which page the key is going on.  will it fit on the
-            // current page or does it have to bump to the next one?  we don't know yet.
-
-            let vloc = {
-                let maxValueInline = {
-                    // TODO use calc_page_len
-                    let fixed_costs_on_new_page =
-                        LEAF_PAGE_OVERHEAD
-                        + 2 // worst case prefixlen varint
-                        + kloc.need(&k, 0)
-                        + 1 // value flags
-                        + varint::space_needed_for(pgsz as u64) // vlen can't be larger than this for inline
-                        ;
-                    assert!(fixed_costs_on_new_page < pgsz);
-                    let available_for_inline_value_on_new_page = pgsz - fixed_costs_on_new_page;
-                    available_for_inline_value_on_new_page
-                };
-
-                // for the write_overflow calls below, we already know how much 
-                // we spent on the key, so we know what our actual limit is for the encoded
-                // block list for the value.  the hard limit, basically, is:  we cannot get
-                // into a state where the key and value cannot fit on the same page.
-
+        let vloc = {
+            let maxValueInline = {
                 // TODO use calc_page_len
-                let hard_limit_for_value_overflow =
-                    pgsz
-                    - LEAF_PAGE_OVERHEAD
-                    - 2 // worst case prefixlen varint
-                    - kloc.need(&k, 0)
-                    - 1 // value flags
-                    - 9 // worst case varint for value len
+                let fixed_costs_on_new_page =
+                    LEAF_PAGE_OVERHEAD
+                    + 2 // worst case prefixlen varint
+                    + kloc.need(&k, 0)
+                    + 1 // value flags
+                    + varint::space_needed_for(pgsz as u64) // vlen can't be larger than this for inline
                     ;
-
-                match pair.Value {
-                    Blob::Tombstone => {
-                        ValueLocation::Tombstone
-                    },
-                    Blob::Stream(ref mut strm) => {
-                        // TODO
-                        // not sure reusing vbuf is worth it.  maybe we should just
-                        // alloc here.  ownership will get passed into the
-                        // ValueLocation when it fits.
-                        let vread = try!(misc::io::read_fully(&mut *strm, &mut vbuf[0 .. maxValueInline + 1]));
-                        let vbuf = &vbuf[0 .. vread];
-                        // TODO should be <= ?
-                        if vread < maxValueInline {
-                            // TODO this alloc+copy is unfortunate
-                            let mut va = Vec::with_capacity(vbuf.len());
-                            for i in 0 .. vbuf.len() {
-                                va.push(vbuf[i]);
-                            }
-                            ValueLocation::Buffer(va.into_boxed_slice())
-                        } else {
-                            let (len, blocks) = try!(write_overflow(&mut (vbuf.chain(strm)), pw, hard_limit_for_value_overflow));
-                            ValueLocation::Overflowed (len, blocks)
-                        }
-                    },
-                    Blob::Array(a) => {
-                        // TODO should be <= ?
-                        if a.len() < maxValueInline {
-                            ValueLocation::Buffer(a)
-                        } else {
-                            let (len, blocks) = try!(write_overflow(&mut &*a, pw, hard_limit_for_value_overflow));
-                            ValueLocation::Overflowed(len, blocks)
-                        }
-                    },
-                }
+                assert!(fixed_costs_on_new_page < pgsz);
+                let available_for_inline_value_on_new_page = pgsz - fixed_costs_on_new_page;
+                available_for_inline_value_on_new_page
             };
 
-            // whether/not the key/value are to be overflowed is now already decided.
-            // now all we have to do is decide if this key/value are going into this leaf
-            // or not.  note that it is possible to overflow these and then have them not
-            // fit into the current leaf and end up landing in the next leaf.
+            // for the write_overflow calls below, we already know how much 
+            // we spent on the key, so we know what our actual limit is for the encoded
+            // block list for the value.  the hard limit, basically, is:  we cannot get
+            // into a state where the key and value cannot fit on the same page.
 
-            fn calc_prefix_len(st: &LeafState, k: &[u8], kloc: &KeyLocation) -> usize {
-                if st.keys_in_this_leaf.is_empty() {
-                    0
-                } else {
-                    match kloc {
-                        &KeyLocation::Inline => {
-                            let max_prefix =
-                                if st.prefixLen > 0 {
-                                    st.prefixLen
-                                } else {
-                                    k.len()
-                                };
-                            bcmp::PrefixMatch(&*st.keys_in_this_leaf[0].key.key, &k, max_prefix)
-                        },
-                        &KeyLocation::Overflowed(_) => {
-                            // an overflowed key does not change the prefix
-                            st.prefixLen
-                        },
-                    }
-                }
-            }
+            // TODO use calc_page_len
+            let hard_limit_for_value_overflow =
+                pgsz
+                - LEAF_PAGE_OVERHEAD
+                - 2 // worst case prefixlen varint
+                - kloc.need(&k, 0)
+                - 1 // value flags
+                - 9 // worst case varint for value len
+                ;
 
-            let fits = {
-                let would_be_prefix_len = calc_prefix_len(&st, &k, &kloc);
-                let would_be_sofar = 
-                    if would_be_prefix_len != st.prefixLen {
-                        assert!(st.prefixLen == 0 || would_be_prefix_len < st.prefixLen);
-                        // the prefixLen would change with the addition of this key,
-                        // so we need to recalc sofar
-                        let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(would_be_prefix_len) ).sum();;
-                        sum
+            match pair.Value {
+                Blob::Tombstone => {
+                    ValueLocation::Tombstone
+                },
+                Blob::Stream(ref mut strm) => {
+                    // TODO
+                    // not sure reusing vbuf is worth it.  maybe we should just
+                    // alloc here.  ownership will get passed into the
+                    // ValueLocation when it fits.
+                    let vread = try!(misc::io::read_fully(&mut *strm, &mut vbuf[0 .. maxValueInline + 1]));
+                    let vbuf = &vbuf[0 .. vread];
+                    // TODO should be <= ?
+                    if vread < maxValueInline {
+                        // TODO this alloc+copy is unfortunate
+                        let mut va = Vec::with_capacity(vbuf.len());
+                        for i in 0 .. vbuf.len() {
+                            va.push(vbuf[i]);
+                        }
+                        ValueLocation::Buffer(va.into_boxed_slice())
                     } else {
-                        st.sofarLeaf
-                    };
-                let would_be_len_page = calc_page_len(would_be_prefix_len, would_be_sofar);
-                if pgsz > would_be_len_page {
-                    let available = pgsz - would_be_len_page;
-                    let needed = kloc.need(&k, would_be_prefix_len) + vloc.need();
-                    available >= needed
-                } else {
-                    false
-                }
-            };
-
-            if !fits {
-                assert!(st.keys_in_this_leaf.len() > 0);
-                let should_be = calc_page_len(st.prefixLen, st.sofarLeaf);
-                let len_page = try!(write_leaf(&mut st, pb, pw));
-                //println!("should_be = {}   len_page = {}", should_be, len_page);
-                assert!(should_be == len_page);
+                        let (len, blocks) = try!(write_overflow(&mut (vbuf.chain(strm)), pw, hard_limit_for_value_overflow));
+                        ValueLocation::Overflowed (len, blocks)
+                    }
+                },
+                Blob::Array(a) => {
+                    // TODO should be <= ?
+                    if a.len() < maxValueInline {
+                        ValueLocation::Buffer(a)
+                    } else {
+                        let (len, blocks) = try!(write_overflow(&mut &*a, pw, hard_limit_for_value_overflow));
+                        ValueLocation::Overflowed(len, blocks)
+                    }
+                },
             }
+        };
 
-            // see if the prefix len actually did change
-            let new_prefix_len = calc_prefix_len(&st, &k, &kloc);
-            let sofar = 
-                if new_prefix_len != st.prefixLen {
-                    assert!(st.prefixLen == 0 || new_prefix_len < st.prefixLen);
-                    // the prefixLen will change with the addition of this key,
+        // whether/not the key/value are to be overflowed is now already decided.
+        // now all we have to do is decide if this key/value are going into this leaf
+        // or not.  note that it is possible to overflow these and then have them not
+        // fit into the current leaf and end up landing in the next leaf.
+
+        fn calc_prefix_len(st: &LeafState, k: &[u8], kloc: &KeyLocation) -> usize {
+            if st.keys_in_this_leaf.is_empty() {
+                0
+            } else {
+                match kloc {
+                    &KeyLocation::Inline => {
+                        let max_prefix =
+                            if st.prefixLen > 0 {
+                                st.prefixLen
+                            } else {
+                                k.len()
+                            };
+                        bcmp::PrefixMatch(&*st.keys_in_this_leaf[0].key.key, &k, max_prefix)
+                    },
+                    &KeyLocation::Overflowed(_) => {
+                        // an overflowed key does not change the prefix
+                        st.prefixLen
+                    },
+                }
+            }
+        }
+
+        let fits = {
+            let would_be_prefix_len = calc_prefix_len(&st, &k, &kloc);
+            let would_be_sofar = 
+                if would_be_prefix_len != st.prefixLen {
+                    assert!(st.prefixLen == 0 || would_be_prefix_len < st.prefixLen);
+                    // the prefixLen would change with the addition of this key,
                     // so we need to recalc sofar
-                    let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(new_prefix_len) ).sum();;
+                    let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(would_be_prefix_len) ).sum();;
                     sum
                 } else {
                     st.sofarLeaf
                 };
-            // note that the LeafPair struct gets ownership of the key provided
-            // from above.
-            let kwloc = KeyWithLocation {
-                key: k,
-                location: kloc,
-            };
-            let lp = LeafPair {
-                        key: kwloc,
-                        value: vloc,
-                        };
+            let would_be_len_page = calc_page_len(would_be_prefix_len, would_be_sofar);
+            if pgsz > would_be_len_page {
+                let available = pgsz - would_be_len_page;
+                let needed = kloc.need(&k, would_be_prefix_len) + vloc.need();
+                available >= needed
+            } else {
+                false
+            }
+        };
 
-            st.sofarLeaf = sofar + lp.need(new_prefix_len);
-            st.prefixLen = new_prefix_len;
-            st.keys_in_this_leaf.push(lp);
-        }
-
-        if !st.keys_in_this_leaf.is_empty() {
+        if !fits {
             assert!(st.keys_in_this_leaf.len() > 0);
             let should_be = calc_page_len(st.prefixLen, st.sofarLeaf);
-            let len_page = try!(write_leaf(&mut st, pb, pw));
+            let len_page = try!(write_leaf(&mut st, &mut pb, pw));
             //println!("should_be = {}   len_page = {}", should_be, len_page);
             assert!(should_be == len_page);
         }
-        Ok(st.leaves)
+
+        // see if the prefix len actually did change
+        let new_prefix_len = calc_prefix_len(&st, &k, &kloc);
+        let sofar = 
+            if new_prefix_len != st.prefixLen {
+                assert!(st.prefixLen == 0 || new_prefix_len < st.prefixLen);
+                // the prefixLen will change with the addition of this key,
+                // so we need to recalc sofar
+                let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(new_prefix_len) ).sum();;
+                sum
+            } else {
+                st.sofarLeaf
+            };
+        // note that the LeafPair struct gets ownership of the key provided
+        // from above.
+        let kwloc = KeyWithLocation {
+            key: k,
+            location: kloc,
+        };
+        let lp = LeafPair {
+                    key: kwloc,
+                    value: vloc,
+                    };
+
+        st.sofarLeaf = sofar + lp.need(new_prefix_len);
+        st.prefixLen = new_prefix_len;
+        st.keys_in_this_leaf.push(lp);
     }
 
-    fn write_parent_nodes(
+    if !st.keys_in_this_leaf.is_empty() {
+        assert!(st.keys_in_this_leaf.len() > 0);
+        let should_be = calc_page_len(st.prefixLen, st.sofarLeaf);
+        let len_page = try!(write_leaf(&mut st, &mut pb, pw));
+        //println!("should_be = {}   len_page = {}", should_be, len_page);
+        assert!(should_be == len_page);
+    }
+    Ok(st.leaves)
+}
+
+fn write_parent_node_tree(
+                       children: Vec<pgitem>,
+                       pw: &mut PageWriter,
+                      ) -> Result<pgitem> {
+
+    fn write_one_set_of_parent_nodes(
                            children: Vec<pgitem>,
-                           pgsz: usize,
                            pw: &mut PageWriter,
                            pb: &mut PageBuilder,
                           ) -> Result<Vec<pgitem>> {
@@ -2854,6 +2861,8 @@ fn create_segment<I>(mut pw: PageWriter,
             }
         }
 
+        let pgsz = pw.page_size();
+
         // deal with all the children except the last one
         for child in children {
             // to fit this child into this parent page, we need room for
@@ -2935,22 +2944,9 @@ fn create_segment<I>(mut pw: PageWriter,
         Ok(st.nextGeneration)
     }
 
-    let pgsz = pw.page_size();
-    // TODO pw.reset_list() ?
-    // or are we promised that the PageWriter we are given is empty?
-    let mut pb = PageBuilder::new(pgsz);
+    let mut pb = PageBuilder::new(pw.page_size());
 
-    // TODO this is a buffer just for the purpose of being reused
-    // in cases where the blob is provided as a stream, and we need
-    // read a bit of it to figure out if it might fit inline rather
-    // than overflow.
-    let mut vbuf = vec![0; pgsz].into_boxed_slice(); 
-
-    let leaves = try!(write_leaves(&mut pw, source, &mut vbuf, &mut pb));
-
-    // we expect there to be at least one leaf.  if the source iterator
-    // is empty, we expect the caller to catch and handle that case.
-    assert!(leaves.len() > 0);
+    assert!(children.len() > 0);
 
     // all the leaves are written.
     // now write the parent pages.
@@ -2960,23 +2956,37 @@ fn create_segment<I>(mut pw: PageWriter,
     // which is the root node.
 
     let root_page =
-        if leaves.len() > 1 {
-            let mut children = leaves;
-            while children.len() > 1 {
+        if children.len() > 1 {
+            let mut kids = children;
+            while kids.len() > 1 {
                 // TODO FWIW, this is where we used to:
                 // before we write this layer of parent nodes, we trim all the
                 // keys to the shortest prefix that will suffice.
 
-                let newChildren = try!(write_parent_nodes(children, pgsz, &mut pw, &mut pb));
-                children = newChildren;
+                let newChildren = try!(write_one_set_of_parent_nodes(kids, pw, &mut pb));
+                kids = newChildren;
             }
-            children.remove(0)
+            kids.remove(0)
         } else {
-            let mut leaves = leaves;
-            leaves.remove(0)
+            let mut children = children;
+            children.remove(0)
         };
+    Ok(root_page)
+}
+
+fn create_segment<I>(mut pw: PageWriter, 
+                                source: I,
+                               ) -> Result<SegmentLocation> where I: Iterator<Item=Result<kvp>> {
+
+    // TODO pw.reset_list() ?
+    // or are we promised that the PageWriter we are given is empty?
+
+    let leaves = try!(write_leaves(&mut pw, source));
+
+    let root_page = try!(write_parent_node_tree(leaves, &mut pw));
 
     let blocks = try!(pw.end());
+
     if cfg!(expensive_check) 
     {
         // if we add the root page to the calculated block list 
