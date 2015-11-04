@@ -30,6 +30,7 @@ extern crate misc;
 
 use misc::endian;
 use misc::varint;
+use misc::Lend;
 
 use std::sync::mpsc;
 use std::thread;
@@ -1190,7 +1191,7 @@ enum Direction {
 }
 
 struct MultiCursor { 
-    subcursors: Box<[SegmentCursor]>, 
+    subcursors: Box<[Lend<PageCursor>]>, 
     sorted: Box<[(usize, Option<Ordering>)]>,
     cur: Option<usize>, 
     dir: Direction,
@@ -1334,7 +1335,7 @@ impl MultiCursor {
         }
     }
 
-    fn Create(subs: Vec<SegmentCursor>) -> MultiCursor {
+    fn Create(subs: Vec<Lend<PageCursor>>) -> MultiCursor {
         let s = subs.into_boxed_slice();
         let mut sorted = Vec::with_capacity(s.len());
         for i in 0 .. s.len() {
@@ -1363,7 +1364,7 @@ impl MultiCursor {
                 self.cur = try!(self.findMin());
                 match self.cur {
                     Some(i) => {
-                        SeekResult::from_cursor(&self.subcursors[i], k)
+                        SeekResult::from_cursor(&*self.subcursors[i], k)
                     },
                     None => {
                         Ok(SeekResult::Invalid)
@@ -1374,7 +1375,7 @@ impl MultiCursor {
                 self.cur = try!(self.findMax());
                 match self.cur {
                     Some(i) => {
-                        SeekResult::from_cursor(&self.subcursors[i], k)
+                        SeekResult::from_cursor(&*self.subcursors[i], k)
                     },
                     None => {
                         Ok(SeekResult::Invalid)
@@ -1507,7 +1508,7 @@ impl ICursor for MultiCursor {
                     // TODO consider simplifying all the stuff below.
                     // all this complexity may not be worth it.
 
-                    fn half(dir: Direction, ki: &KeyRef, subs: &mut [SegmentCursor]) -> Result<()> {
+                    fn half(dir: Direction, ki: &KeyRef, subs: &mut [Lend<PageCursor>]) -> Result<()> {
                         match dir {
                             Direction::Forward => {
                                 unreachable!();
@@ -1765,7 +1766,7 @@ impl ICursor for LivingCursor {
 
 pub struct FilterTombstonesCursor { 
     chain: MultiCursor,
-    behind: Vec<SegmentCursor>,
+    behind: Vec<Lend<PageCursor>>,
 }
 
 impl FilterTombstonesCursor {
@@ -1803,7 +1804,7 @@ impl FilterTombstonesCursor {
         Ok(())
     }
 
-    fn new(ch: MultiCursor, behind: Vec<SegmentCursor>) -> FilterTombstonesCursor {
+    fn new(ch: MultiCursor, behind: Vec<Lend<PageCursor>>) -> FilterTombstonesCursor {
         FilterTombstonesCursor { 
             chain: ch,
             behind: behind,
@@ -3131,7 +3132,7 @@ impl Read for OverflowReader {
 pub struct LeafPage {
     path: String,
     f: std::rc::Rc<std::cell::RefCell<File>>,
-    pr: misc::Lend<Box<[u8]>>,
+    pr: Lend<Box<[u8]>>,
     pagenum: PageNum, // TODO diag only?
 
     prefix: Option<Box<[u8]>>,
@@ -3143,7 +3144,7 @@ impl LeafPage {
     fn new_already_read_page(path: &str, 
            f: std::rc::Rc<std::cell::RefCell<File>>,
            pagenum: PageNum,
-           buf: misc::Lend<Box<[u8]>>
+           buf: Lend<Box<[u8]>>
           ) -> Result<LeafPage> {
 
         let mut res = LeafPage {
@@ -3476,7 +3477,7 @@ impl PageCursor {
     fn new(path: &str, 
            f: std::rc::Rc<std::cell::RefCell<File>>,
            pagenum: PageNum,
-           mut buf: misc::Lend<Box<[u8]>>
+           mut buf: Lend<Box<[u8]>>
           ) -> Result<PageCursor> {
 
         {
@@ -3740,7 +3741,7 @@ impl ParentPageItem {
 pub struct ParentPage {
     path: String,
     f: std::rc::Rc<std::cell::RefCell<File>>,
-    pr: misc::Lend<Box<[u8]>>,
+    pr: Lend<Box<[u8]>>,
     pagenum: PageNum, // TODO diag only?
 
     prefix: Option<Box<[u8]>>,
@@ -3752,7 +3753,7 @@ impl ParentPage {
     fn new_already_read_page(path: &str, 
            f: std::rc::Rc<std::cell::RefCell<File>>,
            pagenum: PageNum,
-           buf: misc::Lend<Box<[u8]>>
+           buf: Lend<Box<[u8]>>
           ) -> Result<ParentPage> {
 
         let (prefix, children) = try!(Self::parse_page(&buf));
@@ -3816,7 +3817,7 @@ impl ParentPage {
             let child_buf = vec![0; self.pr.len()].into_boxed_slice();
             let done_page = move |_| -> () {
             };
-            let mut child_buf = misc::Lend::new(child_buf, box done_page);
+            let mut child_buf = Lend::new(child_buf, box done_page);
             let mut sub = try!(PageCursor::new(&self.path, self.f.clone(), self.children[i].page, child_buf));
             try!(sub.First());
             assert!(sub.IsValid());
@@ -3962,7 +3963,7 @@ impl ParentPage {
         let child_buf = vec![0; self.pr.len()].into_boxed_slice();
         let done_page = move |_| -> () {
         };
-        let mut child_buf = misc::Lend::new(child_buf, box done_page);
+        let mut child_buf = Lend::new(child_buf, box done_page);
 
         let sub = try!(PageCursor::new(&self.path, self.f.clone(), self.children[i].page, child_buf));
         Ok(sub)
@@ -4198,95 +4199,6 @@ impl ICursor for ParentCursor {
                 }
             },
         }
-    }
-
-}
-
-pub struct SegmentCursor {
-    done: Option<Box<Fn() -> ()>>,
-    location: SegmentLocation,
-    sub: PageCursor,
-}
-
-impl SegmentCursor {
-    fn new(path: &str, 
-           f: std::rc::Rc<std::cell::RefCell<File>>,
-           mut buf: misc::Lend<Box<[u8]>>,
-           location: SegmentLocation
-          ) -> Result<SegmentCursor> {
-
-        let sub = try!(PageCursor::new(path, f, location.root_page, buf));
-
-        let res = SegmentCursor {
-            location: location,
-            done: None,
-            sub: sub,
-        };
-
-        Ok(res)
-    }
-
-    fn set_hook(&mut self, done: Box<Fn() -> ()>) {
-        // TODO instead of this thing have a done() hook, should we instead
-        // be wrapping it in a Lend?
-        self.done = Some(done);
-    }
-
-}
-
-impl Drop for SegmentCursor {
-    fn drop(&mut self) {
-        match self.done {
-            Some(ref f) => {
-                f();
-            },
-            None => {
-            },
-        }
-    }
-}
-
-impl ICursor for SegmentCursor {
-    fn IsValid(&self) -> bool {
-        self.sub.IsValid()
-    }
-
-    fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
-        //println!("SegmentCursor page {} SeekRef, k: {:?}", self.location.root_page, k);
-        let sr = try!(self.sub.SeekRef(k, sop));
-        if cfg!(expensive_check) 
-        {
-            try!(sr.verify(k, sop, self));
-        }
-        Ok(sr)
-    }
-
-    fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
-        self.sub.KeyRef()
-    }
-
-    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
-        self.sub.ValueRef()
-    }
-
-    fn ValueLength(&self) -> Result<Option<usize>> {
-        self.sub.ValueLength()
-    }
-
-    fn First(&mut self) -> Result<()> {
-        self.sub.First()
-    }
-
-    fn Last(&mut self) -> Result<()> {
-        self.sub.Last()
-    }
-
-    fn Next(&mut self) -> Result<()> {
-        self.sub.Next()
-    }
-
-    fn Prev(&mut self) -> Result<()> {
-        self.sub.Prev()
     }
 
 }
@@ -4705,10 +4617,6 @@ impl DatabaseFile {
         InnerPart::open_cursor(&self.inner)
     }
 
-    pub fn open_cursor_on_active_segment(&self, n: SegmentNum) -> Result<SegmentCursor> {
-        InnerPart::open_cursor_on_active_segment(&self.inner, n)
-    }
-
     pub fn open_cursor_on_page(&self, pg: PageNum) -> Result<PageCursor> {
         InnerPart::open_cursor_on_page(&self.inner, pg)
     }
@@ -4724,10 +4632,6 @@ impl DatabaseFile {
 
     pub fn read_parent_page(&self, pg: PageNum) -> Result<ParentPage> {
         InnerPart::read_parent_page(&self.inner, pg)
-    }
-
-    pub fn open_cursor_on_pending_segment(&self, location: SegmentLocation) -> Result<SegmentCursor> {
-        InnerPart::open_cursor_on_pending_segment(&self.inner, location)
     }
 
     pub fn write_segment(&self, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<SegmentLocation> {
@@ -5059,7 +4963,7 @@ impl InnerPart {
         header: &HeaderData,
         g: SegmentNum,
         f: std::rc::Rc<std::cell::RefCell<File>>,
-        ) -> Result<SegmentCursor> {
+        ) -> Result<Lend<PageCursor>> {
 
         match header.segments_info.get(&g) {
             None => Err(Error::Misc(String::from("get_cursor_on_active_segment: segment not found"))),
@@ -5067,24 +4971,23 @@ impl InnerPart {
                 let mut space = try!(inner.space.lock());
                 let csrnum = space.nextCursorNum;
                 let foo = inner.clone();
-                // TODO this should use misc::Lend<>
-                let done = move || -> () {
+                let done = move |_| -> () {
                     // TODO this wants to propagate errors
                     foo.cursor_dropped(g, csrnum);
                 };
-                let page = try!(Self::get_loaner_page(inner));
-                let mut csr = try!(SegmentCursor::new(&inner.path, f, page, seg.location.clone()));
+                let buf = try!(Self::get_loaner_page(inner));
+                let csr = try!(PageCursor::new(&inner.path, f, seg.location.root_page, buf));
+                let csr = Lend::new(csr, box done);
 
                 space.nextCursorNum = space.nextCursorNum + 1;
                 let was = space.cursors.insert(csrnum, g);
                 assert!(was.is_none());
-                csr.set_hook(box done);
                 Ok(csr)
             }
         }
     }
 
-    fn get_loaner_page(inner: &std::sync::Arc<InnerPart>) -> Result<misc::Lend<Box<[u8]>>> {
+    fn get_loaner_page(inner: &std::sync::Arc<InnerPart>) -> Result<Lend<Box<[u8]>>> {
         let page = {
             match inner.pagepool.try_lock() {
                 Ok(mut pagepool) => {
@@ -5105,15 +5008,8 @@ impl InnerPart {
         let done_page = move |p| -> () {
             foo.return_page_to_pool(p);
         };
-        let page = misc::Lend::new(page, box done_page);
+        let page = Lend::new(page, box done_page);
         Ok(page)
-    }
-
-    fn open_cursor_on_active_segment(inner: &std::sync::Arc<InnerPart>, g: SegmentNum) -> Result<SegmentCursor> {
-        let st = try!(inner.header.read());
-        let f = try!(inner.open_file_for_cursor());
-        let cursor = try!(Self::get_cursor_on_active_segment(inner, &*st, g, f));
-        Ok(cursor)
     }
 
     fn open_cursor_on_page(inner: &std::sync::Arc<InnerPart>, pg: PageNum) -> Result<PageCursor> {
@@ -5165,14 +5061,6 @@ impl InnerPart {
 
         let page = try!(ParentPage::new_already_read_page(&inner.path, f, pg, buf));
         Ok(page)
-    }
-
-    fn open_cursor_on_pending_segment(inner: &std::sync::Arc<InnerPart>, location: SegmentLocation) -> Result<SegmentCursor> {
-        let page = try!(Self::get_loaner_page(inner));
-        let f = try!(inner.open_file_for_cursor());
-        let cursor = try!(SegmentCursor::new(&inner.path, f, page, location));
-        // note no set_hook here
-        Ok(cursor)
     }
 
     fn open_cursor(inner: &std::sync::Arc<InnerPart>) -> Result<LivingCursor> {

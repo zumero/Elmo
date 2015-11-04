@@ -164,23 +164,6 @@ fn seek_bytes(name: &str, k: Box<[u8]>, sop: String) -> Result<(),lsm::Error> {
     Ok(())
 }
 
-fn dump_segment(name: &str, segnum: u64) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
-    let mut cursor = try!(db.open_cursor_on_active_segment(segnum));
-    try!(cursor.First());
-    while cursor.IsValid() {
-        {
-            let k = try!(cursor.KeyRef());
-            println!("k: {:?}", k);
-            let v = try!(cursor.ValueRef());
-            println!("v: {:?}", v);
-            //let q = try!(v.into_boxed_slice());
-        }
-        try!(cursor.Next());
-    }
-    Ok(())
-}
-
 fn add_numbers(name: &str, count: u64, start: u64, step: u64) -> Result<(),lsm::Error> {
     let mut pending = BTreeMap::new();
     for i in 0 .. count {
@@ -345,13 +328,6 @@ fn result_main() -> Result<(),lsm::Error> {
         },
         "list_free_blocks" => {
             list_free_blocks(name)
-        },
-        "dump_segment" => {
-            if args.len() < 4 {
-                return Err(lsm::Error::Misc(String::from("too few args")));
-            }
-            let segnum = args[3].parse::<u64>().unwrap();
-            dump_segment(name, segnum)
         },
         _ => {
             Err(lsm::Error::Misc(String::from("unknown command")))
