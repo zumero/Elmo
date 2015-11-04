@@ -42,9 +42,6 @@ became part of S) become free pages
 
 MultiCursor needs to accept any kind of ICursor
 
-SegmentCursor is now nothing but a PageCursor with a hook.  it could
-just be a PageCursor wrapper in a Lend.
-
 do we need a Page class like PageCursor which can represent either
 LeafPage or ParentPage, with a common set of methods?
 
@@ -70,7 +67,9 @@ a full segment with Next(), because somebody might call Prev()
 or First().  and we probably don't want to add thousands of
 little locks.  rather, we need the notion of "I have a lock on
 this page and all the pages it uses."  Kind of like what we
-have now, but works on the page number.
+have now, but works on the page number.  or maybe each read lock
+is a blocklist.  a page/block can be freed as soon as it is
+not a member of any readlock's blocklist.
 
 any given parent set might be less efficient since, for
 example, "new Y" might have pages that are kind of empty.
