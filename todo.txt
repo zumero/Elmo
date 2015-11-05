@@ -1,23 +1,27 @@
 
+multi level merge needs the ability for the source to be just one
+piece.
+
+doing overlaps/siblings entirely in terms of leaves might be
+great for young-to-zero, but not later?
+
 having last_key be an Option<> is so tedious
 
 merge:
 
 let M = stuff that wants to be merged up.  
     could be multiple young level segments.  
-    could be a ParentPage within something else?
+    could be a ParentPage within something else?  TODO
     whatever.
 
 let D = the dest segment.
 
 let R = the root page of D
 
-let X = the lowest single page in D that entirely contains M.
-    could be a leaf
-    could be a parent, could be the root
-    could be none (M and D do not overlap)
-
-TODO should we allow X to be multiple contiguous pages?
+let X = the set of pages that overlap M
+    if only one, it's a leaf.  currently.
+    considering having X only be leaves.
+    could be none (M and D do not overlap, or between)
 
 let Y = the ParentPage that contains X, if X exists and is not the root
 
@@ -44,17 +48,8 @@ became part of S) become free pages
 
 --------
 
-MultiCursor needs to accept any kind of ICursor
-
 do we need a Page class like PageCursor which can represent either
 LeafPage or ParentPage, with a common set of methods?
-
-LeafPage and ParentPage now need methods to return the key range and
-the complete block list.
-
-get rid of segments_info?  blocks for a page can be gotten from the page.
-
-get rid of SegmentNum?
 
 header can get really small.  so small that we no longer want to 
 waste 4096 bytes or an entire page on it.  it needs to live on
