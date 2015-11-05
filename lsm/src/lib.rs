@@ -51,15 +51,6 @@ use std::collections::HashSet;
 const SIZE_32: usize = 4; // like std::mem::size_of::<u32>()
 const SIZE_16: usize = 2; // like std::mem::size_of::<u16>()
 
-// all new segments start at level 0.
-//
-// level 0 size limit is 0 because it is unused, because promotion
-// out of level 0 is not based on a size threshold.
-//
-// final level size limit is 0 because it is unused, because nothing ever
-// gets promoted out of the last level.
-const LEVEL_SIZE_LIMITS_IN_KB: [u64; 4] = [0, 400, 40000, 0];
-
 pub type PageNum = u32;
 pub type PageCount = u32;
 // type PageSize = u32;
@@ -196,13 +187,6 @@ impl BlockRequest {
             &BlockRequest::StartOrAfterMinimumSize(_, after, _) => Some(after),
         }
     }
-}
-
-#[derive(Debug)]
-pub enum MergePromotionRule {
-    Promote,
-    Stay,
-    Threshold(PageCount),
 }
 
 // kvp is the struct used to provide key-value pairs downward,
@@ -438,6 +422,8 @@ pub enum KeyRef<'a> {
 
     // the other two are references into the page
     Prefixed(&'a [u8],&'a [u8]),
+
+    // TODO rename to Slice
     Array(&'a [u8]),
 }
 
@@ -858,8 +844,6 @@ impl PageBlock {
     }
 }
 
-pub type SegmentNum = u64;
-
 #[derive(PartialEq,Copy,Clone,Debug)]
 pub enum SeekOp {
     SEEK_EQ = 0,
@@ -868,11 +852,11 @@ pub enum SeekOp {
 }
 
 struct CursorIterator {
-    csr: Box<ICursor>,
+    csr: Box<IForwardCursor>,
 }
 
 impl CursorIterator {
-    fn new(it: Box<ICursor>) -> CursorIterator {
+    fn new(it: Box<IForwardCursor>) -> CursorIterator {
         CursorIterator { csr: it }
     }
 }
@@ -970,12 +954,9 @@ impl SeekResult {
     }
 }
 
-pub trait ICursor {
-    fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult>;
+pub trait IForwardCursor {
     fn First(&mut self) -> Result<()>;
-    fn Last(&mut self) -> Result<()>;
     fn Next(&mut self) -> Result<()>;
-    fn Prev(&mut self) -> Result<()>;
 
     fn IsValid(&self) -> bool;
 
@@ -986,6 +967,13 @@ pub trait ICursor {
     // way to detect whether a value is a tombstone or not.
     fn ValueLength(&self) -> Result<Option<usize>>; // tombstone is None
     // TODO ValueLength type should be u64
+
+}
+
+pub trait ICursor : IForwardCursor {
+    fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult>;
+    fn Last(&mut self) -> Result<()>;
+    fn Prev(&mut self) -> Result<()>;
 
 }
 
@@ -1026,7 +1014,7 @@ impl SegmentLocation {
 
 }
 
-// TODO this will probably go away again
+// TODO this is ready go away again
 #[derive(Debug,Clone)]
 pub struct SegmentInfo {
     level: u32,
@@ -1390,7 +1378,7 @@ impl MultiCursor {
 
 }
 
-impl ICursor for MultiCursor {
+impl IForwardCursor for MultiCursor {
     fn IsValid(&self) -> bool {
         match self.cur {
             Some(i) => self.subcursors[i].IsValid(),
@@ -1403,14 +1391,6 @@ impl ICursor for MultiCursor {
             try!(self.subcursors[i].First());
         }
         self.cur = try!(self.findMin());
-        Ok(())
-    }
-
-    fn Last(&mut self) -> Result<()> {
-        for i in 0 .. self.subcursors.len() {
-            try!(self.subcursors[i].Last());
-        }
-        self.cur = try!(self.findMax());
         Ok(())
     }
 
@@ -1607,6 +1587,17 @@ impl ICursor for MultiCursor {
         }
     }
 
+}
+
+impl ICursor for MultiCursor {
+    fn Last(&mut self) -> Result<()> {
+        for i in 0 .. self.subcursors.len() {
+            try!(self.subcursors[i].Last());
+        }
+        self.cur = try!(self.findMax());
+        Ok(())
+    }
+
     // TODO fix Prev like Next
     fn Prev(&mut self) -> Result<()> {
         match self.cur {
@@ -1653,6 +1644,333 @@ impl ICursor for MultiCursor {
 
 }
 
+struct MergeCursor { 
+    subcursors: Box<[Box<IForwardCursor>]>, 
+    sorted: Box<[(usize, Option<Ordering>)]>,
+    cur: Option<usize>, 
+}
+
+impl MergeCursor {
+    fn sort(&mut self) -> Result<()> {
+        if self.subcursors.is_empty() {
+            return Ok(())
+        }
+
+        // TODO this memory allocation is expensive.
+
+        // get a KeyRef for all the cursors
+        let mut ka = Vec::with_capacity(self.subcursors.len());
+        for c in self.subcursors.iter() {
+            if c.IsValid() {
+                ka.push(Some(try!(c.KeyRef())));
+            } else {
+                ka.push(None);
+            }
+        }
+
+        // TODO consider converting ka to a boxed slice here?
+
+        // init the orderings to None.
+        // the invalid cursors will stay that way.
+        for i in 0 .. self.sorted.len() {
+            self.sorted[i].1 = None;
+        }
+
+        for i in 1 .. self.sorted.len() {
+            let mut j = i;
+            while j > 0 {
+                let nj = self.sorted[j].0;
+                let nprev = self.sorted[j - 1].0;
+                match (&ka[nj], &ka[nprev]) {
+                    (&Some(ref kj), &Some(ref kprev)) => {
+                        let c = {
+                            KeyRef::cmp(kj, kprev)
+                        };
+                        match c {
+                            Ordering::Greater => {
+                                self.sorted[j].1 = Some(Ordering::Greater);
+                                break;
+                            },
+                            Ordering::Equal => {
+                                match nj.cmp(&nprev) {
+                                    Ordering::Equal => {
+                                        unreachable!();
+                                    },
+                                    Ordering::Greater => {
+                                        self.sorted[j].1 = Some(Ordering::Equal);
+                                        break;
+                                    },
+                                    Ordering::Less => {
+                                        self.sorted[j - 1].1 = Some(Ordering::Equal);
+                                        // keep going
+                                    },
+                                }
+                            },
+                            Ordering::Less => {
+                                // keep going
+                                self.sorted[j - 1].1 = Some(Ordering::Greater);
+                            },
+                        }
+                    },
+                    (&Some(_), &None) => {
+                        // keep going
+                    },
+                    (&None, &Some(_)) => {
+                        break;
+                    },
+                    (&None, &None) => {
+                        match nj.cmp(&nprev) {
+                            Ordering::Equal => {
+                                unreachable!();
+                            },
+                            Ordering::Greater => {
+                                break;
+                            },
+                            Ordering::Less => {
+                                // keep going
+                            },
+                        }
+                    }
+                };
+                self.sorted.swap(j, j - 1);
+                j = j - 1;
+            }
+        }
+
+        // fix the first one
+        if self.sorted.len() > 0 {
+            let n = self.sorted[0].0;
+            if ka[n].is_some() {
+                self.sorted[0].1 = Some(Ordering::Equal);
+            }
+        }
+
+        /*
+        println!("{:?} : {}", self.sorted, if want_max { "backward" } else {"forward"} );
+        for i in 0 .. self.sorted.len() {
+            let (n, ord) = self.sorted[i];
+            println!("    {:?}", ka[n]);
+        }
+        */
+        Ok(())
+    }
+
+    fn sorted_first(&self) -> Option<usize> {
+        let n = self.sorted[0].0;
+        if self.sorted[0].1.is_some() {
+            Some(n)
+        } else {
+            None
+        }
+    }
+
+    fn findMin(&mut self) -> Result<Option<usize>> {
+        if self.subcursors.is_empty() {
+            Ok(None)
+        } else {
+            try!(self.sort());
+            Ok(self.sorted_first())
+        }
+    }
+
+    fn new(subs: Vec<Box<IForwardCursor>>) -> MergeCursor {
+        let s = subs.into_boxed_slice();
+        let mut sorted = Vec::with_capacity(s.len());
+        for i in 0 .. s.len() {
+            sorted.push((i, None));
+        }
+        MergeCursor { 
+            subcursors: s, 
+            sorted: sorted.into_boxed_slice(), 
+            cur: None, 
+        }
+    }
+
+}
+
+impl IForwardCursor for MergeCursor {
+    fn IsValid(&self) -> bool {
+        match self.cur {
+            Some(i) => self.subcursors[i].IsValid(),
+            None => false
+        }
+    }
+
+    fn First(&mut self) -> Result<()> {
+        for i in 0 .. self.subcursors.len() {
+            try!(self.subcursors[i].First());
+        }
+        self.cur = try!(self.findMin());
+        Ok(())
+    }
+
+    fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(icur) => {
+                self.subcursors[icur].KeyRef()
+            },
+        }
+    }
+
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(icur) => {
+                self.subcursors[icur].ValueRef()
+            },
+        }
+    }
+
+    fn ValueLength(&self) -> Result<Option<usize>> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(icur) => {
+                self.subcursors[icur].ValueLength()
+            },
+        }
+    }
+
+    fn Next(&mut self) -> Result<()> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(icur) => {
+                // we need to fix every cursor to point to its min
+                // value > icur.
+
+                // if perf didn't matter, this would be simple.
+                // call Next on icur.  and call Seek(GE) (and maybe Next)
+                // on every other cursor.
+
+                // but there are several cases where we can do a lot
+                // less work than a Seek.  And we have the information
+                // to identify those cases.  So, this function is
+                // pretty complicated, but it's fast.
+
+                // --------
+
+                // the current cursor (icur) is easy.  it just needs Next().
+                // we'll do it last, so we can use it for comparisons.
+                // for now we deal with all the others.
+
+                // the current direction of the multicursor tells us
+                // something about the state of all the others.
+
+                    // this is the happy case.  each cursor is at most
+                    // one step away.
+
+                    // direction is Forward, so we know that every valid cursor
+                    // is pointing at a key which is either == to icur, or
+                    // it is already the min key > icur.
+
+                    assert!(icur == self.sorted[0].0);
+                    // immediately after that, there may (or may not be) some
+                    // entries which were Ordering:Equal to cur.  call Next on
+                    // each of these.
+
+                    for i in 1 .. self.sorted.len() {
+                        //println!("sorted[{}] : {:?}", i, self.sorted[i]);
+                        let (n, c) = self.sorted[i];
+                        match c {
+                            None => {
+                                break;
+                            },
+                            Some(c) => {
+                                if c == Ordering::Equal {
+                                    try!(self.subcursors[n].Next());
+                                } else {
+                                    break;
+                                }
+                            },
+                        }
+                    }
+
+                // now the current cursor
+                try!(self.subcursors[icur].Next());
+
+                // now re-sort
+                self.cur = try!(self.findMin());
+                Ok(())
+            },
+        }
+    }
+
+}
+
+// TODO this will probably go away, and FilterTombstonesCursor
+// modified for the merge case.
+pub struct MergeLivingCursor { 
+    chain: MergeCursor,
+}
+
+impl MergeLivingCursor {
+    pub fn LiveValueRef<'a>(&'a self) -> Result<LiveValueRef<'a>> {
+        match try!(self.chain.ValueRef()) {
+            ValueRef::Array(a) => Ok(LiveValueRef::Array(a)),
+            ValueRef::Overflowed(len, r) => Ok(LiveValueRef::Overflowed(len, r)),
+            ValueRef::Tombstone => Err(Error::Misc(String::from("LiveValueRef tombstone TODO unreachable"))),
+        }
+    }
+
+    fn skipTombstonesForward(&mut self) -> Result<()> {
+        while self.chain.IsValid() && try!(self.chain.ValueLength()).is_none() {
+            try!(self.chain.Next());
+        }
+        Ok(())
+    }
+
+    fn new(ch: MergeCursor) -> MergeLivingCursor {
+        MergeLivingCursor { chain : ch }
+    }
+}
+
+impl IForwardCursor for MergeLivingCursor {
+    fn First(&mut self) -> Result<()> {
+        try!(self.chain.First());
+        try!(self.skipTombstonesForward());
+        Ok(())
+    }
+
+    fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
+        self.chain.KeyRef()
+    }
+
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
+        self.chain.ValueRef()
+    }
+
+    fn ValueLength(&self) -> Result<Option<usize>> {
+        self.chain.ValueLength()
+    }
+
+    fn IsValid(&self) -> bool {
+        self.chain.IsValid() 
+            && {
+                let r = self.chain.ValueLength();
+                if r.is_ok() {
+                    r.unwrap().is_some()
+                } else {
+                    false
+                }
+            }
+    }
+
+    fn Next(&mut self) -> Result<()> {
+        try!(self.chain.Next());
+        try!(self.skipTombstonesForward());
+        Ok(())
+    }
+
+}
+
 pub struct LivingCursor { 
     chain: MultiCursor
 }
@@ -1685,16 +2003,10 @@ impl LivingCursor {
     }
 }
 
-impl ICursor for LivingCursor {
+impl IForwardCursor for LivingCursor {
     fn First(&mut self) -> Result<()> {
         try!(self.chain.First());
         try!(self.skipTombstonesForward());
-        Ok(())
-    }
-
-    fn Last(&mut self) -> Result<()> {
-        try!(self.chain.Last());
-        try!(self.skipTombstonesBackward());
         Ok(())
     }
 
@@ -1725,6 +2037,15 @@ impl ICursor for LivingCursor {
     fn Next(&mut self) -> Result<()> {
         try!(self.chain.Next());
         try!(self.skipTombstonesForward());
+        Ok(())
+    }
+
+}
+
+impl ICursor for LivingCursor {
+    fn Last(&mut self) -> Result<()> {
+        try!(self.chain.Last());
+        try!(self.skipTombstonesBackward());
         Ok(())
     }
 
@@ -1764,6 +2085,7 @@ impl ICursor for LivingCursor {
 
 }
 
+// TODO get this working again
 pub struct FilterTombstonesCursor { 
     chain: MultiCursor,
     behind: Vec<Lend<PageCursor>>,
@@ -1812,16 +2134,10 @@ impl FilterTombstonesCursor {
     }
 }
 
-impl ICursor for FilterTombstonesCursor {
+impl IForwardCursor for FilterTombstonesCursor {
     fn First(&mut self) -> Result<()> {
         try!(self.chain.First());
         try!(self.skipTombstonesForward());
-        Ok(())
-    }
-
-    fn Last(&mut self) -> Result<()> {
-        try!(self.chain.Last());
-        try!(self.skipTombstonesBackward());
         Ok(())
     }
 
@@ -1844,6 +2160,15 @@ impl ICursor for FilterTombstonesCursor {
     fn Next(&mut self) -> Result<()> {
         try!(self.chain.Next());
         try!(self.skipTombstonesForward());
+        Ok(())
+    }
+
+}
+
+impl ICursor for FilterTombstonesCursor {
+    fn Last(&mut self) -> Result<()> {
+        try!(self.chain.Last());
+        try!(self.skipTombstonesBackward());
         Ok(())
     }
 
@@ -2109,8 +2434,9 @@ mod PageFlag {
     pub const FLAG_BOUNDARY_NODE: u8 = 2;
 }
 
-#[derive(Debug)]
-// this struct is used to remember pages we have written.
+#[derive(Debug, Clone)]
+// this struct is used to remember pages we have written, and to
+// provide info needed to write parent nodes.
 struct pgitem {
     page: PageNum,
     blocks: BlockList,
@@ -2150,7 +2476,7 @@ struct ParentState {
 // this enum keeps track of what happened to a key as we
 // processed it.  either we determined that it will fit
 // inline or we wrote it as an overflow.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum KeyLocation {
     Inline,
     Overflowed(BlockList),
@@ -2177,6 +2503,7 @@ impl ValueLocation {
 impl KeyLocation {
     fn need(&self, k: &[u8], prefixLen: usize) -> usize {
         let klen = k.len();
+        assert!(klen >= prefixLen);
         match *self {
             KeyLocation::Inline => {
                 0 // no key flags
@@ -2216,7 +2543,7 @@ impl KeyWithLocation {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KeyWithLocation {
     key: Box<[u8]>,
     location: KeyLocation,
@@ -2607,6 +2934,7 @@ fn write_leaves<I>(
 
         let fits = {
             let would_be_prefix_len = calc_prefix_len(&st, &k, &kloc);
+            assert!(would_be_prefix_len <= k.len());
             let would_be_sofar = 
                 if would_be_prefix_len != st.prefixLen {
                     assert!(st.prefixLen == 0 || would_be_prefix_len < st.prefixLen);
@@ -2637,6 +2965,7 @@ fn write_leaves<I>(
 
         // see if the prefix len actually did change
         let new_prefix_len = calc_prefix_len(&st, &k, &kloc);
+        assert!(new_prefix_len <= k.len());
         let sofar = 
             if new_prefix_len != st.prefixLen {
                 assert!(st.prefixLen == 0 || new_prefix_len < st.prefixLen);
@@ -2864,8 +3193,43 @@ fn write_parent_node_tree(
 
         let pgsz = pw.page_size();
 
+        let mut prev_child: Option<pgitem> = None;
+
         // deal with all the children except the last one
         for child in children {
+
+            if cfg!(expensive_check) 
+            {
+                // TODO FYI this code is the only reason we need to derive Clone on
+                // pgitem and its parts
+                match prev_child {
+                    None => {
+                    },
+                    Some(prev_child) => {
+                        let c = child.first_key.key.cmp(&prev_child.first_key.key);
+                        if c != Ordering::Greater {
+                            println!("prev_child first_key: {:?}", prev_child.first_key);
+                            println!("cur child first_key: {:?}", child.first_key);
+                            panic!("unsorted child pages");
+                        }
+                        match &prev_child.last_key {
+                            &Some(ref last_key) => {
+                                let c = child.first_key.key.cmp(&last_key.key);
+                                if c != Ordering::Greater {
+                                    println!("prev_child first_key: {:?}", prev_child.first_key);
+                                    println!("prev_child last_key: {:?}", last_key);
+                                    println!("cur child first_key: {:?}", child.first_key);
+                                    panic!("overlapping child pages");
+                                }
+                            },
+                            &None => {
+                            },
+                        }
+                    },
+                }
+                prev_child = Some(child.clone());
+            }
+
             // to fit this child into this parent page, we need room for
             // the root page
             // the block list
@@ -2977,7 +3341,7 @@ fn write_parent_node_tree(
 
 fn create_segment<I>(mut pw: PageWriter, 
                                 source: I,
-                               ) -> Result<SegmentLocation> where I: Iterator<Item=Result<kvp>> {
+                               ) -> Result<PageNum> where I: Iterator<Item=Result<kvp>> {
 
     // TODO pw.reset_list() ?
     // or are we promised that the PageWriter we are given is empty?
@@ -2985,7 +3349,8 @@ fn create_segment<I>(mut pw: PageWriter,
     let leaves = try!(write_leaves(&mut pw, source));
 
     let root_page = try!(write_parent_node_tree(leaves, &mut pw));
-
+// TODO do we need to return the blocklist?
+// if not, the only reason to call pw.end() is to make it release leftovers
     let blocks = try!(pw.end());
 
     if cfg!(expensive_check) 
@@ -3007,11 +3372,8 @@ fn create_segment<I>(mut pw: PageWriter,
         }
     }
     assert!(blocks.contains_page(root_page.page));
-    let loc = SegmentLocation {
-        root_page: root_page.page,
-        blocks: blocks,
-    };
-    Ok(loc)
+
+    Ok(root_page.page)
 }
 
 struct OverflowReader {
@@ -3199,6 +3561,52 @@ impl LeafPage {
         list
     }
 
+    fn overlaps(&self, first_key: &[u8], last_key: &[u8]) -> Result<Overlap> {
+        match try!(self.key(0)).compare_with(last_key) {
+            Ordering::Greater => {
+                Ok(Overlap::Greater)
+            },
+            Ordering::Less | Ordering::Equal => {
+                let last_pair = self.pairs.len() - 1;
+                match try!(self.key(last_pair)).compare_with(first_key) {
+                    Ordering::Less => {
+                        Ok(Overlap::Less)
+                    },
+                    Ordering::Greater | Ordering::Equal => {
+                        Ok(Overlap::Yes)
+                    },
+                }
+            },
+        }
+    }
+
+    fn first_key_with_location(&self) -> Result<KeyWithLocation> {
+        self.key_with_location(0)
+    }
+
+    fn last_key_with_location(&self) -> Result<Option<KeyWithLocation>> {
+        if self.pairs.len() == 1 {
+            Ok(None)
+        } else {
+            let i = self.pairs.len() - 1;
+            let kw = try!(self.key_with_location(i));
+            Ok(Some(kw))
+        }
+    }
+
+    fn pgitem(&self) -> Result<pgitem> {
+        let blocks = self.complete_blocklist();
+        let first_key = try!(self.first_key_with_location());
+        let last_key = try!(self.last_key_with_location());
+        let pg = pgitem {
+            page: self.pagenum,
+            blocks: blocks,
+            first_key: first_key,
+            last_key: last_key,
+        };
+        Ok(pg)
+    }
+
     fn parse_page(&mut self) -> Result<()> {
         self.prefix = None;
 
@@ -3273,6 +3681,51 @@ impl LeafPage {
             };
         let k = try!(self.pairs[n].key.keyref(&self.pr, prefix, &self.path));
         Ok(k)
+    }
+
+    fn key_with_location(&self, n: usize) -> Result<KeyWithLocation> { 
+        let prefix: Option<&[u8]> = 
+            match self.prefix {
+                Some(ref b) => Some(b),
+                None => None,
+            };
+        let k = try!(self.pairs[n].key.key_with_location(&self.pr, prefix, &self.path));
+        Ok(k)
+    }
+
+    fn min_key(&self, m: Option<Box<[u8]>>) -> Result<Box<[u8]>> {
+        let k = try!(self.key(0)).into_boxed_slice();
+        match m {
+            Some(m) => {
+                if Ordering::Less == bcmp::Compare(&k, &m) {
+                    // TODO could wait until here to do the into_boxed_slice
+                    Ok(k)
+                } else {
+                    Ok(m)
+                }
+            },
+            None => {
+                Ok(k)
+            },
+        }
+    }
+
+    fn max_key(&self, m: Option<Box<[u8]>>) -> Result<Box<[u8]>> {
+        let i = self.pairs.len() - 1;
+        let k = try!(self.key(i)).into_boxed_slice();
+        match m {
+            Some(m) => {
+                if Ordering::Greater == bcmp::Compare(&k, &m) {
+                    // TODO could wait until here to do the into_boxed_slice
+                    Ok(k)
+                } else {
+                    Ok(m)
+                }
+            },
+            None => {
+                Ok(k)
+            },
+        }
     }
 
     // TODO shouldn't we have a method that returns the ValueInLeaf?
@@ -3371,9 +3824,10 @@ impl LeafCursor {
     fn read_page(&mut self, pgnum: PageNum) -> Result<()> {
         self.page.read_page(pgnum)
     }
+
 }
 
-impl ICursor for LeafCursor {
+impl IForwardCursor for LeafCursor {
     fn IsValid(&self) -> bool {
         if let Some(i) = self.cur {
             assert!(i < self.page.count_keys());
@@ -3381,16 +3835,6 @@ impl ICursor for LeafCursor {
         } else {
             false
         }
-    }
-
-    fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
-        //println!("Leaf SeekRef {}  k={:?}  sop={:?}", self.pagenum, k, sop);
-        let sr = try!(self.seek(k, sop));
-        if cfg!(expensive_check) 
-        {
-            try!(sr.verify(k, sop, self));
-        }
-        Ok(sr)
     }
 
     fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
@@ -3431,11 +3875,6 @@ impl ICursor for LeafCursor {
         Ok(())
     }
 
-    fn Last(&mut self) -> Result<()> {
-        self.cur = Some(self.page.count_keys() - 1);
-        Ok(())
-    }
-
     fn Next(&mut self) -> Result<()> {
         match self.cur {
             Some(cur) => {
@@ -3448,6 +3887,14 @@ impl ICursor for LeafCursor {
             None => {
             },
         }
+        Ok(())
+    }
+
+}
+
+impl ICursor for LeafCursor {
+    fn Last(&mut self) -> Result<()> {
+        self.cur = Some(self.page.count_keys() - 1);
         Ok(())
     }
 
@@ -3466,7 +3913,84 @@ impl ICursor for LeafCursor {
         Ok(())
     }
 
+    fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
+        //println!("Leaf SeekRef {}  k={:?}  sop={:?}", self.pagenum, k, sop);
+        let sr = try!(self.seek(k, sop));
+        if cfg!(expensive_check) 
+        {
+            try!(sr.verify(k, sop, self));
+        }
+        Ok(sr)
+    }
+
 }
+
+/* TODO use or rm
+pub enum Page {
+    Leaf(LeafPage),
+    Parent(ParentPage),
+}
+
+impl Page {
+    fn new(path: &str, 
+           f: std::rc::Rc<std::cell::RefCell<File>>,
+           pagenum: PageNum,
+           mut buf: Lend<Box<[u8]>>
+          ) -> Result<Page> {
+
+        {
+            let f = &mut *(f.borrow_mut());
+            try!(utils::SeekPage(f, buf.len(), pagenum));
+            try!(misc::io::read_fully(f, &mut buf));
+        }
+
+        let pt = try!(PageType::from_u8(buf[0]));
+        let sub = 
+            match pt {
+                PageType::LEAF_NODE => {
+                    let page = try!(LeafPage::new_already_read_page(path, f, pagenum, buf));
+                    Page::Leaf(page)
+                },
+                PageType::PARENT_NODE => {
+                    let page = try!(ParentPage::new_already_read_page(path, f, pagenum, buf));
+                    Page::Parent(page)
+                },
+                PageType::OVERFLOW_NODE => {
+                    return Err(Error::CorruptFile("child page has invalid page type"));
+                },
+            };
+
+        Ok(sub)
+    }
+
+    pub fn page_type(&self) -> PageType {
+        match self {
+            &Page::Leaf(_) => {
+                PageType::LEAF_NODE
+            },
+            &Page::Parent(_) => {
+                PageType::PARENT_NODE
+            },
+        }
+    }
+
+    fn read_page(&mut self, pg: PageNum) -> Result<()> {
+        match self {
+            &mut Page::Leaf(ref mut c) => {
+                try!(c.read_page(pg));
+            },
+            &mut Page::Parent(ref mut c) => {
+                try!(c.read_page(pg));
+            },
+        }
+        Ok(())
+    }
+
+// TODO complete_blocklist
+
+// TODO first and last key
+}
+*/
 
 pub enum PageCursor {
     Leaf(LeafCursor),
@@ -3531,27 +4055,12 @@ impl PageCursor {
     }
 }
 
-impl ICursor for PageCursor {
+impl IForwardCursor for PageCursor {
     fn IsValid(&self) -> bool {
         match self {
             &PageCursor::Leaf(ref c) => c.IsValid(),
             &PageCursor::Parent(ref c) => c.IsValid(),
         }
-    }
-
-    fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
-        //println!("PageCursor SeekRef  k={:?}  sop={:?}", k, sop);
-        let sr = 
-            match self {
-                &mut PageCursor::Leaf(ref mut c) => c.SeekRef(k, sop),
-                &mut PageCursor::Parent(ref mut c) => c.SeekRef(k, sop),
-            };
-        let sr = try!(sr);
-        if cfg!(expensive_check) 
-        {
-            try!(sr.verify(k, sop, self));
-        }
-        Ok(sr)
     }
 
     fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
@@ -3582,17 +4091,20 @@ impl ICursor for PageCursor {
         }
     }
 
-    fn Last(&mut self) -> Result<()> {
-        match self {
-            &mut PageCursor::Leaf(ref mut c) => c.Last(),
-            &mut PageCursor::Parent(ref mut c) => c.Last(),
-        }
-    }
-
     fn Next(&mut self) -> Result<()> {
         match self {
             &mut PageCursor::Leaf(ref mut c) => c.Next(),
             &mut PageCursor::Parent(ref mut c) => c.Next(),
+        }
+    }
+
+}
+
+impl ICursor for PageCursor {
+    fn Last(&mut self) -> Result<()> {
+        match self {
+            &mut PageCursor::Leaf(ref mut c) => c.Last(),
+            &mut PageCursor::Parent(ref mut c) => c.Last(),
         }
     }
 
@@ -3603,6 +4115,28 @@ impl ICursor for PageCursor {
         }
     }
 
+    fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
+        //println!("PageCursor SeekRef  k={:?}  sop={:?}", k, sop);
+        let sr = 
+            match self {
+                &mut PageCursor::Leaf(ref mut c) => c.SeekRef(k, sop),
+                &mut PageCursor::Parent(ref mut c) => c.SeekRef(k, sop),
+            };
+        let sr = try!(sr);
+        if cfg!(expensive_check) 
+        {
+            try!(sr.verify(k, sop, self));
+        }
+        Ok(sr)
+    }
+
+}
+
+#[derive(PartialEq,Copy,Clone,Debug)]
+pub enum Overlap {
+    Less,
+    Yes,
+    Greater,
 }
 
 #[derive(Debug)]
@@ -3661,6 +4195,53 @@ impl KeyInPage {
                 try!(ostrm.read_to_end(&mut x_k));
                 let x_k = x_k.into_boxed_slice();
                 Ok(KeyRef::Boxed(x_k))
+            },
+        }
+    }
+
+    #[inline]
+    fn key_with_location(&self, pr: &[u8], prefix: Option<&[u8]>, path: &str) -> Result<KeyWithLocation> { 
+        match self {
+            &KeyInPage::Inline(klen, at) => {
+                let k = 
+                    match prefix {
+                        Some(a) => {
+                            let k = {
+                                let mut k = Vec::with_capacity(klen);
+                                k.push_all(a);
+                                k.push_all(&pr[at .. at + klen - a.len()]);
+                                k.into_boxed_slice()
+                            };
+                            k
+                        },
+                        None => {
+                            let k = {
+                                let mut k = Vec::with_capacity(klen);
+                                k.push_all(&pr[at .. at + klen]);
+                                k.into_boxed_slice()
+                            };
+                            k
+                        },
+                    };
+                let kw = KeyWithLocation {
+                    key: k,
+                    location: KeyLocation::Inline,
+                };
+                Ok(kw)
+            },
+            &KeyInPage::Overflowed(klen, ref blocks) => {
+                let k = {
+                    let mut ostrm = try!(OverflowReader::new(path, pr.len(), blocks.blocks[0].firstPage, klen));
+                    let mut x_k = Vec::with_capacity(klen);
+                    try!(ostrm.read_to_end(&mut x_k));
+                    let x_k = x_k.into_boxed_slice();
+                    x_k
+                };
+                let kw = KeyWithLocation {
+                    key: k,
+                    location: KeyLocation::Overflowed(blocks.clone()),
+                };
+                Ok(kw)
             },
         }
     }
@@ -3749,6 +4330,12 @@ pub struct ParentPage {
 
 }
 
+#[derive(Debug)]
+enum MergeSiblings {
+    Leaves(Vec<pgitem>),
+    Parents(Vec<pgitem>),
+}
+
 impl ParentPage {
     fn new_already_read_page(path: &str, 
            f: std::rc::Rc<std::cell::RefCell<File>>,
@@ -3776,6 +4363,272 @@ impl ParentPage {
         }
 
         Ok(res)
+    }
+
+    fn pgitem(&self) -> Result<pgitem> {
+        let blocks = self.complete_blocklist();
+        let first_key = try!(self.first_key_with_location());
+        let last_key = try!(self.last_key_with_location());
+        let pg = pgitem {
+            page: self.pagenum,
+            blocks: blocks,
+            first_key: first_key,
+            last_key: last_key,
+        };
+        Ok(pg)
+    }
+
+    fn child_pgitem(&self, i: usize) -> Result<pgitem> {
+        let blocks = self.children[i].blocks.clone();
+        let first_key = try!(self.key_with_location(&self.children[i].first_key));
+        let last_key = {
+            match &self.children[i].last_key {
+                &Some(ref last_key) => {
+                    let kw = try!(self.key_with_location(last_key));
+                    Some(kw)
+                },
+                &None => {
+                    None
+                },
+            }
+        };
+        let pg = pgitem {
+            page: self.children[i].page,
+            blocks: blocks,
+            first_key: first_key,
+            last_key: last_key,
+        };
+        Ok(pg)
+    }
+
+// TODO dislike
+    fn first_key<'a>(&'a self) -> Result<KeyRef<'a>> {
+        self.key(&self.children[0].first_key)
+    }
+
+// TODO dislike
+    fn last_key<'a>(&'a self) -> Result<KeyRef<'a>> {
+        let i = self.children.len() - 1;
+        let last_key =
+            match &self.children[i].last_key {
+                &Some(ref last_key) => {
+                    last_key
+                },
+                &None => {
+                    &self.children[i].first_key
+                },
+            };
+        self.key(last_key)
+    }
+
+    fn overlaps(&self, first_key: &[u8], last_key: &[u8]) -> Result<Overlap> {
+        match try!(self.first_key()).compare_with(last_key) {
+            Ordering::Greater => {
+                Ok(Overlap::Greater)
+            },
+            Ordering::Less | Ordering::Equal => {
+                match try!(self.last_key()).compare_with(first_key) {
+                    Ordering::Less => {
+                        Ok(Overlap::Less)
+                    },
+                    Ordering::Greater | Ordering::Equal => {
+                        Ok(Overlap::Yes)
+                    },
+                }
+            },
+        }
+    }
+
+    fn siblings_for(&self, skip: Option<(usize, usize)>) -> Result<Vec<pgitem>> {
+        let mut v = Vec::with_capacity(self.children.len());
+        for i in 0 .. self.children.len() {
+            let include =
+                match skip {
+                    Some((first, last)) => {
+                        i < first || i > last
+                    },
+                    None => {
+                        true
+                    },
+                };
+            if include {
+                let pg = try!(self.child_pgitem(i));
+                v.push(pg);
+            }
+        }
+        Ok(v)
+    }
+
+    fn find_merge_target(&self, first: &[u8], last: &[u8], parent: Option<&ParentPage>) -> Result<(Option<Vec<PageNum>>, Option<MergeSiblings>)> {
+        assert!(try!(self.overlaps(first, last)) == Overlap::Yes);
+
+        let mut first_overlap = None;
+        let mut last_overlap = None;
+        for i in 0 .. self.children.len() {
+            match try!(self.child_overlaps(i, first, last)) {
+                Overlap::Yes => {
+                    if first_overlap.is_none() {
+                        first_overlap = Some(i);
+                    } else {
+                        // keep going until we find the next one that does not overlap
+                    }
+                },
+                Overlap::Less => {
+                    assert!(first_overlap.is_none());
+                    assert!(last_overlap.is_none());
+                    // keep going until we find the first one that overlaps
+                },
+                Overlap::Greater => {
+                    if first_overlap.is_some() {
+                        last_overlap = Some(i - 1);
+                    }
+                    break;
+                },
+            }
+        }
+
+        // TODO this is awful.  parent pages either need to know their children page
+        // type or they need to stop requiring all children to be the same type.
+        let child_pagetype = {
+            let pagenum = self.children[0].page;
+            // TODO it's a little silly here to construct a Lend<>
+            let child_buf = vec![0; self.pr.len()].into_boxed_slice();
+            let done_page = move |_| -> () {
+            };
+            let mut child_buf = Lend::new(child_buf, box done_page);
+
+            {
+                let f = &mut *(self.f.borrow_mut());
+                try!(utils::SeekPage(f, child_buf.len(), pagenum));
+                try!(misc::io::read_fully(f, &mut child_buf));
+            }
+
+            let pt = try!(PageType::from_u8(child_buf[0]));
+            // TODO use a different type here that cannot represent an overflow page
+            pt
+        };
+
+        // three cases:
+        // if 1 child overlaps
+        //     if the child is a leaf, it's the one
+        //     if the child is a parent, dive
+        // otherwise, this is the one.
+
+        // TODO consider always doing overlaps in terms of leaves
+
+        match first_overlap {
+            None => {
+                // the overall range of this page overlaps, but none of
+                // the children do.  the given range falls entirely between
+                // two children.
+                // no overlaps.  all current children are siblings.
+                let siblings = try!(self.siblings_for(None));
+                let siblings = 
+                    match child_pagetype {
+                        PageType::LEAF_NODE => {
+                            MergeSiblings::Leaves(siblings)
+                        },
+                        PageType::PARENT_NODE => {
+                            MergeSiblings::Parents(siblings)
+                        },
+                        PageType::OVERFLOW_NODE => {
+                            unreachable!();
+                        },
+                    };
+                Ok((None, Some(siblings)))
+            },
+            Some(first_overlap) => {
+                let last_overlap = last_overlap.unwrap_or(self.children.len() - 1);
+                assert!(last_overlap >= first_overlap);
+                if first_overlap == last_overlap {
+                    let pagenum = self.children[first_overlap].page;
+                    // 1 child overlap
+                    // load it
+
+                    //println!("only one child overlaps: {}:{}", first_overlap, pagenum);
+                    //println!("    the overlap child: {:?}", self.children[first_overlap]);
+                    //println!("    its first_key: {:?}", try!(self.key(&self.children[first_overlap].first_key)));
+                    match self.children[first_overlap].last_key {
+                        Some(ref my_last_key) => {
+                            let my_last_key = try!(self.key(my_last_key));
+                            println!("    its last_key: {:?}", my_last_key);
+                        },
+                        None => {
+                            println!("    its last_key: none");
+                        },
+                    }
+
+                    match child_pagetype {
+                        PageType::LEAF_NODE => {
+                            // child is the one
+                            // other self.children are siblings
+                            // self is parent
+                            //println!("the one overlapping child is a leaf");
+                            let siblings = try!(self.siblings_for(Some((first_overlap, last_overlap))));
+                            let siblings = 
+                                match child_pagetype {
+                                    PageType::LEAF_NODE => {
+                                        MergeSiblings::Leaves(siblings)
+                                    },
+                                    PageType::PARENT_NODE => {
+                                        MergeSiblings::Parents(siblings)
+                                    },
+                                    PageType::OVERFLOW_NODE => {
+                                        unreachable!();
+                                    },
+                                };
+                            Ok((Some(vec![pagenum]), Some(siblings)))
+                        },
+                        PageType::PARENT_NODE => {
+                            // dive
+                            // TODO it's a little silly here to construct a Lend<>
+                            let child_buf = vec![0; self.pr.len()].into_boxed_slice();
+                            let done_page = move |_| -> () {
+                            };
+                            let mut child_buf = Lend::new(child_buf, box done_page);
+
+                            {
+                                let f = &mut *(self.f.borrow_mut());
+                                try!(utils::SeekPage(f, child_buf.len(), pagenum));
+                                try!(misc::io::read_fully(f, &mut child_buf));
+                            }
+
+                            let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, child_buf));
+                            page.find_merge_target(first, last, Some(self))
+                        },
+                        PageType::OVERFLOW_NODE => {
+                            return Err(Error::CorruptFile("child page has invalid page type"));
+                        },
+                    }
+                } else {
+                    // TODO if ALL the children overlap, we can just have self be the overlap.
+                    // but would that be any faster?
+                    // multiple children overlap.  like if there are no siblings?
+                    // take the multiple overlapping children and the rest as siblings.
+                    let mut overlaps = Vec::with_capacity(last_overlap - first_overlap + 1);
+                    for i in 0 .. last_overlap - first_overlap + 1 {
+                        let pagenum = self.children[i + first_overlap].page;
+                        overlaps.push(pagenum);
+                    }
+                    let siblings = try!(self.siblings_for(Some((first_overlap, last_overlap))));
+                    let siblings = 
+                        match child_pagetype {
+                            PageType::LEAF_NODE => {
+                                println!("overlaps: {} of {} leaves", overlaps.len(), self.children.len());
+                                MergeSiblings::Leaves(siblings)
+                            },
+                            PageType::PARENT_NODE => {
+                                println!("overlaps: {} of {} parents", overlaps.len(), self.children.len());
+                                MergeSiblings::Parents(siblings)
+                            },
+                            PageType::OVERFLOW_NODE => {
+                                unreachable!();
+                            },
+                        };
+                    Ok((Some(overlaps), Some(siblings)))
+                }
+            },
+        }
     }
 
     pub fn complete_blocklist(&self) -> BlockList {
@@ -3857,6 +4710,78 @@ impl ParentPage {
             };
         let k = try!(k.keyref(&self.pr, prefix, &self.path));
         Ok(k)
+    }
+
+    fn key_with_location(&self, k: &KeyInPage) -> Result<KeyWithLocation> { 
+        let prefix: Option<&[u8]> = 
+            match self.prefix {
+                Some(ref b) => Some(b),
+                None => None,
+            };
+        let k = try!(k.key_with_location(&self.pr, prefix, &self.path));
+        Ok(k)
+    }
+
+    fn first_key_with_location(&self) -> Result<KeyWithLocation> {
+        self.key_with_location(&self.children[0].first_key)
+    }
+
+    fn last_key_with_location(&self) -> Result<Option<KeyWithLocation>> {
+        let i = self.children.len() - 1;
+        match &self.children[i].last_key {
+            &Some(ref last_key) => {
+                let kw = try!(self.key_with_location(last_key));
+                Ok(Some(kw))
+            },
+            &None => {
+                // TODO is this right?
+                Ok(None)
+            },
+        }
+    }
+
+    fn min_key(&self, m: Option<Box<[u8]>>) -> Result<Box<[u8]>> {
+        let k = try!(self.key(&self.children[0].first_key)).into_boxed_slice();
+        match m {
+            Some(m) => {
+                if Ordering::Less == bcmp::Compare(&k, &m) {
+                    // TODO could wait until here to do the into_boxed_slice
+                    Ok(k)
+                } else {
+                    Ok(m)
+                }
+            },
+            None => {
+                Ok(k)
+            },
+        }
+    }
+
+    fn max_key(&self, m: Option<Box<[u8]>>) -> Result<Box<[u8]>> {
+        let i = self.children.len() - 1;
+        let last_key =
+            match &self.children[i].last_key {
+                &Some(ref last_key) => {
+                    last_key
+                },
+                &None => {
+                    &self.children[i].first_key
+                },
+            };
+        let k = try!(self.key(last_key)).into_boxed_slice();
+        match m {
+            Some(m) => {
+                if Ordering::Greater == bcmp::Compare(&k, &m) {
+                    // TODO could wait until here to do the into_boxed_slice
+                    Ok(k)
+                } else {
+                    Ok(m)
+                }
+            },
+            None => {
+                Ok(k)
+            },
+        }
     }
 
     fn parse_page(pr: &[u8]) -> Result<(Option<Box<[u8]>>, Vec<ParentPageItem>)> {
@@ -3958,6 +4883,57 @@ impl ParentPage {
         }
     }
 
+    fn child_overlaps(&self, i: usize, first_key: &[u8], last_key: &[u8]) -> Result<Overlap> {
+        match self.children[i].last_key {
+            Some(ref my_last_key) => {
+                let my_last_key = try!(self.key(my_last_key));
+                match my_last_key.compare_with(first_key) {
+                    Ordering::Less => {
+                        Ok(Overlap::Less)
+                    },
+                    Ordering::Equal => {
+                        Ok(Overlap::Yes)
+                    },
+                    Ordering::Greater => {
+                        let my_first_key = try!(self.key(&self.children[i].first_key));
+                        match my_first_key.compare_with(last_key) {
+                            Ordering::Greater => {
+                                Ok(Overlap::Greater)
+                            },
+                            Ordering::Less | Ordering::Equal => {
+                                Ok(Overlap::Yes)
+                            },
+                        }
+                    },
+                }
+            },
+            None => {
+                let my_first_key = try!(self.key(&self.children[i].first_key));
+                match my_first_key.compare_with(last_key) {
+                    Ordering::Greater => {
+                        Ok(Overlap::Greater)
+                    },
+                    Ordering::Equal => {
+                        Ok(Overlap::Yes)
+                    },
+                    Ordering::Less => {
+                        match my_first_key.compare_with(first_key) {
+                            Ordering::Greater => {
+                                Ok(Overlap::Yes)
+                            },
+                            Ordering::Equal => {
+                                Ok(Overlap::Yes)
+                            },
+                            Ordering::Less => {
+                                Ok(Overlap::Less)
+                            },
+                        }
+                    },
+                }
+            },
+        }
+    }
+
     fn get_child_cursor(&self, i: usize) -> Result<PageCursor> {
         // TODO it's a little silly here to construct a Lend<>
         let child_buf = vec![0; self.pr.len()].into_boxed_slice();
@@ -3999,6 +4975,16 @@ impl ParentCursor {
     }
 
     fn set_child(&mut self, i: usize) -> Result<()> {
+        match self.cur {
+            Some(n) => {
+                if n == i {
+                    // already there
+                    return Ok(());
+                }
+            },
+            None => {
+            },
+        }
         let pagenum = self.page.get_child_pagenum(i);
         try!(self.sub.read_page(pagenum));
         self.cur = Some(i);
@@ -4104,7 +5090,7 @@ impl ParentCursor {
 
 }
 
-impl ICursor for ParentCursor {
+impl IForwardCursor for ParentCursor {
     fn IsValid(&self) -> bool {
         match self.cur {
             None => false,
@@ -4112,15 +5098,6 @@ impl ICursor for ParentCursor {
                 self.sub.IsValid()
             },
         }
-    }
-
-    fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
-        let sr = try!(self.seek(k, sop));
-        if cfg!(expensive_check) 
-        {
-            try!(sr.verify(k, sop, self));
-        }
-        Ok(sr)
     }
 
     fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
@@ -4161,12 +5138,6 @@ impl ICursor for ParentCursor {
         self.sub.First()
     }
 
-    fn Last(&mut self) -> Result<()> {
-        let last_child = self.page.count_items() - 1;
-        try!(self.set_child(last_child));
-        self.sub.Last()
-    }
-
     fn Next(&mut self) -> Result<()> {
         match self.cur {
             None => {
@@ -4182,6 +5153,15 @@ impl ICursor for ParentCursor {
                 }
             },
         }
+    }
+
+}
+
+impl ICursor for ParentCursor {
+    fn Last(&mut self) -> Result<()> {
+        let last_child = self.page.count_items() - 1;
+        try!(self.set_child(last_child));
+        self.sub.Last()
     }
 
     fn Prev(&mut self) -> Result<()> {
@@ -4201,19 +5181,143 @@ impl ICursor for ParentCursor {
         }
     }
 
+    fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
+        let sr = try!(self.seek(k, sop));
+        if cfg!(expensive_check) 
+        {
+            try!(sr.verify(k, sop, self));
+        }
+        Ok(sr)
+    }
+
+}
+
+pub struct MultiPageCursor {
+    path: String,
+    children: Vec<PageNum>,
+    cur: Option<usize>,
+    sub: Box<PageCursor>,
+}
+
+impl MultiPageCursor {
+    fn new(path: &str, 
+           f: std::rc::Rc<std::cell::RefCell<File>>,
+           pagesize: usize,
+           children: Vec<PageNum>,
+          ) -> Result<MultiPageCursor> {
+
+        assert!(children.len() > 0);
+
+        // TODO it's a little silly here to construct a Lend<>
+        let child_buf = vec![0; pagesize].into_boxed_slice();
+        let done_page = move |_| -> () {
+        };
+        let mut child_buf = Lend::new(child_buf, box done_page);
+
+        let sub = try!(PageCursor::new(path, f, children[0], child_buf));
+
+        let res = MultiPageCursor {
+            path: String::from(path),
+            children: children,
+            cur: Some(0),
+            sub: box sub,
+
+        };
+
+        Ok(res)
+    }
+
+    fn set_child(&mut self, i: usize) -> Result<()> {
+        match self.cur {
+            Some(n) => {
+                if n == i {
+                    // already there
+                    return Ok(());
+                }
+            },
+            None => {
+            },
+        }
+        let pagenum = self.children[i];
+        try!(self.sub.read_page(pagenum));
+        self.cur = Some(i);
+        Ok(())
+    }
+
+}
+
+impl IForwardCursor for MultiPageCursor {
+    fn IsValid(&self) -> bool {
+        match self.cur {
+            None => false,
+            Some(_) => {
+                self.sub.IsValid()
+            },
+        }
+    }
+
+    fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(_) => {
+                self.sub.KeyRef()
+            },
+        }
+    }
+
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(_) => {
+                self.sub.ValueRef()
+            },
+        }
+    }
+
+    fn ValueLength(&self) -> Result<Option<usize>> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(_) => {
+                self.sub.ValueLength()
+            },
+        }
+    }
+
+    fn First(&mut self) -> Result<()> {
+        try!(self.set_child(0));
+        self.sub.First()
+    }
+
+    fn Next(&mut self) -> Result<()> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(i) => {
+                try!(self.sub.Next());
+                if !self.sub.IsValid() && i + 1 < self.children.len() {
+                    try!(self.set_child(i + 1));
+                    self.sub.First()
+                } else {
+                    Ok(())
+                }
+            },
+        }
+    }
+
 }
 
 #[derive(Clone)]
 struct HeaderData {
-    // TODO young, levels, etc
-    current_state: Vec<SegmentNum>,
 
-    segments_info: HashMap<SegmentNum, SegmentInfo>,
+    segments: Vec<PageNum>,
 
-    // TODO maybe the locations don't need to be in the
-    // header?
-
-    next_segnum: SegmentNum,
     changeCounter: u64,
     mergeCounter: u64,
 }
@@ -4234,31 +5338,14 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
     }
 
     fn parse(pr: &Box<[u8]>, cur: &mut usize) -> Result<(HeaderData, usize)> {
-        fn readSegmentList(pr: &Box<[u8]>, cur: &mut usize) -> Result<(Vec<SegmentNum>, HashMap<SegmentNum, SegmentInfo>)> {
+        fn readSegmentList(pr: &Box<[u8]>, cur: &mut usize) -> Result<Vec<PageNum>> {
             let count = varint::read(&pr, cur) as usize;
             let mut a = Vec::with_capacity(count);
-            let mut m = HashMap::with_capacity(count);
             for _ in 0 .. count {
-                let g = varint::read(&pr, cur) as SegmentNum;
-                a.push(g);
                 let root_page = varint::read(&pr, cur) as PageNum;
-                let blocks = BlockList::read(pr, cur);
-                let level = varint::read(&pr, cur) as u32;
-                if !blocks.contains_page(root_page) {
-                    return Err(Error::RootPageNotInSegmentBlockList);
-                }
-
-                let location = SegmentLocation {
-                    root_page: root_page,
-                    blocks: blocks
-                };
-                let info = SegmentInfo {
-                    location: location,
-                    level: level,
-                };
-                m.insert(g,info);
+                a.push(root_page);
             }
-            Ok((a,m))
+            Ok(a)
         }
 
         // --------
@@ -4266,17 +5353,14 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
         let pgsz = misc::buf_advance::get_u32(&pr, cur) as usize;
         let changeCounter = varint::read(&pr, cur);
         let mergeCounter = varint::read(&pr, cur);
-        let next_segnum = varint::read(&pr, cur);
 
-        let (state, segments_info) = try!(readSegmentList(pr, cur));
+        let segments = try!(readSegmentList(pr, cur));
 
         let hd = 
             HeaderData {
-                current_state: state,
-                segments_info: segments_info,
+                segments: segments,
                 changeCounter: changeCounter,
                 mergeCounter: mergeCounter,
-                next_segnum: next_segnum,
             };
 
         Ok((hd, pgsz))
@@ -4307,11 +5391,9 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
         let defaultPageSize = DEFAULT_SETTINGS.DefaultPageSize;
         let h = {
             HeaderData {
-                segments_info: HashMap::new(),
-                current_state: Vec::new(),
+                segments: vec![],
                 changeCounter: 0,
                 mergeCounter: 0,
-                next_segnum: 1,
             }
         };
         let nextAvailablePage = calcNextPage(defaultPageSize, HEADER_SIZE_IN_BYTES);
@@ -4320,19 +5402,57 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
 
 }
 
-fn list_all_blocks(h: &HeaderData, pgsz: usize) -> BlockList {
+fn list_all_blocks(h: &HeaderData, pgsz: usize, path: &str) -> Result<BlockList> {
     let mut blocks = BlockList::new();
 
     let headerBlock = PageBlock::new(1, (HEADER_SIZE_IN_BYTES / pgsz) as PageNum);
     blocks.add_block_no_reorder(headerBlock);
 
-    for info in h.segments_info.values() {
-        blocks.add_blocklist_no_reorder(&info.location.blocks);
+    let f = try!(OpenOptions::new()
+            .read(true)
+            .open(path));
+    let f = std::cell::RefCell::new(f);
+    let f = std::rc::Rc::new(f);
+
+    for page in h.segments.iter() {
+        let pagenum = *page;
+
+        blocks.add_page_no_reorder(pagenum);
+
+        // TODO it's a little silly here to construct a Lend<>
+        let buf = vec![0; pgsz].into_boxed_slice();
+        let done_page = move |_| -> () {
+        };
+        let mut buf = Lend::new(buf, box done_page);
+
+        {
+            let f = &mut *(f.borrow_mut());
+            try!(utils::SeekPage(f, buf.len(), pagenum));
+            try!(misc::io::read_fully(f, &mut buf));
+        }
+        let pt = try!(PageType::from_u8(buf[0]));
+        let blist = 
+            match pt {
+                PageType::LEAF_NODE => {
+                    let page = try!(LeafPage::new_already_read_page(path, f.clone(), pagenum, buf));
+                    page.complete_blocklist()
+                },
+                PageType::PARENT_NODE => {
+                    let page = try!(ParentPage::new_already_read_page(path, f.clone(), pagenum, buf));
+                    page.complete_blocklist()
+                },
+                PageType::OVERFLOW_NODE => {
+                    panic!();
+                    //return Err(Error::CorruptFile("child page has invalid page type"));
+                },
+            };
+
+        blocks.add_blocklist_no_reorder(&blist);
     }
 
     blocks.sort_and_consolidate();
 
-    blocks
+    Ok(blocks)
 }
 
 use std::sync::Mutex;
@@ -4345,25 +5465,25 @@ struct Space {
     freeBlocks: BlockList,
 
     nextCursorNum: u64,
-    cursors: HashMap<u64, SegmentNum>,
+    cursors: HashMap<u64, PageNum>,
 
     // a zombie segment is one that was replaced by a merge, but
     // when the merge was done, it could not be reclaimed as free
     // blocks because there was an open cursor on it.
-    zombie_segments: HashMap<SegmentNum, SegmentInfo>,
+    zombie_segments: HashMap<PageNum, SegmentInfo>,
 }
 
+#[derive(Debug)]
 pub struct PendingMerge {
-    old_segments: Vec<SegmentNum>,
-    merge_level: u32,
-    new_segment: Option<SegmentInfo>,
+    old_segments: Vec<PageNum>,
+    new_segment: Option<PageNum>,
 }
 
 struct SafeMergeStuff {
     // TODO can we design a way to not need the following?
     // it keeps track of which segments are being merged,
     // so we don't try to merge something that is already being merged.
-    merging: HashSet<SegmentNum>,
+    merging: HashSet<PageNum>,
 }
 
 struct SafePagePool {
@@ -4389,7 +5509,7 @@ struct InnerPart {
 }
 
 enum AutomergeMessage {
-    NewSegment(SegmentNum, u32),
+    NewSegment(PageNum, u32),
     Terminate,
 }
 
@@ -4399,51 +5519,15 @@ pub struct WriteLock {
 }
 
 impl WriteLock {
-    pub fn commit_segment(&self, new_seg: SegmentLocation) -> Result<()> {
-        let segnum = try!(self.inner.commit_segment(new_seg));
-        try!(self.notify_automerge[0].send(AutomergeMessage::NewSegment(segnum, 0)).map_err(wrap_err));
+    pub fn commit_segment(&self, root_page: PageNum) -> Result<()> {
+        try!(self.inner.commit_segment(root_page));
+        try!(self.notify_automerge[0].send(AutomergeMessage::NewSegment(root_page, 0)).map_err(wrap_err));
         Ok(())
     }
 
     pub fn commit_merge(&self, pm: PendingMerge) -> Result<()> {
-        let notify =
-            match pm.new_segment {
-                Some(ref info) => {
-                    if info.level == pm.merge_level {
-                        // we only want to notify if this was a promotion.
-                        // this merge was just cleaning up a level and
-                        // leaving the resulting segment in that same level.
-                        None
-                    } else {
-                        // this merge resulted in a segment getting promoted
-                        // to the next level.  need to notify that level,
-                        // because it might need a merge now.
-                        Some(info.level)
-                    }
-                },
-                None => {
-                    // this merge did not result in a segment.  this happens
-                    // because tombstones.
-                    None
-                },
-            };
-        let new_segnum = try!(self.inner.commit_merge(pm));
-        match notify {
-            Some(level) => {
-                // the unwrap in the following line is correct.
-                // if notify.is_some(), then commit_merge() has to
-                // return a segment number.
-                let new_segnum = new_segnum.unwrap();
-
-                // nothing gets "promoted" to level 0.
-                // new segments start in level 0
-                assert!(level > 0);
-                assert!((level as usize) < self.notify_automerge.len());
-                try!(self.notify_automerge[level as usize].send(AutomergeMessage::NewSegment(new_segnum, level as u32)).map_err(wrap_err));
-            },
-            None => {
-            },
-        }
+// TODO notify next level
+        try!(self.inner.commit_merge(pm));
         Ok(())
     }
 }
@@ -4458,12 +5542,15 @@ pub struct DatabaseFile {
 impl DatabaseFile {
     pub fn new(path: String, settings: DbSettings) -> Result<std::sync::Arc<DatabaseFile>> {
 
+        // TODO read_header and list_all_blocks both open the file
+        //let f = try!(OpenOptions::new() .read(true) .open(&path));
+
         // TODO we should pass in settings to read_header, right?
         let (header, pgsz, first_available_page) = try!(read_header(&path));
 
         // when we first open the file, we find all the blocks that are in use by
         // an active segment.  all OTHER blocks are considered free.
-        let mut blocks = list_all_blocks(&header, pgsz);
+        let mut blocks = try!(list_all_blocks(&header, pgsz, &path));
         //println!("blocks in use: {:?}", blocks);
         let last_page_used = blocks.last_page();
         blocks.invert();
@@ -4502,7 +5589,9 @@ impl DatabaseFile {
 
         let mut senders = vec![];
         let mut receivers = vec![];
-        for _level in 0 .. LEVEL_SIZE_LIMITS_IN_KB.len() {
+        // TODO for now there is only one merge level
+        //for _level in 0 .. LEVEL_SIZE_LIMITS_IN_KB.len() {
+        {
             let (tx, rx): (mpsc::Sender<AutomergeMessage>, mpsc::Receiver<AutomergeMessage>) = mpsc::channel();
             senders.push(tx);
             receivers.push(rx);
@@ -4573,32 +5662,17 @@ impl DatabaseFile {
         Ok(db)
     }
 
-    fn automerge_level(&self, new_segnum: SegmentNum, level: u32) -> Result<()> {
-        assert!((level as usize) < LEVEL_SIZE_LIMITS_IN_KB.len());
-        let promotion =
-            if level == 0 {
-                // all new segments come in at level 0.
-                // we want to merge and promote them to level 1 as
-                // quickly as possible.
-                MergePromotionRule::Promote
-            } else if (level as usize) == LEVEL_SIZE_LIMITS_IN_KB.len() - 1 {
-                // nothing gets promoted out of the last level.
-                MergePromotionRule::Stay
-            } else {
-                // for all the levels in between, we promote when the
-                // level reaches a certain threshold of size.
-                let mb = LEVEL_SIZE_LIMITS_IN_KB[level as usize];
-                let bytes = mb * 1024;
-                let pages = (bytes / (self.inner.pgsz as u64)) as PageCount;
-                MergePromotionRule::Threshold(pages)
-            };
-        match try!(self.merge(level, 2, 8, promotion)) {
-            Some(seg) => {
-                let lck = try!(self.get_write_lock());
-                try!(lck.commit_merge(seg));
-            },
-            None => {
-            },
+    fn automerge_level(&self, new_segnum: PageNum, level: u32) -> Result<()> {
+        loop {
+            match try!(self.merge()) {
+                Some(pm) => {
+                    let lck = try!(self.get_write_lock());
+                    try!(lck.commit_merge(pm));
+                },
+                None => {
+                    break;
+                },
+            }
         }
         Ok(())
     }
@@ -4634,19 +5708,19 @@ impl DatabaseFile {
         InnerPart::read_parent_page(&self.inner, pg)
     }
 
-    pub fn write_segment(&self, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<SegmentLocation> {
+    pub fn write_segment(&self, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<PageNum> {
         InnerPart::write_segment(&self.inner, pairs)
     }
 
-    pub fn merge(&self, level: u32, min_segs: usize, max_segs: usize, promote: MergePromotionRule) -> Result<Option<PendingMerge>> {
-        InnerPart::merge(&self.inner, level, min_segs, max_segs, promote)
+    pub fn merge(&self) -> Result<Option<PendingMerge>> {
+        InnerPart::merge(&self.inner)
     }
 
-    pub fn list_segments(&self) -> Result<(Vec<SegmentNum>, HashMap<SegmentNum, SegmentInfo>)> {
+    pub fn list_segments(&self) -> Result<Vec<PageNum>> {
         InnerPart::list_segments(&self.inner)
     }
 
-    pub fn release_pending_segment(&self, location: SegmentLocation) -> Result<()> {
+    pub fn release_pending_segment(&self, location: PageNum) -> Result<()> {
         InnerPart::release_pending_segment(&self.inner, location)
     }
 
@@ -4660,7 +5734,7 @@ impl DatabaseFile {
 }
 
 // TODO this could be generic
-fn slice_within(sub: &[SegmentNum], within: &[SegmentNum]) -> Result<usize> {
+fn slice_within(sub: &[PageNum], within: &[PageNum]) -> Result<usize> {
     match within.iter().position(|&g| g == sub[0]) {
         Some(ndx_first) => {
             let count = sub.len();
@@ -4697,7 +5771,7 @@ impl InnerPart {
         }
     }
 
-    fn cursor_dropped(&self, segnum: SegmentNum, csrnum: u64) {
+    fn cursor_dropped(&self, segnum: PageNum, csrnum: u64) {
         //println!("cursor_dropped");
         let mut space = self.space.lock().unwrap(); // gotta succeed
         let seg = space.cursors.remove(&csrnum).expect("gotta be there");
@@ -4917,21 +5991,20 @@ impl InnerPart {
 
         fn build_segment_list(h: &HeaderData) -> Vec<u8> {
             let mut pb = vec![];
-            misc::push_varint(&mut pb, h.current_state.len() as u64);
-            for g in h.current_state.iter() {
-                misc::push_varint(&mut pb, *g);
-                match h.segments_info.get(&g) {
-                    Some(info) => {
-                        misc::push_varint(&mut pb, info.location.root_page as u64);
-                        info.location.blocks.encode(&mut pb);
-                        misc::push_varint(&mut pb, info.level as u64);
-                    },
-                    None => panic!("segment num in current_state but not in segments_info")
+
+            fn add_list(pb: &mut Vec<u8>, v: &Vec<PageNum>) {
+                misc::push_varint(pb, v.len() as u64);
+                for pagenum in v.iter() {
+                    misc::push_varint(pb, *pagenum as u64);
                 }
             }
 
+            add_list(&mut pb, &h.segments);
+
             pb
         }
+
+        println!("header contains {} segments", hdr.segments.len());
 
         let mut pb = PageBuilder::new(HEADER_SIZE_IN_BYTES);
         // TODO format version number
@@ -4939,7 +6012,6 @@ impl InnerPart {
 
         pb.PutVarint(hdr.changeCounter);
         pb.PutVarint(hdr.mergeCounter);
-        pb.PutVarint(hdr.next_segnum);
 
         let pbSegList = build_segment_list(&hdr);
 
@@ -4958,33 +6030,28 @@ impl InnerPart {
         Ok(())
     }
 
+// TODO name get cursor with read lock
     fn get_cursor_on_active_segment(
         inner: &std::sync::Arc<InnerPart>, 
-        header: &HeaderData,
-        g: SegmentNum,
+        space: &mut Space,
+        root_page: PageNum,
         f: std::rc::Rc<std::cell::RefCell<File>>,
         ) -> Result<Lend<PageCursor>> {
 
-        match header.segments_info.get(&g) {
-            None => Err(Error::Misc(String::from("get_cursor_on_active_segment: segment not found"))),
-            Some(seg) => {
-                let mut space = try!(inner.space.lock());
-                let csrnum = space.nextCursorNum;
-                let foo = inner.clone();
-                let done = move |_| -> () {
-                    // TODO this wants to propagate errors
-                    foo.cursor_dropped(g, csrnum);
-                };
-                let buf = try!(Self::get_loaner_page(inner));
-                let csr = try!(PageCursor::new(&inner.path, f, seg.location.root_page, buf));
-                let csr = Lend::new(csr, box done);
+        let csrnum = space.nextCursorNum;
+        let foo = inner.clone();
+        let done = move |_| -> () {
+            // TODO this wants to propagate errors
+            foo.cursor_dropped(root_page, csrnum);
+        };
+        let buf = try!(Self::get_loaner_page(inner));
+        let csr = try!(PageCursor::new(&inner.path, f, root_page, buf));
+        let csr = Lend::new(csr, box done);
 
-                space.nextCursorNum = space.nextCursorNum + 1;
-                let was = space.cursors.insert(csrnum, g);
-                assert!(was.is_none());
-                Ok(csr)
-            }
-        }
+        space.nextCursorNum = space.nextCursorNum + 1;
+        let was = space.cursors.insert(csrnum, root_page);
+        assert!(was.is_none());
+        Ok(csr)
     }
 
     fn get_loaner_page(inner: &std::sync::Arc<InnerPart>) -> Result<Lend<Box<[u8]>>> {
@@ -5066,10 +6133,11 @@ impl InnerPart {
     fn open_cursor(inner: &std::sync::Arc<InnerPart>) -> Result<LivingCursor> {
         let header = try!(inner.header.read());
         let f = try!(inner.open_file_for_cursor());
+        let mut space = try!(inner.space.lock());
         let cursors = 
-            header.current_state
+            header.segments
             .iter()
-            .map(|g| Self::get_cursor_on_active_segment(inner, &header, *g, f.clone()))
+            .map(|g| Self::get_cursor_on_active_segment(inner, &mut space, *g, f.clone()))
             .collect::<Result<Vec<_>>>();
         let cursors = try!(cursors);
         let mc = MultiCursor::Create(cursors);
@@ -5094,35 +6162,27 @@ impl InnerPart {
         Ok(space.freeBlocks.clone())
     }
 
-    fn release_pending_segment(inner: &std::sync::Arc<InnerPart>, location: SegmentLocation) -> Result<()> {
-        let mut space = try!(inner.space.lock());
-        try!(Self::addFreeBlocks(&mut space, &inner.path, inner.pgsz, location.blocks.blocks));
+    fn release_pending_segment(inner: &std::sync::Arc<InnerPart>, location: PageNum) -> Result<()> {
+        //let mut space = try!(inner.space.lock());
+        // TODO have to read the page to get the block list
+        //try!(Self::addFreeBlocks(&mut space, &inner.path, inner.pgsz, location.blocks.blocks));
         Ok(())
     }
 
-    fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<(Vec<SegmentNum>, HashMap<SegmentNum, SegmentInfo>)> {
+    fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<Vec<PageNum>> {
         let header = try!(inner.header.read());
-        let a = header.current_state.clone();
-        let b = header.segments_info.clone();
-        Ok((a,b))
+        let segments = header.segments.clone();
+        Ok(segments)
     }
 
-    fn commit_segment(&self, new_seg: SegmentLocation) -> Result<SegmentNum> {
-        // all new segments are given level 0
-        let new_seg = SegmentInfo {
-            location: new_seg,
-            level: 0,
-        };
+    fn commit_segment(&self, new_seg: PageNum) -> Result<()> {
         let mut header = try!(self.header.write());
 
         // TODO assert new_seg shares no pages with any seg in current state
 
         let mut newHeader = header.clone();
 
-        let new_segnum = newHeader.next_segnum;
-        newHeader.next_segnum += 1;
-        newHeader.segments_info.insert(new_segnum, new_seg);
-        newHeader.current_state.insert(0, new_segnum);
+        newHeader.segments.insert(0, new_seg);
 
         newHeader.changeCounter = newHeader.changeCounter + 1;
 
@@ -5133,10 +6193,10 @@ impl InnerPart {
         // you can change the segment list more than once while holding
         // the writeLock.  the writeLock gets released when you Dispose() it.
 
-        Ok(new_segnum)
+        Ok(())
     }
 
-    fn write_segment(inner: &std::sync::Arc<InnerPart>, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<SegmentLocation> {
+    fn write_segment(inner: &std::sync::Arc<InnerPart>, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<PageNum> {
         let source = pairs.into_iter().map(|t| {
             let (k, v) = t;
             Ok(kvp {Key:k, Value:v})
@@ -5146,295 +6206,241 @@ impl InnerPart {
         Ok(seg)
     }
 
-    fn write_merge_segment(inner: &std::sync::Arc<InnerPart>, cursor: Box<ICursor>) -> Result<SegmentLocation> {
-        let source = CursorIterator::new(cursor);
-        let pw = try!(PageWriter::new(inner.clone()));
-        let seg = try!(create_segment(pw, source));
-        Ok(seg)
-    }
-
-    fn merge(inner: &std::sync::Arc<InnerPart>, merge_level: u32, min_segs: usize, max_segs: usize, promote: MergePromotionRule) -> Result<Option<PendingMerge>> {
-        assert!(min_segs <= max_segs);
-        let step1 = {
+    fn merge(inner: &std::sync::Arc<InnerPart>) -> Result<Option<PendingMerge>> {
+        let (cursor, merge_segments, siblings) = {
             let header = try!(inner.header.read());
 
-            if header.current_state.len() == 0 {
+            if header.segments.len() < 2 {
                 return Ok(None)
             }
 
-            //println!("merge_level: {}", merge_level);
-            //println!("promote: {:?}", promote);
-            //println!("current_state: {:?}", header.current_state);
-            //println!("segments_info: {:?}", header.segments_info);
-            let mut level_sizes = HashMap::new();
-            for (_, ref info) in header.segments_info.iter() {
-                let pages = info.location.count_pages();
-                match level_sizes.entry(&info.level) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        let n = e.get_mut();
-                        *n = *n + pages;
-                    },
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(pages);
-                    },
-                };
-            }
-            //println!("level_sizes: {:?}", level_sizes);
+            let mut merge_segments = header.segments.clone();
+            merge_segments.reverse();
+            merge_segments.truncate(5);
+            merge_segments.reverse();
 
-            let level_group = 
-                header.current_state
-                .iter()
-                .filter(|g| {
-                    let info = header.segments_info.get(&g).unwrap();
-                    info.level == merge_level
-                })
-                .map(|g| *g)
-                .collect::<Vec<SegmentNum>>();
+            let mut space = try!(inner.space.lock());
 
-            //println!("level_group: {:?}", level_group);
-            //println!("segment in level: {}", level_group.len());
+            // TODO read locks for all the cursors below
 
-            if level_group.len() == 0 {
-                //println!("no merge");
-                return Ok(None)
-            }
-
-            let pages_in_merge_level = level_sizes[&merge_level];
-            //println!("pages_in_merge_level: {:?}", pages_in_merge_level);
-
-            // make sure this is contiguous
-            assert!(slice_within(level_group.as_slice(), header.current_state.as_slice()).is_ok());
-
-            let mut merge_seg_nums = Vec::new();
-
-            let mut mergeStuff = try!(inner.mergeStuff.lock());
-
-            // we can merge any contiguous set of not-already-being-merged 
-            // segments at the end of the group.  if we merge something
-            // that is not at the end of the group, we could end up with
-            // level groups not being contiguous.  TODO techically, the
-            // previous statement is true only if we are promoting the level.
-
-            for g in level_group.iter().rev() {
-                if mergeStuff.merging.contains(g) {
-                    break;
-                } else {
-                    merge_seg_nums.push(*g);
+            let f = try!(inner.open_file_for_cursor());
+            let mut cursors: Vec<Box<IForwardCursor>> = Vec::with_capacity(merge_segments.len());
+            // get cursors for all but the last one
+            let mut min_key: Option<Box<[u8]>> = None;
+            let mut max_key: Option<Box<[u8]>> = None;
+            for i in 0 .. merge_segments.len() - 1 {
+                let pagenum = merge_segments[i];
+                let mut buf = try!(Self::get_loaner_page(inner));
+                {
+                    let f = &mut *(f.borrow_mut());
+                    try!(utils::SeekPage(f, buf.len(), pagenum));
+                    try!(misc::io::read_fully(f, &mut buf));
                 }
-            }
-
-            if merge_seg_nums.len() >= min_segs {
-                merge_seg_nums.truncate(max_segs);
-
-                // right now the merge_seg_nums list is in reverse order because we searched with a
-                // reverse iterator just above.  reverse it again to make it right.
-                merge_seg_nums.reverse();
-
-                //println!("segments being merged: {:?}", merge_seg_nums);
-                let pages_in_merge_segments: PageCount = 
-                    merge_seg_nums
-                    .iter()
-                    .map(
-                        |g| {
-                            let info = header.segments_info.get(g).unwrap();
-                            info.location.count_pages()
-                        })
-                    .sum();
-                //println!("pages_in_merge_segments: {}", pages_in_merge_segments);
-                assert!(pages_in_merge_segments <= pages_in_merge_level);
-                let f = try!(inner.open_file_for_cursor());
-                let cursors = 
-                    merge_seg_nums
-                    .iter()
-                    .map(|g| Self::get_cursor_on_active_segment(inner, &header, *g, f.clone()))
-                    .collect::<Result<Vec<_>>>();
-                let cursors = try!(cursors);
-
-                for g in merge_seg_nums.iter() {
-                    mergeStuff.merging.insert(*g);
-                }
-
-                let cursor = {
-                    let mc = MultiCursor::Create(cursors);
-                    mc
-                };
-
-                let last_seg_being_merged = merge_seg_nums[merge_seg_nums.len() - 1];
-                let pos_last_seg = header.current_state.iter().position(|s| *s == last_seg_being_merged).expect("gotta be there");
-                let count_segments_behind = header.current_state.len() - (pos_last_seg + 1);
-
-                let cursor: Box<ICursor> =
-                    if count_segments_behind == 0 {
-                        // we are merging the last segments in the current state.
-                        // there is nothing behind.
-                        // so all tombstones can be filtered.
-                        // so we just wrap in a LivingCursor.
-                        let cursor = LivingCursor::Create(cursor);
-                        box cursor
-                    } else if count_segments_behind <= 8 {
-                        // TODO arbitrary hard-coded limit in the line above
-
-                        // there are segments behind the ones we are merging.
-                        // we can only filter a tombstone if its key is not present behind.
-
-                        // TODO getting all these cursors can be really expensive.
-
-                        // TODO if we knew there were no tombstones in the segments to be merged,
-                        // we would not bother with this.
-
-                        // TODO if there are a LOT of segments behind, this will fail because
-                        // of opening too many files.
-
-                        // TODO we need a way to cache these cursors.  maybe these "behind"
-                        // cursors are special, and are stored here in the header somewhere.
-                        // the next time we do a merge, we can reuse them.  they need to get
-                        // cleaned up at some point.
-
-                        // TODO capacity
-                        let mut behind = vec![];
-                        for s in &header.current_state[pos_last_seg + 1 ..] {
-                            let s = *s;
-                            let cursor = try!(Self::get_cursor_on_active_segment(inner, &header, s, f.clone()));
-                            behind.push(cursor);
-                        }
-                        // TODO to allow reuse of these behind cursors, we should pass
-                        // them as references, don't transfer ownership.  but then they
-                        // will need to be owned somewhere else.
-                        let cursor = FilterTombstonesCursor::new(cursor, behind);
-                        box cursor
-                    } else {
-                        box cursor
+                let pt = try!(PageType::from_u8(buf[0]));
+                let cursor: Box<IForwardCursor> =
+                    match pt {
+                        PageType::LEAF_NODE => {
+                            let leaf = try!(LeafPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
+                            min_key = Some(try!(leaf.min_key(min_key)));
+                            max_key = Some(try!(leaf.max_key(max_key)));
+                            let cursor = LeafCursor::new(leaf);
+                            box cursor
+                        },
+                        PageType::PARENT_NODE => {
+                            let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
+                            min_key = Some(try!(parent.min_key(min_key)));
+                            max_key = Some(try!(parent.max_key(max_key)));
+                            let cursor = try!(ParentCursor::new(parent));
+                            box cursor
+                        },
+                        PageType::OVERFLOW_NODE => {
+                            return Err(Error::CorruptFile("segment page has invalid page type"));
+                        },
                     };
-
-                Some((merge_seg_nums, pages_in_merge_segments, pages_in_merge_level, cursor))
-            } else {
-                //println!("no merge");
-                None
+                cursors.push(cursor);
             }
+
+            let min_key = min_key.unwrap();
+            let max_key = max_key.unwrap();
+
+            println!("merge min_key: {:?}", min_key);
+            println!("merge max_key: {:?}", max_key);
+
+            // TODO need to read the page for the last segment so we can look through it.
+            // but we don't know which of its pages we want the cursor to be on.
+            // and we don't even know if the root page for the last segment is leaf or parent.
+
+            let dest_root_pagenum = merge_segments[merge_segments.len() - 1];
+            let mut buf = try!(Self::get_loaner_page(inner));
+            {
+                let f = &mut *(f.borrow_mut());
+                try!(utils::SeekPage(f, buf.len(), dest_root_pagenum));
+                try!(misc::io::read_fully(f, &mut buf));
+            }
+            let pt = try!(PageType::from_u8(buf[0]));
+            // need three things:
+            //    root of the dest segment
+            //    page from the dest segment being included in the multicursor
+            //    siblings
+            let (overlaps, siblings) = 
+                match pt {
+                    PageType::LEAF_NODE => {
+                        println!("root of the dest segment is a leaf");
+                        let leaf = try!(LeafPage::new_already_read_page(&inner.path, f.clone(), dest_root_pagenum, buf));
+                        //println!("leaf first_key: {:?}", leaf.first_key());
+                        //println!("leaf last_key: {:?}", leaf.last_key());
+                        if try!(leaf.overlaps(&min_key, &max_key)) == Overlap::Yes {
+                            (Some(vec![dest_root_pagenum]), None)
+                        } else {
+                            (None, Some(MergeSiblings::Leaves(vec![try!(leaf.pgitem())])))
+                        }
+                    },
+                    PageType::PARENT_NODE => {
+                        let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), dest_root_pagenum, buf));
+                        if try!(parent.overlaps(&min_key, &max_key)) == Overlap::Yes {
+                            try!(parent.find_merge_target(&min_key, &max_key, None))
+                        } else {
+                            // TODO parent siblings
+                            (None, Some(MergeSiblings::Parents(vec![try!(parent.pgitem())])))
+                        }
+                    },
+                    PageType::OVERFLOW_NODE => {
+                        return Err(Error::CorruptFile("child page has invalid page type"));
+                    },
+                };
+
+            match overlaps {
+                Some(v) => {
+                    // TODO how to get locks on these pages?
+                    let dest_cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, v));
+                    cursors.push(box dest_cursor);
+                },
+                None => {
+                },
+            }
+
+            let cursor = {
+                let mc = MergeCursor::new(cursors);
+                mc
+            };
+
+            // TODO for now, we don't need FilterTombstonesCursor, since we always merge into the
+            // last segment
+            let cursor = MergeLivingCursor::new(cursor);
+
+            (cursor, merge_segments, siblings)
         };
 
-        match step1 {
-            Some((merge_seg_nums, pages_in_merge_segments, pages_in_merge_level, mut cursor)) => {
-                // TODO if something goes wrong here, the function will exit with
-                // an error but mergeStuff.merging will still contain the segments we are
-                // trying to merge, which will prevent them from EVER being merged.
+        // note that cursor.First() should NOT have already been called
+        let mut cursor = cursor;
+        try!(cursor.First());
+        let seg = 
+            if cursor.IsValid() {
+                let source = CursorIterator::new(box cursor);
+                let mut pw = try!(PageWriter::new(inner.clone()));
+                let leaves = try!(write_leaves(&mut pw, source));
+                println!("merge wrote {} leaves", leaves.len());
+                //println!("leaves: {:?}", leaves);
+                //println!("after write_leaves: first_key = {:?}", leaves[0].first_key.key);
+                if cfg!(not) 
+                {
+                    let last_leaf = leaves.len() - 1;
+                    match &leaves[last_leaf].last_key {
+                        &Some(ref last_key) => {
+                            println!("after write_leaves: last_key = {:?}", last_key.key);
+                        },
+                        &None => {
+                            println!("after write_leaves: last_key = {:?}", leaves[last_leaf].first_key.key);
+                        },
+                    }
+                }
 
-                // note that cursor.First() should NOT have already been called
-                try!(cursor.First());
-                let seg = 
-                    if cursor.IsValid() {
-                        let location = try!(Self::write_merge_segment(inner, cursor));
-                        let pages_in_new_segment = location.count_pages();
-                        //println!("pages_in_new_segment: {}", pages_in_new_segment);
-                        // TODO is the following assert always true?
-                        // TODO assert!(pages_in_new_segment <= pages_in_merge_segments);
-                        let level =
-                            match promote {
-                                MergePromotionRule::Promote => {
-                                    merge_level + 1
-                                },
-                                MergePromotionRule::Stay => {
-                                    merge_level
-                                },
-                                MergePromotionRule::Threshold(n) => {
-                                    if pages_in_merge_level >= n {
-                                        merge_level + 1
-                                    } else {
-                                        merge_level
-                                    }
-                                },
-                            };
-                        let seg =
-                            SegmentInfo {
-                                location: location,
-                                level: level,
-                            };
-                        Some(seg)
-                    } else {
-                        None
-                    };
-                let pm = 
-                    PendingMerge {
-                        old_segments: merge_seg_nums,
-                        new_segment: seg,
-                        merge_level: merge_level,
-                    };
-                Ok(Some(pm))
-            },
-            None => {
-                Ok(None)
-            },
-        }
+                // three cases:
+                //     no siblings
+                //     siblings are leaves
+                //     siblings are parents
+
+                let children = {
+                    let mut children =
+                        match siblings {
+                            Some(MergeSiblings::Leaves(mut v)) => {
+                                for x in leaves {
+                                    v.push(x);
+                                }
+                                v
+                            },
+                            Some(MergeSiblings::Parents(mut v)) => {
+                                let root_page = try!(write_parent_node_tree(leaves, &mut pw));
+                                v.push(root_page);
+                                v
+                            },
+                            None => {
+                                leaves
+                            },
+                        };
+                    children.sort_by(|a,b| a.first_key.key.cmp(&b.first_key.key));
+                    children
+                };
+
+                let z = try!(write_parent_node_tree(children, &mut pw));
+
+                let blocks = try!(pw.end());
+
+                Some(z)
+            } else {
+                None
+            };
+        let pm = 
+            PendingMerge {
+                old_segments: merge_segments,
+                new_segment: seg.map(|pg| pg.page),
+            };
+        println!("PendingMerge: {:?}", pm);
+        Ok(Some(pm))
     }
 
-    fn commit_merge(&self, pm: PendingMerge) -> Result<Option<SegmentNum>> {
-        let (segmentsBeingReplaced, new_segnum) = {
+    fn commit_merge(&self, pm: PendingMerge) -> Result<()> {
+        {
             let mut header = try!(self.header.write());
 
             // TODO assert new_seg shares no pages with any seg in current state
 
-            // we need the list of segments which were merged.  we make a copy of
-            // so that we're not keeping a reference that inhibits our ability to
-            // get other references a little later in the function.
-
-            // TODO why does this Set need to be created?
-            let oldAsSet: HashSet<SegmentNum> = pm.old_segments.iter().map(|g| *g).collect();
-            assert!(oldAsSet.len() == pm.old_segments.len());
-
             // now we need to verify that the segments being replaced are in current_state
-            // and contiguous.
+            // and contiguous and at the end.
 
-            let ndxFirstOld = try!(slice_within(pm.old_segments.as_slice(), header.current_state.as_slice()));
+            let ndxFirstOld = try!(slice_within(pm.old_segments.as_slice(), header.segments.as_slice()));
+            assert!(ndxFirstOld == header.segments.len() - pm.old_segments.len());
 
             // now we construct a newHeader
 
             let mut newHeader = header.clone();
 
-            // remove the old segmentinfos, keeping them for later
-
-            let mut segmentsBeingReplaced = HashMap::with_capacity(oldAsSet.len());
-            for g in &oldAsSet {
-                let info = newHeader.segments_info.remove(g).expect("old seg not found in header.segments_info");
-                segmentsBeingReplaced.insert(*g, info);
-            }
-
             // remove old segments from current state
 
             for _ in &pm.old_segments {
-                newHeader.current_state.remove(ndxFirstOld);
+                newHeader.segments.remove(ndxFirstOld);
             }
 
-            let new_segnum =
-                match pm.new_segment {
-                    None => {
-                        None
-                        // a merge resulted in what would have been an empty segment.
-                        // this happens because tombstones
-                    },
-                    Some(new_seg) => {
-                        let new_segnum = newHeader.next_segnum;
-                        newHeader.next_segnum += 1;
-                        newHeader.current_state.insert(ndxFirstOld, new_segnum);
-                        newHeader.segments_info.insert(new_segnum, new_seg);
-                        Some(new_segnum)
-                    },
-                };
+            match pm.new_segment {
+                None => {
+                    // a merge resulted in what would have been an empty segment.
+                    // this happens because tombstones
+                },
+                Some(new_seg) => {
+                    newHeader.segments.insert(ndxFirstOld, new_seg);
+                },
+            }
 
             newHeader.mergeCounter = newHeader.mergeCounter + 1;
 
             let mut fs = try!(self.OpenForWriting());
             try!(self.write_header(&mut header, &mut fs, newHeader));
-
-            (segmentsBeingReplaced, new_segnum)
-        };
-
-        {
-            let mut mergeStuff = try!(self.mergeStuff.lock());
-            for g in pm.old_segments {
-                mergeStuff.merging.remove(&g);
-            }
         }
 
+        println!("merge committed");
+
+        /*
+           TODO
         let mut segmentsToBeFreed = segmentsBeingReplaced;
         {
             let mut space = try!(self.space.lock());
@@ -5456,11 +6462,12 @@ impl InnerPart {
             }
             try!(Self::addFreeBlocks(&mut space, &self.path, self.pgsz, blocksToBeFreed));
         }
+        */
 
         // note that we intentionally do not release the writeLock here.
         // you can change the segment list more than once while holding
         // the writeLock.  the writeLock gets released when you Dispose() it.
-        Ok(new_segnum)
+        Ok(())
     }
 
 }

@@ -1,4 +1,6 @@
 
+having last_key be an Option<> is so tedious
+
 merge:
 
 let M = stuff that wants to be merged up.  
@@ -14,6 +16,8 @@ let X = the lowest single page in D that entirely contains M.
     could be a leaf
     could be a parent, could be the root
     could be none (M and D do not overlap)
+
+TODO should we allow X to be multiple contiguous pages?
 
 let Y = the ParentPage that contains X, if X exists and is not the root
 

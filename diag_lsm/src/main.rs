@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 
 extern crate lsm;
 use lsm::ICursor;
+use lsm::IForwardCursor;
 
 extern crate rand;
 use rand::Rng;
@@ -65,16 +66,16 @@ fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     //let pt = cursor.child_page_type();
     //println!("child page type: {:?}", pt);
     println!("count_items: {}", page.count_items());
-    println!("blocks: {:?}", page.complete_blocklist());
+    let blocks = page.complete_blocklist();
+    println!("blocks ({} pages): {:?}", blocks.count_pages(), blocks);
     Ok(())
 }
 
 fn list_segments(name: &str) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
-    let (segments, infos) = try!(db.list_segments());
+    let segments = try!(db.list_segments());
     for s in segments.iter() {
-        println!("{}: {:?}", s, infos[s]);
-        println!("    pages: {}", infos[s].count_pages());
+        println!("{}", s);
     }
     Ok(())
 }
@@ -201,23 +202,6 @@ fn add_random(name: &str, count: u64, seed: usize, klen: usize, vlen: usize) -> 
     Ok(())
 }
 
-fn merge(name: &str, merge_level: u32, min_segs: usize, max_segs: usize) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
-    // TODO not sure this promotion rule is what we want here
-    match try!(db.merge(merge_level, min_segs, max_segs, lsm::MergePromotionRule::Stay)) {
-        Some(pm) => {
-            //println!("merged segment: {:?}", pm);
-            let lck = try!(db.get_write_lock());
-            try!(lck.commit_merge(pm));
-            Ok(())
-        },
-        None => {
-            println!("no merge needed");
-            Ok(())
-        },
-    }
-}
-
 fn result_main() -> Result<(),lsm::Error> {
     let args: Vec<_> = std::env::args().collect();
     println!("args: {:?}", args);
@@ -303,15 +287,6 @@ fn result_main() -> Result<(),lsm::Error> {
                 k.push(b);
             }
             seek_bytes(name, k.into_boxed_slice(), sop)
-        },
-        "merge" => {
-            if args.len() < 6 {
-                return Err(lsm::Error::Misc(String::from("too few args")));
-            }
-            let merge_level = args[3].parse::<u32>().unwrap();
-            let min_segs = args[4].parse::<usize>().unwrap();
-            let max_segs = args[5].parse::<usize>().unwrap();
-            merge(name, merge_level, min_segs, max_segs)
         },
         "dump_page" => {
             if args.len() < 4 {

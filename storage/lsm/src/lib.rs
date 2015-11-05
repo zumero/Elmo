@@ -29,6 +29,7 @@ extern crate elmo;
 extern crate lsm;
 
 use lsm::ICursor;
+use lsm::IForwardCursor;
 
 pub type Result<T> = elmo::Result<T>;
 
