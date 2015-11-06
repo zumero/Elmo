@@ -1,4 +1,9 @@
 
+what is the ratio of leaves to parent pages?  kinda depends on how
+much stuff we can pack into each parent.  but how expensive would
+it be to just assume that merge operations rewrite all the parent
+nodes of the segments involved?
+
 multi level merge needs the ability for the source to be just one
 piece.
 

@@ -73,8 +73,8 @@ fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
 
 fn list_segments(name: &str) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
-    let segments = try!(db.list_segments());
-    for s in segments.iter() {
+    let (young, levels) = try!(db.list_segments());
+    for s in young.iter().chain(levels.iter()) {
         println!("{}", s);
     }
     Ok(())
