@@ -10,9 +10,11 @@ run.
 
 why do so many merges seem to overlap so many leaves?  maybe
 this is where the collection gets dropped, so it's tombstoning
-everything?
+everything?  seems like no, since we still end up writing tons
+of leaves in the merge.
 
-enum DestLevel
+any merge where the stuff we rewrite from dest is much larger
+than the stuff we rewrite from from.  sad.
 
 comment the code for behind
 
@@ -20,12 +22,6 @@ what is the ratio of leaves to parent pages?  kinda depends on how
 much stuff we can pack into each parent.  but how expensive would
 it be to just assume that merge operations rewrite all the parent
 nodes of the segments involved?
-
-multi level merge needs the ability for the source to be just one
-piece.
-
-doing overlaps/siblings entirely in terms of leaves might be
-great for young-to-zero, but not later?
 
 having last_key be an Option<> is so tedious
 
