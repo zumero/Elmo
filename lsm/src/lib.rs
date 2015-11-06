@@ -51,7 +51,7 @@ use std::collections::HashSet;
 const SIZE_32: usize = 4; // like std::mem::size_of::<u32>()
 const SIZE_16: usize = 2; // like std::mem::size_of::<u16>()
 
-// the young level is not included in the following count
+// the fresh and young levels are not included in the following count
 
 const NUM_LEVELS: usize = 4;
 
@@ -5154,6 +5154,7 @@ impl IForwardCursor for MultiPageCursor {
 #[derive(Clone)]
 struct HeaderData {
 
+    fresh: Vec<PageNum>,
     young: Vec<PageNum>,
     levels: Vec<PageNum>,
 
@@ -5193,11 +5194,13 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
         let changeCounter = varint::read(&pr, cur);
         let mergeCounter = varint::read(&pr, cur);
 
+        let fresh = try!(readSegmentList(pr, cur));
         let young = try!(readSegmentList(pr, cur));
         let levels = try!(readSegmentList(pr, cur));
 
         let hd = 
             HeaderData {
+                fresh: fresh,
                 young: young,
                 levels: levels,
                 changeCounter: changeCounter,
@@ -5232,6 +5235,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
         let defaultPageSize = DEFAULT_SETTINGS.DefaultPageSize;
         let h = {
             HeaderData {
+                fresh: vec![],
                 young: vec![],
                 levels: vec![],
                 changeCounter: 0,
@@ -5297,6 +5301,7 @@ fn list_all_blocks(h: &HeaderData, pgsz: usize, path: &str) -> Result<BlockList>
         Ok(())
     }
 
+    do_seglist(&h.fresh, f.clone(), &mut blocks, pgsz, path);
     do_seglist(&h.young, f.clone(), &mut blocks, pgsz, path);
     do_seglist(&h.levels, f.clone(), &mut blocks, pgsz, path);
 
@@ -5326,15 +5331,18 @@ struct Space {
 #[derive(Debug)]
 enum MergeFrom {
 // TODO use named items
+    Fresh(Vec<PageNum>),
     Young(Vec<PageNum>),
     Other(usize, PageNum),
 }
 
 impl MergeFrom {
-    fn get_dest_level(&self) -> usize {
+    // TODO this should be a type that cannot represent Fresh
+    fn get_dest_level(&self) -> Level {
         match self {
-            &MergeFrom::Young(_) => 0,
-            &MergeFrom::Other(level, _) => level + 1,
+            &MergeFrom::Fresh(_) => Level::Young,
+            &MergeFrom::Young(_) => Level::Other(0),
+            &MergeFrom::Other(level, _) => Level::Other(level + 1),
         }
     }
 }
@@ -5376,6 +5384,7 @@ struct InnerPart {
 
 #[derive(Debug, Copy, Clone)]
 enum Level {
+    Fresh,
     Young,
     Other(usize),
 }
@@ -5392,6 +5401,7 @@ enum AutomergeMessage {
 
 pub struct WriteLock {
     inner: std::sync::Arc<InnerPart>,
+    notify_fresh: mpsc::Sender<NewSegmentMessage>,
     notify_young: mpsc::Sender<NewSegmentMessage>,
     notify_automerge: Vec<mpsc::Sender<AutomergeMessage>>,
 }
@@ -5399,15 +5409,25 @@ pub struct WriteLock {
 impl WriteLock {
     pub fn commit_segment(&self, root_page: PageNum) -> Result<()> {
         try!(self.inner.commit_segment(root_page));
-        try!(self.notify_young.send(NewSegmentMessage::NewSegment).map_err(wrap_err));
+        try!(self.notify_fresh.send(NewSegmentMessage::NewSegment).map_err(wrap_err));
         Ok(())
     }
 
     pub fn commit_merge(&self, pm: PendingMerge) -> Result<()> {
         let level = pm.from.get_dest_level();
         try!(self.inner.commit_merge(pm));
-        if level + 1 < NUM_LEVELS {
-            try!(self.notify_automerge[level].send(AutomergeMessage::Merged(level)).map_err(wrap_err));
+        match level {
+            Level::Fresh => {
+                unreachable!();
+            },
+            Level::Young => {
+                try!(self.notify_young.send(NewSegmentMessage::NewSegment).map_err(wrap_err));
+            },
+            Level::Other(level) => {
+                if level + 1 < NUM_LEVELS {
+                    try!(self.notify_automerge[level].send(AutomergeMessage::Merged(level)).map_err(wrap_err));
+                }
+            },
         }
         Ok(())
     }
@@ -5468,6 +5488,7 @@ impl DatabaseFile {
         // each merge level is handled by its own thread.  a Rust channel is used to
         // notify that thread that there may be merge work to be done.
 
+        let (tx_fresh, rx_fresh): (mpsc::Sender<NewSegmentMessage>, mpsc::Receiver<NewSegmentMessage>) = mpsc::channel();
         let (tx_young, rx_young): (mpsc::Sender<NewSegmentMessage>, mpsc::Receiver<NewSegmentMessage>) = mpsc::channel();
 
         let mut senders = vec![];
@@ -5493,6 +5514,7 @@ impl DatabaseFile {
         let lck = 
             WriteLock { 
                 inner: inner.clone(),
+                notify_fresh: tx_fresh,
                 notify_young: tx_young,
                 notify_automerge: senders,
             };
@@ -5505,6 +5527,41 @@ impl DatabaseFile {
 
         // TODO so when we do send Terminate messages to these threads?
         // impl Drop for DatabaseFile ? 
+
+// all these closures.  DRY.
+        {
+            let db = db.clone();
+            thread::spawn(move || {
+                loop {
+                    match rx_fresh.recv() {
+                        Ok(msg) => {
+                            match msg {
+                                NewSegmentMessage::NewSegment => {
+                                    match db.automerge_level(Level::Fresh) {
+                                        Ok(()) => {
+                                        },
+                                        Err(e) => {
+                                            // TODO what now?
+                                            println!("{:?}", e);
+                                            panic!();
+                                        },
+                                    }
+                                },
+                                NewSegmentMessage::Terminate => {
+                                    break;
+                                },
+                            }
+                        },
+                        Err(e) => {
+                            // TODO what now?
+                            println!("{:?}", e);
+                            panic!();
+                        },
+                    }
+                }
+            });
+
+        }
 
         {
             let db = db.clone();
@@ -5632,7 +5689,7 @@ impl DatabaseFile {
         InnerPart::merge(&self.inner, level)
     }
 
-    pub fn list_segments(&self) -> Result<(Vec<PageNum>, Vec<PageNum>)> {
+    pub fn list_segments(&self) -> Result<(Vec<PageNum>, Vec<PageNum>, Vec<PageNum>)> {
         InnerPart::list_segments(&self.inner)
     }
 
@@ -5915,14 +5972,14 @@ impl InnerPart {
                 }
             }
 
+            add_list(&mut pb, &h.fresh);
             add_list(&mut pb, &h.young);
             add_list(&mut pb, &h.levels);
 
             pb
         }
 
-        println!("header young contains {} segments", hdr.young.len());
-        println!("header levels contains {} segments", hdr.levels.len());
+        println!("header segments: {} -- {} -- {}", hdr.fresh.len(), hdr.young.len(), hdr.levels.len());
 
         let mut pb = PageBuilder::new(HEADER_SIZE_IN_BYTES);
         // TODO format version number
@@ -6053,7 +6110,8 @@ impl InnerPart {
         let f = try!(inner.open_file_for_cursor());
         let mut space = try!(inner.space.lock());
         let cursors = 
-            header.young.iter()
+            header.fresh.iter()
+            .chain(header.young.iter())
             .chain(header.levels.iter())
             .map(|g| Self::get_cursor_on_active_segment(inner, &mut space, *g, f.clone()))
             .collect::<Result<Vec<_>>>();
@@ -6087,11 +6145,12 @@ impl InnerPart {
         Ok(())
     }
 
-    fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<(Vec<PageNum>, Vec<PageNum>)> {
+    fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<(Vec<PageNum>, Vec<PageNum>, Vec<PageNum>)> {
         let header = try!(inner.header.read());
+        let fresh = header.fresh.clone();
         let young = header.young.clone();
         let levels = header.levels.clone();
-        Ok((young, levels))
+        Ok((fresh, young, levels))
     }
 
     fn commit_segment(&self, new_seg: PageNum) -> Result<()> {
@@ -6101,7 +6160,7 @@ impl InnerPart {
 
         let mut newHeader = header.clone();
 
-        newHeader.young.insert(0, new_seg);
+        newHeader.fresh.insert(0, new_seg);
 
         newHeader.changeCounter = newHeader.changeCounter + 1;
 
@@ -6127,6 +6186,7 @@ impl InnerPart {
 
     fn merge(inner: &std::sync::Arc<InnerPart>, level: Level) -> Result<Option<PendingMerge>> {
         enum MergingFrom {
+            Fresh(Vec<PageNum>),
             Young(Vec<PageNum>),
             Other(usize, Vec<pgitem>),
         }
@@ -6135,8 +6195,71 @@ impl InnerPart {
             let header = try!(inner.header.read());
 
             let f = try!(inner.open_file_for_cursor());
-            let (mut cursors, min_key, max_key, from, dest_level) =
+            let (mut cursors, min_key, max_key, from, dest_level) = {
+                fn get_cursors(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &Vec<PageNum>) -> Result<(Vec<Box<IForwardCursor>>, Box<[u8]>, Box<[u8]>)> {
+                    // TODO read locks for all the cursors below
+
+                    let mut cursors: Vec<Box<IForwardCursor>> = Vec::with_capacity(merge_segments.len());
+                    // get cursors for all but the last one
+                    let mut min_key: Option<Box<[u8]>> = None;
+                    let mut max_key: Option<Box<[u8]>> = None;
+                    for i in 0 .. merge_segments.len() {
+                        let pagenum = merge_segments[i];
+                        let mut buf = try!(InnerPart::get_loaner_page(inner));
+                        {
+                            let f = &mut *(f.borrow_mut());
+                            try!(utils::SeekPage(f, buf.len(), pagenum));
+                            try!(misc::io::read_fully(f, &mut buf));
+                        }
+                        let pt = try!(PageType::from_u8(buf[0]));
+                        let cursor: Box<IForwardCursor> =
+                            match pt {
+                                PageType::LEAF_NODE => {
+                                    let leaf = try!(LeafPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
+                                    min_key = Some(try!(leaf.min_key(min_key)));
+                                    max_key = Some(try!(leaf.max_key(max_key)));
+                                    let cursor = LeafCursor::new(leaf);
+                                    box cursor
+                                },
+                                PageType::PARENT_NODE => {
+                                    let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
+                                    min_key = Some(try!(parent.min_key(min_key)));
+                                    max_key = Some(try!(parent.max_key(max_key)));
+                                    let cursor = try!(ParentCursor::new(parent));
+                                    box cursor
+                                },
+                                PageType::OVERFLOW_NODE => {
+                                    return Err(Error::CorruptFile("segment page has invalid page type"));
+                                },
+                            };
+                        cursors.push(cursor);
+                    }
+
+                    let min_key = min_key.unwrap();
+                    let max_key = max_key.unwrap();
+
+                    Ok((cursors, min_key, max_key))
+                }
+
                 match level {
+                    Level::Fresh => {
+                        // TODO constant
+                        if header.fresh.len() < 8 {
+                            return Ok(None)
+                        }
+
+                        let mut merge_segments = header.fresh.clone();
+                        merge_segments.reverse();
+                        merge_segments.truncate(16);
+                        merge_segments.reverse();
+
+                        // TODO read locks for all the cursors below
+                        //let mut space = try!(inner.space.lock());
+
+                        let (cursors, min_key, max_key) = try!(get_cursors(inner, f.clone(), &merge_segments));
+
+                        (cursors, min_key, max_key, MergingFrom::Fresh(merge_segments), Level::Young)
+                    },
                     Level::Young => {
                         // TODO constant
                         if header.young.len() < 2 {
@@ -6148,50 +6271,12 @@ impl InnerPart {
                         merge_segments.truncate(8);
                         merge_segments.reverse();
 
-                        let mut space = try!(inner.space.lock());
-
                         // TODO read locks for all the cursors below
+                        //let mut space = try!(inner.space.lock());
 
-                        let mut cursors: Vec<Box<IForwardCursor>> = Vec::with_capacity(merge_segments.len());
-                        // get cursors for all but the last one
-                        let mut min_key: Option<Box<[u8]>> = None;
-                        let mut max_key: Option<Box<[u8]>> = None;
-                        for i in 0 .. merge_segments.len() {
-                            let pagenum = merge_segments[i];
-                            let mut buf = try!(Self::get_loaner_page(inner));
-                            {
-                                let f = &mut *(f.borrow_mut());
-                                try!(utils::SeekPage(f, buf.len(), pagenum));
-                                try!(misc::io::read_fully(f, &mut buf));
-                            }
-                            let pt = try!(PageType::from_u8(buf[0]));
-                            let cursor: Box<IForwardCursor> =
-                                match pt {
-                                    PageType::LEAF_NODE => {
-                                        let leaf = try!(LeafPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
-                                        min_key = Some(try!(leaf.min_key(min_key)));
-                                        max_key = Some(try!(leaf.max_key(max_key)));
-                                        let cursor = LeafCursor::new(leaf);
-                                        box cursor
-                                    },
-                                    PageType::PARENT_NODE => {
-                                        let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
-                                        min_key = Some(try!(parent.min_key(min_key)));
-                                        max_key = Some(try!(parent.max_key(max_key)));
-                                        let cursor = try!(ParentCursor::new(parent));
-                                        box cursor
-                                    },
-                                    PageType::OVERFLOW_NODE => {
-                                        return Err(Error::CorruptFile("segment page has invalid page type"));
-                                    },
-                                };
-                            cursors.push(cursor);
-                        }
+                        let (cursors, min_key, max_key) = try!(get_cursors(inner, f.clone(), &merge_segments));
 
-                        let min_key = min_key.unwrap();
-                        let max_key = max_key.unwrap();
-
-                        (cursors, min_key, max_key, MergingFrom::Young(merge_segments), 0)
+                        (cursors, min_key, max_key, MergingFrom::Young(merge_segments), Level::Other(0))
                     },
                     Level::Other(level) => {
                         // TODO it is painful here to load this page just to find out we don't need to merge
@@ -6224,7 +6309,7 @@ impl InnerPart {
                                         let min_key = try!(parent.min_key(None));
                                         let max_key = try!(parent.max_key(None));
                                         let cursor: Box<IForwardCursor> = box try!(ParentCursor::new(parent));
-                                        (vec![cursor], min_key, max_key, MergingFrom::Other(level, siblings), level + 1)
+                                        (vec![cursor], min_key, max_key, MergingFrom::Other(level, siblings), Level::Other(level + 1))
                                     },
                                 }
 
@@ -6234,65 +6319,87 @@ impl InnerPart {
                             },
                         }
                     },
-                };
+                }
+            };
 
-            println!("merge min_key: {:?}", min_key);
-            println!("merge max_key: {:?}", max_key);
+            //println!("merge min_key: {:?}", min_key);
+            //println!("merge max_key: {:?}", max_key);
 
             // TODO need to read the page for the dest segment so we can look through it.
             // but we don't know which of its pages we want the cursor to be on.
             // and we don't even know if the root page for the last segment is leaf or parent.
 
-            let dest_siblings = 
-                if header.levels.len() > dest_level {
-                    let dest_root_pagenum = header.levels[dest_level];
-                    let mut buf = try!(Self::get_loaner_page(inner));
-                    {
-                        let f = &mut *(f.borrow_mut());
-                        try!(utils::SeekPage(f, buf.len(), dest_root_pagenum));
-                        try!(misc::io::read_fully(f, &mut buf));
-                    }
-                    let pt = try!(PageType::from_u8(buf[0]));
-                    // need three things:
-                    //    root of the dest segment
-                    //    page from the dest segment being included in the multicursor
-                    //    siblings
-                    let (overlaps, dest_siblings) = 
-                        match pt {
-                            PageType::LEAF_NODE => {
-                                println!("root of the dest segment is a leaf");
-                                let leaf = try!(LeafPage::new_already_read_page(&inner.path, f.clone(), dest_root_pagenum, buf));
-                                let pg = try!(leaf.pgitem());
-                                //println!("leaf first_key: {:?}", leaf.first_key());
-                                //println!("leaf last_key: {:?}", leaf.last_key());
-                                if try!(leaf.overlaps(&min_key, &max_key)) == Overlap::Yes {
-                                    (vec![pg], vec![])
-                                } else {
-                                    (vec![], vec![pg])
-                                }
-                            },
-                            PageType::PARENT_NODE => {
-                                let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), dest_root_pagenum, buf));
-                                try!(parent.find_merge_target(&min_key, &max_key))
-                            },
-                            PageType::OVERFLOW_NODE => {
-                                return Err(Error::CorruptFile("child page has invalid page type"));
-                            },
-                        };
+// so we can filter TODO
 
-                    if !overlaps.is_empty() {
-                        // TODO how to get locks on these pages?
-                        let overlaps = 
-                            overlaps
-                            .into_iter()
-                            .map(|pg| pg.page)
-                            .collect::<Vec<_>>();
-                        let dest_cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, overlaps));
-                        cursors.push(box dest_cursor);
-                    }
-                    dest_siblings
-                } else {
-                    vec![]
+            let mut behind = vec![];
+            let (dest_siblings, first_level_after) = 
+                match dest_level {
+                    Level::Fresh => {
+                        unreachable!();
+                    },
+                    Level::Young => {
+                        // no siblings, nothing included from dest
+                        for i in 0 .. header.young.len() {
+                            // TODO how to get locks on these pages?
+                            let mut buf = try!(Self::get_loaner_page(inner));
+                            let cursor = try!(PageCursor::new(&inner.path, f.clone(), header.young[i], buf));
+                            behind.push(cursor);
+                        }
+                        (vec![], 0)
+                    },
+                    Level::Other(dest_level) => {
+                        let first_level_after = dest_level + 1;
+                        if header.levels.len() > dest_level {
+                            let dest_root_pagenum = header.levels[dest_level];
+                            let mut buf = try!(Self::get_loaner_page(inner));
+                            {
+                                let f = &mut *(f.borrow_mut());
+                                try!(utils::SeekPage(f, buf.len(), dest_root_pagenum));
+                                try!(misc::io::read_fully(f, &mut buf));
+                            }
+                            let pt = try!(PageType::from_u8(buf[0]));
+                            // need three things:
+                            //    root of the dest segment
+                            //    page from the dest segment being included in the multicursor
+                            //    siblings
+                            let (overlaps, dest_siblings) = 
+                                match pt {
+                                    PageType::LEAF_NODE => {
+                                        println!("root of the dest segment is a leaf");
+                                        let leaf = try!(LeafPage::new_already_read_page(&inner.path, f.clone(), dest_root_pagenum, buf));
+                                        let pg = try!(leaf.pgitem());
+                                        //println!("leaf first_key: {:?}", leaf.first_key());
+                                        //println!("leaf last_key: {:?}", leaf.last_key());
+                                        if try!(leaf.overlaps(&min_key, &max_key)) == Overlap::Yes {
+                                            (vec![pg], vec![])
+                                        } else {
+                                            (vec![], vec![pg])
+                                        }
+                                    },
+                                    PageType::PARENT_NODE => {
+                                        let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), dest_root_pagenum, buf));
+                                        try!(parent.find_merge_target(&min_key, &max_key))
+                                    },
+                                    PageType::OVERFLOW_NODE => {
+                                        return Err(Error::CorruptFile("child page has invalid page type"));
+                                    },
+                                };
+
+                            if !overlaps.is_empty() {
+                                // TODO how to get locks on these pages?
+                                let overlaps = 
+                                    overlaps
+                                    .into_iter()
+                                    .map(|pg| pg.page)
+                                    .collect::<Vec<_>>();
+                                let dest_cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, overlaps));
+                                cursors.push(box dest_cursor);
+                            }
+                            (dest_siblings, first_level_after)
+                        } else {
+                            (vec![], first_level_after)
+                        }
+                    },
                 };
 
             let cursor = {
@@ -6300,8 +6407,7 @@ impl InnerPart {
                 mc
             };
 
-            let mut behind = vec![];
-            for i in dest_level + 1 .. header.levels.len() {
+            for i in first_level_after .. header.levels.len() {
                 // TODO how to get locks on these pages?
                 let mut buf = try!(Self::get_loaner_page(inner));
                 let cursor = try!(PageCursor::new(&inner.path, f.clone(), header.levels[i], buf));
@@ -6322,7 +6428,7 @@ impl InnerPart {
             if cursor.IsValid() {
                 let source = CursorIterator::new(box cursor);
                 let leaves = try!(write_leaves(&mut pw, source));
-                println!("merge wrote {} leaves", leaves.len());
+                //println!("merge wrote {} leaves", leaves.len());
                 //println!("leaves: {:?}", leaves);
                 //println!("after write_leaves: first_key = {:?}", leaves[0].first_key.key);
                 if cfg!(not) 
@@ -6357,6 +6463,9 @@ impl InnerPart {
 
         let from = 
             match from {
+                MergingFrom::Fresh(segments) => {
+                    MergeFrom::Fresh(segments)
+                },
                 MergingFrom::Young(segments) => {
                     MergeFrom::Young(segments)
                 },
@@ -6374,7 +6483,7 @@ impl InnerPart {
                 from: from,
                 new_segment: seg.map(|pg| pg.page),
             };
-        println!("PendingMerge: {:?}", pm);
+        //println!("PendingMerge: {:?}", pm);
         Ok(Some(pm))
     }
 
@@ -6386,9 +6495,31 @@ impl InnerPart {
 
             let mut newHeader = header.clone();
 
-            let dest_level = pm.from.get_dest_level();
 
             match pm.from {
+                MergeFrom::Fresh(segments) => {
+                    // now we need to verify that the segments being replaced are in fresh
+                    // and contiguous and at the end.
+
+                    let ndxFirstOld = try!(slice_within(segments.as_slice(), header.fresh.as_slice()));
+                    assert!(ndxFirstOld == header.fresh.len() - segments.len());
+
+                    for _ in &segments {
+                        newHeader.fresh.remove(ndxFirstOld);
+                    }
+
+                    match pm.new_segment {
+                        None => {
+                            // a merge resulted in what would have been an empty segment.
+                            // this happens because tombstones
+                            // TODO, er what?!?
+                            // if a segment exists in this level, do we just delete it?
+                        },
+                        Some(new_seg) => {
+                            newHeader.young.insert(0, new_seg);
+                        },
+                    }
+                },
                 MergeFrom::Young(segments) => {
                     // now we need to verify that the segments being replaced are in young
                     // and contiguous and at the end.
@@ -6400,28 +6531,47 @@ impl InnerPart {
                         newHeader.young.remove(ndxFirstOld);
                     }
 
+                    let dest_level = 0;
+                    // TODO DRY
+                    match pm.new_segment {
+                        None => {
+                            // a merge resulted in what would have been an empty segment.
+                            // this happens because tombstones
+                            // TODO, er what?!?
+                            // if a segment exists in this level, do we just delete it?
+                        },
+                        Some(new_seg) => {
+                            assert!(dest_level <= newHeader.levels.len());
+                            if dest_level == newHeader.levels.len() {
+                                newHeader.levels.push(new_seg);
+                            } else {
+                                newHeader.levels[dest_level] = new_seg;
+                            }
+                        },
+                    }
                 },
-                MergeFrom::Other(level, new_seg) => {
-                    newHeader.levels[level] = new_seg;
-                },
-            }
-
-            match pm.new_segment {
-                None => {
-                    // a merge resulted in what would have been an empty segment.
-                    // this happens because tombstones
-                    // TODO, er what?!?
-                    // if a segment exists in this level, do we just delete it?
-                },
-                Some(new_seg) => {
-                    assert!(dest_level <= newHeader.levels.len());
-                    if dest_level == newHeader.levels.len() {
-                        newHeader.levels.push(new_seg);
-                    } else {
-                        newHeader.levels[dest_level] = new_seg;
+                MergeFrom::Other(level, new_from_seg) => {
+                    newHeader.levels[level] = new_from_seg;
+                    let dest_level = level + 1;
+                    match pm.new_segment {
+                        None => {
+                            // a merge resulted in what would have been an empty segment.
+                            // this happens because tombstones
+                            // TODO, er what?!?
+                            // if a segment exists in this level, do we just delete it?
+                        },
+                        Some(new_seg) => {
+                            assert!(dest_level <= newHeader.levels.len());
+                            if dest_level == newHeader.levels.len() {
+                                newHeader.levels.push(new_seg);
+                            } else {
+                                newHeader.levels[dest_level] = new_seg;
+                            }
+                        },
                     }
                 },
             }
+
 
             newHeader.mergeCounter = newHeader.mergeCounter + 1;
 
@@ -6429,7 +6579,7 @@ impl InnerPart {
             try!(self.write_header(&mut header, &mut fs, newHeader));
         }
 
-        println!("merge committed");
+        //println!("merge committed");
 
         /*
            TODO
