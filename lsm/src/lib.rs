@@ -53,7 +53,7 @@ const SIZE_16: usize = 2; // like std::mem::size_of::<u16>()
 
 // the fresh and young levels are not included in the following count
 
-const NUM_LEVELS: usize = 4;
+const NUM_LEVELS: usize = 8;
 
 pub type PageNum = u32;
 pub type PageCount = u32;
@@ -408,8 +408,8 @@ impl std::ops::Index<usize> for BlockList {
 
 fn get_level_size(i: usize) -> u64 {
     let mut n = 1;
-    for _ in 0 .. i+1 {
-        n *= 10;
+    for _ in 0 .. i + 1 {
+        n *= 2;
     }
     n * 1024 * 1024
 }
@@ -2055,6 +2055,7 @@ impl FilterTombstonesCursor {
 
     fn skipTombstonesForward(&mut self) -> Result<()> {
         while try!(self.can_skip()) {
+            //println!("skipping a tombstone");
             try!(self.chain.Next());
         }
         Ok(())
@@ -4364,14 +4365,29 @@ impl ParentPage {
 
     // TODO might want the ability to promote less than a whole parent page.
     // but just one leaf seems pretty small.
+    // stuff that's getting promoted from one level to another.
     fn find_merge_source(&self) -> Result<Option<(ParentPage, Vec<pgitem>)>> {
+        // TODO this needs to get smarter
         let count = self.children.len();
         if count < 2 {
             Ok(None)
         } else if self.child_page_type() == PageType::LEAF_NODE {
+            // if the root is not a grandparent, we're not going to merge.
+            // because either we are promoting just one leaf, or the whole
+            // segment.
             Ok(None)
         } else {
-            let chosen = count / 2;
+            // root is a grandparent.  but we don't know how deep it goes.
+            // for now, we choose one of its children (also a parent).
+            // TODO I wish parent pages knew their depth
+
+            let chosen =
+                match self.children[0].page % 3 {
+                    0 => 0,
+                    1 => self.children.len() - 1,
+                    2 => self.children.len() / 2,
+                    _ => unreachable!(),
+                };
             let pagenum = self.children[chosen].page;
             // TODO it's a little silly here to construct a Lend<>
             let child_buf = vec![0; self.pr.len()].into_boxed_slice();
@@ -4386,6 +4402,9 @@ impl ParentPage {
             }
 
             let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, child_buf));
+            if page.child_page_type() == PageType::PARENT_NODE {
+                println!("find_merge_source chose a grandparent");
+            }
             let siblings = try!(self.siblings_for(Some((chosen, chosen))));
             assert!(siblings.len() == self.children.len() - 1);
             Ok(Some((page, siblings)))
@@ -4462,7 +4481,6 @@ impl ParentPage {
         let mut overlaps = Vec::with_capacity(self.children.len());
         let mut siblings = Vec::with_capacity(self.children.len());
         try!(self.collect_leaves(first, last, &mut overlaps, &mut siblings));
-        println!("overlaps: {}   siblings: {}", overlaps.len(), siblings.len());
         Ok((overlaps, siblings))
     }
 
@@ -5337,12 +5355,11 @@ enum MergeFrom {
 }
 
 impl MergeFrom {
-    // TODO this should be a type that cannot represent Fresh
-    fn get_dest_level(&self) -> Level {
+    fn get_dest_level(&self) -> DestLevel {
         match self {
-            &MergeFrom::Fresh(_) => Level::Young,
-            &MergeFrom::Young(_) => Level::Other(0),
-            &MergeFrom::Other(level, _) => Level::Other(level + 1),
+            &MergeFrom::Fresh(_) => DestLevel::Young,
+            &MergeFrom::Young(_) => DestLevel::Other(0),
+            &MergeFrom::Other(level, _) => DestLevel::Other(level + 1),
         }
     }
 }
@@ -5350,7 +5367,7 @@ impl MergeFrom {
 #[derive(Debug)]
 pub struct PendingMerge {
     from: MergeFrom,
-    new_segment: Option<PageNum>,
+    new_segment: Option<pgitem>,
 }
 
 struct SafeMergeStuff {
@@ -5383,8 +5400,24 @@ struct InnerPart {
 }
 
 #[derive(Debug, Copy, Clone)]
-enum Level {
+enum FromLevel {
     Fresh,
+    Young,
+    Other(usize),
+}
+
+impl FromLevel {
+    fn get_dest_level(&self) -> DestLevel {
+        match self {
+            &FromLevel::Fresh => DestLevel::Young,
+            &FromLevel::Young => DestLevel::Other(0),
+            &FromLevel::Other(level) => DestLevel::Other(level + 1),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+enum DestLevel {
     Young,
     Other(usize),
 }
@@ -5414,18 +5447,27 @@ impl WriteLock {
     }
 
     pub fn commit_merge(&self, pm: PendingMerge) -> Result<()> {
-        let level = pm.from.get_dest_level();
+        let dest_level = pm.from.get_dest_level();
+        let count_pages_in_new_segment = 
+            match pm.new_segment {
+                Some(ref pg) => {
+                    pg.blocks.count_pages()
+                },
+                None => {
+                    0
+                },
+            };
         try!(self.inner.commit_merge(pm));
-        match level {
-            Level::Fresh => {
-                unreachable!();
-            },
-            Level::Young => {
+        match dest_level {
+            DestLevel::Young => {
                 try!(self.notify_young.send(NewSegmentMessage::NewSegment).map_err(wrap_err));
             },
-            Level::Other(level) => {
-                if level + 1 < NUM_LEVELS {
-                    try!(self.notify_automerge[level].send(AutomergeMessage::Merged(level)).map_err(wrap_err));
+            DestLevel::Other(dest_level) => {
+                if dest_level + 1 < NUM_LEVELS {
+                    let size = (count_pages_in_new_segment as u64) * (self.inner.pgsz as u64);
+                    if size > get_level_size(dest_level) {
+                        try!(self.notify_automerge[dest_level].send(AutomergeMessage::Merged(dest_level)).map_err(wrap_err));
+                    }
                 }
             },
         }
@@ -5537,7 +5579,7 @@ impl DatabaseFile {
                         Ok(msg) => {
                             match msg {
                                 NewSegmentMessage::NewSegment => {
-                                    match db.automerge_level(Level::Fresh) {
+                                    match db.automerge_level(FromLevel::Fresh) {
                                         Ok(()) => {
                                         },
                                         Err(e) => {
@@ -5571,7 +5613,7 @@ impl DatabaseFile {
                         Ok(msg) => {
                             match msg {
                                 NewSegmentMessage::NewSegment => {
-                                    match db.automerge_level(Level::Young) {
+                                    match db.automerge_level(FromLevel::Young) {
                                         Ok(()) => {
                                         },
                                         Err(e) => {
@@ -5606,7 +5648,7 @@ impl DatabaseFile {
                             match msg {
                                 AutomergeMessage::Merged(level) => {
                                     assert!(level == closure_level);
-                                    match db.automerge_level(Level::Other(level)) {
+                                    match db.automerge_level(FromLevel::Other(level)) {
                                         Ok(()) => {
                                         },
                                         Err(e) => {
@@ -5635,7 +5677,7 @@ impl DatabaseFile {
         Ok(db)
     }
 
-    fn automerge_level(&self, level: Level) -> Result<()> {
+    fn automerge_level(&self, level: FromLevel) -> Result<()> {
         loop {
             match try!(self.merge(level)) {
                 Some(pm) => {
@@ -5685,7 +5727,7 @@ impl DatabaseFile {
         InnerPart::write_segment(&self.inner, pairs)
     }
 
-    fn merge(&self, level: Level) -> Result<Option<PendingMerge>> {
+    fn merge(&self, level: FromLevel) -> Result<Option<PendingMerge>> {
         InnerPart::merge(&self.inner, level)
     }
 
@@ -6184,7 +6226,7 @@ impl InnerPart {
         Ok(seg)
     }
 
-    fn merge(inner: &std::sync::Arc<InnerPart>, level: Level) -> Result<Option<PendingMerge>> {
+    fn merge(inner: &std::sync::Arc<InnerPart>, from_level: FromLevel) -> Result<Option<PendingMerge>> {
         enum MergingFrom {
             Fresh(Vec<PageNum>),
             Young(Vec<PageNum>),
@@ -6241,8 +6283,8 @@ impl InnerPart {
                     Ok((cursors, min_key, max_key))
                 }
 
-                match level {
-                    Level::Fresh => {
+                match from_level {
+                    FromLevel::Fresh => {
                         // TODO constant
                         if header.fresh.len() < 8 {
                             return Ok(None)
@@ -6258,9 +6300,9 @@ impl InnerPart {
 
                         let (cursors, min_key, max_key) = try!(get_cursors(inner, f.clone(), &merge_segments));
 
-                        (cursors, min_key, max_key, MergingFrom::Fresh(merge_segments), Level::Young)
+                        (cursors, min_key, max_key, MergingFrom::Fresh(merge_segments), DestLevel::Young)
                     },
-                    Level::Young => {
+                    FromLevel::Young => {
                         // TODO constant
                         if header.young.len() < 2 {
                             return Ok(None)
@@ -6276,9 +6318,9 @@ impl InnerPart {
 
                         let (cursors, min_key, max_key) = try!(get_cursors(inner, f.clone(), &merge_segments));
 
-                        (cursors, min_key, max_key, MergingFrom::Young(merge_segments), Level::Other(0))
+                        (cursors, min_key, max_key, MergingFrom::Young(merge_segments), DestLevel::Other(0))
                     },
-                    Level::Other(level) => {
+                    FromLevel::Other(level) => {
                         // TODO it is painful here to load this page just to find out we don't need to merge
                         // the result of commit_merge() should return the size of the resulting segment
                         assert!(header.levels.len() > level);
@@ -6309,7 +6351,7 @@ impl InnerPart {
                                         let min_key = try!(parent.min_key(None));
                                         let max_key = try!(parent.max_key(None));
                                         let cursor: Box<IForwardCursor> = box try!(ParentCursor::new(parent));
-                                        (vec![cursor], min_key, max_key, MergingFrom::Other(level, siblings), Level::Other(level + 1))
+                                        (vec![cursor], min_key, max_key, MergingFrom::Other(level, siblings), DestLevel::Other(level + 1))
                                     },
                                 }
 
@@ -6334,10 +6376,7 @@ impl InnerPart {
             let mut behind = vec![];
             let (dest_siblings, first_level_after) = 
                 match dest_level {
-                    Level::Fresh => {
-                        unreachable!();
-                    },
-                    Level::Young => {
+                    DestLevel::Young => {
                         // no siblings, nothing included from dest
                         for i in 0 .. header.young.len() {
                             // TODO how to get locks on these pages?
@@ -6347,7 +6386,7 @@ impl InnerPart {
                         }
                         (vec![], 0)
                     },
-                    Level::Other(dest_level) => {
+                    DestLevel::Other(dest_level) => {
                         let first_level_after = dest_level + 1;
                         if header.levels.len() > dest_level {
                             let dest_root_pagenum = header.levels[dest_level];
@@ -6384,6 +6423,8 @@ impl InnerPart {
                                         return Err(Error::CorruptFile("child page has invalid page type"));
                                     },
                                 };
+
+                            println!("dest_level: {}   overlaps: {}   siblings: {}", dest_level, overlaps.len(), dest_siblings.len());
 
                             if !overlaps.is_empty() {
                                 // TODO how to get locks on these pages?
@@ -6428,7 +6469,7 @@ impl InnerPart {
             if cursor.IsValid() {
                 let source = CursorIterator::new(box cursor);
                 let leaves = try!(write_leaves(&mut pw, source));
-                //println!("merge wrote {} leaves", leaves.len());
+                println!("dest_level: {:?}  merge wrote {} leaves", from_level.get_dest_level(), leaves.len());
                 //println!("leaves: {:?}", leaves);
                 //println!("after write_leaves: first_key = {:?}", leaves[0].first_key.key);
                 if cfg!(not) 
@@ -6481,7 +6522,7 @@ impl InnerPart {
         let pm = 
             PendingMerge {
                 from: from,
-                new_segment: seg.map(|pg| pg.page),
+                new_segment: seg,
             };
         //println!("PendingMerge: {:?}", pm);
         Ok(Some(pm))
@@ -6516,7 +6557,7 @@ impl InnerPart {
                             // if a segment exists in this level, do we just delete it?
                         },
                         Some(new_seg) => {
-                            newHeader.young.insert(0, new_seg);
+                            newHeader.young.insert(0, new_seg.page);
                         },
                     }
                 },
@@ -6543,9 +6584,9 @@ impl InnerPart {
                         Some(new_seg) => {
                             assert!(dest_level <= newHeader.levels.len());
                             if dest_level == newHeader.levels.len() {
-                                newHeader.levels.push(new_seg);
+                                newHeader.levels.push(new_seg.page);
                             } else {
-                                newHeader.levels[dest_level] = new_seg;
+                                newHeader.levels[dest_level] = new_seg.page;
                             }
                         },
                     }
@@ -6553,6 +6594,7 @@ impl InnerPart {
                 MergeFrom::Other(level, new_from_seg) => {
                     newHeader.levels[level] = new_from_seg;
                     let dest_level = level + 1;
+                    // TODO DRY
                     match pm.new_segment {
                         None => {
                             // a merge resulted in what would have been an empty segment.
@@ -6563,9 +6605,9 @@ impl InnerPart {
                         Some(new_seg) => {
                             assert!(dest_level <= newHeader.levels.len());
                             if dest_level == newHeader.levels.len() {
-                                newHeader.levels.push(new_seg);
+                                newHeader.levels.push(new_seg.page);
                             } else {
-                                newHeader.levels[dest_level] = new_seg;
+                                newHeader.levels[dest_level] = new_seg.page;
                             }
                         },
                     }

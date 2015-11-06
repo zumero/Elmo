@@ -1,4 +1,21 @@
 
+how can we end up never pushing to more than one level, at 4 MB?
+
+intermittent test failures
+
+how to choose a page from the merge source when merging Other?
+is a parent too big?  a leaf too small?  rotate through the
+key space?  note that this code is currently never getting
+run.
+
+why do so many merges seem to overlap so many leaves?  maybe
+this is where the collection gets dropped, so it's tombstoning
+everything?
+
+enum DestLevel
+
+comment the code for behind
+
 what is the ratio of leaves to parent pages?  kinda depends on how
 much stuff we can pack into each parent.  but how expensive would
 it be to just assume that merge operations rewrite all the parent
