@@ -164,6 +164,39 @@ impl<T> From<std::sync::PoisonError<T>> for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
+pub struct KeyRange {
+    // TODO consider enum to support case where min=max
+    min: Box<[u8]>,
+    max: Box<[u8]>,
+}
+
+#[derive(Debug)]
+pub struct KeyRangeRef<'a> {
+    // TODO consider enum to support case where min=max
+    min: KeyRef<'a>,
+    max: KeyRef<'a>,
+}
+
+impl<'a> KeyRangeRef<'a> {
+    fn into_keyrange(self) -> KeyRange {
+        KeyRange {
+            min: self.min.into_boxed_slice(),
+            max: self.max.into_boxed_slice(),
+        }
+    }
+    
+    fn grow(self, cur: KeyRange) -> KeyRange {
+        let min = self.min.min_with(cur.min);
+        let max = self.max.max_with(cur.max);
+        let range = KeyRange {
+            min: min,
+            max: max,
+        };
+        range
+    }
+}
+
+#[derive(Debug)]
 pub enum BlockRequest {
     Any,
     MinimumSize(PageCount),
@@ -480,6 +513,22 @@ impl<'a> KeyRef<'a> {
                     }
                 }
             },
+        }
+    }
+
+    pub fn min_with(self, k: Box<[u8]>) -> Box<[u8]> {
+        if Ordering::Greater == self.compare_with(&k) {
+            self.into_boxed_slice()
+        } else {
+            k
+        }
+    }
+
+    pub fn max_with(self, k: Box<[u8]>) -> Box<[u8]> {
+        if Ordering::Less == self.compare_with(&k) {
+            self.into_boxed_slice()
+        } else {
+            k
         }
     }
 
@@ -3473,14 +3522,15 @@ impl LeafPage {
         list
     }
 
-    fn overlaps(&self, first_key: &[u8], last_key: &[u8]) -> Result<Overlap> {
-        match try!(self.key(0)).compare_with(last_key) {
+    fn overlaps(&self, range: &KeyRange) -> Result<Overlap> {
+// TODO get a KeyRangeRef first?
+        match try!(self.key(0)).compare_with(&range.max) {
             Ordering::Greater => {
                 Ok(Overlap::Greater)
             },
             Ordering::Less | Ordering::Equal => {
                 let last_pair = self.pairs.len() - 1;
-                match try!(self.key(last_pair)).compare_with(first_key) {
+                match try!(self.key(last_pair)).compare_with(&range.min) {
                     Ordering::Less => {
                         Ok(Overlap::Less)
                     },
@@ -3605,37 +3655,27 @@ impl LeafPage {
         Ok(k)
     }
 
-    fn min_key(&self, m: Option<Box<[u8]>>) -> Result<Box<[u8]>> {
-        let k = try!(self.key(0)).into_boxed_slice();
-        match m {
-            Some(m) => {
-                if Ordering::Less == bcmp::Compare(&k, &m) {
-                    // TODO could wait until here to do the into_boxed_slice
-                    Ok(k)
-                } else {
-                    Ok(m)
-                }
-            },
-            None => {
-                Ok(k)
-            },
-        }
+    fn range(&self) -> Result<KeyRangeRef> {
+        let min = try!(self.key(0));
+        let max = {
+            let i = self.pairs.len() - 1;
+            try!(self.key(i))
+        };
+        let range = KeyRangeRef {
+            min: min,
+            max: max,
+        };
+        Ok(range)
     }
 
-    fn max_key(&self, m: Option<Box<[u8]>>) -> Result<Box<[u8]>> {
-        let i = self.pairs.len() - 1;
-        let k = try!(self.key(i)).into_boxed_slice();
-        match m {
-            Some(m) => {
-                if Ordering::Greater == bcmp::Compare(&k, &m) {
-                    // TODO could wait until here to do the into_boxed_slice
-                    Ok(k)
-                } else {
-                    Ok(m)
-                }
-            },
+    fn grow_range(&self, cur: Option<KeyRange>) -> Result<KeyRange> {
+        let range = try!(self.range());
+        match cur {
             None => {
-                Ok(k)
+                Ok(range.into_keyrange())
+            },
+            Some(cur) => {
+                Ok(range.grow(cur))
             },
         }
     }
@@ -4451,7 +4491,8 @@ impl ParentPage {
         }
     }
 
-    fn collect_leaves(&self, first: &[u8], last: &[u8], overlaps: &mut Vec<pgitem>, siblings: &mut Vec<pgitem>) -> Result<()> {
+    // TODO change this to accept more ranges
+    fn collect_leaves(&self, range: &KeyRange, overlaps: &mut Vec<pgitem>, siblings: &mut Vec<pgitem>) -> Result<()> {
         if self.is_grandparent() {
             for i in 0 .. self.children.len() {
                 // TODO this could use one ParentPage object and just tell it to read_page()
@@ -4469,9 +4510,10 @@ impl ParentPage {
                 }
 
                 let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, child_buf));
-                try!(page.collect_leaves(first, last, overlaps, siblings));
+                try!(page.collect_leaves(range, overlaps, siblings));
             }
         } else {
+            // TODO if there are more ranges, last_overlap_seen won't work the same way
             let mut count_overlaps_seen = 0;
             let mut last_overlap_seen = false;
             for i in 0 .. self.children.len() {
@@ -4479,7 +4521,7 @@ impl ParentPage {
                 if last_overlap_seen {
                     siblings.push(pg);
                 } else {
-                    match try!(self.child_overlaps(i, first, last)) {
+                    match try!(self.child_overlaps(i, range)) {
                         Overlap::Yes => {
                             assert!(!last_overlap_seen);
                             overlaps.push(pg);
@@ -4503,10 +4545,14 @@ impl ParentPage {
         Ok(())
     }
 
-    fn find_merge_target(&self, first: &[u8], last: &[u8]) -> Result<(Vec<pgitem>, Vec<pgitem>)> {
+    // TODO change this to accept more ranges
+    fn find_merge_target(&self, range: &KeyRange) -> Result<(Vec<pgitem>, Vec<pgitem>)> {
         let mut overlaps = Vec::with_capacity(self.children.len());
         let mut siblings = Vec::with_capacity(self.children.len());
-        try!(self.collect_leaves(first, last, &mut overlaps, &mut siblings));
+        // TODO for large segments, probably need to reconsider decision
+        // to go all the way down to the leaves level.  A 5 GB segment
+        // would have over a million leaves.
+        try!(self.collect_leaves(range, &mut overlaps, &mut siblings));
         Ok((overlaps, siblings))
     }
 
@@ -4619,46 +4665,36 @@ impl ParentPage {
         }
     }
 
-    fn min_key(&self, m: Option<Box<[u8]>>) -> Result<Box<[u8]>> {
-        let k = try!(self.key(&self.children[0].first_key)).into_boxed_slice();
-        match m {
-            Some(m) => {
-                if Ordering::Less == bcmp::Compare(&k, &m) {
-                    // TODO could wait until here to do the into_boxed_slice
-                    Ok(k)
-                } else {
-                    Ok(m)
-                }
-            },
-            None => {
-                Ok(k)
-            },
-        }
+    fn range(&self) -> Result<KeyRangeRef> {
+        let min = try!(self.key(&self.children[0].first_key));
+        let max = {
+            let i = self.children.len() - 1;
+            let key =
+                match &self.children[i].last_key {
+                    &Some(ref last_key) => {
+                        last_key
+                    },
+                    &None => {
+                        &self.children[i].first_key
+                    },
+                };
+            try!(self.key(key))
+        };
+        let range = KeyRangeRef {
+            min: min,
+            max: max,
+        };
+        Ok(range)
     }
 
-    fn max_key(&self, m: Option<Box<[u8]>>) -> Result<Box<[u8]>> {
-        let i = self.children.len() - 1;
-        let last_key =
-            match &self.children[i].last_key {
-                &Some(ref last_key) => {
-                    last_key
-                },
-                &None => {
-                    &self.children[i].first_key
-                },
-            };
-        let k = try!(self.key(last_key)).into_boxed_slice();
-        match m {
-            Some(m) => {
-                if Ordering::Greater == bcmp::Compare(&k, &m) {
-                    // TODO could wait until here to do the into_boxed_slice
-                    Ok(k)
-                } else {
-                    Ok(m)
-                }
-            },
+    fn grow_range(&self, cur: Option<KeyRange>) -> Result<KeyRange> {
+        let range = try!(self.range());
+        match cur {
             None => {
-                Ok(k)
+                Ok(range.into_keyrange())
+            },
+            Some(cur) => {
+                Ok(range.grow(cur))
             },
         }
     }
@@ -4765,11 +4801,13 @@ impl ParentPage {
         }
     }
 
-    fn child_overlaps(&self, i: usize, first_key: &[u8], last_key: &[u8]) -> Result<Overlap> {
+// TODO fn child_range() ?
+
+    fn child_overlaps(&self, i: usize, range: &KeyRange) -> Result<Overlap> {
         match self.children[i].last_key {
             Some(ref my_last_key) => {
                 let my_last_key = try!(self.key(my_last_key));
-                match my_last_key.compare_with(first_key) {
+                match my_last_key.compare_with(&range.min) {
                     Ordering::Less => {
                         Ok(Overlap::Less)
                     },
@@ -4778,7 +4816,7 @@ impl ParentPage {
                     },
                     Ordering::Greater => {
                         let my_first_key = try!(self.key(&self.children[i].first_key));
-                        match my_first_key.compare_with(last_key) {
+                        match my_first_key.compare_with(&range.max) {
                             Ordering::Greater => {
                                 Ok(Overlap::Greater)
                             },
@@ -4791,7 +4829,7 @@ impl ParentPage {
             },
             None => {
                 let my_first_key = try!(self.key(&self.children[i].first_key));
-                match my_first_key.compare_with(last_key) {
+                match my_first_key.compare_with(&range.max) {
                     Ordering::Greater => {
                         Ok(Overlap::Greater)
                     },
@@ -4799,7 +4837,7 @@ impl ParentPage {
                         Ok(Overlap::Yes)
                     },
                     Ordering::Less => {
-                        match my_first_key.compare_with(first_key) {
+                        match my_first_key.compare_with(&range.min) {
                             Ordering::Greater => {
                                 Ok(Overlap::Yes)
                             },
@@ -6261,7 +6299,7 @@ impl InnerPart {
             let header = try!(inner.header.read());
 
             let f = try!(inner.open_file_for_cursor());
-            let (mut cursors, min_key, max_key, from, dest_level) = {
+            let (mut cursors, range, from, dest_level) = {
                 fn count_leaves_expensive(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &Vec<PageNum>) -> Result<usize> {
                     // TODO read locks?
 
@@ -6292,12 +6330,12 @@ impl InnerPart {
                     Ok(count)
                 }
 
-                fn get_cursors_and_range(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &Vec<PageNum>) -> Result<(Vec<Box<IForwardCursor>>, Box<[u8]>, Box<[u8]>)> {
+                // TODO return multiple ranges
+                fn get_cursors_and_range(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &Vec<PageNum>) -> Result<(Vec<Box<IForwardCursor>>, KeyRange)> {
                     // TODO read locks for all the cursors below
 
                     let mut cursors: Vec<Box<IForwardCursor>> = Vec::with_capacity(merge_segments.len());
-                    let mut min_key: Option<Box<[u8]>> = None;
-                    let mut max_key: Option<Box<[u8]>> = None;
+                    let mut range = None;
                     for i in 0 .. merge_segments.len() {
                         let pagenum = merge_segments[i];
                         let mut buf = try!(InnerPart::get_loaner_page(inner));
@@ -6324,16 +6362,15 @@ impl InnerPart {
                                 PageType::LEAF_NODE => {
                                     let leaf = try!(LeafPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
                                     println!("    segment {} is a leaf with {} keys", pagenum, leaf.count_keys());
-                                    min_key = Some(try!(leaf.min_key(min_key)));
-                                    max_key = Some(try!(leaf.max_key(max_key)));
+                                    // TODO just get one range per key
+                                    range = Some(try!(leaf.grow_range(range)));
                                     let cursor = LeafCursor::new(leaf);
                                     box cursor
                                 },
                                 PageType::PARENT_NODE => {
                                     let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
                                     println!("    segment {} is a parent of depth {}", pagenum, parent.depth());
-                                    min_key = Some(try!(parent.min_key(min_key)));
-                                    max_key = Some(try!(parent.max_key(max_key)));
+                                    range = Some(try!(parent.grow_range(range)));
                                     let cursor = try!(ParentCursor::new(parent));
                                     box cursor
                                 },
@@ -6344,10 +6381,9 @@ impl InnerPart {
                         cursors.push(cursor);
                     }
 
-                    let min_key = min_key.unwrap();
-                    let max_key = max_key.unwrap();
+                    let range = range.unwrap();
 
-                    Ok((cursors, min_key, max_key))
+                    Ok((cursors, range))
                 }
 
                 match from_level {
@@ -6367,9 +6403,9 @@ impl InnerPart {
 
                         println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
                         println!("dest_level: {:?}   leaves in from: {}", from_level.get_dest_level(), try!(count_leaves_expensive(inner, f.clone(), &merge_segments)));
-                        let (cursors, min_key, max_key) = try!(get_cursors_and_range(inner, f.clone(), &merge_segments));
+                        let (cursors, range) = try!(get_cursors_and_range(inner, f.clone(), &merge_segments));
 
-                        (cursors, min_key, max_key, MergingFrom::Fresh(merge_segments), DestLevel::Young)
+                        (cursors, range, MergingFrom::Fresh(merge_segments), DestLevel::Young)
                     },
                     FromLevel::Young => {
                         // TODO constant
@@ -6387,9 +6423,9 @@ impl InnerPart {
 
                         println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
                         println!("dest_level: {:?}   leaves in from: {}", from_level.get_dest_level(), try!(count_leaves_expensive(inner, f.clone(), &merge_segments)));
-                        let (cursors, min_key, max_key) = try!(get_cursors_and_range(inner, f.clone(), &merge_segments));
+                        let (cursors, range) = try!(get_cursors_and_range(inner, f.clone(), &merge_segments));
 
-                        (cursors, min_key, max_key, MergingFrom::Young(merge_segments), DestLevel::Other(0))
+                        (cursors, range, MergingFrom::Young(merge_segments), DestLevel::Other(0))
                     },
                     FromLevel::Other(level) => {
                         assert!(header.levels.len() > level);
@@ -6424,10 +6460,9 @@ impl InnerPart {
                                     },
                                     Some((parent, siblings)) => {
                                         let siblings_depth = parent.depth();
-                                        let min_key = try!(parent.min_key(None));
-                                        let max_key = try!(parent.max_key(None));
+                                        let range = try!(parent.grow_range(None));
                                         let cursor: Box<IForwardCursor> = box try!(ParentCursor::new(parent));
-                                        (vec![cursor], min_key, max_key, MergingFrom::Other(level, siblings, siblings_depth), DestLevel::Other(level + 1))
+                                        (vec![cursor], range, MergingFrom::Other(level, siblings, siblings_depth), DestLevel::Other(level + 1))
                                     },
                                 }
 
@@ -6440,8 +6475,9 @@ impl InnerPart {
                 }
             };
 
-            println!("dest_level: {:?}   merge min_key: {:?}", from_level.get_dest_level(), min_key);
-            println!("dest_level: {:?}   merge max_key: {:?}", from_level.get_dest_level(), max_key);
+// TODO collapse any ranges that overlap
+
+            println!("dest_level: {:?}   merge key range: {:?}", from_level.get_dest_level(), range);
 
             // TODO need to read the page for the dest segment so we can look through it.
             // but we don't know which of its pages we want the cursor to be on.
@@ -6483,7 +6519,7 @@ impl InnerPart {
                                         let pg = try!(leaf.pgitem());
                                         //println!("leaf first_key: {:?}", leaf.first_key());
                                         //println!("leaf last_key: {:?}", leaf.last_key());
-                                        if try!(leaf.overlaps(&min_key, &max_key)) == Overlap::Yes {
+                                        if try!(leaf.overlaps(&range)) == Overlap::Yes {
                                             (vec![pg], vec![])
                                         } else {
                                             (vec![], vec![pg])
@@ -6491,7 +6527,7 @@ impl InnerPart {
                                     },
                                     PageType::PARENT_NODE => {
                                         let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), dest_root_pagenum, buf));
-                                        try!(parent.find_merge_target(&min_key, &max_key))
+                                        try!(parent.find_merge_target(&range))
                                     },
                                     PageType::OVERFLOW_NODE => {
                                         return Err(Error::CorruptFile("child page has invalid page type"));
@@ -6558,6 +6594,10 @@ impl InnerPart {
                         },
                     }
                 }
+
+                // TODO if dest_siblings were not leaves, here is where we need to
+                // construct parents for the leaves we just wrote.  and in fact,
+                // we need a construct a parent of the same depth as the siblings.
 
                 let children = {
                     let mut children = dest_siblings;
