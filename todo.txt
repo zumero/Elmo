@@ -1,4 +1,8 @@
 
+at some point, review all decisions about what actually gets stored
+in the parent page and make sure it's worth it.  two keys?  full
+block list?  should we store the number of descendant leaves?
+
 how can we end up never pushing to more than one level, at 4 MB?
 
 intermittent test failures

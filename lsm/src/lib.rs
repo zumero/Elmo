@@ -409,6 +409,8 @@ impl std::ops::Index<usize> for BlockList {
 fn get_level_size(i: usize) -> u64 {
     let mut n = 1;
     for _ in 0 .. i + 1 {
+        // TODO tune this factor.
+        // for leveldb, it is 10.
         n *= 2;
     }
     n * 1024 * 1024
@@ -2030,6 +2032,9 @@ pub struct FilterTombstonesCursor {
 
 impl FilterTombstonesCursor {
     fn can_skip(&mut self) -> Result<bool> {
+        // in leveldb, this is simpler.  they don't do a full seek.  rather,
+        // they keep a tombstone if any upstream segments have any "files"
+        // that overlap the key.  it's a shallower search.
         if self.chain.IsValid() && try!(self.chain.ValueLength()).is_none() {
             if self.behind.is_empty() {
                 return Ok(true);
@@ -2323,14 +2328,13 @@ impl PageType {
 }
 
 mod ValueFlag {
-    // TODO remove FLAG_
+    // TODO remove FLAG_ prefix
     pub const FLAG_OVERFLOW: u8 = 1;
     pub const FLAG_TOMBSTONE: u8 = 2;
 }
 
 mod PageFlag {
-    // TODO remove FLAG_
-    pub const FLAG_GRANDPARENT: u8 = 1;
+    // TODO remove FLAG_ prefix
     pub const FLAG_BOUNDARY_NODE: u8 = 2;
 }
 
@@ -2904,19 +2908,20 @@ fn write_leaves<I>(
 
 fn write_parent_node_tree(
                        children: Vec<pgitem>,
-                       children_pagetype: PageType,
+                       children_depth: u8,
                        pw: &mut PageWriter,
                       ) -> Result<pgitem> {
 
     fn write_one_set_of_parent_nodes(
                            children: Vec<pgitem>,
-                           children_pagetype: PageType,
+                           my_depth: u8,
                            pw: &mut PageWriter,
                            pb: &mut PageBuilder,
                           ) -> Result<Vec<pgitem>> {
 
         fn calc_page_len(prefix_len: usize, sofar: usize) -> usize {
             2 // page type and flags
+            + 1 // stored depth
             + 2 // stored count
             + varint::space_needed_for(prefix_len as u64) 
             + prefix_len 
@@ -2925,18 +2930,15 @@ fn write_parent_node_tree(
 
         fn build_parent_page(st: &mut ParentState, 
                           pb: &mut PageBuilder,
-                          grandparent: bool,
+                          my_depth: u8,
                           ) -> (KeyWithLocation, Option<KeyWithLocation>, BlockList, usize) {
             // TODO? assert!(st.items.len() > 1);
             //println!("build_parent_page, prefixLen: {:?}", st.prefixLen);
             //println!("build_parent_page, items: {:?}", st.items);
             pb.Reset();
             pb.PutByte(PageType::PARENT_NODE.to_u8());
-            if grandparent {
-                pb.PutByte(PageFlag::FLAG_GRANDPARENT);
-            } else {
-                pb.PutByte(0u8);
-            }
+            pb.PutByte(0u8);
+            pb.PutByte(my_depth);
             pb.PutVarint(st.prefixLen as u64);
             if st.prefixLen > 0 {
                 pb.PutArray(&st.items[0].first_key.key[0 .. st.prefixLen]);
@@ -3026,10 +3028,10 @@ fn write_parent_node_tree(
         fn write_parent_page(st: &mut ParentState, 
                               pb: &mut PageBuilder, 
                               pw: &mut PageWriter,
-                              grandparent: bool,
+                              my_depth: u8,
                              ) -> Result<usize> {
             // assert st.sofar > 0
-            let (first_key, last_key, blocks, len_page) = build_parent_page(st, pb, grandparent);
+            let (first_key, last_key, blocks, len_page) = build_parent_page(st, pb, my_depth);
             assert!(st.items.is_empty());
             //println!("parent blocklist: {:?}", blocks);
             //println!("parent blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
@@ -3182,7 +3184,7 @@ fn write_parent_node_tree(
             if !fits {
                 assert!(st.items.len() > 0);
                 let should_be = calc_page_len(st.prefixLen, st.sofar);
-                let len_page = try!(write_parent_page(&mut st, pb, pw, children_pagetype == PageType::PARENT_NODE));
+                let len_page = try!(write_parent_page(&mut st, pb, pw, my_depth));
                 //println!("should_be = {}   len_page = {}", should_be, len_page);
                 assert!(should_be == len_page);
                 assert!(st.items.is_empty());
@@ -3208,7 +3210,7 @@ fn write_parent_node_tree(
         {
             assert!(st.items.len() > 0);
             let should_be = calc_page_len(st.prefixLen, st.sofar);
-            let len_page = try!(write_parent_page(&mut st, pb, pw, children_pagetype == PageType::PARENT_NODE));
+            let len_page = try!(write_parent_page(&mut st, pb, pw, my_depth));
             //println!("should_be = {}   len_page = {}", should_be, len_page);
             assert!(should_be == len_page);
             assert!(st.items.is_empty());
@@ -3231,14 +3233,14 @@ fn write_parent_node_tree(
     let root_page =
         if children.len() > 1 {
             let mut kids = children;
-            let mut children_pagetype = children_pagetype;
+            let mut my_depth = children_depth + 1;
             while kids.len() > 1 {
                 // TODO FWIW, this is where we used to:
                 // before we write this layer of parent nodes, we trim all the
                 // keys to the shortest prefix that will suffice.
 
-                let newChildren = try!(write_one_set_of_parent_nodes(kids, children_pagetype, pw, &mut pb));
-                children_pagetype = PageType::PARENT_NODE;
+                let newChildren = try!(write_one_set_of_parent_nodes(kids, my_depth, pw, &mut pb));
+                my_depth += 1;
                 kids = newChildren;
             }
             kids.remove(0)
@@ -3258,7 +3260,7 @@ fn create_segment<I>(mut pw: PageWriter,
 
     let leaves = try!(write_leaves(&mut pw, source));
 
-    let root_page = try!(write_parent_node_tree(leaves, PageType::LEAF_NODE, &mut pw));
+    let root_page = try!(write_parent_node_tree(leaves, 0, &mut pw));
 // TODO do we need to return the blocklist?
 // if not, the only reason to call pw.end() is to make it release leftovers
     let blocks = try!(pw.end());
@@ -4371,16 +4373,19 @@ impl ParentPage {
         let count = self.children.len();
         if count < 2 {
             Ok(None)
-        } else if self.child_page_type() == PageType::LEAF_NODE {
+        } else if !self.is_grandparent() {
             // if the root is not a grandparent, we're not going to merge.
-            // because either we are promoting just one leaf, or the whole
+            // because either we would be promoting just one leaf, or the whole
             // segment.
             Ok(None)
         } else {
+            // TODO dive until depth is 2
             // root is a grandparent.  but we don't know how deep it goes.
             // for now, we choose one of its children (also a parent).
-            // TODO I wish parent pages knew their depth
 
+            // TODO we probably need to be more clever about which one we
+            // choose.  for now, the following hack just tries to make sure
+            // the choice moves around the key range.
             let chosen =
                 match self.children[0].page % 3 {
                     0 => 0,
@@ -4402,9 +4407,6 @@ impl ParentPage {
             }
 
             let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, child_buf));
-            if page.child_page_type() == PageType::PARENT_NODE {
-                println!("find_merge_source chose a grandparent");
-            }
             let siblings = try!(self.siblings_for(Some((chosen, chosen))));
             assert!(siblings.len() == self.children.len() - 1);
             Ok(Some((page, siblings)))
@@ -4412,67 +4414,91 @@ impl ParentPage {
 
     }
 
-    pub fn child_page_type(&self) -> PageType {
-        if 0 == self.pr[1] & PageFlag::FLAG_GRANDPARENT {
-            PageType::LEAF_NODE
+    pub fn depth(&self) -> u8 {
+        self.pr[2]
+    }
+
+    pub fn is_grandparent(&self) -> bool {
+        // depth is never 0
+        // when children are leaves, depth is 1
+        self.depth() > 1
+    }
+
+    fn count_leaves_expensive(&self) -> Result<usize> {
+        if self.is_grandparent() {
+            let mut count = 0;
+            for i in 0 .. self.children.len() {
+                // TODO this could use one ParentPage object and just tell it to read_page()
+                let pagenum = self.children[i].page;
+
+                let child_buf = vec![0; self.pr.len()].into_boxed_slice();
+                let done_page = move |_| -> () {
+                };
+                let mut child_buf = Lend::new(child_buf, box done_page);
+
+                {
+                    let f = &mut *(self.f.borrow_mut());
+                    try!(utils::SeekPage(f, child_buf.len(), pagenum));
+                    try!(misc::io::read_fully(f, &mut child_buf));
+                }
+
+                let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, child_buf));
+                count += try!(page.count_leaves_expensive());
+            }
+            Ok(count)
         } else {
-            PageType::PARENT_NODE
+            Ok(self.children.len())
         }
     }
 
     fn collect_leaves(&self, first: &[u8], last: &[u8], overlaps: &mut Vec<pgitem>, siblings: &mut Vec<pgitem>) -> Result<()> {
-        match self.child_page_type() {
-            PageType::OVERFLOW_NODE => {
-                unreachable!();
-            },
-            PageType::PARENT_NODE => {
-                for i in 0 .. self.children.len() {
-                    let pagenum = self.children[i].page;
+        if self.is_grandparent() {
+            for i in 0 .. self.children.len() {
+                // TODO this could use one ParentPage object and just tell it to read_page()
+                let pagenum = self.children[i].page;
 
-                    let child_buf = vec![0; self.pr.len()].into_boxed_slice();
-                    let done_page = move |_| -> () {
-                    };
-                    let mut child_buf = Lend::new(child_buf, box done_page);
+                let child_buf = vec![0; self.pr.len()].into_boxed_slice();
+                let done_page = move |_| -> () {
+                };
+                let mut child_buf = Lend::new(child_buf, box done_page);
 
-                    {
-                        let f = &mut *(self.f.borrow_mut());
-                        try!(utils::SeekPage(f, child_buf.len(), pagenum));
-                        try!(misc::io::read_fully(f, &mut child_buf));
-                    }
-
-                    let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, child_buf));
-                    try!(page.collect_leaves(first, last, overlaps, siblings));
+                {
+                    let f = &mut *(self.f.borrow_mut());
+                    try!(utils::SeekPage(f, child_buf.len(), pagenum));
+                    try!(misc::io::read_fully(f, &mut child_buf));
                 }
-            },
-            PageType::LEAF_NODE => {
-                let mut count_overlaps_seen = 0;
-                let mut last_overlap_seen = false;
-                for i in 0 .. self.children.len() {
-                    let pg = try!(self.child_pgitem(i));
-                    if last_overlap_seen {
-                        siblings.push(pg);
-                    } else {
-                        match try!(self.child_overlaps(i, first, last)) {
-                            Overlap::Yes => {
-                                assert!(!last_overlap_seen);
-                                overlaps.push(pg);
-                                count_overlaps_seen += 1;
-                            },
-                            Overlap::Less => {
-                                assert!(count_overlaps_seen == 0);
-                                assert!(count_overlaps_seen == 0);
-                                assert!(!last_overlap_seen);
-                                siblings.push(pg);
-                                // keep going
-                            },
-                            Overlap::Greater => {
-                                last_overlap_seen = true;
-                                siblings.push(pg);
-                            },
-                        }
+
+                let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, child_buf));
+                try!(page.collect_leaves(first, last, overlaps, siblings));
+            }
+        } else {
+            let mut count_overlaps_seen = 0;
+            let mut last_overlap_seen = false;
+            for i in 0 .. self.children.len() {
+                let pg = try!(self.child_pgitem(i));
+                if last_overlap_seen {
+                    siblings.push(pg);
+                } else {
+                    match try!(self.child_overlaps(i, first, last)) {
+                        Overlap::Yes => {
+                            assert!(!last_overlap_seen);
+                            overlaps.push(pg);
+                            count_overlaps_seen += 1;
+                        },
+                        Overlap::Less => {
+                            assert!(count_overlaps_seen == 0);
+                            assert!(count_overlaps_seen == 0);
+                            assert!(!last_overlap_seen);
+                            siblings.push(pg);
+                            // keep going
+                        },
+                        Overlap::Greater => {
+                            last_overlap_seen = true;
+                            siblings.push(pg);
+                        },
                     }
                 }
-            },
+            }
         }
         Ok(())
     }
@@ -4644,7 +4670,9 @@ impl ParentPage {
             //panic!();
             return Err(Error::CorruptFile("parent page has invalid page type"));
         }
-        cur = cur + 1; // skip the page flags
+        let flags = misc::buf_advance::get_byte(pr, &mut cur);
+        let depth = misc::buf_advance::get_byte(pr, &mut cur);
+        assert!(depth > 0);
         let prefix_len = varint::read(pr, &mut cur) as usize;
         let prefix = {
             if prefix_len > 0 {
@@ -4814,6 +4842,7 @@ pub struct ParentCursor {
 impl ParentCursor {
     fn new(page: ParentPage,) -> Result<ParentCursor> {
 
+        // TODO so, er, ParentPage actually does know its depth/child_type
         let sub = try!(page.get_child_cursor(0));
 
         let res = ParentCursor {
@@ -4823,11 +4852,6 @@ impl ParentCursor {
         };
 
         Ok(res)
-    }
-
-// TODO ParentPage.child_page_type?
-    pub fn child_page_type(&self) -> PageType {
-        self.sub.page_type()
     }
 
     fn set_child(&mut self, i: usize) -> Result<()> {
@@ -6230,7 +6254,7 @@ impl InnerPart {
         enum MergingFrom {
             Fresh(Vec<PageNum>),
             Young(Vec<PageNum>),
-            Other(usize, Vec<pgitem>),
+            Other(usize, Vec<pgitem>, u8),
         }
 
         let (cursor, from, dest_siblings) = {
@@ -6238,16 +6262,57 @@ impl InnerPart {
 
             let f = try!(inner.open_file_for_cursor());
             let (mut cursors, min_key, max_key, from, dest_level) = {
-                fn get_cursors(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &Vec<PageNum>) -> Result<(Vec<Box<IForwardCursor>>, Box<[u8]>, Box<[u8]>)> {
+                fn count_leaves_expensive(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &Vec<PageNum>) -> Result<usize> {
+                    // TODO read locks?
+
+                    let mut count = 0;
+                    for i in 0 .. merge_segments.len() {
+                        let pagenum = merge_segments[i];
+                        let mut buf = try!(InnerPart::get_loaner_page(inner));
+                        {
+                            let f = &mut *(f.borrow_mut());
+                            try!(utils::SeekPage(f, buf.len(), pagenum));
+                            try!(misc::io::read_fully(f, &mut buf));
+                        }
+                        let pt = try!(PageType::from_u8(buf[0]));
+                        match pt {
+                            PageType::LEAF_NODE => {
+                                count += 1;
+                            },
+                            PageType::PARENT_NODE => {
+                                let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
+                                count += try!(parent.count_leaves_expensive());
+                            },
+                            PageType::OVERFLOW_NODE => {
+                                return Err(Error::CorruptFile("segment page has invalid page type"));
+                            },
+                        }
+                    }
+
+                    Ok(count)
+                }
+
+                fn get_cursors_and_range(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &Vec<PageNum>) -> Result<(Vec<Box<IForwardCursor>>, Box<[u8]>, Box<[u8]>)> {
                     // TODO read locks for all the cursors below
 
                     let mut cursors: Vec<Box<IForwardCursor>> = Vec::with_capacity(merge_segments.len());
-                    // get cursors for all but the last one
                     let mut min_key: Option<Box<[u8]>> = None;
                     let mut max_key: Option<Box<[u8]>> = None;
                     for i in 0 .. merge_segments.len() {
                         let pagenum = merge_segments[i];
                         let mut buf = try!(InnerPart::get_loaner_page(inner));
+                        // TODO I suppose if we stored the depth in the header segment lists
+                        // we would not have to pre-read the page when we start at the top
+                        // of a segment.  
+                        // but it's so nice just having the segment list
+                        // be simple page numbers.
+
+                        // TODO the pre-read of the page here could just be done by calling
+                        // PageCursor::new.  We are loading the page objects ourselves so
+                        // we can call min_key/max_key, etc.  but those methods could be
+                        // added to PageCursor.  We currently don't have a general Page
+                        // object which represents either LeafPage or ParentPage.
+
                         {
                             let f = &mut *(f.borrow_mut());
                             try!(utils::SeekPage(f, buf.len(), pagenum));
@@ -6258,6 +6323,7 @@ impl InnerPart {
                             match pt {
                                 PageType::LEAF_NODE => {
                                     let leaf = try!(LeafPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
+                                    println!("    segment {} is a leaf with {} keys", pagenum, leaf.count_keys());
                                     min_key = Some(try!(leaf.min_key(min_key)));
                                     max_key = Some(try!(leaf.max_key(max_key)));
                                     let cursor = LeafCursor::new(leaf);
@@ -6265,6 +6331,7 @@ impl InnerPart {
                                 },
                                 PageType::PARENT_NODE => {
                                     let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
+                                    println!("    segment {} is a parent of depth {}", pagenum, parent.depth());
                                     min_key = Some(try!(parent.min_key(min_key)));
                                     max_key = Some(try!(parent.max_key(max_key)));
                                     let cursor = try!(ParentCursor::new(parent));
@@ -6298,31 +6365,33 @@ impl InnerPart {
                         // TODO read locks for all the cursors below
                         //let mut space = try!(inner.space.lock());
 
-                        let (cursors, min_key, max_key) = try!(get_cursors(inner, f.clone(), &merge_segments));
+                        println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
+                        println!("dest_level: {:?}   leaves in from: {}", from_level.get_dest_level(), try!(count_leaves_expensive(inner, f.clone(), &merge_segments)));
+                        let (cursors, min_key, max_key) = try!(get_cursors_and_range(inner, f.clone(), &merge_segments));
 
                         (cursors, min_key, max_key, MergingFrom::Fresh(merge_segments), DestLevel::Young)
                     },
                     FromLevel::Young => {
                         // TODO constant
-                        if header.young.len() < 2 {
+                        if header.young.len() < 1 {
                             return Ok(None)
                         }
 
                         let mut merge_segments = header.young.clone();
                         merge_segments.reverse();
-                        merge_segments.truncate(8);
+                        merge_segments.truncate(1);
                         merge_segments.reverse();
 
                         // TODO read locks for all the cursors below
                         //let mut space = try!(inner.space.lock());
 
-                        let (cursors, min_key, max_key) = try!(get_cursors(inner, f.clone(), &merge_segments));
+                        println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
+                        println!("dest_level: {:?}   leaves in from: {}", from_level.get_dest_level(), try!(count_leaves_expensive(inner, f.clone(), &merge_segments)));
+                        let (cursors, min_key, max_key) = try!(get_cursors_and_range(inner, f.clone(), &merge_segments));
 
                         (cursors, min_key, max_key, MergingFrom::Young(merge_segments), DestLevel::Other(0))
                     },
                     FromLevel::Other(level) => {
-                        // TODO it is painful here to load this page just to find out we don't need to merge
-                        // the result of commit_merge() should return the size of the resulting segment
                         assert!(header.levels.len() > level);
                         let pagenum = header.levels[level];
                         let mut buf = try!(Self::get_loaner_page(inner));
@@ -6334,24 +6403,31 @@ impl InnerPart {
                         let pt = try!(PageType::from_u8(buf[0]));
                         match pt {
                             PageType::LEAF_NODE => {
+                                // TODO this should be avoidable by now as well.  the size check on
+                                // notify should have caught it, unless the leaf has big overflows.
+                                // if parent nodes knew their depth, we might have caught it earlier.
                                 return Ok(None);
                             },
                             PageType::PARENT_NODE => {
                                 let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
                                 let size = (parent.complete_blocklist().count_pages() as u64) * (inner.pgsz as u64);
                                 if size < get_level_size(level) {
+                                    // TODO this should never happen because the size check is done before notify
                                     return Ok(None);
                                 }
 
                                 match try!(parent.find_merge_source()) {
                                     None => {
+                                        // TODO this could have been caught earlier, or was a symptom
+                                        // of find_merge_source() currently being kinda simplistic.
                                         return Ok(None);
                                     },
                                     Some((parent, siblings)) => {
+                                        let siblings_depth = parent.depth();
                                         let min_key = try!(parent.min_key(None));
                                         let max_key = try!(parent.max_key(None));
                                         let cursor: Box<IForwardCursor> = box try!(ParentCursor::new(parent));
-                                        (vec![cursor], min_key, max_key, MergingFrom::Other(level, siblings), DestLevel::Other(level + 1))
+                                        (vec![cursor], min_key, max_key, MergingFrom::Other(level, siblings, siblings_depth), DestLevel::Other(level + 1))
                                     },
                                 }
 
@@ -6364,14 +6440,12 @@ impl InnerPart {
                 }
             };
 
-            //println!("merge min_key: {:?}", min_key);
-            //println!("merge max_key: {:?}", max_key);
+            println!("dest_level: {:?}   merge min_key: {:?}", from_level.get_dest_level(), min_key);
+            println!("dest_level: {:?}   merge max_key: {:?}", from_level.get_dest_level(), max_key);
 
             // TODO need to read the page for the dest segment so we can look through it.
             // but we don't know which of its pages we want the cursor to be on.
             // and we don't even know if the root page for the last segment is leaf or parent.
-
-// so we can filter TODO
 
             let mut behind = vec![];
             let (dest_siblings, first_level_after) = 
@@ -6404,7 +6478,7 @@ impl InnerPart {
                             let (overlaps, dest_siblings) = 
                                 match pt {
                                     PageType::LEAF_NODE => {
-                                        println!("root of the dest segment is a leaf");
+                                        //println!("root of the dest segment is a leaf");
                                         let leaf = try!(LeafPage::new_already_read_page(&inner.path, f.clone(), dest_root_pagenum, buf));
                                         let pg = try!(leaf.pgitem());
                                         //println!("leaf first_key: {:?}", leaf.first_key());
@@ -6424,7 +6498,7 @@ impl InnerPart {
                                     },
                                 };
 
-                            println!("dest_level: {}   overlaps: {}   siblings: {}", dest_level, overlaps.len(), dest_siblings.len());
+                            println!("dest_level: {:?}   overlaps: {}   siblings: {}", from_level.get_dest_level(), overlaps.len(), dest_siblings.len());
 
                             if !overlaps.is_empty() {
                                 // TODO how to get locks on these pages?
@@ -6494,7 +6568,7 @@ impl InnerPart {
                     children
                 };
 
-                let z = try!(write_parent_node_tree(children, PageType::LEAF_NODE, &mut pw));
+                let z = try!(write_parent_node_tree(children, 0, &mut pw));
 
                 Some(z)
             } else {
@@ -6510,9 +6584,8 @@ impl InnerPart {
                 MergingFrom::Young(segments) => {
                     MergeFrom::Young(segments)
                 },
-                MergingFrom::Other(level, siblings) => {
-                    // TODO currently, we know the node we are promoting is a parent, so its siblings are too
-                    let root_page = try!(write_parent_node_tree(siblings, PageType::PARENT_NODE, &mut pw));
+                MergingFrom::Other(level, remaining_siblings, siblings_depth) => {
+                    let root_page = try!(write_parent_node_tree(remaining_siblings, siblings_depth, &mut pw));
                     MergeFrom::Other(level, root_page.page)
                 },
             };
@@ -6535,7 +6608,6 @@ impl InnerPart {
             // TODO assert new_seg shares no pages with any seg in current state
 
             let mut newHeader = header.clone();
-
 
             match pm.from {
                 MergeFrom::Fresh(segments) => {
