@@ -163,11 +163,36 @@ impl<T> From<std::sync::PoisonError<T>> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+// TODO maybe KeyRange should just go away, always use the KeyRef form?
 #[derive(Debug)]
 pub struct KeyRange {
     // TODO consider enum to support case where min=max
     min: Box<[u8]>,
     max: Box<[u8]>,
+}
+
+impl KeyRange {
+    fn overlaps(&self, other: &KeyRange) -> Overlap {
+        match bcmp::Compare(&self.min, &other.max) {
+            Ordering::Greater => {
+                Overlap::Greater
+            },
+            Ordering::Equal => {
+                Overlap::Yes
+            },
+            Ordering::Less => {
+                match bcmp::Compare(&self.max, &other.min) {
+                    Ordering::Less => {
+                        Overlap::Less
+                    },
+                    Ordering::Greater | Ordering::Equal => {
+                        Overlap::Yes
+                    },
+                }
+            },
+        }
+    }
+
 }
 
 #[derive(Debug)]
@@ -193,6 +218,27 @@ impl<'a> KeyRangeRef<'a> {
             max: max,
         };
         range
+    }
+
+    fn overlaps(&self, other: &KeyRange) -> Overlap {
+        match self.min.compare_with(&other.max) {
+            Ordering::Greater => {
+                Overlap::Greater
+            },
+            Ordering::Equal => {
+                Overlap::Yes
+            },
+            Ordering::Less => {
+                match self.max.compare_with(&other.min) {
+                    Ordering::Less => {
+                        Overlap::Less
+                    },
+                    Ordering::Greater | Ordering::Equal => {
+                        Overlap::Yes
+                    },
+                }
+            },
+        }
     }
 }
 
@@ -2723,7 +2769,7 @@ fn write_leaves<I>(
         let mut pair = try!(result_pair);
 
         let k = pair.Key;
-        if cfg!(expensive_check) 
+        //if cfg!(expensive_check) 
         {
            // this code can be used to verify that we are being given kvps in order
             match prev_key {
@@ -3157,7 +3203,7 @@ fn write_parent_node_tree(
         // deal with all the children except the last one
         for child in children {
 
-            if cfg!(expensive_check) 
+            //if cfg!(expensive_check) 
             {
                 // TODO FYI this code is the only reason we need to derive Clone on
                 // pgitem and its parts
@@ -4491,7 +4537,6 @@ impl ParentPage {
         }
     }
 
-    // TODO change this to accept more ranges
     fn collect_leaves(&self, range: &KeyRange, overlaps: &mut Vec<pgitem>, siblings: &mut Vec<pgitem>) -> Result<()> {
         if self.is_grandparent() {
             for i in 0 .. self.children.len() {
@@ -4513,29 +4558,23 @@ impl ParentPage {
                 try!(page.collect_leaves(range, overlaps, siblings));
             }
         } else {
-            // TODO if there are more ranges, last_overlap_seen won't work the same way
-            let mut count_overlaps_seen = 0;
-            let mut last_overlap_seen = false;
+            let mut no_more_overlaps = false;
             for i in 0 .. self.children.len() {
                 let pg = try!(self.child_pgitem(i));
-                if last_overlap_seen {
+                if no_more_overlaps {
                     siblings.push(pg);
                 } else {
                     match try!(self.child_overlaps(i, range)) {
                         Overlap::Yes => {
-                            assert!(!last_overlap_seen);
+                            assert!(!no_more_overlaps);
                             overlaps.push(pg);
-                            count_overlaps_seen += 1;
                         },
                         Overlap::Less => {
-                            assert!(count_overlaps_seen == 0);
-                            assert!(count_overlaps_seen == 0);
-                            assert!(!last_overlap_seen);
                             siblings.push(pg);
                             // keep going
                         },
                         Overlap::Greater => {
-                            last_overlap_seen = true;
+                            no_more_overlaps = true;
                             siblings.push(pg);
                         },
                     }
@@ -4545,7 +4584,6 @@ impl ParentPage {
         Ok(())
     }
 
-    // TODO change this to accept more ranges
     fn find_merge_target(&self, range: &KeyRange) -> Result<(Vec<pgitem>, Vec<pgitem>)> {
         let mut overlaps = Vec::with_capacity(self.children.len());
         let mut siblings = Vec::with_capacity(self.children.len());
@@ -4801,7 +4839,26 @@ impl ParentPage {
         }
     }
 
-// TODO fn child_range() ?
+    fn child_range(&self, i: usize) -> Result<KeyRangeRef> {
+        let min = try!(self.key(&self.children[i].first_key));
+        let max = {
+            let key =
+                match &self.children[i].last_key {
+                    &Some(ref last_key) => {
+                        last_key
+                    },
+                    &None => {
+                        &self.children[i].first_key
+                    },
+                };
+            try!(self.key(key))
+        };
+        let range = KeyRangeRef {
+            min: min,
+            max: max,
+        };
+        Ok(range)
+    }
 
     fn child_overlaps(&self, i: usize, range: &KeyRange) -> Result<Overlap> {
         match self.children[i].last_key {
@@ -6330,7 +6387,6 @@ impl InnerPart {
                     Ok(count)
                 }
 
-                // TODO return multiple ranges
                 fn get_cursors_and_range(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &Vec<PageNum>) -> Result<(Vec<Box<IForwardCursor>>, KeyRange)> {
                     // TODO read locks for all the cursors below
 
@@ -6362,7 +6418,6 @@ impl InnerPart {
                                 PageType::LEAF_NODE => {
                                     let leaf = try!(LeafPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
                                     println!("    segment {} is a leaf with {} keys", pagenum, leaf.count_keys());
-                                    // TODO just get one range per key
                                     range = Some(try!(leaf.grow_range(range)));
                                     let cursor = LeafCursor::new(leaf);
                                     box cursor
@@ -6474,8 +6529,6 @@ impl InnerPart {
                     },
                 }
             };
-
-// TODO collapse any ranges that overlap
 
             println!("dest_level: {:?}   merge key range: {:?}", from_level.get_dest_level(), range);
 
