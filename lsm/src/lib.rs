@@ -4836,33 +4836,6 @@ impl ParentPage {
         self.depth() > 1
     }
 
-    fn count_leaves_expensive(&self) -> Result<usize> {
-        if self.is_grandparent() {
-            let mut count = 0;
-            for i in 0 .. self.children.len() {
-                // TODO this could use one ParentPage object and just tell it to read_page()
-                let pagenum = self.children[i].page;
-
-                let child_buf = vec![0; self.pr.len()].into_boxed_slice();
-                let done_page = move |_| -> () {
-                };
-                let mut child_buf = Lend::new(child_buf, box done_page);
-
-                {
-                    let f = &mut *(self.f.borrow_mut());
-                    try!(utils::SeekPage(f, child_buf.len(), pagenum));
-                    try!(misc::io::read_fully(f, &mut child_buf));
-                }
-
-                let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, child_buf));
-                count += try!(page.count_leaves_expensive());
-            }
-            Ok(count)
-        } else {
-            Ok(self.children.len())
-        }
-    }
-
     fn collect_all_leaves(&self, leaves: &mut Vec<pgitem>) -> Result<()> {
         if self.is_grandparent() {
             for i in 0 .. self.children.len() {
@@ -4895,7 +4868,7 @@ impl ParentPage {
 
     fn all_leaves(&self) -> Result<Vec<pgitem>> {
         let mut v = vec![];
-        self.collect_all_leaves(&mut v);
+        try!(self.collect_all_leaves(&mut v));
         Ok(v)
     }
 
@@ -5046,18 +5019,6 @@ impl ParentPage {
             max: max,
         };
         Ok(range)
-    }
-
-    fn grow_range(&self, cur: Option<KeyRange>) -> Result<KeyRange> {
-        let range = try!(self.range());
-        match cur {
-            None => {
-                Ok(range.into_keyrange())
-            },
-            Some(cur) => {
-                Ok(range.grow(cur))
-            },
-        }
     }
 
     fn parse_page(pr: &[u8]) -> Result<(Option<Box<[u8]>>, Vec<ParentPageItem>)> {
@@ -5500,6 +5461,7 @@ impl ICursor for ParentCursor {
 
 }
 
+// TODO er, this isn't used anymore?
 pub struct MultiPageCursor {
     path: String,
     children: Vec<PageNum>,
@@ -5771,9 +5733,9 @@ fn list_all_blocks(h: &HeaderData, pgsz: usize, path: &str) -> Result<BlockList>
         Ok(())
     }
 
-    do_seglist(&h.fresh, f.clone(), &mut blocks, pgsz, path);
-    do_seglist(&h.young, f.clone(), &mut blocks, pgsz, path);
-    do_seglist(&h.levels, f.clone(), &mut blocks, pgsz, path);
+    try!(do_seglist(&h.fresh, f.clone(), &mut blocks, pgsz, path));
+    try!(do_seglist(&h.young, f.clone(), &mut blocks, pgsz, path));
+    try!(do_seglist(&h.levels, f.clone(), &mut blocks, pgsz, path));
 
     blocks.sort_and_consolidate();
 
@@ -5823,13 +5785,6 @@ pub struct PendingMerge {
     new_dest_segment: Option<pgitem>,
 }
 
-struct SafeMergeStuff {
-    // TODO can we design a way to not need the following?
-    // it keeps track of which segments are being merged,
-    // so we don't try to merge something that is already being merged.
-    merging: HashSet<PageNum>,
-}
-
 struct SafePagePool {
     // we keep a pool of page buffers so we can lend them to
     // SegmentCursors.
@@ -5848,7 +5803,6 @@ struct InnerPart {
     header: RwLock<HeaderData>,
 
     space: Mutex<Space>,
-    mergeStuff: Mutex<SafeMergeStuff>,
     pagepool: Mutex<SafePagePool>,
     mergelock: Mutex<u32>,
 }
@@ -5973,10 +5927,6 @@ impl DatabaseFile {
             zombie_segments: HashMap::new(),
         };
 
-        let mergeStuff = SafeMergeStuff {
-            merging: HashSet::new(),
-        };
-
         let pagepool = SafePagePool {
             pages: vec![],
         };
@@ -5987,7 +5937,6 @@ impl DatabaseFile {
             settings: settings, 
             header: RwLock::new(header),
             space: Mutex::new(space),
-            mergeStuff: Mutex::new(mergeStuff),
             pagepool: Mutex::new(pagepool),
             mergelock: Mutex::new(0),
         };
@@ -6735,36 +6684,6 @@ impl InnerPart {
             let header = try!(inner.header.read());
 
             let (cursors, from, dest_level) = {
-                fn count_leaves_expensive(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &Vec<PageNum>) -> Result<usize> {
-                    // TODO read locks?
-
-                    let mut count = 0;
-                    for i in 0 .. merge_segments.len() {
-                        let pagenum = merge_segments[i];
-                        let mut buf = try!(InnerPart::get_loaner_page(inner));
-                        {
-                            let f = &mut *(f.borrow_mut());
-                            try!(utils::SeekPage(f, buf.len(), pagenum));
-                            try!(misc::io::read_fully(f, &mut buf));
-                        }
-                        let pt = try!(PageType::from_u8(buf[0]));
-                        match pt {
-                            PageType::LEAF_NODE => {
-                                count += 1;
-                            },
-                            PageType::PARENT_NODE => {
-                                let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
-                                count += try!(parent.count_leaves_expensive());
-                            },
-                            PageType::OVERFLOW_NODE => {
-                                return Err(Error::CorruptFile("segment page has invalid page type"));
-                            },
-                        }
-                    }
-
-                    Ok(count)
-                }
-
                 fn get_cursors(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &Vec<PageNum>) -> Result<Vec<Box<IForwardCursor>>> {
                     // TODO read locks for all the cursors below
 
@@ -6830,7 +6749,6 @@ impl InnerPart {
                         //let mut space = try!(inner.space.lock());
 
                         //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
-                        //println!("dest_level: {:?}   leaves in from: {}", from_level.get_dest_level(), try!(count_leaves_expensive(inner, f.clone(), &merge_segments)));
                         let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
 
                         (cursors, MergingFrom::Fresh(merge_segments), DestLevel::Young)
@@ -6850,7 +6768,6 @@ impl InnerPart {
                         //let mut space = try!(inner.space.lock());
 
                         //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
-                        //println!("dest_level: {:?}   leaves in from: {}", from_level.get_dest_level(), try!(count_leaves_expensive(inner, f.clone(), &merge_segments)));
                         let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
 
                         (cursors, MergingFrom::Young(merge_segments), DestLevel::Other(0))
@@ -6990,20 +6907,11 @@ impl InnerPart {
                     .map(|pg| Ok(pg))
                     .collect::<Vec<_>>();
                 let leaves = try!(write_merge(&mut pw, source, dest_leaves.into_iter(), behind, &inner.path, f.clone()));
-                // TODO the following msg isn't really correct anymore, since it re-uses leaves
-                //println!("dest_level: {:?}  merge wrote {} leaves", from_level.get_dest_level(), leaves.len());
-                //println!("leaves: {:?}", leaves);
-                //println!("after write_leaves: first_key = {:?}", leaves[0].first_key.key);
-
-                //for pg in leaves.iter() {
-                    //try!(pg.verify(inner.pgsz, &inner.path, f.clone()));
-                //}
 
                 let z = try!(write_parent_node_tree(leaves, 0, &mut pw ));
 
                 Some(z)
             } else {
-                // TODO the dest segment is just going to disappear?
                 None
             };
 
@@ -7021,7 +6929,7 @@ impl InnerPart {
                 },
             };
 
-        let blocks = try!(pw.end());
+        try!(pw.end());
 
         let pm = 
             PendingMerge {
