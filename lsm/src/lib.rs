@@ -4616,6 +4616,60 @@ impl ParentPageItem {
 
 }
 
+struct LeafIterator {
+    stack: Vec<(ParentPage, usize)>,
+}
+
+impl LeafIterator {
+    fn new(top: ParentPage) -> Self {
+        LeafIterator {
+            stack: vec![(top, 0)],
+        }
+    }
+
+    fn get_next(&mut self) -> Result<Option<pgitem>> {
+        loop {
+            match self.stack.pop() {
+                None => {
+                    return Ok(None);
+                },
+                Some((parent, cur)) => {
+                    if parent.depth() == 1 {
+                        let pg = try!(parent.child_pgitem(cur));
+                        if cur + 1 < parent.count_items() {
+                            self.stack.push((parent, cur + 1));
+                        }
+                        return Ok(Some(pg));
+                    } else {
+                        let child = try!(parent.fetch_item_parent(cur));
+                        if cur + 1 < parent.count_items() {
+                            self.stack.push((parent, cur + 1));
+                        }
+                        self.stack.push((child, 0));
+                    }
+                },
+            }
+        }
+    }
+}
+
+impl Iterator for LeafIterator {
+    type Item = Result<pgitem>;
+    fn next(&mut self) -> Option<Result<pgitem>> {
+        match self.get_next() {
+            Ok(None) => {
+                None
+            },
+            Ok(Some(pg)) => {
+                Some(Ok(pg))
+            },
+            Err(e) => {
+                Some(Err(e))
+            },
+        }
+    }
+}
+
 pub struct ParentPage {
     path: String,
     f: std::rc::Rc<std::cell::RefCell<File>>,
@@ -4834,42 +4888,6 @@ impl ParentPage {
         // depth is never 0
         // when children are leaves, depth is 1
         self.depth() > 1
-    }
-
-    fn collect_all_leaves(&self, leaves: &mut Vec<pgitem>) -> Result<()> {
-        if self.is_grandparent() {
-            for i in 0 .. self.children.len() {
-                // TODO this could use one ParentPage object and just tell it to read_page()
-                let pagenum = self.children[i].page;
-
-                let child_buf = vec![0; self.pr.len()].into_boxed_slice();
-                let done_page = move |_| -> () {
-                };
-                let mut child_buf = Lend::new(child_buf, box done_page);
-
-                {
-                    let f = &mut *(self.f.borrow_mut());
-                    try!(utils::SeekPage(f, child_buf.len(), pagenum));
-                    try!(misc::io::read_fully(f, &mut child_buf));
-                }
-
-                let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, child_buf));
-                try!(page.collect_all_leaves(leaves));
-            }
-        } else {
-            for i in 0 .. self.children.len() {
-                let pg = try!(self.child_pgitem(i));
-                //try!(pg.verify(self.pr.len(), &self.path, self.f.clone()));
-                leaves.push(pg);
-            }
-        }
-        Ok(())
-    }
-
-    fn all_leaves(&self) -> Result<Vec<pgitem>> {
-        let mut v = vec![];
-        try!(self.collect_all_leaves(&mut v));
-        Ok(v)
     }
 
     pub fn complete_blocklist(&self) -> Result<BlockList> {
@@ -5212,6 +5230,24 @@ impl ParentPage {
 
     pub fn get_child_pagenum(&self, i: usize) -> PageNum {
         self.children[i].page
+    }
+
+    fn fetch_item_parent(&self, i: usize) -> Result<ParentPage> {
+        let child_pagenum = self.children[i].page;
+
+        let child_buf = vec![0; self.pr.len()].into_boxed_slice();
+        let done_page = move |_| -> () {
+        };
+        let mut child_buf = Lend::new(child_buf, box done_page);
+
+        {
+            let f = &mut *(self.f.borrow_mut());
+            try!(utils::SeekPage(f, child_buf.len(), child_pagenum));
+            try!(misc::io::read_fully(f, &mut child_buf));
+        }
+
+        let child = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), child_pagenum, child_buf));
+        Ok(child)
     }
 }
 
@@ -6834,7 +6870,8 @@ impl InnerPart {
                             let cursor = try!(PageCursor::new(&inner.path, f.clone(), header.young[i], buf));
                             behind.push(cursor);
                         }
-                        (vec![], None, 0)
+                        let dest_leaves: Box<Iterator<Item=Result<pgitem>>> = box std::iter::empty();
+                        (dest_leaves, None, 0)
                     },
                     DestLevel::Other(dest_level) => {
                         let first_level_after = dest_level + 1;
@@ -6847,7 +6884,7 @@ impl InnerPart {
                                 try!(misc::io::read_fully(f, &mut buf));
                             }
                             let pt = try!(PageType::from_u8(buf[0]));
-                            let dest_leaves = 
+                            let dest_leaves: Box<Iterator<Item=Result<pgitem>>> = 
                                 match pt {
                                     PageType::LEAF_NODE => {
                                         //println!("root of the dest segment is a leaf");
@@ -6855,15 +6892,14 @@ impl InnerPart {
                                         let pg = try!(leaf.pgitem());
                                         //println!("leaf first_key: {:?}", leaf.first_key());
                                         //println!("leaf last_key: {:?}", leaf.last_key());
-                                        vec![pg]
+                                        box vec![Ok(pg)].into_iter()
                                     },
                                     PageType::PARENT_NODE => {
                                         let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), dest_root_pagenum, buf));
                                         // TODO for large segments, probably need to reconsider decision
                                         // to go all the way down to the leaves level.  A 5 GB segment
                                         // would have over a million leaves.
-                                        // TODO this should be an iterator, not grabbing all of them into a vec
-                                        try!(parent.all_leaves())
+                                        box LeafIterator::new(parent)
                                     },
                                     PageType::OVERFLOW_NODE => {
                                         return Err(Error::CorruptFile("child page has invalid page type"));
@@ -6872,7 +6908,8 @@ impl InnerPart {
 
                             (dest_leaves, Some(dest_root_pagenum), first_level_after)
                         } else {
-                            (vec![], None, first_level_after)
+                            let dest_leaves: Box<Iterator<Item=Result<pgitem>>> = box std::iter::empty();
+                            (dest_leaves, None, first_level_after)
                         }
                     },
                 };
@@ -6900,16 +6937,8 @@ impl InnerPart {
         let new_dest_segment = 
             if cursor.IsValid() {
                 let source = CursorIterator::new(box cursor);
-                // TODO just make a leaf iterator
-                let dest_leaves = 
-                    dest_leaves
-                    .into_iter()
-                    .map(|pg| Ok(pg))
-                    .collect::<Vec<_>>();
-                let leaves = try!(write_merge(&mut pw, source, dest_leaves.into_iter(), behind, &inner.path, f.clone()));
-
+                let leaves = try!(write_merge(&mut pw, source, dest_leaves, behind, &inner.path, f.clone()));
                 let z = try!(write_parent_node_tree(leaves, 0, &mut pw ));
-
                 Some(z)
             } else {
                 None

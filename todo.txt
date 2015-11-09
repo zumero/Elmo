@@ -7,6 +7,9 @@ size of the encoded block lists.
 still need to be concerned about really big segments
 and merge working entirely at the granularity of a leaf.
 
+I suppose the real issue of a segment with a million
+leaves is that write_leaves() returns them all in a vec.
+
 look for ways to make index entry encoding more compact
 
 seq of keys

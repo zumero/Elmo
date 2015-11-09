@@ -133,6 +133,7 @@ impl RangeCursorBsonValueIterator {
 impl Iterator for RangeCursorBsonValueIterator {
     type Item = Result<elmo::Row>;
     fn next(&mut self) -> Option<Self::Item> {
+        // TODO misc::inside_out ?
         match self.iter_next() {
             Err(e) => {
                 // TODO will this put us in situations where the iterator just
