@@ -1,4 +1,12 @@
 
+read_page(0) calls probably not needed
+
+revisit when to check for tombstones during write_merge
+
+need finer grained merge locks?
+
+lsm_diag should just have show_page
+
 consider fiddling with the depth at which parent nodes
 store child block lists.  more than just one?  would
 need parent nodes fit calculations to account for the
@@ -12,104 +20,15 @@ leaves is that write_leaves() returns them all in a vec.
 
 look for ways to make index entry encoding more compact
 
-seq of keys
-seq of other leaves
-
-for pair in source {
-    if no more otherleaf
-        add key, next key
-    else if no more key
-        add otherleaf to output, next otherleaf
-    else if key < otherleaf.min
-        add key, next key
-    else if key <= otherleaf.max
-        eat otherleaf into seq of keys
-        next otherleaf
-    else (key > otherleaf.max)
-        flush any leaf in progress
-        add otherleaf to output, next otherleaf
-
-    if no more keys AND no more otherleaf, break
-}
-
-
-
-
-
-
-
-
-
 at some point, review all decisions about what actually gets stored
 in the parent page and make sure it's worth it.  two keys?  full
 block list?  should we store the number of descendant leaves?
 
-how can we end up never pushing to more than one level, at 4 MB?
-
-intermittent test failures
-
 how to choose a page from the merge source when merging Other?
-is a parent too big?  a leaf too small?  rotate through the
-key space?  note that this code is currently never getting
-run.
-
-why do so many merges seem to overlap so many leaves?  maybe
-this is where the collection gets dropped, so it's tombstoning
-everything?  seems like no, since we still end up writing tons
-of leaves in the merge.
-
-any merge where the stuff we rewrite from dest is much larger
-than the stuff we rewrite from from.  sad.
-
-comment the code for behind
-
-what is the ratio of leaves to parent pages?  kinda depends on how
-much stuff we can pack into each parent.  but how expensive would
-it be to just assume that merge operations rewrite all the parent
-nodes of the segments involved?
+is a parent too big?  a leaf too small?  
+rotate through the key space?
 
 having last_key be an Option<> is so tedious
-
-merge:
-
-let M = stuff that wants to be merged up.  
-    could be multiple young level segments.  
-    could be a ParentPage within something else?  TODO
-    whatever.
-
-let D = the dest segment.
-
-let R = the root page of D
-
-let X = the set of pages that overlap M
-    if only one, it's a leaf.  currently.
-    considering having X only be leaves.
-    could be none (M and D do not overlap, or between)
-
-let Y = the ParentPage that contains X, if X exists and is not the root
-
-let Z = the segment produced from MultiCursor(M + X)
-    
-if Y did not exist:
-    if X did not exist, let S = ParentPage for R + Z
-    if X was the root, let S = Z
-
-otherwise:
-    take the direct children of Y 
-    make a Vec<pgitem>
-    replace X with Z
-        if X was a leaf, keep Z as leaves
-        if X was a parent but Z is a single leaf, make a parent
-    let S = write parent node tree
-
-S replaces R
-
-M becomes free pages
-
-X and its parents/ancestors (but not its siblings, which
-became part of S) become free pages
-
---------
 
 do we need a Page class like PageCursor which can represent either
 LeafPage or ParentPage, with a common set of methods?
@@ -133,14 +52,6 @@ have now, but works on the page number.  or maybe each read lock
 is a blocklist.  a page/block can be freed as soon as it is
 not a member of any readlock's blocklist.
 
-any given parent set might be less efficient since, for
-example, "new Y" might have pages that are kind of empty.
-
-any page cursor now knows its entire block list without
-reading any deeper.
-
-ParentPageCursor will need an API to iterate over page information.
-
 it is true that any given page (leaf or parent) can only have one
 parent at a time?  but the page (on disk) does not know its parent,
 because the parent can change, and we don't want to rewrite it when
@@ -158,7 +69,7 @@ go back to only one key?  just keep the last key of each item?
 
 multiple prefixes?
 
-get rid of the blocklists?
+get rid of the blocklists?  currently only at depth 1.
 
 perf problem with storing locations of each page in parent pages?
     seek doesn't need them.
@@ -171,7 +82,8 @@ perf problem with storing locations of each page in parent pages?
 
 any way to represent/store keys as deltas?  vcdiff?
 
-get rid of pagenum in leaf/parent cursor?  diag only?
+get rid of pagenum in leaf/parent cursor?  diag only?  probably not.
+I think this gets used more now.
 
 need more tests of large overflows, especially with block allocation
 issues, fragmentation, etc.
@@ -184,11 +96,6 @@ which estimates how many pages will be needed so that it can
 pass that hint on when it asks for a block so it can avoid using
 little tiny blocks.
 
-make sure stuff gets removed from merging when an error occurs while
-writing a merge segment.
-
-can we get rid of mergeStuff.merging?
-
 tune block sizes for perf?
 
 figure out proper limits for how much should be at each level
@@ -200,16 +107,10 @@ update rust nightly?
 separate lsm code into multiple files (modules) so we can get 
 better privacy on struct fields
 
-separate merge() into find_merge() and write_merge_segment()?
-
 rethink how merged segments are reclaimed into free space.
 locking issues.  send a message to a separate thread, telling
 it that the segment has become a zombie, and to reclaim it
 whenever possible?
-
-should min_segs on merges really be 2?  that means every
-merge that promotes will automatically cause a merge in the
-next level.
 
 ability to merge entire file  (into what level? 2?)
 
@@ -235,9 +136,6 @@ how much perf trouble is being caused by all these mutexes and Arcs?
 
 fix fts in lsm storage
 
-in lsm, when the root lands on a boundary, don't fetch a block only
-to end up giving it back.
-
 consider better (at higher level?) cache of elmo indexes
 
 we're using usize all over the place for cases size and index into a page.
@@ -248,8 +146,6 @@ make pgnum a u64?
 same for pgnum but then storage is wasteful,
 want to store as a varint, but then space in the page calculations are
 more complicated.
-
-core feature:  graveyard
 
 reduce malloc
 
@@ -270,11 +166,6 @@ bigger page size.
 currently using trait objects Seek+Write for writing to the db.  the overhead
 of dynamic dispatch is negligible compared to the IO, right?  lack of
 inline optimization?  verify this.
-
-maybe page manager should own the file (or Seek+Write) as well, and should
-have a method called WritePage which the bt code would call?  this might
-make it easier later to do things like witholding 16 bytes at the end for
-crypto.
 
 what if db goes out of scope with pending segments?
 

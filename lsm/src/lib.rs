@@ -3113,6 +3113,9 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
         Ok(false)
     }
 
+    // TODO how would this algorithm be adjusted to work at a different depth?
+    // like, suppose instead of leaves, we were given depth 1 parents?
+
     // TODO it's a little silly here to construct a Lend<>
     let child_buf = vec![0; pw.page_size()].into_boxed_slice();
     let done_page = move |_| -> () {
@@ -4616,6 +4619,10 @@ impl ParentPageItem {
 
 }
 
+// TODO could be renamed DepthIterator and could be used
+// to fetch nodes at whatever depth is desired, so that
+// very large segments could be done by reusing parents
+// or grandparents instead of leaves..
 struct LeafIterator {
     stack: Vec<(ParentPage, usize)>,
 }
@@ -6937,8 +6944,16 @@ impl InnerPart {
             if cursor.IsValid() {
                 let source = CursorIterator::new(box cursor);
                 let leaves = try!(write_merge(&mut pw, source, dest_leaves, behind, &inner.path, f.clone()));
-                let z = try!(write_parent_node_tree(leaves, 0, &mut pw ));
-                Some(z)
+                if leaves.len() == 0 {
+                    None
+                } else if leaves.len() == 1 {
+                    let mut leaves = leaves;
+                    let z = leaves.remove(0);
+                    Some(z)
+                } else {
+                    let z = try!(write_parent_node_tree(leaves, 0, &mut pw ));
+                    Some(z)
+                }
             } else {
                 None
             };
