@@ -2653,7 +2653,414 @@ fn write_overflow(
     Ok((sofar, blocks))
 }
 
-fn write_leaves<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
+// TODO begin mod leaf
+
+fn calc_leaf_page_len(prefix_len: usize, sofar: usize) -> usize {
+    2 // page type and flags
+    + 2 // stored count
+    + varint::space_needed_for(prefix_len as u64)
+    + prefix_len
+    + sofar // sum of size of all the actual items
+}
+
+fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (KeyWithLocation, Option<KeyWithLocation>, BlockList, usize) {
+    pb.Reset();
+    pb.PutByte(PageType::LEAF_NODE.to_u8());
+    pb.PutByte(0u8); // flags
+    pb.PutVarint(st.prefixLen as u64);
+    if st.prefixLen > 0 {
+        pb.PutArray(&st.keys_in_this_leaf[0].key.key[0 .. st.prefixLen]);
+    }
+    let count_keys_in_this_leaf = st.keys_in_this_leaf.len();
+    // TODO should we support more than 64k keys in a leaf?
+    // either way, overflow-check this cast.
+    pb.PutInt16(count_keys_in_this_leaf as u16);
+
+    fn f(pb: &mut PageBuilder, prefixLen: usize, lp: &LeafPair, list: &mut BlockList) {
+        match lp.key.location {
+            KeyLocation::Inline => {
+                pb.PutVarint(lp.key.len_with_overflow_flag());
+                pb.PutArray(&lp.key.key[prefixLen .. ]);
+            },
+            KeyLocation::Overflowed(ref blocks) => {
+                pb.PutVarint(lp.key.len_with_overflow_flag());
+                // TODO capacity, no temp vec
+                let mut v = vec![];
+                blocks.encode(&mut v);
+                pb.PutArray(&v);
+                list.add_blocklist_no_reorder(blocks);
+            },
+        }
+        match lp.value {
+            ValueLocation::Tombstone => {
+                pb.PutByte(ValueFlag::FLAG_TOMBSTONE);
+            },
+            ValueLocation::Buffer(ref vbuf) => {
+                pb.PutByte(0u8);
+                pb.PutVarint(vbuf.len() as u64);
+                pb.PutArray(&vbuf);
+            },
+            ValueLocation::Overflowed(vlen, ref blocks) => {
+                pb.PutByte(ValueFlag::FLAG_OVERFLOW);
+                pb.PutVarint(vlen as u64);
+                // TODO capacity, no temp vec
+                let mut v = vec![];
+                blocks.encode(&mut v);
+                pb.PutArray(&v);
+                list.add_blocklist_no_reorder(blocks);
+            },
+        }
+    }
+
+    let mut blocks = BlockList::new();
+
+    // deal with the first key separately
+    let first_key = {
+        let lp = st.keys_in_this_leaf.remove(0); 
+        assert!(st.keys_in_this_leaf.len() == count_keys_in_this_leaf - 1);
+        f(pb, st.prefixLen, &lp, &mut blocks);
+        lp.key
+    };
+
+    if st.keys_in_this_leaf.len() == 0 {
+        // there was only one key in this leaf.
+        blocks.sort_and_consolidate();
+        (first_key, None, blocks, pb.sofar())
+    } else {
+        if st.keys_in_this_leaf.len() > 1 {
+            // deal with all the remaining keys except the last one
+            for lp in st.keys_in_this_leaf.drain(0 .. count_keys_in_this_leaf - 2) {
+                f(pb, st.prefixLen, &lp, &mut blocks);
+            }
+        }
+        assert!(st.keys_in_this_leaf.len() == 1);
+
+        // now the last key
+        let last_key = {
+            let lp = st.keys_in_this_leaf.remove(0); 
+            assert!(st.keys_in_this_leaf.is_empty());
+            f(pb, st.prefixLen, &lp, &mut blocks);
+            lp.key
+        };
+        blocks.sort_and_consolidate();
+        (first_key, Some(last_key), blocks, pb.sofar())
+    }
+}
+
+fn write_leaf(st: &mut LeafState, 
+                pb: &mut PageBuilder, 
+                pw: &mut PageWriter,
+               ) -> Result<(usize, pgitem)> {
+    let (first_key, last_key, blocks, len_page) = build_leaf(st, pb);
+    //println!("leaf blocklist: {:?}", blocks);
+    //println!("leaf blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
+    assert!(st.keys_in_this_leaf.is_empty());
+    let thisPageNumber = try!(pw.write_page(pb.buf()));
+    let pg = pgitem {
+        page: thisPageNumber, 
+        blocks: blocks,
+        first_key: first_key,
+        last_key: last_key
+    };
+    st.sofarLeaf = 0;
+    st.prefixLen = 0;
+    Ok((len_page, pg))
+}
+
+fn process_pair_into_leaf(st: &mut LeafState, 
+                pb: &mut PageBuilder, 
+                pw: &mut PageWriter,
+                vbuf: &mut [u8],
+                mut pair: kvp,
+               ) -> Result<Option<pgitem>> {
+    let pgsz = pw.page_size();
+    let k = pair.Key;
+
+    if cfg!(expensive_check) 
+    {
+       // this code can be used to verify that we are being given kvps in order
+        match st.prev_key {
+            None => {
+            },
+            Some(ref prev_key) => {
+                let c = k.cmp(&prev_key);
+                if c != Ordering::Greater {
+                    println!("prev_key: {:?}", prev_key);
+                    println!("k: {:?}", k);
+                    panic!("unsorted keys");
+                }
+            },
+        }
+        st.prev_key = Some(k.clone());
+    }
+
+    let kloc = {
+        // the max limit of an inline key is when that key is the only
+        // one in the leaf, and its value is overflowed.  well actually,
+        // the reference to an overflowed value can take up a few dozen bytes 
+        // in pathological cases, whereas a really short value could be smaller.
+        // nevermind that.
+
+        // TODO the following code still needs tuning
+
+        // TODO the following code is even more pessimistic now that we do
+        // offsets in encoded blocklists
+        const PESSIMISTIC_OVERFLOW_INFO_SIZE: usize = 
+            1 // number of blocks
+            +
+            (
+            5 // varint, block start page num, worst case
+            + 4 // varint, num pages in block, pathological
+            )
+            * 8 // crazy case
+            ;
+
+        let maxKeyInline = 
+            pgsz 
+            - 2 // page type and flags
+            - 2 // count keys
+            - 1 // prefixLen of 0
+            - varint::space_needed_for((pgsz * 2) as u64) // approx worst case inline key len
+            - 1 // value flags
+            - 9 // worst case varint value len
+            - PESSIMISTIC_OVERFLOW_INFO_SIZE; // overflowed value page
+
+        if k.len() <= maxKeyInline {
+            KeyLocation::Inline
+        } else {
+            // for an overflowed key, there is probably no practical hard limit on the size
+            // of the encoded block list.  we want things to be as contiguous as
+            // possible, but if the block list won't fit on the usable part of a
+            // fresh page, something is seriously wrong.
+            // rather than calculate the actual hard limit, we provide an arbitrary
+            // fraction of the page which would still be pathological.
+            let hard_limit = pgsz / 4;
+            let (len, blocks) = try!(write_overflow(&mut &*k, pw, hard_limit));
+            assert!(len == k.len());
+            KeyLocation::Overflowed(blocks)
+        }
+    };
+
+    // we have decided whether the key is going to be inlined or overflowed.  but
+    // we have NOT yet decided which page the key is going on.  will it fit on the
+    // current page or does it have to bump to the next one?  we don't know yet.
+
+    // 2 for the page type and flags
+    // 2 for the stored count
+    const LEAF_PAGE_OVERHEAD: usize = 2 + 2;
+
+    let vloc = {
+        let maxValueInline = {
+            // TODO use calc_leaf_page_len
+            let fixed_costs_on_new_page =
+                LEAF_PAGE_OVERHEAD
+                + 2 // worst case prefixlen varint
+                + kloc.need(&k, 0)
+                + 1 // value flags
+                + varint::space_needed_for(pgsz as u64) // vlen can't be larger than this for inline
+                ;
+            assert!(fixed_costs_on_new_page < pgsz);
+            let available_for_inline_value_on_new_page = pgsz - fixed_costs_on_new_page;
+            available_for_inline_value_on_new_page
+        };
+
+        // for the write_overflow calls below, we already know how much 
+        // we spent on the key, so we know what our actual limit is for the encoded
+        // block list for the value.  the hard limit, basically, is:  we cannot get
+        // into a state where the key and value cannot fit on the same page.
+
+        // TODO use calc_leaf_page_len
+        let hard_limit_for_value_overflow =
+            pgsz
+            - LEAF_PAGE_OVERHEAD
+            - 2 // worst case prefixlen varint
+            - kloc.need(&k, 0)
+            - 1 // value flags
+            - 9 // worst case varint for value len
+            ;
+
+        match pair.Value {
+            Blob::Tombstone => {
+                ValueLocation::Tombstone
+            },
+            Blob::Stream(ref mut strm) => {
+                // TODO
+                // not sure reusing vbuf is worth it.  maybe we should just
+                // alloc here.  ownership will get passed into the
+                // ValueLocation when it fits.
+                let vread = try!(misc::io::read_fully(&mut *strm, &mut vbuf[0 .. maxValueInline + 1]));
+                let vbuf = &vbuf[0 .. vread];
+                // TODO should be <= ?
+                if vread < maxValueInline {
+                    // TODO this alloc+copy is unfortunate
+                    let mut va = Vec::with_capacity(vbuf.len());
+                    for i in 0 .. vbuf.len() {
+                        va.push(vbuf[i]);
+                    }
+                    ValueLocation::Buffer(va.into_boxed_slice())
+                } else {
+                    let (len, blocks) = try!(write_overflow(&mut (vbuf.chain(strm)), pw, hard_limit_for_value_overflow));
+                    ValueLocation::Overflowed (len, blocks)
+                }
+            },
+            Blob::Array(a) => {
+                // TODO should be <= ?
+                if a.len() < maxValueInline {
+                    ValueLocation::Buffer(a)
+                } else {
+                    let (len, blocks) = try!(write_overflow(&mut &*a, pw, hard_limit_for_value_overflow));
+                    ValueLocation::Overflowed(len, blocks)
+                }
+            },
+        }
+    };
+
+    // whether/not the key/value are to be overflowed is now already decided.
+    // now all we have to do is decide if this key/value are going into this leaf
+    // or not.  note that it is possible to overflow these and then have them not
+    // fit into the current leaf and end up landing in the next leaf.
+
+    fn calc_prefix_len(st: &LeafState, k: &[u8], kloc: &KeyLocation) -> usize {
+        if st.keys_in_this_leaf.is_empty() {
+            0
+        } else {
+            match kloc {
+                &KeyLocation::Inline => {
+                    let max_prefix =
+                        if st.prefixLen > 0 {
+                            st.prefixLen
+                        } else {
+                            k.len()
+                        };
+                    bcmp::PrefixMatch(&*st.keys_in_this_leaf[0].key.key, &k, max_prefix)
+                },
+                &KeyLocation::Overflowed(_) => {
+                    // an overflowed key does not change the prefix
+                    st.prefixLen
+                },
+            }
+        }
+    }
+
+    let fits = {
+        let would_be_prefix_len = calc_prefix_len(&st, &k, &kloc);
+        assert!(would_be_prefix_len <= k.len());
+        let would_be_sofar = 
+            if would_be_prefix_len != st.prefixLen {
+                assert!(st.prefixLen == 0 || would_be_prefix_len < st.prefixLen);
+                // the prefixLen would change with the addition of this key,
+                // so we need to recalc sofar
+                let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(would_be_prefix_len) ).sum();;
+                sum
+            } else {
+                st.sofarLeaf
+            };
+        let would_be_len_page = calc_leaf_page_len(would_be_prefix_len, would_be_sofar);
+        if pgsz > would_be_len_page {
+            let available = pgsz - would_be_len_page;
+            let needed = kloc.need(&k, would_be_prefix_len) + vloc.need();
+            available >= needed
+        } else {
+            false
+        }
+    };
+
+    let wrote =
+        if !fits {
+            assert!(st.keys_in_this_leaf.len() > 0);
+            let should_be = calc_leaf_page_len(st.prefixLen, st.sofarLeaf);
+            let (len_page, pg) = try!(write_leaf(st, pb, pw));
+            //println!("should_be = {}   len_page = {}", should_be, len_page);
+            assert!(should_be == len_page);
+            Some(pg)
+        } else {
+            None
+        };
+
+    // see if the prefix len actually did change
+    let new_prefix_len = calc_prefix_len(&st, &k, &kloc);
+    assert!(new_prefix_len <= k.len());
+    let sofar = 
+        if new_prefix_len != st.prefixLen {
+            assert!(st.prefixLen == 0 || new_prefix_len < st.prefixLen);
+            // the prefixLen will change with the addition of this key,
+            // so we need to recalc sofar
+            let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(new_prefix_len) ).sum();;
+            sum
+        } else {
+            st.sofarLeaf
+        };
+    // note that the LeafPair struct gets ownership of the key provided
+    // from above.
+    let kwloc = KeyWithLocation {
+        key: k,
+        location: kloc,
+    };
+    let lp = LeafPair {
+                key: kwloc,
+                value: vloc,
+                };
+
+    st.sofarLeaf = sofar + lp.need(new_prefix_len);
+    st.prefixLen = new_prefix_len;
+    st.keys_in_this_leaf.push(lp);
+
+    Ok(wrote)
+}
+
+fn flush_leaf(st: &mut LeafState, 
+                pb: &mut PageBuilder, 
+                pw: &mut PageWriter,
+               ) -> Result<Option<pgitem>> {
+    if !st.keys_in_this_leaf.is_empty() {
+        assert!(st.keys_in_this_leaf.len() > 0);
+        let should_be = calc_leaf_page_len(st.prefixLen, st.sofarLeaf);
+        let (len_page, pg) = try!(write_leaf(st, pb, pw));
+        //println!("should_be = {}   len_page = {}", should_be, len_page);
+        assert!(should_be == len_page);
+        Ok(Some(pg))
+    } else {
+        Ok(None)
+    }
+}
+
+fn write_leaves<I: Iterator<Item=Result<kvp>>, >(
+                    pw: &mut PageWriter,
+                    mut pairs: I,
+                    ) -> Result<Vec<pgitem>> {
+
+    let mut pb = PageBuilder::new(pw.page_size());
+
+    // TODO this is a buffer just for the purpose of being reused
+    // in cases where the blob is provided as a stream, and we need
+    // read a bit of it to figure out if it might fit inline rather
+    // than overflow.
+    let mut vbuf = vec![0; pw.page_size()].into_boxed_slice(); 
+
+    let mut st = LeafState {
+        sofarLeaf: 0,
+        keys_in_this_leaf: Vec::new(),
+        prefixLen: 0,
+        prev_key: None,
+    };
+
+    let mut items = vec![];
+    for result_pair in pairs {
+        let pair = try!(result_pair);
+        if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
+            //try!(pg.verify(pw.page_size(), path, f.clone()));
+            items.push(pg);
+        }
+    }
+    if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
+        //try!(pg.verify(pw.page_size(), path, f.clone()));
+        items.push(pg);
+    }
+
+    Ok(items)
+}
+
+fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                     pw: &mut PageWriter,
                     mut pairs: I,
                     mut leaves: J,
@@ -2661,375 +3068,6 @@ fn write_leaves<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>
                     path: &str,
                     f: std::rc::Rc<std::cell::RefCell<File>>,
                     ) -> Result<Vec<pgitem>> {
-
-    // 2 for the page type and flags
-    // 2 for the stored count
-    const LEAF_PAGE_OVERHEAD: usize = 2 + 2;
-
-    fn calc_page_len(prefix_len: usize, sofar: usize) -> usize {
-        2 // page type and flags
-        + 2 // stored count
-        + varint::space_needed_for(prefix_len as u64)
-        + prefix_len
-        + sofar // sum of size of all the actual items
-    }
-
-    fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (KeyWithLocation, Option<KeyWithLocation>, BlockList, usize) {
-        pb.Reset();
-        pb.PutByte(PageType::LEAF_NODE.to_u8());
-        pb.PutByte(0u8); // flags
-        pb.PutVarint(st.prefixLen as u64);
-        if st.prefixLen > 0 {
-            pb.PutArray(&st.keys_in_this_leaf[0].key.key[0 .. st.prefixLen]);
-        }
-        let count_keys_in_this_leaf = st.keys_in_this_leaf.len();
-        // TODO should we support more than 64k keys in a leaf?
-        // either way, overflow-check this cast.
-        pb.PutInt16(count_keys_in_this_leaf as u16);
-
-        fn f(pb: &mut PageBuilder, prefixLen: usize, lp: &LeafPair, list: &mut BlockList) {
-            match lp.key.location {
-                KeyLocation::Inline => {
-                    pb.PutVarint(lp.key.len_with_overflow_flag());
-                    pb.PutArray(&lp.key.key[prefixLen .. ]);
-                },
-                KeyLocation::Overflowed(ref blocks) => {
-                    pb.PutVarint(lp.key.len_with_overflow_flag());
-                    // TODO capacity, no temp vec
-                    let mut v = vec![];
-                    blocks.encode(&mut v);
-                    pb.PutArray(&v);
-                    list.add_blocklist_no_reorder(blocks);
-                },
-            }
-            match lp.value {
-                ValueLocation::Tombstone => {
-                    pb.PutByte(ValueFlag::FLAG_TOMBSTONE);
-                },
-                ValueLocation::Buffer(ref vbuf) => {
-                    pb.PutByte(0u8);
-                    pb.PutVarint(vbuf.len() as u64);
-                    pb.PutArray(&vbuf);
-                },
-                ValueLocation::Overflowed(vlen, ref blocks) => {
-                    pb.PutByte(ValueFlag::FLAG_OVERFLOW);
-                    pb.PutVarint(vlen as u64);
-                    // TODO capacity, no temp vec
-                    let mut v = vec![];
-                    blocks.encode(&mut v);
-                    pb.PutArray(&v);
-                    list.add_blocklist_no_reorder(blocks);
-                },
-            }
-        }
-
-        let mut blocks = BlockList::new();
-
-        // deal with the first key separately
-        let first_key = {
-            let lp = st.keys_in_this_leaf.remove(0); 
-            assert!(st.keys_in_this_leaf.len() == count_keys_in_this_leaf - 1);
-            f(pb, st.prefixLen, &lp, &mut blocks);
-            lp.key
-        };
-
-        if st.keys_in_this_leaf.len() == 0 {
-            // there was only one key in this leaf.
-            blocks.sort_and_consolidate();
-            (first_key, None, blocks, pb.sofar())
-        } else {
-            if st.keys_in_this_leaf.len() > 1 {
-                // deal with all the remaining keys except the last one
-                for lp in st.keys_in_this_leaf.drain(0 .. count_keys_in_this_leaf - 2) {
-                    f(pb, st.prefixLen, &lp, &mut blocks);
-                }
-            }
-            assert!(st.keys_in_this_leaf.len() == 1);
-
-            // now the last key
-            let last_key = {
-                let lp = st.keys_in_this_leaf.remove(0); 
-                assert!(st.keys_in_this_leaf.is_empty());
-                f(pb, st.prefixLen, &lp, &mut blocks);
-                lp.key
-            };
-            blocks.sort_and_consolidate();
-            (first_key, Some(last_key), blocks, pb.sofar())
-        }
-    }
-
-    fn write_leaf(st: &mut LeafState, 
-                    pb: &mut PageBuilder, 
-                    pw: &mut PageWriter,
-                   ) -> Result<(usize, pgitem)> {
-        let (first_key, last_key, blocks, len_page) = build_leaf(st, pb);
-        //println!("leaf blocklist: {:?}", blocks);
-        //println!("leaf blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
-        assert!(st.keys_in_this_leaf.is_empty());
-        let thisPageNumber = try!(pw.write_page(pb.buf()));
-        let pg = pgitem {
-            page: thisPageNumber, 
-            blocks: blocks,
-            first_key: first_key,
-            last_key: last_key
-        };
-        st.sofarLeaf = 0;
-        st.prefixLen = 0;
-        Ok((len_page, pg))
-    }
-
-    fn process_pair(st: &mut LeafState, 
-                    pb: &mut PageBuilder, 
-                    pw: &mut PageWriter,
-                    vbuf: &mut [u8],
-                    mut pair: kvp,
-                   ) -> Result<Option<pgitem>> {
-        let pgsz = pw.page_size();
-        let k = pair.Key;
-
-        if cfg!(expensive_check) 
-        {
-           // this code can be used to verify that we are being given kvps in order
-            match st.prev_key {
-                None => {
-                },
-                Some(ref prev_key) => {
-                    let c = k.cmp(&prev_key);
-                    if c != Ordering::Greater {
-                        println!("prev_key: {:?}", prev_key);
-                        println!("k: {:?}", k);
-                        panic!("unsorted keys");
-                    }
-                },
-            }
-            st.prev_key = Some(k.clone());
-        }
-
-        let kloc = {
-            // the max limit of an inline key is when that key is the only
-            // one in the leaf, and its value is overflowed.  well actually,
-            // the reference to an overflowed value can take up a few dozen bytes 
-            // in pathological cases, whereas a really short value could be smaller.
-            // nevermind that.
-
-            // TODO the following code still needs tuning
-
-            // TODO the following code is even more pessimistic now that we do
-            // offsets in encoded blocklists
-            const PESSIMISTIC_OVERFLOW_INFO_SIZE: usize = 
-                1 // number of blocks
-                +
-                (
-                5 // varint, block start page num, worst case
-                + 4 // varint, num pages in block, pathological
-                )
-                * 8 // crazy case
-                ;
-
-            let maxKeyInline = 
-                pgsz 
-                - 2 // page type and flags
-                - 2 // count keys
-                - 1 // prefixLen of 0
-                - varint::space_needed_for((pgsz * 2) as u64) // approx worst case inline key len
-                - 1 // value flags
-                - 9 // worst case varint value len
-                - PESSIMISTIC_OVERFLOW_INFO_SIZE; // overflowed value page
-
-            if k.len() <= maxKeyInline {
-                KeyLocation::Inline
-            } else {
-                // for an overflowed key, there is probably no practical hard limit on the size
-                // of the encoded block list.  we want things to be as contiguous as
-                // possible, but if the block list won't fit on the usable part of a
-                // fresh page, something is seriously wrong.
-                // rather than calculate the actual hard limit, we provide an arbitrary
-                // fraction of the page which would still be pathological.
-                let hard_limit = pgsz / 4;
-                let (len, blocks) = try!(write_overflow(&mut &*k, pw, hard_limit));
-                assert!(len == k.len());
-                KeyLocation::Overflowed(blocks)
-            }
-        };
-
-        // we have decided whether the key is going to be inlined or overflowed.  but
-        // we have NOT yet decided which page the key is going on.  will it fit on the
-        // current page or does it have to bump to the next one?  we don't know yet.
-
-        let vloc = {
-            let maxValueInline = {
-                // TODO use calc_page_len
-                let fixed_costs_on_new_page =
-                    LEAF_PAGE_OVERHEAD
-                    + 2 // worst case prefixlen varint
-                    + kloc.need(&k, 0)
-                    + 1 // value flags
-                    + varint::space_needed_for(pgsz as u64) // vlen can't be larger than this for inline
-                    ;
-                assert!(fixed_costs_on_new_page < pgsz);
-                let available_for_inline_value_on_new_page = pgsz - fixed_costs_on_new_page;
-                available_for_inline_value_on_new_page
-            };
-
-            // for the write_overflow calls below, we already know how much 
-            // we spent on the key, so we know what our actual limit is for the encoded
-            // block list for the value.  the hard limit, basically, is:  we cannot get
-            // into a state where the key and value cannot fit on the same page.
-
-            // TODO use calc_page_len
-            let hard_limit_for_value_overflow =
-                pgsz
-                - LEAF_PAGE_OVERHEAD
-                - 2 // worst case prefixlen varint
-                - kloc.need(&k, 0)
-                - 1 // value flags
-                - 9 // worst case varint for value len
-                ;
-
-            match pair.Value {
-                Blob::Tombstone => {
-                    ValueLocation::Tombstone
-                },
-                Blob::Stream(ref mut strm) => {
-                    // TODO
-                    // not sure reusing vbuf is worth it.  maybe we should just
-                    // alloc here.  ownership will get passed into the
-                    // ValueLocation when it fits.
-                    let vread = try!(misc::io::read_fully(&mut *strm, &mut vbuf[0 .. maxValueInline + 1]));
-                    let vbuf = &vbuf[0 .. vread];
-                    // TODO should be <= ?
-                    if vread < maxValueInline {
-                        // TODO this alloc+copy is unfortunate
-                        let mut va = Vec::with_capacity(vbuf.len());
-                        for i in 0 .. vbuf.len() {
-                            va.push(vbuf[i]);
-                        }
-                        ValueLocation::Buffer(va.into_boxed_slice())
-                    } else {
-                        let (len, blocks) = try!(write_overflow(&mut (vbuf.chain(strm)), pw, hard_limit_for_value_overflow));
-                        ValueLocation::Overflowed (len, blocks)
-                    }
-                },
-                Blob::Array(a) => {
-                    // TODO should be <= ?
-                    if a.len() < maxValueInline {
-                        ValueLocation::Buffer(a)
-                    } else {
-                        let (len, blocks) = try!(write_overflow(&mut &*a, pw, hard_limit_for_value_overflow));
-                        ValueLocation::Overflowed(len, blocks)
-                    }
-                },
-            }
-        };
-
-        // whether/not the key/value are to be overflowed is now already decided.
-        // now all we have to do is decide if this key/value are going into this leaf
-        // or not.  note that it is possible to overflow these and then have them not
-        // fit into the current leaf and end up landing in the next leaf.
-
-        fn calc_prefix_len(st: &LeafState, k: &[u8], kloc: &KeyLocation) -> usize {
-            if st.keys_in_this_leaf.is_empty() {
-                0
-            } else {
-                match kloc {
-                    &KeyLocation::Inline => {
-                        let max_prefix =
-                            if st.prefixLen > 0 {
-                                st.prefixLen
-                            } else {
-                                k.len()
-                            };
-                        bcmp::PrefixMatch(&*st.keys_in_this_leaf[0].key.key, &k, max_prefix)
-                    },
-                    &KeyLocation::Overflowed(_) => {
-                        // an overflowed key does not change the prefix
-                        st.prefixLen
-                    },
-                }
-            }
-        }
-
-        let fits = {
-            let would_be_prefix_len = calc_prefix_len(&st, &k, &kloc);
-            assert!(would_be_prefix_len <= k.len());
-            let would_be_sofar = 
-                if would_be_prefix_len != st.prefixLen {
-                    assert!(st.prefixLen == 0 || would_be_prefix_len < st.prefixLen);
-                    // the prefixLen would change with the addition of this key,
-                    // so we need to recalc sofar
-                    let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(would_be_prefix_len) ).sum();;
-                    sum
-                } else {
-                    st.sofarLeaf
-                };
-            let would_be_len_page = calc_page_len(would_be_prefix_len, would_be_sofar);
-            if pgsz > would_be_len_page {
-                let available = pgsz - would_be_len_page;
-                let needed = kloc.need(&k, would_be_prefix_len) + vloc.need();
-                available >= needed
-            } else {
-                false
-            }
-        };
-
-        let wrote =
-            if !fits {
-                assert!(st.keys_in_this_leaf.len() > 0);
-                let should_be = calc_page_len(st.prefixLen, st.sofarLeaf);
-                let (len_page, pg) = try!(write_leaf(st, pb, pw));
-                //println!("should_be = {}   len_page = {}", should_be, len_page);
-                assert!(should_be == len_page);
-                Some(pg)
-            } else {
-                None
-            };
-
-        // see if the prefix len actually did change
-        let new_prefix_len = calc_prefix_len(&st, &k, &kloc);
-        assert!(new_prefix_len <= k.len());
-        let sofar = 
-            if new_prefix_len != st.prefixLen {
-                assert!(st.prefixLen == 0 || new_prefix_len < st.prefixLen);
-                // the prefixLen will change with the addition of this key,
-                // so we need to recalc sofar
-                let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(new_prefix_len) ).sum();;
-                sum
-            } else {
-                st.sofarLeaf
-            };
-        // note that the LeafPair struct gets ownership of the key provided
-        // from above.
-        let kwloc = KeyWithLocation {
-            key: k,
-            location: kloc,
-        };
-        let lp = LeafPair {
-                    key: kwloc,
-                    value: vloc,
-                    };
-
-        st.sofarLeaf = sofar + lp.need(new_prefix_len);
-        st.prefixLen = new_prefix_len;
-        st.keys_in_this_leaf.push(lp);
-
-        Ok(wrote)
-    }
-
-    fn flush_leaf(st: &mut LeafState, 
-                    pb: &mut PageBuilder, 
-                    pw: &mut PageWriter,
-                   ) -> Result<Option<pgitem>> {
-        if !st.keys_in_this_leaf.is_empty() {
-            assert!(st.keys_in_this_leaf.len() > 0);
-            let should_be = calc_page_len(st.prefixLen, st.sofarLeaf);
-            let (len_page, pg) = try!(write_leaf(st, pb, pw));
-            //println!("should_be = {}   len_page = {}", should_be, len_page);
-            assert!(should_be == len_page);
-            Ok(Some(pg))
-        } else {
-            Ok(None)
-        }
-    }
 
     let mut pb = PageBuilder::new(pw.page_size());
 
@@ -3049,208 +3087,193 @@ fn write_leaves<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>
     let mut cur_otherleaf = try!(misc::inside_out(leaves.next()));
 
     let mut items = vec![];
-// TODO make two separate functions
-    if cur_otherleaf.is_some() {
-        fn necessary_tombstone(k: &[u8], 
-                        behind: &mut Vec<PageCursor>,
-                   ) -> Result<bool> {
+    fn necessary_tombstone(k: &[u8], 
+                    behind: &mut Vec<PageCursor>,
+               ) -> Result<bool> {
 
-            // in leveldb, this is simpler.  they don't do a full seek.  rather,
-            // they keep a tombstone if any upstream segments have any "files"
-            // that overlap the key.  it's a shallower search.
-            if behind.is_empty() {
-                return Ok(false);
-            }
-
-            // TODO would it be faster to just keep behind moving Next() along with chain?
-            // then we could optimize cases where we already know that the key is not present
-            // in behind because, for example, we hit the max key in behind already.
-
-            let k = KeyRef::Array(k);
-
-            for mut cursor in behind.iter_mut() {
-                if SeekResult::Equal == try!(cursor.SeekRef(&k, SeekOp::SEEK_EQ)) {
-                    // TODO if the value was found but it is another tombstone...
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+        // in leveldb, this is simpler.  they don't do a full seek.  rather,
+        // they keep a tombstone if any upstream segments have any "files"
+        // that overlap the key.  it's a shallower search.
+        if behind.is_empty() {
+            return Ok(false);
         }
 
-        // TODO it's a little silly here to construct a Lend<>
-        let child_buf = vec![0; pw.page_size()].into_boxed_slice();
-        let done_page = move |_| -> () {
-        };
-        let mut child_buf = Lend::new(child_buf, box done_page);
-        let mut leafreader = LeafPage::new(path, f.clone(), child_buf);
+        // TODO would it be faster to just keep behind moving Next() along with chain?
+        // then we could optimize cases where we already know that the key is not present
+        // in behind because, for example, we hit the max key in behind already.
 
-        let mut cur_pair = try!(misc::inside_out(pairs.next()));
-        let mut cur_in_other = None;
-        let mut leaves_rewritten = 0;
-        let mut leaves_recycled = 0;
-        loop {
-            // TODO which cases below should check to see if a tombstone can be filtered?
-            match (cur_pair, cur_in_other, cur_otherleaf) {
-                (Some(pair), Some(i), q) => {
-                    // we are in the middle of a leaf being rewritten
+        let k = KeyRef::Array(k);
 
-                    // TODO if there is an otherleaf in q, we know that it
-                    // is greater than pair or kvp/i.  assert.
-                    let c = {
-                        let k = try!(leafreader.key(i));
-                        k.compare_with(&pair.Key)
-                    };
-                    match c {
-                        Ordering::Greater => {
-                            //println!("otherpair greater, pair from merge: {:?}", pair.Key);
-                            if !pair.Value.is_tombstone() || try!(necessary_tombstone(&pair.Key, &mut behind)) {
-                                if let Some(pg) = try!(process_pair(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                                    //try!(pg.verify(pw.page_size(), path, f.clone()));
-                                    items.push(pg);
-                                }
-                            }
-                            cur_pair = try!(misc::inside_out(pairs.next()));
-                        },
-                        Ordering::Equal => {
-                            //println!("otherpair equal, pair from merge: {:?}", pair.Key);
-                            if !pair.Value.is_tombstone() || try!(necessary_tombstone(&pair.Key, &mut behind)) {
-                                if let Some(pg) = try!(process_pair(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                                    //try!(pg.verify(pw.page_size(), path, f.clone()));
-                                    items.push(pg);
-                                }
-                            }
-                            cur_pair = try!(misc::inside_out(pairs.next()));
-                            // whatever value is coming from the rewritten leaf, it is superceded
-                            if i + 1 < leafreader.count_keys() {
-                                cur_in_other = Some(i + 1);
-                            } else {
-                                try!(leafreader.read_page(0));
-                                cur_in_other = None;
-                            }
-                        },
-                        Ordering::Less => {
-                            let leafpair = try!(leafreader.kvp(i));
-                            //println!("otherpair wins: {:?}", leafpair.Key);
-                            if let Some(pg) = try!(process_pair(&mut st, &mut pb, pw, &mut vbuf, leafpair)) {
+        for mut cursor in behind.iter_mut() {
+            if SeekResult::Equal == try!(cursor.SeekRef(&k, SeekOp::SEEK_EQ)) {
+                // TODO if the value was found but it is another tombstone...
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // TODO it's a little silly here to construct a Lend<>
+    let child_buf = vec![0; pw.page_size()].into_boxed_slice();
+    let done_page = move |_| -> () {
+    };
+    let mut child_buf = Lend::new(child_buf, box done_page);
+    let mut leafreader = LeafPage::new(path, f.clone(), child_buf);
+
+    let mut cur_pair = try!(misc::inside_out(pairs.next()));
+    let mut cur_in_other = None;
+    let mut leaves_rewritten = 0;
+    let mut leaves_recycled = 0;
+    loop {
+        // TODO which cases below should check to see if a tombstone can be filtered?
+        match (cur_pair, cur_in_other, cur_otherleaf) {
+            (Some(pair), Some(i), q) => {
+                // we are in the middle of a leaf being rewritten
+
+                // TODO if there is an otherleaf in q, we know that it
+                // is greater than pair or kvp/i.  assert.
+                let c = {
+                    let k = try!(leafreader.key(i));
+                    k.compare_with(&pair.Key)
+                };
+                match c {
+                    Ordering::Greater => {
+                        //println!("otherpair greater, pair from merge: {:?}", pair.Key);
+                        if !pair.Value.is_tombstone() || try!(necessary_tombstone(&pair.Key, &mut behind)) {
+                            if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
                                 //try!(pg.verify(pw.page_size(), path, f.clone()));
                                 items.push(pg);
                             }
-                            if i + 1 < leafreader.count_keys() {
-                                cur_in_other = Some(i + 1);
-                            } else {
-                                try!(leafreader.read_page(0));
-                                cur_in_other = None;
-                            }
-                            cur_pair = Some(pair);
-                        },
-                    }
-                    cur_otherleaf = q;
-                },
-                (None, Some(i), q) => {
-                    let pair = try!(leafreader.kvp(i));
-                    //println!("regular pairs gone, otherpair: {:?}", pair.Key);
-                    if let Some(pg) = try!(process_pair(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                        //try!(pg.verify(pw.page_size(), path, f.clone()));
-                        items.push(pg);
-                    }
-                    if i + 1 < leafreader.count_keys() {
-                        cur_in_other = Some(i + 1);
-                    } else {
-                        try!(leafreader.read_page(0));
-                        cur_in_other = None;
-                    }
-                    cur_pair = None;
-                    cur_otherleaf = q;
-                },
-                (Some(pair), None, None) => {
-                    //println!("everything else gone, regular pair: {:?}", pair.Key);
-                    if let Some(pg) = try!(process_pair(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                        //try!(pg.verify(pw.page_size(), path, f.clone()));
-                        items.push(pg);
-                    }
-                    cur_pair = try!(misc::inside_out(pairs.next()));
-                    cur_otherleaf = None;
-                },
-                (None, None, Some(pg)) => {
-                    //println!("everything else gone, reusing page: {:?}", pg);
-                    if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
-                        //try!(pg.verify(pw.page_size(), path, f.clone()));
-                        items.push(pg);
-                    }
-                    //try!(pg.verify(pw.page_size(), path, f.clone()));
-                    items.push(pg);
-                    leaves_recycled += 1;
-                    cur_otherleaf = try!(misc::inside_out(leaves.next()));
-                    cur_pair = None;
-                },
-                (Some(pair), None, Some(pg)) => {
-                    match try!(pg.key_in_range(&pair.Key)) {
-                        KeyInRange::Less => {
-                            //println!("regular pair less than next otherleaf: {:?}", pair.Key);
-                            if let Some(pg) = try!(process_pair(&mut st, &mut pb, pw, &mut vbuf, pair)) {
+                        }
+                        cur_pair = try!(misc::inside_out(pairs.next()));
+                    },
+                    Ordering::Equal => {
+                        //println!("otherpair equal, pair from merge: {:?}", pair.Key);
+                        if !pair.Value.is_tombstone() || try!(necessary_tombstone(&pair.Key, &mut behind)) {
+                            if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
                                 //try!(pg.verify(pw.page_size(), path, f.clone()));
                                 items.push(pg);
                             }
-                            cur_pair = try!(misc::inside_out(pairs.next()));
-                            cur_otherleaf = Some(pg);
-                            assert!(cur_in_other.is_none());
-                        },
-                        KeyInRange::Greater => {
-                            //println!("regular pair passed otherleaf, reusing: {:?}", pg);
-                            assert!(cur_in_other.is_none());
-                            if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
-                                //try!(pg.verify(pw.page_size(), path, f.clone()));
-                                items.push(pg);
-                            }
+                        }
+                        cur_pair = try!(misc::inside_out(pairs.next()));
+                        // whatever value is coming from the rewritten leaf, it is superceded
+                        if i + 1 < leafreader.count_keys() {
+                            cur_in_other = Some(i + 1);
+                        } else {
+                            try!(leafreader.read_page(0));
+                            cur_in_other = None;
+                        }
+                    },
+                    Ordering::Less => {
+                        let leafpair = try!(leafreader.kvp(i));
+                        //println!("otherpair wins: {:?}", leafpair.Key);
+                        if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, leafpair)) {
                             //try!(pg.verify(pw.page_size(), path, f.clone()));
                             items.push(pg);
-                            leaves_recycled += 1;
-                            cur_otherleaf = try!(misc::inside_out(leaves.next()));
-                            cur_pair = Some(pair);
-                        },
-                        KeyInRange::EqualFirst | KeyInRange::EqualLast | KeyInRange::Within => {
-                            //println!("regular pair inside otherleaf, rewriting: {:?}", pg);
-                            leaves_rewritten += 1;
-                            try!(leafreader.read_page(pg.page));
-                            cur_in_other = Some(0);
-
-                            // TODO technically, EqualFirst could start at 1, since the first key
-                            // of the rewritten page will get skipped anyway because it is equal to
-                            // the current key from the merge.
-
-                            // TODO EqualLast could just ignore the other leaf, since it won't matter.
-
-                            cur_otherleaf = try!(misc::inside_out(leaves.next()));
-                            cur_pair = Some(pair);
-                        },
-                    }
-                },
-                (None, None, None) => {
-                    if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
-                        //try!(pg.verify(pw.page_size(), path, f.clone()));
-                        items.push(pg);
-                    }
-                    break;
-                },
-            }
-        }
-        // TODO sometimes leaves_rewritten is 0.  how does that happen?
-        // all the new stuff squeezed in between existing leaves?
-
-        //println!("leaves rewritten = {}   recycled = {}", leaves_rewritten, leaves_recycled);
-    } else {
-        for result_pair in pairs {
-            let pair = try!(result_pair);
-            if let Some(pg) = try!(process_pair(&mut st, &mut pb, pw, &mut vbuf, pair)) {
+                        }
+                        if i + 1 < leafreader.count_keys() {
+                            cur_in_other = Some(i + 1);
+                        } else {
+                            try!(leafreader.read_page(0));
+                            cur_in_other = None;
+                        }
+                        cur_pair = Some(pair);
+                    },
+                }
+                cur_otherleaf = q;
+            },
+            (None, Some(i), q) => {
+                let pair = try!(leafreader.kvp(i));
+                //println!("regular pairs gone, otherpair: {:?}", pair.Key);
+                if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
+                    //try!(pg.verify(pw.page_size(), path, f.clone()));
+                    items.push(pg);
+                }
+                if i + 1 < leafreader.count_keys() {
+                    cur_in_other = Some(i + 1);
+                } else {
+                    try!(leafreader.read_page(0));
+                    cur_in_other = None;
+                }
+                cur_pair = None;
+                cur_otherleaf = q;
+            },
+            (Some(pair), None, None) => {
+                //println!("everything else gone, regular pair: {:?}", pair.Key);
+                if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
+                    //try!(pg.verify(pw.page_size(), path, f.clone()));
+                    items.push(pg);
+                }
+                cur_pair = try!(misc::inside_out(pairs.next()));
+                cur_otherleaf = None;
+            },
+            (None, None, Some(pg)) => {
+                //println!("everything else gone, reusing page: {:?}", pg);
+                if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
+                    //try!(pg.verify(pw.page_size(), path, f.clone()));
+                    items.push(pg);
+                }
                 //try!(pg.verify(pw.page_size(), path, f.clone()));
                 items.push(pg);
-            }
-        }
-        if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
-            //try!(pg.verify(pw.page_size(), path, f.clone()));
-            items.push(pg);
+                leaves_recycled += 1;
+                cur_otherleaf = try!(misc::inside_out(leaves.next()));
+                cur_pair = None;
+            },
+            (Some(pair), None, Some(pg)) => {
+                match try!(pg.key_in_range(&pair.Key)) {
+                    KeyInRange::Less => {
+                        //println!("regular pair less than next otherleaf: {:?}", pair.Key);
+                        if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
+                            //try!(pg.verify(pw.page_size(), path, f.clone()));
+                            items.push(pg);
+                        }
+                        cur_pair = try!(misc::inside_out(pairs.next()));
+                        cur_otherleaf = Some(pg);
+                        assert!(cur_in_other.is_none());
+                    },
+                    KeyInRange::Greater => {
+                        //println!("regular pair passed otherleaf, reusing: {:?}", pg);
+                        assert!(cur_in_other.is_none());
+                        if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
+                            //try!(pg.verify(pw.page_size(), path, f.clone()));
+                            items.push(pg);
+                        }
+                        //try!(pg.verify(pw.page_size(), path, f.clone()));
+                        items.push(pg);
+                        leaves_recycled += 1;
+                        cur_otherleaf = try!(misc::inside_out(leaves.next()));
+                        cur_pair = Some(pair);
+                    },
+                    KeyInRange::EqualFirst | KeyInRange::EqualLast | KeyInRange::Within => {
+                        //println!("regular pair inside otherleaf, rewriting: {:?}", pg);
+                        leaves_rewritten += 1;
+                        try!(leafreader.read_page(pg.page));
+                        cur_in_other = Some(0);
+
+                        // TODO technically, EqualFirst could start at 1, since the first key
+                        // of the rewritten page will get skipped anyway because it is equal to
+                        // the current key from the merge.
+
+                        // TODO EqualLast could just ignore the other leaf, since it won't matter.
+
+                        cur_otherleaf = try!(misc::inside_out(leaves.next()));
+                        cur_pair = Some(pair);
+                    },
+                }
+            },
+            (None, None, None) => {
+                if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
+                    //try!(pg.verify(pw.page_size(), path, f.clone()));
+                    items.push(pg);
+                }
+                break;
+            },
         }
     }
+    // TODO sometimes leaves_rewritten is 0.  how does that happen?
+    // all the new stuff squeezed in between existing leaves?
+
+    //println!("leaves rewritten = {}   recycled = {}", leaves_rewritten, leaves_recycled);
 
     Ok(items)
 }
@@ -3551,6 +3574,9 @@ fn write_parent_node_tree(
             };
 
             if !fits {
+                // if the assert below fires, that's bad.  it means we have a child item which
+                // is too small for a parent page even if it is the only thing on that page.
+                // it probably means the block list for that child item got out of control.
                 assert!(st.items.len() > 0);
                 let should_be = calc_page_len(st.prefixLen, st.sofar);
                 let (len_page, pg) = try!(write_parent_page(&mut st, pb, pw, my_depth));
@@ -3633,9 +3659,7 @@ fn create_segment<I>(mut pw: PageWriter,
     // TODO pw.reset_list() ?
     // or are we promised that the PageWriter we are given is empty?
 
-    // TODO all this extra junk being passed.  write_leaves() needs to be separate from
-    // write_leaves_with_merge(), but those two funcs need to share a lot of their code.
-    let leaves = try!(write_leaves(&mut pw, source, std::iter::empty(), vec![], path, f.clone()));
+    let leaves = try!(write_leaves(&mut pw, source));
 
     let root_page = try!(write_parent_node_tree(leaves, 0, &mut pw, path, f.clone()));
 // TODO do we need to return the blocklist?
@@ -4918,63 +4942,6 @@ impl ParentPage {
         let mut v = vec![];
         self.collect_all_leaves(&mut v);
         Ok(v)
-    }
-
-    fn collect_leaves(&self, range: &KeyRange, overlaps: &mut Vec<pgitem>, siblings: &mut Vec<pgitem>) -> Result<()> {
-        if self.is_grandparent() {
-            for i in 0 .. self.children.len() {
-                // TODO this could use one ParentPage object and just tell it to read_page()
-                let pagenum = self.children[i].page;
-
-                let child_buf = vec![0; self.pr.len()].into_boxed_slice();
-                let done_page = move |_| -> () {
-                };
-                let mut child_buf = Lend::new(child_buf, box done_page);
-
-                {
-                    let f = &mut *(self.f.borrow_mut());
-                    try!(utils::SeekPage(f, child_buf.len(), pagenum));
-                    try!(misc::io::read_fully(f, &mut child_buf));
-                }
-
-                let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, child_buf));
-                try!(page.collect_leaves(range, overlaps, siblings));
-            }
-        } else {
-            let mut no_more_overlaps = false;
-            for i in 0 .. self.children.len() {
-                let pg = try!(self.child_pgitem(i));
-                if no_more_overlaps {
-                    siblings.push(pg);
-                } else {
-                    match try!(self.child_overlaps(i, range)) {
-                        Overlap::Yes => {
-                            assert!(!no_more_overlaps);
-                            overlaps.push(pg);
-                        },
-                        Overlap::Less => {
-                            siblings.push(pg);
-                            // keep going
-                        },
-                        Overlap::Greater => {
-                            no_more_overlaps = true;
-                            siblings.push(pg);
-                        },
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn find_merge_target(&self, range: &KeyRange) -> Result<(Vec<pgitem>, Vec<pgitem>)> {
-        let mut overlaps = Vec::with_capacity(self.children.len());
-        let mut siblings = Vec::with_capacity(self.children.len());
-        // TODO for large segments, probably need to reconsider decision
-        // to go all the way down to the leaves level.  A 5 GB segment
-        // would have over a million leaves.
-        try!(self.collect_leaves(range, &mut overlaps, &mut siblings));
-        Ok((overlaps, siblings))
     }
 
     pub fn complete_blocklist(&self) -> Result<BlockList> {
@@ -6813,7 +6780,7 @@ impl InnerPart {
         let (cursor, from, dest_leaves, old_dest_segment, behind) = {
             let header = try!(inner.header.read());
 
-            let (cursors, range, from, dest_level) = {
+            let (cursors, from, dest_level) = {
                 fn count_leaves_expensive(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &Vec<PageNum>) -> Result<usize> {
                     // TODO read locks?
 
@@ -6844,11 +6811,10 @@ impl InnerPart {
                     Ok(count)
                 }
 
-                fn get_cursors_and_range(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &Vec<PageNum>) -> Result<(Vec<Box<IForwardCursor>>, KeyRange)> {
+                fn get_cursors(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &Vec<PageNum>) -> Result<Vec<Box<IForwardCursor>>> {
                     // TODO read locks for all the cursors below
 
                     let mut cursors: Vec<Box<IForwardCursor>> = Vec::with_capacity(merge_segments.len());
-                    let mut range = None;
                     for i in 0 .. merge_segments.len() {
                         let pagenum = merge_segments[i];
                         let mut buf = try!(InnerPart::get_loaner_page(inner));
@@ -6875,14 +6841,12 @@ impl InnerPart {
                                 PageType::LEAF_NODE => {
                                     let leaf = try!(LeafPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
                                     //println!("    segment {} is a leaf with {} keys", pagenum, leaf.count_keys());
-                                    range = Some(try!(leaf.grow_range(range)));
                                     let cursor = LeafCursor::new(leaf);
                                     box cursor
                                 },
                                 PageType::PARENT_NODE => {
                                     let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
                                     //println!("    segment {} is a parent of depth {}", pagenum, parent.depth());
-                                    range = Some(try!(parent.grow_range(range)));
                                     let cursor = try!(ParentCursor::new(parent));
                                     box cursor
                                 },
@@ -6893,9 +6857,7 @@ impl InnerPart {
                         cursors.push(cursor);
                     }
 
-                    let range = range.unwrap();
-
-                    Ok((cursors, range))
+                    Ok(cursors)
                 }
 
                 match from_level {
@@ -6915,9 +6877,9 @@ impl InnerPart {
 
                         //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
                         //println!("dest_level: {:?}   leaves in from: {}", from_level.get_dest_level(), try!(count_leaves_expensive(inner, f.clone(), &merge_segments)));
-                        let (cursors, range) = try!(get_cursors_and_range(inner, f.clone(), &merge_segments));
+                        let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
 
-                        (cursors, range, MergingFrom::Fresh(merge_segments), DestLevel::Young)
+                        (cursors, MergingFrom::Fresh(merge_segments), DestLevel::Young)
                     },
                     FromLevel::Young => {
                         // TODO constant
@@ -6935,9 +6897,9 @@ impl InnerPart {
 
                         //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
                         //println!("dest_level: {:?}   leaves in from: {}", from_level.get_dest_level(), try!(count_leaves_expensive(inner, f.clone(), &merge_segments)));
-                        let (cursors, range) = try!(get_cursors_and_range(inner, f.clone(), &merge_segments));
+                        let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
 
-                        (cursors, range, MergingFrom::Young(merge_segments), DestLevel::Other(0))
+                        (cursors, MergingFrom::Young(merge_segments), DestLevel::Other(0))
                     },
                     FromLevel::Other(level) => {
                         assert!(header.levels.len() > level);
@@ -6973,9 +6935,8 @@ impl InnerPart {
                                     },
                                     Some((parent, siblings)) => {
                                         let siblings_depth = parent.depth();
-                                        let range = try!(parent.grow_range(None));
                                         let cursor: Box<IForwardCursor> = box try!(ParentCursor::new(parent));
-                                        (vec![cursor], range, MergingFrom::Other(level, pagenum, siblings, siblings_depth), DestLevel::Other(level + 1))
+                                        (vec![cursor], MergingFrom::Other(level, pagenum, siblings, siblings_depth), DestLevel::Other(level + 1))
                                     },
                                 }
 
@@ -7062,8 +7023,6 @@ impl InnerPart {
                 behind.push(cursor);
             }
 
-            // TODO let cursor = FilterTombstonesCursor::new(cursor, behind);
-
             (cursor, from, dest_leaves, old_dest_segment, behind)
         };
 
@@ -7075,12 +7034,13 @@ impl InnerPart {
         let new_dest_segment = 
             if cursor.IsValid() {
                 let source = CursorIterator::new(box cursor);
+                // TODO just make a leaf iterator
                 let dest_leaves = 
                     dest_leaves
                     .into_iter()
                     .map(|pg| Ok(pg))
                     .collect::<Vec<_>>();
-                let leaves = try!(write_leaves(&mut pw, source, dest_leaves.into_iter(), behind, &inner.path, f.clone()));
+                let leaves = try!(write_merge(&mut pw, source, dest_leaves.into_iter(), behind, &inner.path, f.clone()));
                 // TODO the following msg isn't really correct anymore, since it re-uses leaves
                 //println!("dest_level: {:?}  merge wrote {} leaves", from_level.get_dest_level(), leaves.len());
                 //println!("leaves: {:?}", leaves);
