@@ -28,14 +28,14 @@ use rand::Rng;
 use rand::SeedableRng;
 
 fn dump_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
     let page = try!(db.get_page(pgnum));
     println!("{:?}", page);
     Ok(())
 }
 
 fn show_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
     let cursor = try!(db.open_cursor_on_page(pgnum));
     let pt = cursor.page_type();
     println!("page type: {:?}", pt);
@@ -43,8 +43,34 @@ fn show_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     Ok(())
 }
 
+fn merge(name: &str, from_level: String) -> Result<(),lsm::Error> {
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
+    let from_level =
+        match from_level.as_str() {
+            "fresh" => {
+                lsm::FromLevel::Fresh
+            },
+            "young" => {
+                lsm::FromLevel::Young
+            },
+            _ => {
+                let level = from_level.parse::<usize>().unwrap();
+                lsm::FromLevel::Other(level)
+            },
+        };
+    match try!(db.merge(from_level)) {
+        Some(pm) => {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_merge(pm));
+        },
+        None => {
+        },
+    }
+    Ok(())
+}
+
 fn show_leaf_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
     let mut cursor = try!(db.open_cursor_on_leaf_page(pgnum));
     try!(cursor.First());
     while cursor.IsValid() {
@@ -61,27 +87,45 @@ fn show_leaf_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
 }
 
 fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
     let page = try!(db.read_parent_page(pgnum));
-    //let pt = cursor.child_page_type();
-    //println!("child page type: {:?}", pt);
+    println!("depth: {}", page.depth());
     println!("count_items: {}", page.count_items());
-    let blocks = page.complete_blocklist();
+    let blocks = try!(page.complete_blocklist());
     println!("blocks ({} pages): {:?}", blocks.count_pages(), blocks);
+    println!("key range: {:?}", try!(page.range()));
+    let count = page.count_items();
+    println!("items ({}):", count);
+    for i in 0 .. count {
+        let p = page.get_child_pagenum(i);
+        println!("    {}", p);
+        let child_range = try!(page.child_range(i));
+        println!("    {:?}", child_range);
+    }
+    try!(page.verify_child_keys());
     Ok(())
 }
 
 fn list_segments(name: &str) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
-    let (young, levels) = try!(db.list_segments());
-    for s in young.iter().chain(levels.iter()) {
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
+    let (fresh, young, levels) = try!(db.list_segments());
+    println!("fresh ({}): ", fresh.len());
+    for s in fresh.iter() {
+        println!("{}", s);
+    }
+    println!("young ({}): ", young.len());
+    for s in young.iter() {
+        println!("{}", s);
+    }
+    println!("levels ({}): ", levels.len());
+    for s in levels.iter() {
         println!("{}", s);
     }
     Ok(())
 }
 
 fn list_free_blocks(name: &str) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
     let blocks = try!(db.list_free_blocks());
     println!("{:?}", blocks);
     println!("total pages: {}", blocks.count_pages());
@@ -89,7 +133,7 @@ fn list_free_blocks(name: &str) -> Result<(),lsm::Error> {
 }
 
 fn list_keys(name: &str) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
     let mut cursor = try!(db.open_cursor());
     try!(cursor.First());
     while cursor.IsValid() {
@@ -115,7 +159,7 @@ fn seek_string(name: &str, key: String, sop: String) -> Result<(),lsm::Error> {
         };
     let k = key.into_bytes().into_boxed_slice();
     let k = lsm::KeyRef::from_boxed_slice(k);
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
     let mut cursor = try!(db.open_cursor());
     let sr = try!(cursor.SeekRef(&k, sop));
     println!("sr: {:?}", sr);
@@ -139,7 +183,7 @@ fn seek_bytes(name: &str, k: Box<[u8]>, sop: String) -> Result<(),lsm::Error> {
             _ => return Err(lsm::Error::Misc(String::from("invalid sop"))),
         };
     let k = lsm::KeyRef::from_boxed_slice(k);
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
     let mut cursor = try!(db.open_cursor());
     let sr = try!(cursor.SeekRef(&k, sop));
     println!("RESULT sr: {:?}", sr);
@@ -173,7 +217,7 @@ fn add_numbers(name: &str, count: u64, start: u64, step: u64) -> Result<(),lsm::
         let v = format!("{}", val).into_bytes().into_boxed_slice();
         pending.insert(k, lsm::Blob::Array(v));
     }
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
     let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
     let lck = try!(db.get_write_lock());
     try!(lck.commit_segment(seg).map_err(lsm::wrap_err));
@@ -195,7 +239,7 @@ fn add_random(name: &str, count: u64, seed: usize, klen: usize, vlen: usize) -> 
         let v = make(&mut rng, vlen);
         pending.insert(k, lsm::Blob::Array(v));
     }
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
     let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
     let lck = try!(db.get_write_lock());
     try!(lck.commit_segment(seg).map_err(lsm::wrap_err));
@@ -233,6 +277,9 @@ fn result_main() -> Result<(),lsm::Error> {
             let count = args[3].parse::<u64>().unwrap();
             let start = args[4].parse::<u64>().unwrap();
             let step = args[5].parse::<u64>().unwrap();
+            if step == 0 {
+                return Err(lsm::Error::Misc(String::from("step cannot be 0")));
+            }
             add_numbers(name, count, start, step)
         },
         "show_page" => {
@@ -267,6 +314,14 @@ fn result_main() -> Result<(),lsm::Error> {
             let key = args[3].clone();
             let sop = args[4].clone();
             seek_string(name, key, sop)
+        },
+        "merge" => {
+            println!("usage: merge from_level");
+            if args.len() < 4 {
+                return Err(lsm::Error::Misc(String::from("too few args")));
+            }
+            let from_level = args[3].clone();
+            merge(name, from_level)
         },
         "seek_bytes" => {
             println!("usage: seek_bytes sop numbytes b1 b2 b3 ... ");

@@ -1,4 +1,42 @@
 
+consider fiddling with the depth at which parent nodes
+store child block lists.  more than just one?  would
+need parent nodes fit calculations to account for the
+size of the encoded block lists.
+
+still need to be concerned about really big segments
+and merge working entirely at the granularity of a leaf.
+
+look for ways to make index entry encoding more compact
+
+seq of keys
+seq of other leaves
+
+for pair in source {
+    if no more otherleaf
+        add key, next key
+    else if no more key
+        add otherleaf to output, next otherleaf
+    else if key < otherleaf.min
+        add key, next key
+    else if key <= otherleaf.max
+        eat otherleaf into seq of keys
+        next otherleaf
+    else (key > otherleaf.max)
+        flush any leaf in progress
+        add otherleaf to output, next otherleaf
+
+    if no more keys AND no more otherleaf, break
+}
+
+
+
+
+
+
+
+
+
 at some point, review all decisions about what actually gets stored
 in the parent page and make sure it's worth it.  two keys?  full
 block list?  should we store the number of descendant leaves?

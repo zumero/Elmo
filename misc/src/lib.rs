@@ -923,3 +923,16 @@ pub mod buf_advance {
     }
 }
 
+// TODO this is probably in std somewhere
+pub fn inside_out<T,E>(v: Option<Result<T,E>>) -> Result<Option<T>,E> {
+    match v {
+        Some(v) => {
+            let v = try!(v);
+            Ok(Some(v))
+        },
+        None => {
+            Ok(None)
+        },
+    }
+}
+
