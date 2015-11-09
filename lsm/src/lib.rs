@@ -6023,7 +6023,7 @@ impl DatabaseFile {
                             Ok(msg) => {
                                 match msg {
                                     NewSegmentMessage::NewSegment => {
-                                        match db.automerge_level(FromLevel::Fresh) {
+                                        match db.merge(FromLevel::Fresh) {
                                             Ok(()) => {
                                             },
                                             Err(e) => {
@@ -6057,7 +6057,7 @@ impl DatabaseFile {
                             Ok(msg) => {
                                 match msg {
                                     NewSegmentMessage::NewSegment => {
-                                        match db.automerge_level(FromLevel::Young) {
+                                        match db.merge(FromLevel::Young) {
                                             Ok(()) => {
                                             },
                                             Err(e) => {
@@ -6092,7 +6092,7 @@ impl DatabaseFile {
                                 match msg {
                                     AutomergeMessage::Merged(level) => {
                                         assert!(level == closure_level);
-                                        match db.automerge_level(FromLevel::Other(level)) {
+                                        match db.merge(FromLevel::Other(level)) {
                                             Ok(()) => {
                                             },
                                             Err(e) => {
@@ -6122,7 +6122,7 @@ impl DatabaseFile {
         Ok(db)
     }
 
-    fn automerge_level(&self, level: FromLevel) -> Result<()> {
+    pub fn merge(&self, level: FromLevel) -> Result<()> {
         // no merge should prevent writes of new segments
         // into fresh.  merges do not need the main write lock
         // until commit_merge() is called.
@@ -6135,7 +6135,7 @@ impl DatabaseFile {
                 // FromLevel::Fresh does not need a merge lock,
                 // since it only inserts something into Young.
                 loop {
-                    match try!(self.merge(level)) {
+                    match try!(self.prepare_merge(level)) {
                         Some(pm) => {
                             let lck = try!(self.get_write_lock());
                             try!(lck.commit_merge(pm));
@@ -6157,7 +6157,7 @@ impl DatabaseFile {
 
                 let foo = try!(self.inner.mergelock.lock());
                 loop {
-                    match try!(self.merge(level)) {
+                    match try!(self.prepare_merge(level)) {
                         Some(pm) => {
                             let lck = try!(self.get_write_lock());
                             try!(lck.commit_merge(pm));
@@ -6207,9 +6207,8 @@ impl DatabaseFile {
         InnerPart::write_segment(&self.inner, pairs)
     }
 
-    // TODO should not be public.  call automerge_level(), since it manages the merge locks.
-    pub fn merge(&self, level: FromLevel) -> Result<Option<PendingMerge>> {
-        InnerPart::merge(&self.inner, level)
+    fn prepare_merge(&self, level: FromLevel) -> Result<Option<PendingMerge>> {
+        InnerPart::prepare_merge(&self.inner, level)
     }
 
     pub fn list_segments(&self) -> Result<(Vec<PageNum>, Vec<PageNum>, Vec<PageNum>)> {
@@ -6707,7 +6706,7 @@ impl InnerPart {
         Ok(seg)
     }
 
-    fn merge(inner: &std::sync::Arc<InnerPart>, from_level: FromLevel) -> Result<Option<PendingMerge>> {
+    fn prepare_merge(inner: &std::sync::Arc<InnerPart>, from_level: FromLevel) -> Result<Option<PendingMerge>> {
         enum MergingFrom {
             Fresh(Vec<PageNum>),
             Young(Vec<PageNum>),

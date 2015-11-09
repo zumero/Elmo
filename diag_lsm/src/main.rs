@@ -58,14 +58,7 @@ fn merge(name: &str, from_level: String) -> Result<(),lsm::Error> {
                 lsm::FromLevel::Other(level)
             },
         };
-    match try!(db.merge(from_level)) {
-        Some(pm) => {
-            let lck = try!(db.get_write_lock());
-            try!(lck.commit_merge(pm));
-        },
-        None => {
-        },
-    }
+    try!(db.merge(from_level));
     Ok(())
 }
 
