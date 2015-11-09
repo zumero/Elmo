@@ -3656,35 +3656,9 @@ fn create_segment<I>(mut pw: PageWriter,
            f: std::rc::Rc<std::cell::RefCell<File>>,
                        ) -> Result<PageNum> where I: Iterator<Item=Result<kvp>> {
 
-    // TODO pw.reset_list() ?
-    // or are we promised that the PageWriter we are given is empty?
-
     let leaves = try!(write_leaves(&mut pw, source));
-
     let root_page = try!(write_parent_node_tree(leaves, 0, &mut pw, path, f.clone()));
-// TODO do we need to return the blocklist?
-// if not, the only reason to call pw.end() is to make it release leftovers
-    let blocks = try!(pw.end());
-
-    if cfg!(expensive_check) 
-    {
-        // if we add the root page to the calculated block list 
-        // it should be the same as the one from pw
-
-        let mut tmp = root_page.blocks.clone();
-        tmp.add_page_no_reorder(root_page.page);
-        tmp.sort_and_consolidate();
-        let mut v1 = vec![];
-        tmp.encode(&mut v1);
-        let mut v2 = vec![];
-        blocks.encode(&mut v2);
-        if v1 != v2 {
-            println!("pw blocks: {:?}", blocks);
-            println!("calc blocks: {:?}", tmp);
-            assert!(v1 == v2);
-        }
-    }
-    assert!(blocks.contains_page(root_page.page));
+    try!(pw.end());
 
     Ok(root_page.page)
 }
@@ -4864,9 +4838,9 @@ impl ParentPage {
             }
 
             let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, child_buf));
-            let siblings = try!(self.siblings_for(Some((chosen, chosen))));
-            assert!(siblings.len() == self.children.len() - 1);
-            Ok(Some((page, siblings)))
+            let remaining_siblings = try!(self.siblings_for(Some((chosen, chosen))));
+            assert!(remaining_siblings.len() == self.children.len() - 1);
+            Ok(Some((page, remaining_siblings)))
         }
 
     }
@@ -6933,10 +6907,10 @@ impl InnerPart {
                                         // of find_merge_source() currently being kinda simplistic.
                                         return Ok(None);
                                     },
-                                    Some((parent, siblings)) => {
+                                    Some((parent, remaining_siblings)) => {
                                         let siblings_depth = parent.depth();
                                         let cursor: Box<IForwardCursor> = box try!(ParentCursor::new(parent));
-                                        (vec![cursor], MergingFrom::Other(level, pagenum, siblings, siblings_depth), DestLevel::Other(level + 1))
+                                        (vec![cursor], MergingFrom::Other(level, pagenum, remaining_siblings, siblings_depth), DestLevel::Other(level + 1))
                                     },
                                 }
 
@@ -6949,8 +6923,6 @@ impl InnerPart {
                 }
             };
 
-            //println!("dest_level: {:?}   merge key range: {:?}", from_level.get_dest_level(), range);
-
             // TODO need to read the page for the dest segment so we can look through it.
             // but we don't know which of its pages we want the cursor to be on.
             // and we don't even know if the root page for the last segment is leaf or parent.
@@ -6959,7 +6931,6 @@ impl InnerPart {
             let (dest_leaves, old_dest_segment, first_level_after) = 
                 match dest_level {
                     DestLevel::Young => {
-                        // no siblings, nothing included from dest
                         for i in 0 .. header.young.len() {
                             // TODO how to get locks on these pages?
                             let mut buf = try!(Self::get_loaner_page(inner));
@@ -7001,8 +6972,6 @@ impl InnerPart {
                                         return Err(Error::CorruptFile("child page has invalid page type"));
                                     },
                                 };
-
-                            //println!("dest_level: {:?}   overlaps: {}   siblings: {}", from_level.get_dest_level(), overlaps.len(), dest_siblings.len());
 
                             (dest_leaves, Some(dest_root_pagenum), first_level_after)
                         } else {
@@ -7239,7 +7208,6 @@ impl InnerPart {
 struct PageWriter {
     inner: std::sync::Arc<InnerPart>,
     f: File,
-    list: BlockList,
 
     // TODO the following two could be BlockLists if we didn't have to worry about it reordering the list
     blocks: Vec<PageBlock>,
@@ -7254,7 +7222,6 @@ impl PageWriter {
         let pw = PageWriter {
             inner: inner,
             f: f,
-            list: BlockList::new(),
             blocks: vec![],
             group_blocks: vec![],
             last_page: 0,
@@ -7309,7 +7276,6 @@ impl PageWriter {
     fn get_page(&mut self) -> Result<PageNum> {
         try!(self.ensure_inventory());
         let pg = try!(Self::get_page_from(&mut self.blocks));
-        self.add_page_to_list(pg);
         Ok(pg)
     }
 
@@ -7443,7 +7409,6 @@ impl PageWriter {
     fn get_group_page(&mut self, group: &mut BlockList, limit: usize) -> Result<PageNum> {
         try!(self.ensure_group_inventory(group, limit));
         let pg = try!(Self::get_page_from(&mut self.group_blocks));
-        self.add_page_to_list(pg);
         if group.blocks.len() > 0 {
             let first = group.blocks[0].firstPage;
             assert!(pg > first);
@@ -7476,12 +7441,6 @@ impl PageWriter {
         }
     }
 
-    fn add_page_to_list(&mut self, pg: PageNum) {
-        let extended = self.list.add_page_no_reorder(pg);
-        // TODO only consol if above false?
-        self.list.sort_and_consolidate();
-    }
-
     fn do_write(&mut self, buf: &[u8], pg: PageNum) -> Result<()> {
         if pg != self.last_page + 1 {
             try!(utils::SeekPage(&mut self.f, self.inner.pgsz, pg));
@@ -7503,7 +7462,10 @@ impl PageWriter {
         Ok(pg)
     }
 
-    fn end(self) -> Result<BlockList> {
+    // TODO this could happen on Drop.
+    // but it needs error handling.
+    // so maybe Drop should panic if it didn't happen.
+    fn end(self) -> Result<()> {
         if !self.blocks.is_empty() || !self.group_blocks.is_empty() {
             let mut space = try!(self.inner.space.lock());
             if !self.blocks.is_empty() {
@@ -7513,7 +7475,7 @@ impl PageWriter {
                 try!(InnerPart::addFreeBlocks(&mut space, &self.inner.path, self.inner.pgsz, self.group_blocks));
             }
         }
-        Ok(self.list)
+        Ok(())
     }
 
 }
