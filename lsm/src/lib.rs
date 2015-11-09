@@ -3141,7 +3141,6 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                         //println!("otherpair greater, pair from merge: {:?}", pair.Key);
                         if !pair.Value.is_tombstone() || try!(necessary_tombstone(&pair.Key, &mut behind)) {
                             if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                                //try!(pg.verify(pw.page_size(), path, f.clone()));
                                 items.push(pg);
                             }
                         }
@@ -3151,7 +3150,6 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                         //println!("otherpair equal, pair from merge: {:?}", pair.Key);
                         if !pair.Value.is_tombstone() || try!(necessary_tombstone(&pair.Key, &mut behind)) {
                             if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                                //try!(pg.verify(pw.page_size(), path, f.clone()));
                                 items.push(pg);
                             }
                         }
@@ -3168,7 +3166,6 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                         let leafpair = try!(leafreader.kvp(i));
                         //println!("otherpair wins: {:?}", leafpair.Key);
                         if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, leafpair)) {
-                            //try!(pg.verify(pw.page_size(), path, f.clone()));
                             items.push(pg);
                         }
                         if i + 1 < leafreader.count_keys() {
@@ -3186,7 +3183,6 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                 let pair = try!(leafreader.kvp(i));
                 //println!("regular pairs gone, otherpair: {:?}", pair.Key);
                 if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                    //try!(pg.verify(pw.page_size(), path, f.clone()));
                     items.push(pg);
                 }
                 if i + 1 < leafreader.count_keys() {
@@ -3201,7 +3197,6 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
             (Some(pair), None, None) => {
                 //println!("everything else gone, regular pair: {:?}", pair.Key);
                 if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                    //try!(pg.verify(pw.page_size(), path, f.clone()));
                     items.push(pg);
                 }
                 cur_pair = try!(misc::inside_out(pairs.next()));
@@ -3210,10 +3205,8 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
             (None, None, Some(pg)) => {
                 //println!("everything else gone, reusing page: {:?}", pg);
                 if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
-                    //try!(pg.verify(pw.page_size(), path, f.clone()));
                     items.push(pg);
                 }
-                //try!(pg.verify(pw.page_size(), path, f.clone()));
                 items.push(pg);
                 leaves_recycled += 1;
                 cur_otherleaf = try!(misc::inside_out(leaves.next()));
@@ -3224,7 +3217,6 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                     KeyInRange::Less => {
                         //println!("regular pair less than next otherleaf: {:?}", pair.Key);
                         if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                            //try!(pg.verify(pw.page_size(), path, f.clone()));
                             items.push(pg);
                         }
                         cur_pair = try!(misc::inside_out(pairs.next()));
@@ -3235,10 +3227,8 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                         //println!("regular pair passed otherleaf, reusing: {:?}", pg);
                         assert!(cur_in_other.is_none());
                         if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
-                            //try!(pg.verify(pw.page_size(), path, f.clone()));
                             items.push(pg);
                         }
-                        //try!(pg.verify(pw.page_size(), path, f.clone()));
                         items.push(pg);
                         leaves_recycled += 1;
                         cur_otherleaf = try!(misc::inside_out(leaves.next()));
@@ -3263,7 +3253,6 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
             },
             (None, None, None) => {
                 if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
-                    //try!(pg.verify(pw.page_size(), path, f.clone()));
                     items.push(pg);
                 }
                 break;
@@ -3282,8 +3271,6 @@ fn write_parent_node_tree(
                        children: Vec<pgitem>,
                        children_depth: u8,
                        pw: &mut PageWriter,
-                    path: &str,
-                    f: std::rc::Rc<std::cell::RefCell<File>>,
                       ) -> Result<pgitem> {
 
     fn write_one_set_of_parent_nodes(
@@ -3291,8 +3278,6 @@ fn write_parent_node_tree(
                            my_depth: u8,
                            pw: &mut PageWriter,
                            pb: &mut PageBuilder,
-                    path: &str,
-                    f: std::rc::Rc<std::cell::RefCell<File>>,
                           ) -> Result<Vec<pgitem>> {
 
         fn calc_page_len(prefix_len: usize, sofar: usize) -> usize {
@@ -3481,8 +3466,6 @@ fn write_parent_node_tree(
         let mut new_items = vec![];
         for child in children {
 
-            //try!(child.verify(pw.page_size(), path, f.clone()));
-
             if cfg!(expensive_check) 
             {
                 // TODO FYI this code is the only reason we need to derive Clone on
@@ -3580,7 +3563,7 @@ fn write_parent_node_tree(
                 assert!(st.items.len() > 0);
                 let should_be = calc_page_len(st.prefixLen, st.sofar);
                 let (len_page, pg) = try!(write_parent_page(&mut st, pb, pw, my_depth));
-                //try!(pg.verify(pw.page_size(), path, f.clone()));
+                // TODO try!(pg.verify(pw.page_size(), path, f.clone()));
                 new_items.push(pg);
                 //println!("should_be = {}   len_page = {}", should_be, len_page);
                 assert!(should_be == len_page);
@@ -3608,7 +3591,7 @@ fn write_parent_node_tree(
             assert!(st.items.len() > 0);
             let should_be = calc_page_len(st.prefixLen, st.sofar);
             let (len_page, pg) = try!(write_parent_page(&mut st, pb, pw, my_depth));
-            //try!(pg.verify(pw.page_size(), path, f.clone()));
+            // TODO try!(pg.verify(pw.page_size(), path, f.clone()));
             new_items.push(pg);
             //println!("should_be = {}   len_page = {}", should_be, len_page);
             assert!(should_be == len_page);
@@ -3638,7 +3621,7 @@ fn write_parent_node_tree(
                 // before we write this layer of parent nodes, we trim all the
                 // keys to the shortest prefix that will suffice.
 
-                let newChildren = try!(write_one_set_of_parent_nodes(kids, my_depth, pw, &mut pb, path, f.clone()));
+                let newChildren = try!(write_one_set_of_parent_nodes(kids, my_depth, pw, &mut pb ));
                 my_depth += 1;
                 kids = newChildren;
             }
@@ -3652,12 +3635,10 @@ fn write_parent_node_tree(
 
 fn create_segment<I>(mut pw: PageWriter, 
                         source: I,
-        path: &str, 
-           f: std::rc::Rc<std::cell::RefCell<File>>,
                        ) -> Result<PageNum> where I: Iterator<Item=Result<kvp>> {
 
     let leaves = try!(write_leaves(&mut pw, source));
-    let root_page = try!(write_parent_node_tree(leaves, 0, &mut pw, path, f.clone()));
+    let root_page = try!(write_parent_node_tree(leaves, 0, &mut pw ));
     try!(pw.end());
 
     Ok(root_page.page)
@@ -6737,8 +6718,7 @@ impl InnerPart {
             Ok(kvp {Key:k, Value:v})
         });
         let pw = try!(PageWriter::new(inner.clone()));
-        let f = try!(inner.open_file_for_cursor());
-        let seg = try!(create_segment(pw, source, &inner.path, f));
+        let seg = try!(create_segment(pw, source));
         Ok(seg)
     }
 
@@ -7019,7 +6999,7 @@ impl InnerPart {
                     //try!(pg.verify(inner.pgsz, &inner.path, f.clone()));
                 //}
 
-                let z = try!(write_parent_node_tree(leaves, 0, &mut pw, &inner.path, f.clone()));
+                let z = try!(write_parent_node_tree(leaves, 0, &mut pw ));
 
                 Some(z)
             } else {
@@ -7036,7 +7016,7 @@ impl InnerPart {
                     MergeFrom::Young(segments)
                 },
                 MergingFrom::Other(level, old_from_pagenum, remaining_siblings, siblings_depth) => {
-                    let root_page = try!(write_parent_node_tree(remaining_siblings, siblings_depth, &mut pw, &inner.path, f.clone()));
+                    let root_page = try!(write_parent_node_tree(remaining_siblings, siblings_depth, &mut pw));
                     MergeFrom::Other(level, old_from_pagenum, root_page.page)
                 },
             };
