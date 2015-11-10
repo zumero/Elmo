@@ -6832,21 +6832,13 @@ impl InnerPart {
             // but we don't know which of its pages we want the cursor to be on.
             // and we don't even know if the root page for the last segment is leaf or parent.
 
-            let mut behind = vec![];
-            let (dest_leaves, old_dest_segment, first_level_after) = 
+            let (dest_leaves, old_dest_segment) = 
                 match dest_level {
                     DestLevel::Young => {
-                        for i in 0 .. header.young.len() {
-                            // TODO how to get locks on these pages?
-                            let mut buf = try!(Self::get_loaner_page(inner));
-                            let cursor = try!(PageCursor::new(&inner.path, f.clone(), header.young[i], buf));
-                            behind.push(cursor);
-                        }
                         let dest_leaves: Box<Iterator<Item=Result<pgitem>>> = box std::iter::empty();
-                        (dest_leaves, None, 0)
+                        (dest_leaves, None)
                     },
                     DestLevel::Other(dest_level) => {
-                        let first_level_after = dest_level + 1;
                         if header.levels.len() > dest_level {
                             let dest_root_pagenum = header.levels[dest_level];
                             let mut buf = try!(Self::get_loaner_page(inner));
@@ -6878,10 +6870,10 @@ impl InnerPart {
                                     },
                                 };
 
-                            (dest_leaves, Some(dest_root_pagenum), first_level_after)
+                            (dest_leaves, Some(dest_root_pagenum))
                         } else {
                             let dest_leaves: Box<Iterator<Item=Result<pgitem>>> = box std::iter::empty();
-                            (dest_leaves, None, first_level_after)
+                            (dest_leaves, None)
                         }
                     },
                 };
@@ -6891,12 +6883,32 @@ impl InnerPart {
                 mc
             };
 
-            for i in first_level_after .. header.levels.len() {
-                // TODO how to get locks on these pages?
-                let mut buf = try!(Self::get_loaner_page(inner));
-                let cursor = try!(PageCursor::new(&inner.path, f.clone(), header.levels[i], buf));
-                behind.push(cursor);
-            }
+            let behind = {
+                let mut behind = vec![];
+                let first_level_after = 
+                    match dest_level {
+                        DestLevel::Young => {
+                            for i in 0 .. header.young.len() {
+                                // TODO how to get locks on these pages?
+                                let mut buf = try!(Self::get_loaner_page(inner));
+                                let cursor = try!(PageCursor::new(&inner.path, f.clone(), header.young[i], buf));
+                                behind.push(cursor);
+                            }
+                            0
+                        },
+                        DestLevel::Other(dest_level) => {
+                            dest_level + 1
+                        },
+                    };
+
+                for i in first_level_after .. header.levels.len() {
+                    // TODO how to get locks on these pages?
+                    let mut buf = try!(Self::get_loaner_page(inner));
+                    let cursor = try!(PageCursor::new(&inner.path, f.clone(), header.levels[i], buf));
+                    behind.push(cursor);
+                }
+                behind
+            };
 
             (cursor, from, dest_leaves, old_dest_segment, behind)
         };
