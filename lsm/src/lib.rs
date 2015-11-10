@@ -490,7 +490,7 @@ fn get_level_size(i: usize) -> u64 {
     for _ in 0 .. i + 1 {
         // TODO tune this factor.
         // for leveldb, it is 10.
-        n *= 10;
+        n *= 2;
     }
     n * 1024 * 1024
 }
@@ -6720,8 +6720,8 @@ impl InnerPart {
             Other(usize, PageNum, Vec<pgitem>, u8),
         }
 
-// TODO can this f move to an inner scope?
         let f = try!(inner.open_file_for_cursor());
+
         let (cursor, from, dest_leaves, old_dest_segment, behind) = {
             let header = try!(inner.header.read());
 
@@ -6733,42 +6733,7 @@ impl InnerPart {
                     for i in 0 .. merge_segments.len() {
                         let pagenum = merge_segments[i];
                         let mut buf = try!(InnerPart::get_loaner_page(inner));
-                        // TODO I suppose if we stored the depth in the header segment lists
-                        // we would not have to pre-read the page when we start at the top
-                        // of a segment.  
-                        // but it's so nice just having the segment list
-                        // be simple page numbers.
-
-                        // TODO the pre-read of the page here could just be done by calling
-                        // PageCursor::new.  We are loading the page objects ourselves so
-                        // we can call min_key/max_key, etc.  but those methods could be
-                        // added to PageCursor.  We currently don't have a general Page
-                        // object which represents either LeafPage or ParentPage.
-
-                        {
-                            let f = &mut *(f.borrow_mut());
-                            try!(utils::SeekPage(f, buf.len(), pagenum));
-                            try!(misc::io::read_fully(f, &mut buf));
-                        }
-                        let pt = try!(PageType::from_u8(buf[0]));
-                        let cursor: Box<IForwardCursor> =
-                            match pt {
-                                PageType::LEAF_NODE => {
-                                    let leaf = try!(LeafPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
-                                    //println!("    segment {} is a leaf with {} keys", pagenum, leaf.count_keys());
-                                    let cursor = LeafCursor::new(leaf);
-                                    box cursor
-                                },
-                                PageType::PARENT_NODE => {
-                                    let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
-                                    //println!("    segment {} is a parent of depth {}", pagenum, parent.depth());
-                                    let cursor = try!(ParentCursor::new(parent));
-                                    box cursor
-                                },
-                                PageType::OVERFLOW_NODE => {
-                                    return Err(Error::CorruptFile("segment page has invalid page type"));
-                                },
-                            };
+                        let cursor: Box<IForwardCursor> = box try!(PageCursor::new(&inner.path, f.clone(), pagenum, buf));
                         cursors.push(cursor);
                     }
 
@@ -6816,7 +6781,7 @@ impl InnerPart {
                     },
                     FromLevel::Other(level) => {
                         assert!(header.levels.len() > level);
-// TODO old dest segment pagenum
+                        // TODO old dest segment pagenum
                         let pagenum = header.levels[level];
                         let mut buf = try!(Self::get_loaner_page(inner));
                         {
@@ -6847,6 +6812,7 @@ impl InnerPart {
                                         return Ok(None);
                                     },
                                     Some((parent, remaining_siblings)) => {
+                                        // TODO need read lock
                                         let siblings_depth = parent.depth();
                                         let cursor: Box<IForwardCursor> = box try!(ParentCursor::new(parent));
                                         (vec![cursor], MergingFrom::Other(level, pagenum, remaining_siblings, siblings_depth), DestLevel::Other(level + 1))
@@ -6992,6 +6958,36 @@ impl InnerPart {
 
             let mut newHeader = header.clone();
 
+            fn update_header(newHeader: &mut HeaderData, old_dest_segment: Option<PageNum>, new_dest_segment: Option<PageNum>, dest_level: usize) {
+                match (old_dest_segment, new_dest_segment) {
+                    (None, None) => {
+                        // a merge resulted in what would have been an empty segment.
+                        // multiple segments from the young level cancelled each other out.
+                        // there wasn't anything in this level anyway.
+                        assert!(newHeader.levels.len() == dest_level);
+                    },
+                    (None, Some(new_seg)) => {
+                        // first merge into this new level
+                        assert!(newHeader.levels.len() == dest_level);
+                        newHeader.levels.push(new_seg);
+                    },
+                    (Some(_), None) => {
+                        // a merge resulted in what would have been an empty segment.
+                        // segments from young cancelled out everything that was in
+                        // the dest level.
+                        assert!(dest_level < newHeader.levels.len());
+                        // TODO what do we do about this?
+                        panic!();
+                    },
+                    (Some(old), Some(new_seg)) => {
+                        // level already exists
+                        assert!(dest_level < newHeader.levels.len());
+                        assert!(newHeader.levels[dest_level] == old);
+                        newHeader.levels[dest_level] = new_seg;
+                    },
+                }
+            }
+
             match pm.from {
                 MergeFrom::Fresh(segments) => {
                     // now we need to verify that the segments being replaced are in fresh
@@ -7029,68 +7025,17 @@ impl InnerPart {
                     }
 
                     let dest_level = 0;
-                    // TODO DRY
-                    match (pm.old_dest_segment, pm.new_dest_segment) {
-                        (None, None) => {
-                            // a merge resulted in what would have been an empty segment.
-                            // multiple segments from the young level cancelled each other out.
-                            // there wasn't anything in this level anyway.
-                            assert!(header.levels.len() == dest_level);
-                        },
-                        (None, Some(new_seg)) => {
-                            // first merge into this new level
-                            assert!(header.levels.len() == dest_level);
-                            newHeader.levels.push(new_seg.page);
-                        },
-                        (Some(_), None) => {
-                            // a merge resulted in what would have been an empty segment.
-                            // segments from young cancelled out everything that was in
-                            // the dest level.
-                            assert!(dest_level < newHeader.levels.len());
-                            // TODO what do we do about this?
-                            panic!();
-                        },
-                        (Some(old), Some(new_seg)) => {
-                            // level already exists
-                            assert!(dest_level < newHeader.levels.len());
-                            assert!(header.levels[dest_level] == old);
-                            newHeader.levels[dest_level] = new_seg.page;
-                        },
-                    }
+                    // TODO need to get the blocklist out of new_dest_segment
+                    let new_dest_segment = pm.new_dest_segment.map(|pg| pg.page);
+                    update_header(&mut newHeader, pm.old_dest_segment, new_dest_segment, dest_level);
                 },
                 MergeFrom::Other(level, old_from_seg, new_from_seg) => {
                     assert!(old_from_seg == newHeader.levels[level]);
                     newHeader.levels[level] = new_from_seg;
 
                     let dest_level = level + 1;
-                    // TODO DRY
-                    match (pm.old_dest_segment, pm.new_dest_segment) {
-                        (None, None) => {
-                            // a merge resulted in what would have been an empty segment.
-                            // multiple segments from the young level cancelled each other out.
-                            // there wasn't anything in this level anyway.
-                            assert!(header.levels.len() == dest_level);
-                        },
-                        (None, Some(new_seg)) => {
-                            // first merge into this new level
-                            assert!(header.levels.len() == dest_level);
-                            newHeader.levels.push(new_seg.page);
-                        },
-                        (Some(_), None) => {
-                            // a merge resulted in what would have been an empty segment.
-                            // segments from young cancelled out everything that was in
-                            // the dest level.
-                            assert!(dest_level < newHeader.levels.len());
-                            // TODO what do we do about this?
-                            panic!();
-                        },
-                        (Some(old), Some(new_seg)) => {
-                            // level already exists
-                            assert!(dest_level < newHeader.levels.len());
-                            assert!(header.levels[dest_level] == old);
-                            newHeader.levels[dest_level] = new_seg.page;
-                        },
-                    }
+                    let new_dest_segment = pm.new_dest_segment.map(|pg| pg.page);
+                    update_header(&mut newHeader, pm.old_dest_segment, new_dest_segment, dest_level);
                 },
             }
 
