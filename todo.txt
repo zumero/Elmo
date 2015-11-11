@@ -1,4 +1,29 @@
 
+consider having add_free_blocks() just put the new stuff into
+a waiting area, and only do the sorts on the main free block list
+every so often.
+
+avoiding rewrites of leaves has a downside:  once something is
+high up in the file, it probably won't move, the file doesn't
+shrink much, and ends up with a lot of empty blocks in it.
+
+allow block allocation policy that always selects the earliest block?
+
+to make open_cursor faster, for every run in the current
+state:
+    cache the first page
+    and cache the blocklist
+
+to reduce fragmentation:
+
+    experiment with write_merge and decisions to reuse leaves.
+    allow specifying the minimum number of consecutive leaves to 
+    be reused.
+
+maybe everywhere we read a page (cursors), instead of a file,
+we should provide an object which abstracts the reading of the
+page with a cache.
+
 read_page(0) calls probably not needed
 
 revisit when to check for tombstones during write_merge
