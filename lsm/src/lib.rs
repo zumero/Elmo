@@ -1422,10 +1422,6 @@ impl PageBuilder {
         self.buf.len() - self.cur
     }
 
-    fn SetPageFlag(&mut self, x: u8) {
-        self.buf[1] = self.buf[1] | (x);
-    }
-
     fn PutByte(&mut self, x: u8) {
         self.buf[self.cur] = x;
         self.cur = self.cur + 1;
@@ -2517,8 +2513,9 @@ impl<'c> PrefixCursor<'c> {
 pub enum PageType {
     LEAF_NODE,
     PARENT_NODE,
-    OVERFLOW_NODE,
 }
+
+const PAGE_TYPE_OVERFLOW: u8 = 3;
 
 impl PageType {
 
@@ -2527,7 +2524,6 @@ impl PageType {
         match self {
             PageType::LEAF_NODE => 1,
             PageType::PARENT_NODE => 2,
-            PageType::OVERFLOW_NODE => 3,
         }
     }
 
@@ -2536,8 +2532,7 @@ impl PageType {
         match v {
             1 => Ok(PageType::LEAF_NODE),
             2 => Ok(PageType::PARENT_NODE),
-            3 => Ok(PageType::OVERFLOW_NODE),
-            _ => panic!(), // TODO Err(Error::InvalidPageType(v)),
+            _ => panic!("invalid page type"), // TODO Err(Error::InvalidPageType(v)),
         }
     }
 }
@@ -2683,9 +2678,6 @@ impl pgitem {
                 }
                 try!(parent.verify_child_keys());
             },
-            PageType::OVERFLOW_NODE => {
-                return Err(Error::CorruptFile("segment page has invalid page type"));
-            },
         }
         Ok(())
     }
@@ -2813,7 +2805,7 @@ fn write_overflow(
 
     fn write_page(ba: &mut Read, pb: &mut PageBuilder, pgsz: usize, pw: &mut PageWriter, blocks: &mut BlockList, limit: usize) -> Result<(usize, bool)> {
         pb.Reset();
-        pb.PutByte(PageType::OVERFLOW_NODE.to_u8());
+        pb.PutByte(PAGE_TYPE_OVERFLOW);
         let boundary = try!(pw.is_group_on_block_boundary(blocks, limit));
         let room = 
             if boundary.is_some() {
@@ -3888,7 +3880,7 @@ impl OverflowReader {
     fn ReadPage(&mut self) -> Result<()> {
         try!(utils::SeekPage(&mut self.fs, self.buf.len(), self.currentPage));
         try!(misc::io::read_fully(&mut self.fs, &mut *self.buf));
-        if try!(self.PageType()) != (PageType::OVERFLOW_NODE) {
+        if self.buf[0] != PAGE_TYPE_OVERFLOW {
             return Err(Error::CorruptFile("first overflow page has invalid page type"));
         }
         self.sofarThisPage = 0;
@@ -3906,10 +3898,6 @@ impl OverflowReader {
         // TODO just self.buf?  instead of making 4-byte slice.
         let a = misc::bytes::extract_4(&self.buf[at .. at + 4]);
         endian::u32_from_bytes_be(a)
-    }
-
-    fn PageType(&self) -> Result<PageType> {
-        PageType::from_u8(self.buf[0])
     }
 
     fn CheckPageFlag(&self, f: u8) -> bool {
@@ -4524,9 +4512,6 @@ impl PageCursor {
                     }
                     let sub = try!(ParentCursor::new(page));
                     PageCursor::Parent(sub)
-                },
-                PageType::OVERFLOW_NODE => {
-                    return Err(Error::CorruptFile("child page has invalid page type"));
                 },
             };
 
@@ -5913,10 +5898,6 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
                             let page = try!(ParentPage::new_already_read_page(path, f.clone(), pagenum, buf));
                             try!(page.blocklist_unsorted())
                         },
-                        PageType::OVERFLOW_NODE => {
-                            panic!();
-                            //return Err(Error::CorruptFile("child page has invalid page type"));
-                        },
                     };
 
                 blist.sort_and_consolidate();
@@ -7134,9 +7115,6 @@ impl InnerPart {
                                 }
 
                             },
-                            PageType::OVERFLOW_NODE => {
-                                return Err(Error::CorruptFile("segment page has invalid page type"));
-                            },
                         }
                     },
                 }
@@ -7188,9 +7166,6 @@ impl InnerPart {
                                         // would have over a million leaves.
                                         let dest_leaves: Box<Iterator<Item=Result<pgitem>>> = box LeafIterator::new(parent);
                                         dest_leaves
-                                    },
-                                    PageType::OVERFLOW_NODE => {
-                                        return Err(Error::CorruptFile("child page has invalid page type"));
                                     },
                                 };
 
