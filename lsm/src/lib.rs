@@ -6031,7 +6031,8 @@ struct Space {
     pages_per_block: PageCount,
     nextPage: PageNum,
 
-    freeBlocks: BlockList,
+    fresh_free: Vec<BlockList>,
+    free_blocks: BlockList,
 
     next_rlock: u64,
     rlocks: HashMap<u64, BlockList>,
@@ -6060,11 +6061,11 @@ impl Space {
         blocks
     }
 
-    fn release_rlock(&mut self, rlock: u64) -> Result<()> {
+    fn release_rlock(&mut self, rlock: u64) {
         let blocks = 
             match self.rlocks.remove(&rlock) {
                 None => {
-                    return Err(Error::Misc(String::from("attempt to release non-existent rlock")));
+                    panic!("attempt to release non-existent rlock");
                 },
                 Some(blocks) => {
                     blocks
@@ -6072,7 +6073,7 @@ impl Space {
             };
         if self.zombies.is_empty() {
             // if there are no zombies, there is nothing more to do here
-            return Ok(());
+            return;
         }
         // the rlock we released might not be the only one for those
         // blocks.  anything that still has an rlock has gotta be
@@ -6080,18 +6081,16 @@ impl Space {
         let mut blocks = blocks;
         blocks.remove_anything_in(&self.all_rlocks());
         if blocks.is_empty() {
-            return Ok(());
+            return;
         }
 
         // OK, now anything in blocks which is also in zombies
         // can be added to the free list and removed from zombies.
         let free = self.zombies.remove_anything_in(&blocks);
-        let free = free.into_vec();
-        try!(self.add_free_blocks(free));
-        Ok(())
+        self.add_free_blocks(free);
     }
 
-    fn add_inactive(&mut self, mut blocks: BlockList) -> Result<()> {
+    fn add_inactive(&mut self, mut blocks: BlockList) {
         // everything in blocks should go in either free or zombie
 
         if !blocks.is_empty() {
@@ -6102,35 +6101,56 @@ impl Space {
             }
             if !blocks.is_empty() {
                 //println!("freed blocks: {:?}", blocks);
-                try!(self.add_free_blocks(blocks.into_vec()));
+                self.add_free_blocks(blocks);
             }
         }
-
-        Ok(())
     }
 
-    // TODO should this accept a BlockList instead of a Vec<>
-    fn add_free_blocks(&mut self, blocks: Vec<PageBlock>) -> Result<()> {
+    fn add_free_blocks(&mut self, blocks: BlockList) {
+        // organizing the free block list can be expensive
+        // if the list is large, so we only do it every so
+        // often.
+        self.fresh_free.push(blocks);
+        // TODO tunable parameter, not constant
+        if self.fresh_free.len() >= 8 {
+            self.organize_free_blocks();
+        }
+    }
 
-        // all additions to the freeBlocks list should happen here
-        // by calling this function.
-        //
+    fn step1_sort_and_consolidate(&mut self) {
+        for list in self.fresh_free.iter() {
+            self.free_blocks.add_blocklist_no_reorder(list);
+        }
+        self.fresh_free.clear();
+
+        self.free_blocks.sort_and_consolidate();
+        if self.free_blocks.count_blocks() > 0 && self.free_blocks.last_page() == self.nextPage - 1 {
+            let i_last_block = self.free_blocks.count_blocks() - 1;
+            let blk = self.free_blocks.remove_block(i_last_block);
+            //println!("    killing free_at_end: {:?}", blk);
+            self.nextPage = blk.firstPage;
+        }
+
+    }
+
+    fn step2_sort_for_usage(&mut self) {
+        // we want the largest blocks at the front of the list
+        // two blocks of the same size?  sort earlier block first.
+        self.free_blocks.sort_by_size_desc_page_asc();
+    }
+
+    fn organize_free_blocks(&mut self) {
         // the list is kept consolidated and sorted by size descending.
         // unfortunately this requires two sorts, and they happen here
         // inside a critical section.  but the benefit is considered
         // worth the trouble.
 
-        //println!("adding free blocks: {:?}", blocks);
-        for b in blocks {
-            self.freeBlocks.add_block_no_reorder(b);
-        }
-        self.freeBlocks.sort_and_consolidate();
-        if self.freeBlocks.count_blocks() > 0 && self.freeBlocks.last_page() == self.nextPage - 1 {
-            let i_last_block = self.freeBlocks.count_blocks() - 1;
-            let blk = self.freeBlocks.remove_block(i_last_block);
-            //println!("    killing free_at_end: {:?}", blk);
-            self.nextPage = blk.firstPage;
-        }
+        self.step1_sort_and_consolidate();
+        self.step2_sort_for_usage();
+    }
+
+    fn truncate_file_if_possible(&mut self) -> Result<()> {
+        self.step1_sort_and_consolidate();
 
         let file_length = try!(std::fs::metadata(&self.path)).len();
         let page_size = self.page_size as u64;
@@ -6144,20 +6164,17 @@ impl Space {
             try!(fs.set_len(((self.nextPage - 1) as u64) * page_size));
         }
 
-        // we want the largest blocks at the front of the list
-        // two blocks of the same size?  sort earlier block first.
-        self.freeBlocks.sort_by_size_desc_page_asc();
+        self.step2_sort_for_usage();
 
-        //println!("    space now: {:?}", self);
         Ok(())
     }
 
     fn getBlock(&mut self, req: BlockRequest) -> PageBlock {
         fn find_block_starting_at(space: &mut Space, start: Vec<PageNum>) -> Option<usize> {
-// TODO which way should we nest these two loops?
-            for i in 0 .. space.freeBlocks.count_blocks() {
+            // TODO which way should we nest these two loops?
+            for i in 0 .. space.free_blocks.count_blocks() {
                 for j in 0 .. start.len() {
-                    if space.freeBlocks[i].firstPage == start[j] {
+                    if space.free_blocks[i].firstPage == start[j] {
                         return Some(i);
                     }
                 }
@@ -6166,9 +6183,9 @@ impl Space {
         }
 
         fn find_block_minimum_size(space: &mut Space, size: PageCount) -> Option<usize> {
-            // space.freeBlocks is sorted by size desc, so we only
+            // space.free_blocks is sorted by size desc, so we only
             // need to check the first block.
-            if space.freeBlocks[0].count_pages() >= size {
+            if space.free_blocks[0].count_pages() >= size {
                 return Some(0);
             } else {
                 // if this block isn't big enough, none of the ones after it will be
@@ -6177,9 +6194,9 @@ impl Space {
         }
 
         fn find_block_after_minimum_size(space: &mut Space, after: PageNum, size: PageCount) -> Option<usize> {
-            for i in 0 .. space.freeBlocks.count_blocks() {
-                if space.freeBlocks[i].count_pages() >= size {
-                    if space.freeBlocks[i].firstPage > after {
+            for i in 0 .. space.free_blocks.count_blocks() {
+                if space.free_blocks[i].count_pages() >= size {
+                    if space.free_blocks[i].firstPage > after {
                         return Some(i);
                     } else {
                         // big enough, but not "after".  keep looking.
@@ -6202,8 +6219,12 @@ impl Space {
             assert!(self.nextPage > after);
         }
 
+        if self.free_blocks.is_empty() && !self.fresh_free.is_empty() {
+            self.organize_free_blocks();
+        }
+
         let from =
-            if self.freeBlocks.is_empty() {
+            if self.free_blocks.is_empty() {
                 FromWhere::End(self.pages_per_block)
             } else if req.start_is(self.nextPage) {
                 FromWhere::End(self.pages_per_block)
@@ -6242,10 +6263,10 @@ impl Space {
 
         match from {
             FromWhere::FirstFree => {
-                self.freeBlocks.remove_block(0)
+                self.free_blocks.remove_block(0)
             },
             FromWhere::SpecificFree(i) => {
-                self.freeBlocks.remove_block(i)
+                self.free_blocks.remove_block(i)
             },
             FromWhere::End(size) => {
                 let newBlk = PageBlock::new(self.nextPage, self.nextPage + size - 1) ;
@@ -6422,7 +6443,8 @@ impl DatabaseFile {
             page_size: pgsz,
             nextPage: first_available_page, 
             pages_per_block: settings.PagesPerBlock,
-            freeBlocks: blocks,
+            fresh_free: vec![],
+            free_blocks: blocks,
             next_rlock: 1,
             rlocks: HashMap::new(),
             zombies: BlockList::new(),
@@ -6740,8 +6762,9 @@ impl InnerPart {
     }
 
     fn cursor_dropped(&self, rlock: u64) {
+        // TODO dislike doing stuff which requires error handling here in impl Drop
         //println!("cursor_dropped");
-        let mut space = self.space.lock().unwrap(); // gotta succeed
+        let mut space = self.space.lock().unwrap(); // TODO gotta succeed
         space.release_rlock(rlock);
     }
 
@@ -6962,7 +6985,12 @@ impl InnerPart {
 
     fn list_free_blocks(inner: &std::sync::Arc<InnerPart>) -> Result<BlockList> {
         let space = try!(inner.space.lock());
-        Ok(space.freeBlocks.clone())
+		let mut blocks = space.free_blocks.clone();
+        for list in space.fresh_free.iter() {
+            blocks.add_blocklist_no_reorder(list);
+        }
+        blocks.sort_and_consolidate();
+        Ok(blocks)
     }
 
     fn release_pending_segment(inner: &std::sync::Arc<InnerPart>, location: PageNum) -> Result<()> {
@@ -7267,7 +7295,7 @@ impl InnerPart {
         match behind_rlock {
             Some(behind_rlock) => {
                 let mut space = try!(inner.space.lock());
-                try!(space.release_rlock(behind_rlock));
+                space.release_rlock(behind_rlock);
             },
             None => {
             },
@@ -7416,7 +7444,7 @@ impl InnerPart {
 
         if !pm.now_inactive.is_empty() {
             let mut space = try!(self.space.lock());
-            try!(space.add_inactive(pm.now_inactive));
+            space.add_inactive(pm.now_inactive);
         }
 
         // note that we intentionally do not release the writeLock here.
@@ -7691,11 +7719,12 @@ impl PageWriter {
         if !self.blocks.is_empty() || !self.group_blocks.is_empty() {
             let mut space = try!(self.inner.space.lock());
             if !self.blocks.is_empty() {
-                try!(space.add_free_blocks(self.blocks));
+                space.add_free_blocks(BlockList {blocks: self.blocks});
             }
             if !self.group_blocks.is_empty() {
-                try!(space.add_free_blocks(self.group_blocks));
+                space.add_free_blocks(BlockList {blocks: self.group_blocks});
             }
+            // TODO consider calling space.truncate_if_possible() here
         }
         Ok(())
     }

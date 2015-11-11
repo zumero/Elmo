@@ -1,4 +1,7 @@
 
+need to figure out a place to call truncate_file_if_possible()
+every so often.
+
 consider having add_free_blocks() just put the new stuff into
 a waiting area, and only do the sorts on the main free block list
 every so often.
