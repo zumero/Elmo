@@ -578,13 +578,20 @@ impl std::ops::Index<usize> for BlockList {
     }
 }
 
-fn read_and_alloc_page(f: &std::rc::Rc<std::cell::RefCell<File>>, page: PageNum, pgsz: usize) -> Result<Box<[u8]>> {
-    let mut buf = vec![0; pgsz].into_boxed_slice();
+#[inline]
+fn read_page_into_buf(f: &std::rc::Rc<std::cell::RefCell<File>>, page: PageNum, buf: &mut [u8]) -> Result<()> {
     {
         let f = &mut *(f.borrow_mut());
         try!(utils::SeekPage(f, buf.len(), page));
-        try!(misc::io::read_fully(f, &mut buf));
+        try!(misc::io::read_fully(f, buf));
     }
+    Ok(())
+}
+
+#[inline]
+fn read_and_alloc_page(f: &std::rc::Rc<std::cell::RefCell<File>>, page: PageNum, pgsz: usize) -> Result<Box<[u8]>> {
+    let mut buf = vec![0; pgsz].into_boxed_slice();
+    try!(read_page_into_buf(f, page, &mut buf));
     Ok(buf)
 }
 
@@ -593,7 +600,7 @@ fn get_level_size(i: usize) -> u64 {
     for _ in 0 .. i + 1 {
         // TODO tune this factor.
         // for leveldb, it is 10.
-        n *= 2;
+        n *= 10;
     }
     n * 1024 * 1024
 }
@@ -2635,16 +2642,11 @@ impl pgitem {
               path: &str, 
               f: std::rc::Rc<std::cell::RefCell<File>>,
              ) -> Result<()> {
-        let buf = vec![0; pgsz].into_boxed_slice();
+
+        let buf = try!(read_and_alloc_page(&f, self.page, pgsz));
         let done_page = move |_| -> () {
         };
-        let mut buf = Lend::new(buf, box done_page);
-
-        {
-            let f = &mut *(f.borrow_mut());
-            try!(utils::SeekPage(f, buf.len(), self.page));
-            try!(misc::io::read_fully(f, &mut buf));
-        }
+        let buf = Lend::new(buf, box done_page);
 
         let pt = try!(PageType::from_u8(buf[0]));
         match pt {
@@ -3368,7 +3370,6 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                         if i + 1 < leafreader.count_keys() {
                             cur_in_other = Some(i + 1);
                         } else {
-                            try!(leafreader.read_page(0));
                             cur_in_other = None;
                         }
                     },
@@ -3381,7 +3382,6 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                         if i + 1 < leafreader.count_keys() {
                             cur_in_other = Some(i + 1);
                         } else {
-                            try!(leafreader.read_page(0));
                             cur_in_other = None;
                         }
                         cur_pair = Some(pair);
@@ -3398,7 +3398,6 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                 if i + 1 < leafreader.count_keys() {
                     cur_in_other = Some(i + 1);
                 } else {
-                    try!(leafreader.read_page(0));
                     cur_in_other = None;
                 }
                 cur_pair = None;
@@ -4165,20 +4164,15 @@ impl LeafPage {
     }
 
     fn read_page(&mut self, pgnum: PageNum) -> Result<()> {
-        if pgnum == 0 {
-// TODO dislike use 0 as invalid/None
-            self.pagenum = pgnum;
-            self.pairs.clear();
-            self.prefix = None;
-        } else {
-            {
-                let f = &mut *(self.f.borrow_mut());
-                try!(utils::SeekPage(f, self.pr.len(), pgnum));
-                try!(misc::io::read_fully(f, &mut self.pr));
-                self.pagenum = pgnum;
-            }
-            try!(self.parse_page());
-        }
+        // TODO
+        // this code is the only reason this object needs to own its buffer.
+        // for the top Leaf/Parent Page object, the one corresponding to a
+        // segment, we want it to borrow the buffer in the header.
+        // but for a child, we want to be able to switch it from one
+        // page to another without re-allocating memory.
+        try!(read_page_into_buf(&self.f, pgnum, &mut self.pr));
+        self.pagenum = pgnum;
+        try!(self.parse_page());
         Ok(())
     }
 
@@ -4538,22 +4532,6 @@ impl PageCursor {
             };
 
         Ok(sub)
-    }
-
-    fn new(path: &str, 
-           f: std::rc::Rc<std::cell::RefCell<File>>,
-           pagenum: PageNum,
-           mut buf: Lend<Box<[u8]>>
-          ) -> Result<PageCursor> {
-
-        {
-            let f = &mut *(f.borrow_mut());
-            try!(utils::SeekPage(f, buf.len(), pagenum));
-            try!(misc::io::read_fully(f, &mut buf));
-        }
-
-        Self::new_already_read_page(path, f, pagenum, buf)
-
     }
 
     pub fn page_type(&self) -> PageType {
@@ -4976,18 +4954,12 @@ impl ParentPage {
                 assert!(self.depth() > 1);
                 let pagenum = self.children[i].page;
 
-                let child_buf = vec![0; self.pr.len()].into_boxed_slice();
+                let buf = try!(read_and_alloc_page(&self.f, pagenum, self.pr.len()));
                 let done_page = move |_| -> () {
                 };
-                let mut child_buf = Lend::new(child_buf, box done_page);
+                let buf = Lend::new(buf, box done_page);
 
-                {
-                    let f = &mut *(self.f.borrow_mut());
-                    try!(utils::SeekPage(f, child_buf.len(), pagenum));
-                    try!(misc::io::read_fully(f, &mut child_buf));
-                }
-
-                let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, child_buf));
+                let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, buf));
                 page.blocklist_unsorted()
             },
         }
@@ -5103,19 +5075,13 @@ impl ParentPage {
                     _ => unreachable!(),
                 };
             let pagenum = self.children[chosen].page;
-            // TODO it's a little silly here to construct a Lend<>
-            let child_buf = vec![0; self.pr.len()].into_boxed_slice();
+
+            let buf = try!(read_and_alloc_page(&self.f, pagenum, self.pr.len()));
             let done_page = move |_| -> () {
             };
-            let mut child_buf = Lend::new(child_buf, box done_page);
+            let buf = Lend::new(buf, box done_page);
 
-            {
-                let f = &mut *(self.f.borrow_mut());
-                try!(utils::SeekPage(f, child_buf.len(), pagenum));
-                try!(misc::io::read_fully(f, &mut child_buf));
-            }
-
-            let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, child_buf));
+            let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, buf));
             let remaining_siblings = try!(self.siblings_for(Some((chosen, chosen))));
             assert!(remaining_siblings.len() == self.children.len() - 1);
             Ok(Some((page, remaining_siblings)))
@@ -5174,12 +5140,12 @@ impl ParentPage {
             // for each child, make sure it provides the same first and
             // last key as the ones we've got.
 
-            // TODO it's a little silly here to construct a Lend<>
-            let child_buf = vec![0; self.pr.len()].into_boxed_slice();
+            let buf = try!(read_and_alloc_page(&self.f, self.children[i].page, self.pr.len()));
             let done_page = move |_| -> () {
             };
-            let mut child_buf = Lend::new(child_buf, box done_page);
-            let mut sub = try!(PageCursor::new(&self.path, self.f.clone(), self.children[i].page, child_buf));
+            let buf = Lend::new(buf, box done_page);
+
+            let mut sub = try!(PageCursor::new_already_read_page(&self.path, self.f.clone(), self.children[i].page, buf));
             try!(sub.First());
             assert!(sub.IsValid());
             {
@@ -5344,12 +5310,14 @@ impl ParentPage {
     }
 
     fn read_page(&mut self, pgnum: PageNum) -> Result<()> {
-        {
-            let f = &mut *(self.f.borrow_mut());
-            try!(utils::SeekPage(f, self.pr.len(), pgnum));
-            try!(misc::io::read_fully(f, &mut self.pr));
-            self.pagenum = pgnum;
-        }
+        // TODO
+        // this code is the only reason this object needs to own its buffer.
+        // for the top Leaf/Parent Page object, the one corresponding to a
+        // segment, we want it to borrow the buffer in the header.
+        // but for a child, we want to be able to switch it from one
+        // page to another without re-allocating memory.
+        try!(read_page_into_buf(&self.f, pgnum, &mut self.pr));
+        self.pagenum = pgnum;
         let (prefix, children) = try!(Self::parse_page(&self.pr));
         self.prefix = prefix;
         self.children = children;
@@ -5466,13 +5434,13 @@ impl ParentPage {
     }
 
     fn get_child_cursor(&self, i: usize) -> Result<PageCursor> {
-        // TODO it's a little silly here to construct a Lend<>
-        let child_buf = vec![0; self.pr.len()].into_boxed_slice();
+        let pagenum = self.children[i].page;
+        let buf = try!(read_and_alloc_page(&self.f, pagenum, self.pr.len()));
         let done_page = move |_| -> () {
         };
-        let mut child_buf = Lend::new(child_buf, box done_page);
+        let buf = Lend::new(buf, box done_page);
 
-        let sub = try!(PageCursor::new(&self.path, self.f.clone(), self.children[i].page, child_buf));
+        let sub = try!(PageCursor::new_already_read_page(&self.path, self.f.clone(), self.children[i].page, buf));
         Ok(sub)
     }
 
@@ -5481,20 +5449,13 @@ impl ParentPage {
     }
 
     fn fetch_item_parent(&self, i: usize) -> Result<ParentPage> {
-        let child_pagenum = self.children[i].page;
-
-        let child_buf = vec![0; self.pr.len()].into_boxed_slice();
+        let pagenum = self.children[i].page;
+        let buf = try!(read_and_alloc_page(&self.f, pagenum, self.pr.len()));
         let done_page = move |_| -> () {
         };
-        let mut child_buf = Lend::new(child_buf, box done_page);
+        let buf = Lend::new(buf, box done_page);
 
-        {
-            let f = &mut *(self.f.borrow_mut());
-            try!(utils::SeekPage(f, child_buf.len(), child_pagenum));
-            try!(misc::io::read_fully(f, &mut child_buf));
-        }
-
-        let child = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), child_pagenum, child_buf));
+        let child = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, buf));
         Ok(child)
     }
 }
@@ -5766,13 +5727,12 @@ impl MultiPageCursor {
 
         assert!(children.len() > 0);
 
-        // TODO it's a little silly here to construct a Lend<>
-        let child_buf = vec![0; pagesize].into_boxed_slice();
+        let buf = try!(read_and_alloc_page(&f, children[0], pagesize));
         let done_page = move |_| -> () {
         };
-        let mut child_buf = Lend::new(child_buf, box done_page);
+        let buf = Lend::new(buf, box done_page);
 
-        let sub = try!(PageCursor::new(path, f, children[0], child_buf));
+        let sub = try!(PageCursor::new_already_read_page(path, f, children[0], buf));
 
         let res = MultiPageCursor {
             path: String::from(path),
@@ -5921,7 +5881,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
                     let done_page = move |_| -> () {
                     };
                     // TODO and the clone below is silly too
-                    let mut buf = Lend::new(buf.clone(), box done_page);
+                    let buf = Lend::new(buf.clone(), box done_page);
 
                     match pt {
                         PageType::LEAF_NODE => {
@@ -6880,7 +6840,10 @@ impl InnerPart {
     fn open_cursor_on_page(inner: &std::sync::Arc<InnerPart>, pg: PageNum) -> Result<PageCursor> {
         let mut buf = try!(Self::get_loaner_page(inner));
         let f = try!(inner.open_file_for_cursor());
-        let cursor = try!(PageCursor::new(&inner.path, f, pg, buf));
+
+        try!(read_page_into_buf(&f, pg, &mut buf));
+
+        let cursor = try!(PageCursor::new_already_read_page(&inner.path, f, pg, buf));
         Ok(cursor)
     }
 
@@ -6888,11 +6851,7 @@ impl InnerPart {
         let mut buf = try!(Self::get_loaner_page(inner));
         let f = try!(inner.open_file_for_cursor());
 
-        {
-            let f = &mut *(f.borrow_mut());
-            try!(utils::SeekPage(f, buf.len(), pg));
-            try!(misc::io::read_fully(f, &mut buf));
-        }
+        try!(read_page_into_buf(&f, pg, &mut buf));
 
         let page = try!(LeafPage::new_already_read_page(&inner.path, f, pg, buf));
         let cursor = LeafCursor::new(page);
@@ -6903,11 +6862,7 @@ impl InnerPart {
         let mut buf = try!(Self::get_loaner_page(inner));
         let f = try!(inner.open_file_for_cursor());
 
-        {
-            let f = &mut *(f.borrow_mut());
-            try!(utils::SeekPage(f, buf.len(), pg));
-            try!(misc::io::read_fully(f, &mut buf));
-        }
+        try!(read_page_into_buf(&f, pg, &mut buf));
 
         let page = try!(ParentPage::new_already_read_page(&inner.path, f, pg, buf));
         let cursor = try!(ParentCursor::new(page));
@@ -6918,11 +6873,7 @@ impl InnerPart {
         let mut buf = try!(Self::get_loaner_page(inner));
         let f = try!(inner.open_file_for_cursor());
 
-        {
-            let f = &mut *(f.borrow_mut());
-            try!(utils::SeekPage(f, buf.len(), pg));
-            try!(misc::io::read_fully(f, &mut buf));
-        }
+        try!(read_page_into_buf(&f, pg, &mut buf));
 
         let page = try!(ParentPage::new_already_read_page(&inner.path, f, pg, buf));
         Ok(page)
