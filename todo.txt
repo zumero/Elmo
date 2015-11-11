@@ -11,10 +11,6 @@ shrink much, and ends up with a lot of empty blocks in it.
 
 allow block allocation policy that always selects the earliest block?
 
-to make open_cursor faster, for every run in the current
-state:
-    cache the first page
-
 to reduce fragmentation:
 
     experiment with write_merge and decisions to reuse leaves.

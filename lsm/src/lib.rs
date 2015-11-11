@@ -578,6 +578,16 @@ impl std::ops::Index<usize> for BlockList {
     }
 }
 
+fn read_and_alloc_page(f: &std::rc::Rc<std::cell::RefCell<File>>, page: PageNum, pgsz: usize) -> Result<Box<[u8]>> {
+    let mut buf = vec![0; pgsz].into_boxed_slice();
+    {
+        let f = &mut *(f.borrow_mut());
+        try!(utils::SeekPage(f, buf.len(), page));
+        try!(misc::io::read_fully(f, &mut buf));
+    }
+    Ok(buf)
+}
+
 fn get_level_size(i: usize) -> u64 {
     let mut n = 1;
     for _ in 0 .. i + 1 {
@@ -1303,27 +1313,19 @@ pub const SETTINGS_NO_AUTOMERGE: DbSettings =
 
 #[derive(Debug, Clone)]
 pub struct SegmentLocation {
-// TODO consider keeping the type here
-// TODO and maybe even the first page
     root_page: PageNum,
+    buf: Box<[u8]>,
     blocks: BlockList,
 }
 
 impl SegmentLocation {
-    pub fn new(root_page: PageNum, blocks: BlockList) -> Self {
-        assert!(blocks.contains_page(root_page));
+    pub fn new(root_page: PageNum, buf: Box<[u8]>, blocks: BlockList) -> Self {
+        assert!(!blocks.contains_page(root_page));
         SegmentLocation {
             root_page: root_page,
+            buf: buf,
             blocks: blocks,
         }
-    }
-
-    pub fn count_pages(&self) -> PageCount {
-        self.blocks.count_pages()
-    }
-
-    fn contains_page(&self, pgnum: PageNum) -> bool {
-        self.blocks.contains_page(pgnum)
     }
 
 }
@@ -1404,6 +1406,10 @@ impl PageBuilder {
 
     fn buf(&self) -> &[u8] {
         &self.buf
+    }
+
+    fn into_buf(self) -> Box<[u8]> {
+        self.buf
     }
 
     fn Reset(&mut self) {
@@ -2555,18 +2561,14 @@ struct pgitem {
     page: PageNum,
     blocks: BlockList,
     // blocks does NOT contain page
-    // TODO depth?
 
     first_key: KeyWithLocation,
     last_key: Option<KeyWithLocation>,
 }
 
 impl pgitem {
-    fn into_segment_location(self) -> SegmentLocation {
-        SegmentLocation {
-            root_page: self.page,
-            blocks: self.blocks,
-        }
+    fn into_segment_location(self, buf: Box<[u8]>) -> SegmentLocation {
+        SegmentLocation::new(self.page, buf, self.blocks)
     }
 
     fn need(&self, prefix_len: usize, depth: u8) -> usize {
@@ -3214,10 +3216,15 @@ fn flush_leaf(st: &mut LeafState,
     }
 }
 
+enum Leaves {
+    One(SegmentLocation),
+    Multiple(Vec<pgitem>),
+}
+
 fn write_leaves<I: Iterator<Item=Result<kvp>>, >(
                     pw: &mut PageWriter,
                     mut pairs: I,
-                    ) -> Result<Vec<pgitem>> {
+                    ) -> Result<Leaves> {
 
     let mut pb = PageBuilder::new(pw.page_size());
 
@@ -3247,7 +3254,17 @@ fn write_leaves<I: Iterator<Item=Result<kvp>>, >(
         items.push(pg);
     }
 
-    Ok(items)
+    if items.len() > 1 {
+        Ok(Leaves::Multiple(items))
+    } else {
+        let mut leaves = items;
+        let pg = leaves.remove(0);
+        // TODO this assumes the last page written is still in pb.
+        // it has to be.
+        let buf = pb.into_buf();
+        let seg = pg.into_segment_location(buf);
+        Ok(Leaves::One(seg))
+    }
 }
 
 fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
@@ -3464,7 +3481,7 @@ fn write_parent_node_tree(
                        children: Vec<pgitem>,
                        children_depth: u8,
                        pw: &mut PageWriter,
-                      ) -> Result<pgitem> {
+                      ) -> Result<SegmentLocation> {
 
     fn write_one_set_of_parent_nodes(
                            children: Vec<pgitem>,
@@ -3794,9 +3811,7 @@ fn write_parent_node_tree(
         Ok(new_items)
     }
 
-    let mut pb = PageBuilder::new(pw.page_size());
-
-    assert!(children.len() > 0);
+    assert!(children.len() > 1);
 
     // all the leaves are written.
     // now write the parent pages.
@@ -3805,36 +3820,49 @@ fn write_parent_node_tree(
     // which has only one node,
     // which is the root node.
 
-    let root_page =
-        if children.len() > 1 {
-            let mut kids = children;
-            let mut my_depth = children_depth + 1;
-            while kids.len() > 1 {
-                // TODO FWIW, this is where we used to:
-                // before we write this layer of parent nodes, we trim all the
-                // keys to the shortest prefix that will suffice.
+    let mut children = children;
+    let mut my_depth = children_depth + 1;
+    let mut pb = PageBuilder::new(pw.page_size());
+    while children.len() > 1 {
+        // TODO FWIW, this is where we used to:
+        // before we write this layer of parent nodes, we trim all the
+        // keys to the shortest prefix that will suffice.
 
-                let newChildren = try!(write_one_set_of_parent_nodes(kids, my_depth, pw, &mut pb ));
-                my_depth += 1;
-                kids = newChildren;
-            }
-            kids.remove(0)
-        } else {
-            let mut children = children;
-            children.remove(0)
-        };
-    Ok(root_page)
+        let newChildren = try!(write_one_set_of_parent_nodes(children, my_depth, pw, &mut pb ));
+        my_depth += 1;
+        children = newChildren;
+    }
+    let pg = children.remove(0);
+    // TODO this assumes the last page written is still in pb.
+    // it has to be.
+    let buf = pb.into_buf();
+    let seg = pg.into_segment_location(buf);
+
+    Ok(seg)
 }
 
 fn create_segment<I>(mut pw: PageWriter, 
                         source: I,
+                        f: std::rc::Rc<std::cell::RefCell<File>>,
                        ) -> Result<SegmentLocation> where I: Iterator<Item=Result<kvp>> {
 
     let leaves = try!(write_leaves(&mut pw, source));
-    let root_page = try!(write_parent_node_tree(leaves, 0, &mut pw ));
+
+    let seg = 
+        match leaves {
+            Leaves::Multiple(leaves) => {
+                assert!(leaves.len() > 0);
+                let seg = try!(write_parent_node_tree(leaves, 0, &mut pw ));
+                seg
+            },
+            Leaves::One(seg) => {
+                seg
+            },
+        };
+
     try!(pw.end());
 
-    Ok(root_page.into_segment_location())
+    Ok(seg)
 }
 
 struct OverflowReader {
@@ -4484,17 +4512,11 @@ pub enum PageCursor {
 }
 
 impl PageCursor {
-    fn new(path: &str, 
+    fn new_already_read_page(path: &str, 
            f: std::rc::Rc<std::cell::RefCell<File>>,
            pagenum: PageNum,
            mut buf: Lend<Box<[u8]>>
           ) -> Result<PageCursor> {
-
-        {
-            let f = &mut *(f.borrow_mut());
-            try!(utils::SeekPage(f, buf.len(), pagenum));
-            try!(misc::io::read_fully(f, &mut buf));
-        }
 
         let pt = try!(PageType::from_u8(buf[0]));
         let sub = 
@@ -4516,6 +4538,22 @@ impl PageCursor {
             };
 
         Ok(sub)
+    }
+
+    fn new(path: &str, 
+           f: std::rc::Rc<std::cell::RefCell<File>>,
+           pagenum: PageNum,
+           mut buf: Lend<Box<[u8]>>
+          ) -> Result<PageCursor> {
+
+        {
+            let f = &mut *(f.borrow_mut());
+            try!(utils::SeekPage(f, buf.len(), pagenum));
+            try!(misc::io::read_fully(f, &mut buf));
+        }
+
+        Self::new_already_read_page(path, f, pagenum, buf)
+
     }
 
     pub fn page_type(&self) -> PageType {
@@ -5875,20 +5913,16 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
             for page in segments.iter() {
                 let pagenum = *page;
 
-                // TODO it's a little silly here to construct a Lend<>
-                let buf = vec![0; pgsz].into_boxed_slice();
-                let done_page = move |_| -> () {
-                };
-                let mut buf = Lend::new(buf, box done_page);
-
-                {
-                    let f = &mut *(f.borrow_mut());
-                    try!(utils::SeekPage(f, buf.len(), pagenum));
-                    try!(misc::io::read_fully(f, &mut buf));
-                }
+                let buf = try!(read_and_alloc_page(&f, pagenum, pgsz));
 
                 let pt = try!(PageType::from_u8(buf[0]));
-                let mut blist = 
+                let mut blist = {
+                    // TODO it's a little silly here to construct a Lend<>
+                    let done_page = move |_| -> () {
+                    };
+                    // TODO and the clone below is silly too
+                    let mut buf = Lend::new(buf.clone(), box done_page);
+
                     match pt {
                         PageType::LEAF_NODE => {
                             let page = try!(LeafPage::new_already_read_page(path, f.clone(), pagenum, buf));
@@ -5898,14 +5932,12 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
                             let page = try!(ParentPage::new_already_read_page(path, f.clone(), pagenum, buf));
                             try!(page.blocklist_unsorted())
                         },
-                    };
+                    }
+                };
 
                 blist.sort_and_consolidate();
 
-                let seg = SegmentLocation {
-                    root_page: pagenum,
-                    blocks: blist,
-                };
+                let seg = SegmentLocation::new(pagenum, buf, blist);
 
                 v.push(seg);
             }
@@ -6257,9 +6289,9 @@ impl Space {
 
 #[derive(Debug)]
 enum MergeFrom {
-    Fresh{segments: Vec<SegmentLocation>},
-    Young{segments: Vec<SegmentLocation>},
-    Other{level: usize, old_segment: SegmentLocation, new_segment: SegmentLocation},
+    Fresh{segments: Vec<PageNum>},
+    Young{segments: Vec<PageNum>},
+    Other{level: usize, old_segment: PageNum, new_segment: SegmentLocation},
 }
 
 impl MergeFrom {
@@ -6275,7 +6307,7 @@ impl MergeFrom {
 #[derive(Debug)]
 pub struct PendingMerge {
     from: MergeFrom,
-    old_dest_segment: Option<SegmentLocation>,
+    old_dest_segment: Option<PageNum>,
     new_dest_segment: Option<SegmentLocation>,
     now_inactive: BlockList,
 }
@@ -6905,8 +6937,12 @@ impl InnerPart {
             .chain(header.young.iter())
             .chain(header.levels.iter())
             .map(|seg| {
-                let buf = try!(Self::get_loaner_page(inner));
-                let csr = try!(PageCursor::new(&inner.path, f.clone(), seg.root_page, buf));
+                let buf = seg.buf.clone();
+// TODO it would be nice to just let pagecursor have a reference. Arc?
+                let done_page = move |_| -> () {
+                };
+                let buf = Lend::new(buf, box done_page);
+                let csr = try!(PageCursor::new_already_read_page(&inner.path, f.clone(), seg.root_page, buf));
                 Ok(csr)
             })
             .collect::<Result<Vec<_>>>();
@@ -7000,7 +7036,8 @@ impl InnerPart {
             Ok(kvp {Key:k, Value:v})
         });
         let pw = try!(PageWriter::new(inner.clone()));
-        let seg = try!(create_segment(pw, source));
+        let f = try!(inner.open_file_for_cursor());
+        let seg = try!(create_segment(pw, source, f));
         Ok(seg)
     }
 
@@ -7030,8 +7067,14 @@ impl InnerPart {
                     let mut cursors = Vec::with_capacity(merge_segments.len());
                     for i in 0 .. merge_segments.len() {
                         let pagenum = merge_segments[i].root_page;
-                        let mut buf = try!(InnerPart::get_loaner_page(inner));
-                        let cursor = try!(PageCursor::new(&inner.path, f.clone(), pagenum, buf));
+
+                        // TODO it's a little silly here to construct a Lend<>
+                        let done_page = move |_| -> () {
+                        };
+                        // TODO and the clone below is silly too
+                        let buf = Lend::new(merge_segments[i].buf.clone(), box done_page);
+
+                        let cursor = try!(PageCursor::new_already_read_page(&inner.path, f.clone(), pagenum, buf));
                         cursors.push(cursor);
                     }
 
@@ -7076,13 +7119,7 @@ impl InnerPart {
                     FromLevel::Other(level) => {
                         assert!(header.levels.len() > level);
                         let old_from_segment = header.levels[level].clone();
-                        let mut buf = try!(Self::get_loaner_page(inner));
-                        {
-                            let f = &mut *(f.borrow_mut());
-                            try!(utils::SeekPage(f, buf.len(), old_from_segment.root_page));
-                            try!(misc::io::read_fully(f, &mut buf));
-                        }
-                        let pt = try!(PageType::from_u8(buf[0]));
+                        let pt = try!(PageType::from_u8(old_from_segment.buf[0]));
                         match pt {
                             PageType::LEAF_NODE => {
                                 // TODO this should be avoidable by now as well.  the size check on
@@ -7091,6 +7128,12 @@ impl InnerPart {
                                 return Ok(None);
                             },
                             PageType::PARENT_NODE => {
+                                // TODO it's a little silly here to construct a Lend<>
+                                let done_page = move |_| -> () {
+                                };
+                                // TODO and the clone below is silly too
+                                let buf = Lend::new(old_from_segment.buf.clone(), box done_page);
+
                                 let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), old_from_segment.root_page, buf));
                                 let size = (try!(parent.blocklist_unsorted()).count_pages() as u64) * (inner.pgsz as u64);
                                 if size < get_level_size(level) {
@@ -7143,14 +7186,15 @@ impl InnerPart {
                     DestLevel::Other(dest_level) => {
                         if header.levels.len() > dest_level {
                             let dest_segment = header.levels[dest_level].clone();
-                            let mut buf = try!(Self::get_loaner_page(inner));
-                            {
-                                let f = &mut *(f.borrow_mut());
-                                try!(utils::SeekPage(f, buf.len(), dest_segment.root_page));
-                                try!(misc::io::read_fully(f, &mut buf));
-                            }
-                            let pt = try!(PageType::from_u8(buf[0]));
-                            let dest_leaves = 
+                            let pt = try!(PageType::from_u8(dest_segment.buf[0]));
+
+                            // TODO it's a little silly here to construct a Lend<>
+                            let done_page = move |_| -> () {
+                            };
+                            // TODO and the clone below is silly too
+                            let buf = Lend::new(dest_segment.buf.clone(), box done_page);
+
+                            let dest_leaves = {
                                 match pt {
                                     PageType::LEAF_NODE => {
                                         //println!("root of the dest segment is a leaf");
@@ -7167,7 +7211,8 @@ impl InnerPart {
                                         let dest_leaves: Box<Iterator<Item=Result<pgitem>>> = box LeafIterator::new(parent);
                                         dest_leaves
                                     },
-                                };
+                                }
+                            };
 
                             (dest_leaves, Some(dest_segment))
                         } else {
@@ -7210,8 +7255,13 @@ impl InnerPart {
                 behind_blocks.sort_and_consolidate();
                 let mut behind_cursors = Vec::with_capacity(behind_segments.len());
                 for i in 0 .. behind_segments.len() {
-                    let mut buf = try!(Self::get_loaner_page(inner));
-                    let cursor = try!(PageCursor::new(&inner.path, f.clone(), behind_segments[i].root_page, buf));
+                    // TODO it's a little silly here to construct a Lend<>
+                    let done_page = move |_| -> () {
+                    };
+                    // TODO and the clone below is silly too
+                    let buf = Lend::new(behind_segments[i].buf.clone(), box done_page);
+
+                    let cursor = try!(PageCursor::new_already_read_page(&inner.path, f.clone(), behind_segments[i].root_page, buf));
                     behind_cursors.push(cursor);
                 }
                 let behind_rlock =
@@ -7249,11 +7299,14 @@ impl InnerPart {
                     None
                 } else if leaves.len() == 1 {
                     let mut leaves = leaves;
-                    let z = leaves.remove(0);
-                    Some(z)
+                    let pg = leaves.remove(0);
+                    // TODO write_merge should return a buf for the last leaf it wrote
+                    let buf = try!(read_and_alloc_page(&f, pg.page, pw.page_size()));
+                    let seg = pg.into_segment_location(buf);
+                    Some(seg)
                 } else {
-                    let z = try!(write_parent_node_tree(leaves, 0, &mut pw ));
-                    Some(z)
+                    let seg = try!(write_parent_node_tree(leaves, 0, &mut pw ));
+                    Some(seg)
                 }
             } else {
                 None
@@ -7303,14 +7356,26 @@ impl InnerPart {
         let from = 
             match from {
                 MergingFrom::Fresh{segments} => {
+                    let segments = segments.into_iter().map(|seg| seg.root_page).collect::<Vec<_>>();
                     MergeFrom::Fresh{segments: segments}
                 },
                 MergingFrom::Young{segments} => {
+                    let segments = segments.into_iter().map(|seg| seg.root_page).collect::<Vec<_>>();
                     MergeFrom::Young{segments: segments}
                 },
                 MergingFrom::Other{level, old_segment, depth, remaining_siblings, ..} => {
-                    let new_from = try!(write_parent_node_tree(remaining_siblings, depth, &mut pw));
-                    MergeFrom::Other{level: level, old_segment: old_segment, new_segment: new_from.into_segment_location()}
+                    if remaining_siblings.len() == 0 {
+                        unreachable!();
+                    } else if remaining_siblings.len() == 1 {
+                        let mut remaining_siblings = remaining_siblings;
+                        let pg = remaining_siblings.remove(0);
+                        let buf = try!(read_and_alloc_page(&f, pg.page, pw.page_size()));
+                        let seg = pg.into_segment_location(buf);
+                        MergeFrom::Other{level: level, old_segment: old_segment.root_page, new_segment: seg}
+                    } else {
+                        let seg = try!(write_parent_node_tree(remaining_siblings, depth, &mut pw));
+                        MergeFrom::Other{level: level, old_segment: old_segment.root_page, new_segment: seg}
+                    }
                 },
             };
 
@@ -7334,8 +7399,7 @@ impl InnerPart {
         // TODO do we need to remove_anything_in the new_from_segment ?
         // TODO or just assert that they don't intersect?
 
-        let new_dest_segment = new_dest_segment.map(|pg| pg.into_segment_location());
-
+        let old_dest_segment = old_dest_segment.map(|seg| seg.root_page);
         let pm = 
             PendingMerge {
                 from: from,
@@ -7355,7 +7419,7 @@ impl InnerPart {
 
             let mut newHeader = header.clone();
 
-            fn update_header(newHeader: &mut HeaderData, old_dest_segment: Option<SegmentLocation>, new_dest_segment: Option<SegmentLocation>, dest_level: usize) {
+            fn update_header(newHeader: &mut HeaderData, old_dest_segment: Option<PageNum>, new_dest_segment: Option<SegmentLocation>, dest_level: usize) {
                 match (old_dest_segment, new_dest_segment) {
                     (None, None) => {
                         // a merge resulted in what would have been an empty segment.
@@ -7379,13 +7443,13 @@ impl InnerPart {
                     (Some(old), Some(new_seg)) => {
                         // level already exists
                         assert!(dest_level < newHeader.levels.len());
-                        assert!(newHeader.levels[dest_level].root_page == old.root_page);
+                        assert!(newHeader.levels[dest_level].root_page == old);
                         newHeader.levels[dest_level] = new_seg;
                     },
                 }
             }
 
-            fn find_segments_in_list(merge: &[SegmentLocation], hdr: &[SegmentLocation]) -> usize {
+            fn find_segments_in_list(merge: &[PageNum], hdr: &[SegmentLocation]) -> usize {
                 fn slice_within(sub: &[PageNum], within: &[PageNum]) -> usize {
                     match within.iter().position(|&g| g == sub[0]) {
                         Some(ndx_first) => {
@@ -7403,9 +7467,8 @@ impl InnerPart {
                 }
 
                 // verify that segemnts are contiguous and at the end
-                let merge = merge.iter().map(|seg| seg.root_page).collect::<Vec<_>>();
                 let hdr = hdr.iter().map(|seg| seg.root_page).collect::<Vec<_>>();
-                let ndx = slice_within(merge.as_slice(), hdr.as_slice());
+                let ndx = slice_within(merge, hdr.as_slice());
                 assert!(ndx == hdr.len() - merge.len());
                 ndx
             }
@@ -7440,7 +7503,7 @@ impl InnerPart {
                     update_header(&mut newHeader, pm.old_dest_segment, pm.new_dest_segment, dest_level);
                 },
                 MergeFrom::Other{level, old_segment, new_segment} => {
-                    assert!(old_segment.root_page == newHeader.levels[level].root_page);
+                    assert!(old_segment == newHeader.levels[level].root_page);
                     newHeader.levels[level] = new_segment;
 
                     let dest_level = level + 1;
