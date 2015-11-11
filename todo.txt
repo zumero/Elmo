@@ -5,10 +5,6 @@ so they can properly error on invalid pages read from the file.
 need to figure out a place to call truncate_file_if_possible()
 every so often.
 
-consider having add_free_blocks() just put the new stuff into
-a waiting area, and only do the sorts on the main free block list
-every so often.
-
 avoiding rewrites of leaves has a downside:  once something is
 high up in the file, it probably won't move, the file doesn't
 shrink much, and ends up with a lot of empty blocks in it.
@@ -18,7 +14,6 @@ allow block allocation policy that always selects the earliest block?
 to make open_cursor faster, for every run in the current
 state:
     cache the first page
-    and cache the blocklist
 
 to reduce fragmentation:
 
@@ -49,7 +44,7 @@ and merge working entirely at the granularity of a leaf.
 I suppose the real issue of a segment with a million
 leaves is that write_leaves() returns them all in a vec.
 
-look for ways to make index entry encoding more compact
+look for ways to make elmo index entry encoding more compact
 
 at some point, review all decisions about what actually gets stored
 in the parent page and make sure it's worth it.  two keys?  full
@@ -71,17 +66,6 @@ page for use by segments.  which means the PageWriter stuff needs
 to know that not all pages are the same size (in terms of their
 usable space).  and create_segment() needs to know how big its
 next page is going to be.
-
-can track open cursors (as read locks to prevent replaced segments
-for being freed yet) by page now.  but we can't drop those read
-locks on read_page(), letting each one go as we walk through
-a full segment with Next(), because somebody might call Prev()
-or First().  and we probably don't want to add thousands of
-little locks.  rather, we need the notion of "I have a lock on
-this page and all the pages it uses."  Kind of like what we
-have now, but works on the page number.  or maybe each read lock
-is a blocklist.  a page/block can be freed as soon as it is
-not a member of any readlock's blocklist.
 
 it is true that any given page (leaf or parent) can only have one
 parent at a time?  but the page (on disk) does not know its parent,
@@ -138,11 +122,6 @@ update rust nightly?
 separate lsm code into multiple files (modules) so we can get 
 better privacy on struct fields
 
-rethink how merged segments are reclaimed into free space.
-locking issues.  send a message to a separate thread, telling
-it that the segment has become a zombie, and to reclaim it
-whenever possible?
-
 ability to merge entire file  (into what level? 2?)
 
 ability to compact a file (write entire thing into one clean new file
@@ -193,10 +172,6 @@ what about cases that don't use it?
 tempted to limit key size.  no overflows for keys.  key is limited by
 the page size (minus overhead).  if you need a bigger key, then use a
 bigger page size.
-
-currently using trait objects Seek+Write for writing to the db.  the overhead
-of dynamic dispatch is negligible compared to the IO, right?  lack of
-inline optimization?  verify this.
 
 what if db goes out of scope with pending segments?
 
