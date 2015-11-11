@@ -1,4 +1,7 @@
 
+lots of bufadvance and varint read calls should probably return Result
+so they can properly error on invalid pages read from the file.
+
 need to figure out a place to call truncate_file_if_possible()
 every so often.
 
