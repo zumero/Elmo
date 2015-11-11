@@ -1,6 +1,15 @@
 
+can we have the segment page objects reference the buf in the
+header instead of cloning it?
+
+get rid of pagepool?
+
+add ability to pass overflows through on merge without rewriting them.
+important for large values.
+
 lots of bufadvance and varint read calls should probably return Result
 so they can properly error on invalid pages read from the file.
+or, when parsing a page, check before calling them.
 
 need to figure out a place to call truncate_file_if_possible()
 every so often.
@@ -11,15 +20,13 @@ shrink much, and ends up with a lot of empty blocks in it.
 
 allow block allocation policy that always selects the earliest block?
 
-to reduce fragmentation:
-
-    experiment with write_merge and decisions to reuse leaves.
-    allow specifying the minimum number of consecutive leaves to 
-    be reused.
+experiment with write_merge and decisions to reuse leaves.
+allow specifying the minimum number of consecutive leaves to 
+be reused.
 
 maybe everywhere we read a page (cursors), instead of a file,
-we should provide an object which abstracts the reading of the
-page with a cache.
+we should provide an object which abstracts the reading of page.
+allows a cache.  or a non-file.
 
 read_page(0) calls probably not needed
 
@@ -30,15 +37,26 @@ need finer grained merge locks?
 lsm_diag should just have show_page
 
 consider fiddling with the depth at which parent nodes
-store child block lists.  more than just one?  would
-need parent nodes fit calculations to account for the
-size of the encoded block lists.
+store child block lists.  more than just one?  do we
+need them at all?  would need parent nodes fit calculations 
+to account for the size of the encoded block lists.  
+do we need this anyway?
+
+perf problem with storing locations of each page in parent pages?
+    seek doesn't need them.
+    next/prev doesn't need them.
+    so most of the time, they're not needed.
+    but they take up space, so lots fewer things fit in a parent page
+    which means the btree gets deeper
+    store locations elsewhere?
+    sidecar page for every parent page, just to store locations?
 
 still need to be concerned about really big segments
 and merge working entirely at the granularity of a leaf.
-
 I suppose the real issue of a segment with a million
 leaves is that write_leaves() returns them all in a vec.
+need write_leaves() to return an iterator which can be
+passed to write_parent_node_tree().
 
 look for ways to make elmo index entry encoding more compact
 
@@ -52,23 +70,19 @@ rotate through the key space?
 
 having last_key be an Option<> is so tedious
 
-do we need a Page class like PageCursor which can represent either
-LeafPage or ParentPage, with a common set of methods?
+rm dead page class
+
+rm dead MultiPageCursor?  or will we need this later for cases
+where we are merging from Other level N to N+1 and want to select 
+more than a leaf and less then a parent?
 
 header can get really small.  so small that we no longer want to 
 waste 4096 bytes or an entire page on it.  it needs to live on
 a portion of the first page, with the rest available as a short
 page for use by segments.  which means the PageWriter stuff needs
 to know that not all pages are the same size (in terms of their
-usable space).  and create_segment() needs to know how big its
-next page is going to be.
-
-it is true that any given page (leaf or parent) can only have one
-parent at a time?  but the page (on disk) does not know its parent,
-because the parent can change, and we don't want to rewrite it when
-that happens.
-
---------
+usable space).  and callers of PageWriter need to know how big
+the next page is going to be.
 
 do binary search of keys in the parent page like in the leaf?
 
@@ -76,25 +90,13 @@ not sure a parent page with only one item in it makes much sense
 
 code for calc/build/write leaf and parent has gotten awfully similar
 
-go back to only one key?  just keep the last key of each item?
+go back to only one key in parent page?  just keep the last key of 
+each item?
 
-multiple prefixes?
-
-get rid of the blocklists?  currently only at depth 1.
-
-perf problem with storing locations of each page in parent pages?
-    seek doesn't need them.
-    next/prev doesn't need them.
-    so most of the time, they're not needed.
-    but they take up space, so lots fewer things fit in a parent page
-    which means the btree gets deeper
-    store locations elsewhere?
-    sidecar page for every parent page, just to store locations?
+multiple prefixes, so we can have better compression of keys in
+parent page?
 
 any way to represent/store keys as deltas?  vcdiff?
-
-get rid of pagenum in leaf/parent cursor?  diag only?  probably not.
-I think this gets used more now.
 
 need more tests of large overflows, especially with block allocation
 issues, fragmentation, etc.
@@ -102,14 +104,11 @@ issues, fragmentation, etc.
 drop db needs to wait until threads end?  need a way to wait until
 threads end?
 
-it might be nice for merges to pass a hint down to create_segment()
-which estimates how many pages will be needed so that it can
-pass that hint on when it asks for a block so it can avoid using
-little tiny blocks.
-
 tune block sizes for perf?
 
-figure out proper limits for how much should be at each level
+figure out proper limits for how much should be at each level.
+currently using geometric like leveldb, sometimes with the
+factor as low as 2.
 
 fix all the lsm tests
 
@@ -118,7 +117,7 @@ update rust nightly?
 separate lsm code into multiple files (modules) so we can get 
 better privacy on struct fields
 
-ability to merge entire file  (into what level? 2?)
+ability to merge entire file
 
 ability to compact a file (write entire thing into one clean new file
 with no free blocks)
@@ -155,24 +154,7 @@ more complicated.
 
 reduce malloc
 
-looks like kvp stuff should probably stay boxed.  both the key and value
-always need to be held longer than one iteration, usually until the
-end of the leaf, and one key for each leaf gets held longer than that.
-which means if the caller provided this as a reference instead of a box,
-we would have to make a copy no matter what, and if the caller had to
-construct a box anyway, we would have done it twice.
-
-a little worried about the KeyCompare always being built in to Seek.
-what about cases that don't use it?
-
-tempted to limit key size.  no overflows for keys.  key is limited by
-the page size (minus overhead).  if you need a bigger key, then use a
-bigger page size.
-
-what if db goes out of scope with pending segments?
-
-let's not panic (int underflow) when we try to write a segment
-but the source iterator provides no pairs
+are we using Arc too much now?
 
 https://github.com/zslayton/lifeguard
 
@@ -180,44 +162,11 @@ cleanup bcmp and friends
 
 vbuf reuse write leaves
 
-review lock ordering
-
 keyInLeafs should share code.
 
 same for Value and ValueRef code
 
-wonder:  cargo bench and callgrind quick() are not the same test.
-bunch is cross-crate  quick() is not.  quick() is the one that
-shows the weird arena_avail calls.  bunch is the one that shows
-the perf degradation.
-
-compare_two makes far more difference than Key() and Value()
-
-removing Overflowed from KeyRef doesn't help.  also removing
-Result wrapper around KeyRef (with Overflowed removed) doesn't
-help.
-
-lto in Cargo.toml doesn't help (and no longer crashes in current
-nightly)
-
-FWIW, switching the new multicursor sort algo to compare_two makes
-a big difference in perf.  compare_two is still way faster than
-KeyRef, and the main difference seems to be in extra work being
-done by jemalloc, for whatever reason.  also, I tried changing KeyRef
-to be smaller by changing Prefixed to store a ref to the page buffer
-and a cur and a len, the latter both as u16, instead of the two
-bytes slices before.  this should have changed the size of that
-enum case from 32 bytes to 12.  and this made very little difference
-in perf, so I never committed it.
-
-interesting to compare differences between the original compare_two
-and one that simply gets two KeyRefs and calls KeyRef::cmp.
-
-shouldn't it warn if a function returns Result but it cannot return Err?
-
-want to write lint to disallow tabs
-
-clean up organization of this code into modules
+want to write lint to disallow tabs?
 
 perhaps, when reading stuff from a buffer, instead of using a cur variable,
 we should use the Read impl of slice
@@ -231,11 +180,9 @@ read bson value without alloc?  but then we need to give references into
 the buffer, which might be big.  that's basically read bson value with
 only one (big) alloc for the object itself.
 
-TODO this cursor needs to expose the changeCounter and segment list
+TODO the cursor needs to expose the changeCounter and segment list
 on which it is based. for optimistic writes.  caller can grab a cursor,
 do their writes, then grab the writelock, and grab another cursor, then
 compare the two cursors to see if anything important changed.  if not,
 commit their writes.  if so, nevermind the written segments and start over.
-
-
 
