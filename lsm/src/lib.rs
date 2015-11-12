@@ -618,8 +618,7 @@ pub enum KeyRef<'a> {
     // the other two are references into the page
     Prefixed(&'a [u8],&'a [u8]),
 
-    // TODO rename to Slice
-    Array(&'a [u8]),
+    Slice(&'a [u8]),
 }
 
 impl<'a> std::fmt::Debug for KeyRef<'a> {
@@ -627,7 +626,7 @@ impl<'a> std::fmt::Debug for KeyRef<'a> {
         match *self {
             KeyRef::Boxed(ref a) => write!(f, "Boxed, a={:?}", a),
             KeyRef::Prefixed(front,back) => write!(f, "Prefixed, front={:?}, back={:?}", front, back),
-            KeyRef::Array(a) => write!(f, "Array, val={:?}", a),
+            KeyRef::Slice(a) => write!(f, "Array, val={:?}", a),
         }
     }
 }
@@ -636,7 +635,7 @@ impl<'a> KeyRef<'a> {
     pub fn len(&self) -> usize {
         match *self {
             KeyRef::Boxed(ref a) => a.len(),
-            KeyRef::Array(a) => a.len(),
+            KeyRef::Slice(a) => a.len(),
             KeyRef::Prefixed(front, back) => front.len() + back.len(),
         }
     }
@@ -650,7 +649,7 @@ impl<'a> KeyRef<'a> {
                     Err(Error::Misc(String::from("u8_at: out of range 1")))
                 }
             },
-            &KeyRef::Array(a) => {
+            &KeyRef::Slice(a) => {
                 if i < a.len() {
                     Ok(a[i])
                 } else {
@@ -693,7 +692,7 @@ impl<'a> KeyRef<'a> {
             &KeyRef::Boxed(ref a) => {
                 bcmp::Compare(&a, &k)
             },
-            &KeyRef::Array(a) => {
+            &KeyRef::Slice(a) => {
                 bcmp::Compare(&a, &k)
             },
             &KeyRef::Prefixed(front, back) => {
@@ -710,7 +709,7 @@ impl<'a> KeyRef<'a> {
                 &KeyRef::Boxed(ref a) => {
                     k == &a[0 .. k.len()]
                 },
-                &KeyRef::Array(a) => {
+                &KeyRef::Slice(a) => {
                     k == &a[0 .. k.len()]
                 },
                 &KeyRef::Prefixed(front, back) => {
@@ -737,7 +736,7 @@ impl<'a> KeyRef<'a> {
             return Err(Error::Misc(String::from("illegal range")));
         }
         match self {
-            &KeyRef::Array(a) => {
+            &KeyRef::Slice(a) => {
                 if end <= a.len() {
                     let t = try!(func(&a[begin .. end]));
                     Ok(t)
@@ -789,7 +788,7 @@ impl<'a> KeyRef<'a> {
     }
 
     pub fn for_slice(k: &[u8]) -> KeyRef {
-        KeyRef::Array(k)
+        KeyRef::Slice(k)
     }
 
     pub fn into_boxed_slice(self) -> Box<[u8]> {
@@ -797,7 +796,7 @@ impl<'a> KeyRef<'a> {
             KeyRef::Boxed(a) => {
                 a
             },
-            KeyRef::Array(a) => {
+            KeyRef::Slice(a) => {
                 let mut k = Vec::with_capacity(a.len());
                 k.push_all(a);
                 k.into_boxed_slice()
@@ -887,25 +886,25 @@ impl<'a> KeyRef<'a> {
             (&KeyRef::Boxed(ref x_k), &KeyRef::Prefixed(ref y_p, ref y_k)) => {
                 Self::compare_x_py(&x_k, y_p, y_k)
             },
-            (&KeyRef::Boxed(ref x_k), &KeyRef::Array(ref y_k)) => {
+            (&KeyRef::Boxed(ref x_k), &KeyRef::Slice(ref y_k)) => {
                 bcmp::Compare(&x_k, &y_k)
             },
             (&KeyRef::Prefixed(ref x_p, ref x_k), &KeyRef::Boxed(ref y_k)) => {
                 Self::compare_px_y(x_p, x_k, &y_k)
             },
-            (&KeyRef::Array(ref x_k), &KeyRef::Boxed(ref y_k)) => {
+            (&KeyRef::Slice(ref x_k), &KeyRef::Boxed(ref y_k)) => {
                 bcmp::Compare(&x_k, &y_k)
             },
             (&KeyRef::Prefixed(ref x_p, ref x_k), &KeyRef::Prefixed(ref y_p, ref y_k)) => {
                 Self::compare_px_py(x_p, x_k, y_p, y_k)
             },
-            (&KeyRef::Prefixed(ref x_p, ref x_k), &KeyRef::Array(ref y_k)) => {
+            (&KeyRef::Prefixed(ref x_p, ref x_k), &KeyRef::Slice(ref y_k)) => {
                 Self::compare_px_y(x_p, x_k, y_k)
             },
-            (&KeyRef::Array(ref x_k), &KeyRef::Prefixed(ref y_p, ref y_k)) => {
+            (&KeyRef::Slice(ref x_k), &KeyRef::Prefixed(ref y_p, ref y_k)) => {
                 Self::compare_x_py(x_k, y_p, y_k)
             },
-            (&KeyRef::Array(ref x_k), &KeyRef::Array(ref y_k)) => {
+            (&KeyRef::Slice(ref x_k), &KeyRef::Slice(ref y_k)) => {
                 bcmp::Compare(&x_k, &y_k)
             },
         }
@@ -916,7 +915,7 @@ impl<'a> KeyRef<'a> {
 /// Like a ValueRef, but cannot represent a tombstone.  Available
 /// only from a LivingCursor.
 pub enum LiveValueRef<'a> {
-    Array(&'a [u8]),
+    Slice(&'a [u8]),
     // TODO return the information about the overflow, but don't
     // open the stream yet.  for the merge case, we want to allow
     // for the overflow to be moved without copying it.
@@ -926,14 +925,14 @@ pub enum LiveValueRef<'a> {
 impl<'a> LiveValueRef<'a> {
     pub fn len(&self) -> usize {
         match *self {
-            LiveValueRef::Array(a) => a.len(),
+            LiveValueRef::Slice(a) => a.len(),
             LiveValueRef::Overflowed(len, _) => len,
         }
     }
 
     pub fn into_blob(self) -> Blob {
         match self {
-            LiveValueRef::Array(a) => {
+            LiveValueRef::Slice(a) => {
                 let mut k = Vec::with_capacity(a.len());
                 k.push_all(a);
                 Blob::Array(k.into_boxed_slice())
@@ -945,7 +944,7 @@ impl<'a> LiveValueRef<'a> {
     // dangerous function if len() is big
     pub fn into_boxed_slice(self) -> Result<Box<[u8]>> {
         match self {
-            LiveValueRef::Array(a) => {
+            LiveValueRef::Slice(a) => {
                 let mut v = Vec::with_capacity(a.len());
                 v.push_all(a);
                 Ok(v.into_boxed_slice())
@@ -965,7 +964,7 @@ impl<'a> LiveValueRef<'a> {
     /// gets called without alloc or copy.
     pub fn map<T, F: Fn(&[u8]) -> Result<T>>(self, func: F) -> Result<T> {
         match self {
-            LiveValueRef::Array(a) => {
+            LiveValueRef::Slice(a) => {
                 let t = try!(func(a));
                 Ok(t)
             },
@@ -983,14 +982,14 @@ impl<'a> LiveValueRef<'a> {
 impl<'a> std::fmt::Debug for LiveValueRef<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         match *self {
-            LiveValueRef::Array(a) => write!(f, "Array, len={:?}", a),
+            LiveValueRef::Slice(a) => write!(f, "Array, len={:?}", a),
             LiveValueRef::Overflowed(klen,_) => write!(f, "Overflowed, len={}", klen),
         }
     }
 }
 
 pub enum ValueRef<'a> {
-    Array(&'a [u8]),
+    Slice(&'a [u8]),
     // TODO return the information about the overflow, but don't
     // open the stream yet.  for the merge case, we want to allow
     // for the overflow to be moved without copying it.
@@ -1001,7 +1000,7 @@ pub enum ValueRef<'a> {
 impl<'a> ValueRef<'a> {
     pub fn len(&self) -> Option<usize> {
         match *self {
-            ValueRef::Array(a) => Some(a.len()),
+            ValueRef::Slice(a) => Some(a.len()),
             ValueRef::Overflowed(len, _) => Some(len),
             ValueRef::Tombstone => None,
         }
@@ -1009,7 +1008,7 @@ impl<'a> ValueRef<'a> {
 
     pub fn into_blob(self) -> Blob {
         match self {
-            ValueRef::Array(a) => {
+            ValueRef::Slice(a) => {
                 let mut k = Vec::with_capacity(a.len());
                 k.push_all(a);
                 Blob::Array(k.into_boxed_slice())
@@ -1024,7 +1023,7 @@ impl<'a> ValueRef<'a> {
 impl<'a> std::fmt::Debug for ValueRef<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         match *self {
-            ValueRef::Array(a) => write!(f, "Array, len={:?}", a),
+            ValueRef::Slice(a) => write!(f, "Array, len={:?}", a),
             ValueRef::Overflowed(klen,_) => write!(f, "Overflowed, len={}", klen),
             ValueRef::Tombstone => write!(f, "Tombstone"),
         }
@@ -2222,7 +2221,7 @@ pub struct LivingCursor {
 impl LivingCursor {
     pub fn LiveValueRef<'a>(&'a self) -> Result<LiveValueRef<'a>> {
         match try!(self.chain.ValueRef()) {
-            ValueRef::Array(a) => Ok(LiveValueRef::Array(a)),
+            ValueRef::Slice(a) => Ok(LiveValueRef::Slice(a)),
             ValueRef::Overflowed(len, r) => Ok(LiveValueRef::Overflowed(len, r)),
             ValueRef::Tombstone => Err(Error::Misc(String::from("LiveValueRef tombstone TODO unreachable"))),
         }
@@ -3300,6 +3299,7 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                     behind: &mut Vec<PageCursor>,
                ) -> Result<bool> {
 
+        // TODO
         // in leveldb, this is simpler.  they don't do a full seek.  rather,
         // they keep a tombstone if any upstream segments have any "files"
         // that overlap the key.  it's a shallower search.
@@ -3311,7 +3311,7 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
         // then we could optimize cases where we already know that the key is not present
         // in behind because, for example, we hit the max key in behind already.
 
-        let k = KeyRef::Array(k);
+        let k = KeyRef::Slice(k);
 
         for mut cursor in behind.iter_mut() {
             if SeekResult::Equal == try!(cursor.SeekRef(&k, SeekOp::SEEK_EQ)) {
@@ -3340,6 +3340,9 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
     let mut leaves_recycled = 0;
     loop {
         // TODO which cases below should check to see if a tombstone can be filtered?
+
+        // TODO the way the code below moves things out of cur_pair and cur_otherleaf
+        // and then sometimes has to move them back.  so dorky.
         match (cur_pair, cur_in_other, cur_otherleaf) {
             (Some(pair), Some(i), q) => {
                 // we are in the middle of a leaf being rewritten
@@ -3995,7 +3998,7 @@ pub struct LeafPage {
     path: String,
     f: std::rc::Rc<std::cell::RefCell<File>>,
     pr: Lend<Box<[u8]>>,
-    pagenum: PageNum, // TODO diag only?
+    pagenum: PageNum,
 
     prefix: Option<Box<[u8]>>,
 
@@ -4079,7 +4082,7 @@ impl LeafPage {
     }
 
     fn overlaps(&self, range: &KeyRange) -> Result<Overlap> {
-// TODO get a KeyRangeRef first?
+        // TODO get a KeyRangeRef first?
         match try!(self.key(0)).compare_with(&range.max) {
             Ordering::Greater => {
                 Ok(Overlap::Greater)
@@ -4258,7 +4261,7 @@ impl LeafPage {
                 Ok(ValueRef::Tombstone)
             },
             &ValueInLeaf::Inline(vlen, pos) => {
-                Ok(ValueRef::Array(&self.pr[pos .. pos + vlen]))
+                Ok(ValueRef::Slice(&self.pr[pos .. pos + vlen]))
             },
             &ValueInLeaf::Overflowed(vlen, ref blocks) => {
                 // TODO return blocks instead of opening the stream
@@ -4450,73 +4453,6 @@ impl ICursor for LeafCursor {
     }
 
 }
-
-/* TODO use or rm
-pub enum Page {
-    Leaf(LeafPage),
-    Parent(ParentPage),
-}
-
-impl Page {
-    fn new(path: &str, 
-           f: std::rc::Rc<std::cell::RefCell<File>>,
-           pagenum: PageNum,
-           mut buf: Lend<Box<[u8]>>
-          ) -> Result<Page> {
-
-        {
-            let f = &mut *(f.borrow_mut());
-            try!(utils::SeekPage(f, buf.len(), pagenum));
-            try!(misc::io::read_fully(f, &mut buf));
-        }
-
-        let pt = try!(PageType::from_u8(buf[0]));
-        let sub = 
-            match pt {
-                PageType::LEAF_NODE => {
-                    let page = try!(LeafPage::new_already_read_page(path, f, pagenum, buf));
-                    Page::Leaf(page)
-                },
-                PageType::PARENT_NODE => {
-                    let page = try!(ParentPage::new_already_read_page(path, f, pagenum, buf));
-                    Page::Parent(page)
-                },
-                PageType::OVERFLOW_NODE => {
-                    return Err(Error::CorruptFile("child page has invalid page type"));
-                },
-            };
-
-        Ok(sub)
-    }
-
-    pub fn page_type(&self) -> PageType {
-        match self {
-            &Page::Leaf(_) => {
-                PageType::LEAF_NODE
-            },
-            &Page::Parent(_) => {
-                PageType::PARENT_NODE
-            },
-        }
-    }
-
-    fn read_page(&mut self, pg: PageNum) -> Result<()> {
-        match self {
-            &mut Page::Leaf(ref mut c) => {
-                try!(c.read_page(pg));
-            },
-            &mut Page::Parent(ref mut c) => {
-                try!(c.read_page(pg));
-            },
-        }
-        Ok(())
-    }
-
-// TODO complete_blocklist
-
-// TODO first and last key
-}
-*/
 
 pub enum PageCursor {
     Leaf(LeafCursor),
@@ -4717,7 +4653,7 @@ impl KeyInPage {
                         Ok(KeyRef::Prefixed(&a, &pr[at .. at + klen - a.len()]))
                     },
                     None => {
-                        Ok(KeyRef::Array(&pr[at .. at + klen]))
+                        Ok(KeyRef::Slice(&pr[at .. at + klen]))
                     },
                 }
             },
@@ -4912,7 +4848,7 @@ pub struct ParentPage {
     path: String,
     f: std::rc::Rc<std::cell::RefCell<File>>,
     pr: Lend<Box<[u8]>>,
-    pagenum: PageNum, // TODO diag only?
+    pagenum: PageNum,
 
     prefix: Option<Box<[u8]>>,
     children: Vec<ParentPageItem>,

@@ -1,4 +1,17 @@
 
+vec capacities
+
+name Array to Slice
+
+ValueRef not overflowed, block ref
+
+prepare_merge clones too much stuff
+
+value length u64
+
+at some point we should review which asserts we really want in release
+builds and perf check without the rest of them.
+
 can we have the segment page objects reference the buf in the
 header instead of cloning it?
 
@@ -27,8 +40,6 @@ be reused.
 maybe everywhere we read a page (cursors), instead of a file,
 we should provide an object which abstracts the reading of page.
 allows a cache.  or a non-file.
-
-read_page(0) calls probably not needed
 
 revisit when to check for tombstones during write_merge
 
