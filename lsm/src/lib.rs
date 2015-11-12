@@ -69,12 +69,9 @@ pub type PageCount = u32;
 
 pub enum Blob {
     Stream(Box<Read>),
-    Array(Box<[u8]>),
+    Boxed(Box<[u8]>),
     Tombstone,
-    // TODO Graveyard?  (considered a delete of anything with the prefix?)
-
-    // TODO consider having a way here to represent an overflow so 
-    // that it can be moved without copying it during a merge
+    SameFileOverflow(usize, BlockList),
 }
 
 impl Blob {
@@ -82,7 +79,8 @@ impl Blob {
         match self {
             &Blob::Tombstone => true,
             &Blob::Stream(_) => false,
-            &Blob::Array(_) => false,
+            &Blob::Boxed(_) => false,
+            &Blob::SameFileOverflow(_, _) => false,
         }
     }
 }
@@ -613,7 +611,7 @@ fn split3<T>(a: &mut [T], i: usize) -> (&mut [T], &mut [T], &mut [T]) {
 
 pub enum KeyRef<'a> {
     Boxed(Box<[u8]>),
-    // TODO consider a type representing an overflow reference?
+    // TODO consider a type representing an overflow reference with len and blocks?
 
     // the other two are references into the page
     Prefixed(&'a [u8],&'a [u8]),
@@ -912,45 +910,86 @@ impl<'a> KeyRef<'a> {
 }
 
 
+pub enum ValueRef<'a> {
+    Slice(&'a [u8]),
+    // TODO should the file and pgsz be in here?
+    Overflowed(String, usize, usize, BlockList),
+    Tombstone,
+}
+
 /// Like a ValueRef, but cannot represent a tombstone.  Available
 /// only from a LivingCursor.
 pub enum LiveValueRef<'a> {
     Slice(&'a [u8]),
-    // TODO return the information about the overflow, but don't
-    // open the stream yet.  for the merge case, we want to allow
-    // for the overflow to be moved without copying it.
-    Overflowed(usize, Box<Read>),
+    // TODO should the file and pgsz be in here?
+    Overflowed(String, usize, usize, BlockList),
+}
+
+impl<'a> ValueRef<'a> {
+    pub fn len(&self) -> Option<usize> {
+        match *self {
+            ValueRef::Slice(a) => Some(a.len()),
+            ValueRef::Overflowed(_, _, len, _) => Some(len),
+            ValueRef::Tombstone => None,
+        }
+    }
+
+    pub fn into_blob_for_merge(self) -> Blob {
+        match self {
+            ValueRef::Slice(a) => {
+                let mut k = Vec::with_capacity(a.len());
+                k.push_all(a);
+                Blob::Boxed(k.into_boxed_slice())
+            },
+            ValueRef::Overflowed(path, pgsz, len, blocks) => Blob::SameFileOverflow(len, blocks),
+            ValueRef::Tombstone => Blob::Tombstone,
+        }
+    }
+
+}
+
+impl<'a> std::fmt::Debug for ValueRef<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
+        match *self {
+            ValueRef::Slice(a) => write!(f, "Array, len={:?}", a),
+            ValueRef::Overflowed(_, _, len, _) => write!(f, "Overflowed, len={}", len),
+            ValueRef::Tombstone => write!(f, "Tombstone"),
+        }
+    }
 }
 
 impl<'a> LiveValueRef<'a> {
     pub fn len(&self) -> usize {
         match *self {
             LiveValueRef::Slice(a) => a.len(),
-            LiveValueRef::Overflowed(len, _) => len,
+            LiveValueRef::Overflowed(_, _, len, _) => len,
         }
     }
 
-    pub fn into_blob(self) -> Blob {
+    pub fn into_blob_for_merge(self) -> Blob {
         match self {
             LiveValueRef::Slice(a) => {
                 let mut k = Vec::with_capacity(a.len());
                 k.push_all(a);
-                Blob::Array(k.into_boxed_slice())
+                Blob::Boxed(k.into_boxed_slice())
             },
-            LiveValueRef::Overflowed(_, r) => Blob::Stream(r),
+            LiveValueRef::Overflowed(path, pgsz, len, blocks) => Blob::SameFileOverflow(len, blocks),
         }
     }
 
-    // dangerous function if len() is big
-    pub fn into_boxed_slice(self) -> Result<Box<[u8]>> {
+    // TODO dangerous function if len() is big
+    // TODO change this to return a stream, and require file/pgsz?
+    #[cfg(remove_me)]
+    pub fn _into_boxed_slice(self) -> Result<Box<[u8]>> {
         match self {
             LiveValueRef::Slice(a) => {
                 let mut v = Vec::with_capacity(a.len());
                 v.push_all(a);
                 Ok(v.into_boxed_slice())
             },
-            LiveValueRef::Overflowed(len, mut strm) => {
+            LiveValueRef::Overflowed(ref path, pgsz, len, ref blocks) => {
                 let mut a = Vec::with_capacity(len);
+                let mut strm = try!(OverflowReader::new(path, pgsz, blocks.blocks[0].firstPage, len));
                 try!(strm.read_to_end(&mut a));
                 Ok(a.into_boxed_slice())
             },
@@ -962,14 +1001,16 @@ impl<'a> LiveValueRef<'a> {
     /// or not.  This function accepts a func which is to be applied to the value.
     /// If the value was overflowed, it will be read into memory.  Otherwise, the func
     /// gets called without alloc or copy.
+    // TODO this func is dangerous if len is big
     pub fn map<T, F: Fn(&[u8]) -> Result<T>>(self, func: F) -> Result<T> {
         match self {
             LiveValueRef::Slice(a) => {
                 let t = try!(func(a));
                 Ok(t)
             },
-            LiveValueRef::Overflowed(len, mut strm) => {
+            LiveValueRef::Overflowed(ref path, pgsz, len, ref blocks) => {
                 let mut a = Vec::with_capacity(len);
+                let mut strm = try!(OverflowReader::new(path, pgsz, blocks.blocks[0].firstPage, len));
                 try!(strm.read_to_end(&mut a));
                 assert!(len == a.len());
                 let t = try!(func(&a));
@@ -983,49 +1024,7 @@ impl<'a> std::fmt::Debug for LiveValueRef<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         match *self {
             LiveValueRef::Slice(a) => write!(f, "Array, len={:?}", a),
-            LiveValueRef::Overflowed(klen,_) => write!(f, "Overflowed, len={}", klen),
-        }
-    }
-}
-
-pub enum ValueRef<'a> {
-    Slice(&'a [u8]),
-    // TODO return the information about the overflow, but don't
-    // open the stream yet.  for the merge case, we want to allow
-    // for the overflow to be moved without copying it.
-    Overflowed(usize, Box<Read>),
-    Tombstone,
-}
-
-impl<'a> ValueRef<'a> {
-    pub fn len(&self) -> Option<usize> {
-        match *self {
-            ValueRef::Slice(a) => Some(a.len()),
-            ValueRef::Overflowed(len, _) => Some(len),
-            ValueRef::Tombstone => None,
-        }
-    }
-
-    pub fn into_blob(self) -> Blob {
-        match self {
-            ValueRef::Slice(a) => {
-                let mut k = Vec::with_capacity(a.len());
-                k.push_all(a);
-                Blob::Array(k.into_boxed_slice())
-            },
-            ValueRef::Overflowed(_, r) => Blob::Stream(r),
-            ValueRef::Tombstone => Blob::Tombstone,
-        }
-    }
-
-}
-
-impl<'a> std::fmt::Debug for ValueRef<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
-        match *self {
-            ValueRef::Slice(a) => write!(f, "Array, len={:?}", a),
-            ValueRef::Overflowed(klen,_) => write!(f, "Overflowed, len={}", klen),
-            ValueRef::Tombstone => write!(f, "Tombstone"),
+            LiveValueRef::Overflowed(_, _, len, _) => write!(f, "Overflowed, len={}", len),
         }
     }
 }
@@ -1169,6 +1168,8 @@ pub enum SeekOp {
     SEEK_GE = 2,
 }
 
+// TODO consider changing the name of this to make it clear that is only for merge,
+// since it uses Blob::SameFileOverflow.
 struct CursorIterator {
     csr: Box<IForwardCursor>,
 }
@@ -1196,7 +1197,7 @@ impl Iterator for CursorIterator {
                 if v.is_err() {
                     return Some(Err(v.err().unwrap()));
                 }
-                let v = v.unwrap().into_blob();
+                let v = v.unwrap().into_blob_for_merge();
                 v
             };
             let r = self.csr.Next();
@@ -2222,7 +2223,7 @@ impl LivingCursor {
     pub fn LiveValueRef<'a>(&'a self) -> Result<LiveValueRef<'a>> {
         match try!(self.chain.ValueRef()) {
             ValueRef::Slice(a) => Ok(LiveValueRef::Slice(a)),
-            ValueRef::Overflowed(len, r) => Ok(LiveValueRef::Overflowed(len, r)),
+            ValueRef::Overflowed(path, pgsz, len, blocks) => Ok(LiveValueRef::Overflowed(path, pgsz, len, blocks)),
             ValueRef::Tombstone => Err(Error::Misc(String::from("LiveValueRef tombstone TODO unreachable"))),
         }
     }
@@ -3108,7 +3109,10 @@ fn process_pair_into_leaf(st: &mut LeafState,
                     ValueLocation::Overflowed (len, blocks)
                 }
             },
-            Blob::Array(a) => {
+            Blob::SameFileOverflow(len, blocks) => {
+                ValueLocation::Overflowed(len, blocks)
+            },
+            Blob::Boxed(a) => {
                 // TODO should be <= ?
                 if a.len() < maxValueInline {
                     ValueLocation::Buffer(a)
@@ -3379,7 +3383,7 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                         }
                     },
                     Ordering::Less => {
-                        let leafpair = try!(leafreader.kvp(i));
+                        let leafpair = try!(leafreader.kvp_for_merge(i));
                         //println!("otherpair wins: {:?}", leafpair.Key);
                         if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, leafpair)) {
                             try!(chain.add_child(pw, pg));
@@ -3395,7 +3399,7 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                 cur_otherleaf = q;
             },
             (None, Some(i), q) => {
-                let pair = try!(leafreader.kvp(i));
+                let pair = try!(leafreader.kvp_for_merge(i));
                 //println!("regular pairs gone, otherpair: {:?}", pair.Key);
                 if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
                     try!(chain.add_child(pw, pg));
@@ -4244,9 +4248,9 @@ impl LeafPage {
         }
     }
 
-    fn kvp(&self, n: usize) -> Result<kvp> {
+    fn kvp_for_merge(&self, n: usize) -> Result<kvp> {
         let k = try!(self.key(n)).into_boxed_slice();
-        let v = try!(self.value(n)).into_blob();
+        let v = try!(self.value(n)).into_blob_for_merge();
         let p = kvp {
             Key: k,
             Value: v,
@@ -4264,9 +4268,7 @@ impl LeafPage {
                 Ok(ValueRef::Slice(&self.pr[pos .. pos + vlen]))
             },
             &ValueInLeaf::Overflowed(vlen, ref blocks) => {
-                // TODO return blocks instead of opening the stream
-                let strm = try!(OverflowReader::new(&self.path, self.pr.len(), blocks.blocks[0].firstPage, vlen));
-                Ok(ValueRef::Overflowed(vlen, box strm))
+                Ok(ValueRef::Overflowed(self.path.clone(), self.pr.len(), vlen, blocks.clone()))
             },
         }
     }
