@@ -104,15 +104,15 @@ fn list_segments(name: &str) -> Result<(),lsm::Error> {
     let (fresh, young, levels) = try!(db.list_segments());
     println!("fresh ({}): ", fresh.len());
     for s in fresh.iter() {
-        println!("{:?}", s);
+        println!("{}", s);
     }
     println!("young ({}): ", young.len());
     for s in young.iter() {
-        println!("{:?}", s);
+        println!("{}", s);
     }
     println!("levels ({}): ", levels.len());
     for s in levels.iter() {
-        println!("{:?}", s);
+        println!("{}", s);
     }
     Ok(())
 }
