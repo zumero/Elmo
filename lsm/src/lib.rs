@@ -600,7 +600,7 @@ fn get_level_size(i: usize) -> u64 {
     for _ in 0 .. i + 1 {
         // TODO tune this factor.
         // for leveldb, it is 10.
-        n *= 10;
+        n *= 2;
     }
     n * 1024 * 1024
 }
@@ -1407,7 +1407,7 @@ struct PageBuilder {
 
 impl PageBuilder {
     fn new(pgsz : usize) -> PageBuilder { 
-        let ba = vec![0;pgsz as usize].into_boxed_slice();
+        let ba = vec![0; pgsz as usize].into_boxed_slice();
         PageBuilder { cur: 0, buf:ba } 
     }
 
@@ -2574,6 +2574,16 @@ struct pgitem {
 }
 
 impl pgitem {
+    fn new(page: PageNum, blocks: BlockList, first_key: KeyWithLocation, last_key: Option<KeyWithLocation>) -> pgitem {
+        assert!(!blocks.contains_page(page));
+        pgitem {
+            page: page,
+            blocks: blocks,
+            first_key: first_key,
+            last_key: last_key,
+        }
+    }
+
     fn into_segment_location(self, buf: Box<[u8]>) -> SegmentLocation {
         SegmentLocation::new(self.page, buf, self.blocks)
     }
@@ -2950,12 +2960,14 @@ fn write_leaf(st: &mut LeafState,
     //println!("leaf blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
     assert!(st.keys_in_this_leaf.is_empty());
     let thisPageNumber = try!(pw.write_page(pb.buf()));
+    // TODO pgitem::new
     let pg = pgitem {
         page: thisPageNumber, 
         blocks: blocks,
         first_key: first_key,
         last_key: last_key
     };
+    assert!(!pg.blocks.contains_page(pg.page));
     st.sofarLeaf = 0;
     st.prefixLen = 0;
     Ok((len_page, pg))
@@ -3218,15 +3230,10 @@ fn flush_leaf(st: &mut LeafState,
     }
 }
 
-enum Leaves {
-    One(SegmentLocation),
-    Multiple(Vec<pgitem>),
-}
-
 fn write_leaves<I: Iterator<Item=Result<kvp>>, >(
                     pw: &mut PageWriter,
                     mut pairs: I,
-                    ) -> Result<Leaves> {
+                    ) -> Result<Option<SegmentLocation>> {
 
     let mut pb = PageBuilder::new(pw.page_size());
 
@@ -3243,30 +3250,24 @@ fn write_leaves<I: Iterator<Item=Result<kvp>>, >(
         prev_key: None,
     };
 
-    let mut items = vec![];
+    let mut chain = ParentNodeWriter::new(pw.page_size(), 0);
+
     for result_pair in pairs {
         let pair = try!(result_pair);
         if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
             //try!(pg.verify(pw.page_size(), path, f.clone()));
-            items.push(pg);
+            try!(chain.add_child(pw, pg));
         }
     }
     if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
         //try!(pg.verify(pw.page_size(), path, f.clone()));
-        items.push(pg);
+        try!(chain.add_child(pw, pg));
     }
 
-    if items.len() > 1 {
-        Ok(Leaves::Multiple(items))
-    } else {
-        let mut leaves = items;
-        let pg = leaves.remove(0);
-        // TODO this assumes the last page written is still in pb.
-        // it has to be.
-        let buf = pb.into_buf();
-        let seg = pg.into_segment_location(buf);
-        Ok(Leaves::One(seg))
-    }
+    // TODO this assumes the last page written is still in pb.  it has to be.
+    let seg = try!(chain.done(pw, pb.into_buf()));
+
+    Ok(seg)
 }
 
 fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
@@ -3276,7 +3277,7 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                     mut behind: Vec<PageCursor>,
                     path: &str,
                     f: std::rc::Rc<std::cell::RefCell<File>>,
-                    ) -> Result<Vec<pgitem>> {
+                    ) -> Result<Option<SegmentLocation>> {
 
     let mut pb = PageBuilder::new(pw.page_size());
 
@@ -3295,7 +3296,6 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
 
     let mut cur_otherleaf = try!(misc::inside_out(leaves.next()));
 
-    let mut items = vec![];
     fn necessary_tombstone(k: &[u8], 
                     behind: &mut Vec<PageCursor>,
                ) -> Result<bool> {
@@ -3321,6 +3321,8 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
         }
         Ok(false)
     }
+
+    let mut chain = ParentNodeWriter::new(pw.page_size(), 0);
 
     // TODO how would this algorithm be adjusted to work at a different depth?
     // like, suppose instead of leaves, we were given depth 1 parents?
@@ -3353,7 +3355,7 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                         //println!("otherpair greater, pair from merge: {:?}", pair.Key);
                         if !pair.Value.is_tombstone() || try!(necessary_tombstone(&pair.Key, &mut behind)) {
                             if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                                items.push(pg);
+                                try!(chain.add_child(pw, pg));
                             }
                         }
                         cur_pair = try!(misc::inside_out(pairs.next()));
@@ -3362,7 +3364,7 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                         //println!("otherpair equal, pair from merge: {:?}", pair.Key);
                         if !pair.Value.is_tombstone() || try!(necessary_tombstone(&pair.Key, &mut behind)) {
                             if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                                items.push(pg);
+                                try!(chain.add_child(pw, pg));
                             }
                         }
                         cur_pair = try!(misc::inside_out(pairs.next()));
@@ -3377,7 +3379,7 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                         let leafpair = try!(leafreader.kvp(i));
                         //println!("otherpair wins: {:?}", leafpair.Key);
                         if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, leafpair)) {
-                            items.push(pg);
+                            try!(chain.add_child(pw, pg));
                         }
                         if i + 1 < leafreader.count_keys() {
                             cur_in_other = Some(i + 1);
@@ -3393,7 +3395,7 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                 let pair = try!(leafreader.kvp(i));
                 //println!("regular pairs gone, otherpair: {:?}", pair.Key);
                 if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                    items.push(pg);
+                    try!(chain.add_child(pw, pg));
                 }
                 if i + 1 < leafreader.count_keys() {
                     cur_in_other = Some(i + 1);
@@ -3406,7 +3408,7 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
             (Some(pair), None, None) => {
                 //println!("everything else gone, regular pair: {:?}", pair.Key);
                 if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                    items.push(pg);
+                    try!(chain.add_child(pw, pg));
                 }
                 cur_pair = try!(misc::inside_out(pairs.next()));
                 cur_otherleaf = None;
@@ -3414,9 +3416,9 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
             (None, None, Some(pg)) => {
                 //println!("everything else gone, reusing page: {:?}", pg);
                 if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
-                    items.push(pg);
+                    try!(chain.add_child(pw, pg));
                 }
-                items.push(pg);
+                try!(chain.add_child(pw, pg));
                 leaves_recycled += 1;
                 cur_otherleaf = try!(misc::inside_out(leaves.next()));
                 cur_pair = None;
@@ -3426,7 +3428,7 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                     KeyInRange::Less => {
                         //println!("regular pair less than next otherleaf: {:?}", pair.Key);
                         if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                            items.push(pg);
+                            try!(chain.add_child(pw, pg));
                         }
                         cur_pair = try!(misc::inside_out(pairs.next()));
                         cur_otherleaf = Some(pg);
@@ -3436,9 +3438,9 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                         //println!("regular pair passed otherleaf, reusing: {:?}", pg);
                         assert!(cur_in_other.is_none());
                         if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
-                            items.push(pg);
+                            try!(chain.add_child(pw, pg));
                         }
-                        items.push(pg);
+                        try!(chain.add_child(pw, pg));
                         leaves_recycled += 1;
                         cur_otherleaf = try!(misc::inside_out(leaves.next()));
                         cur_pair = Some(pair);
@@ -3462,7 +3464,7 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
             },
             (None, None, None) => {
                 if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
-                    items.push(pg);
+                    try!(chain.add_child(pw, pg));
                 }
                 break;
             },
@@ -3473,391 +3475,405 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
 
     //println!("leaves rewritten = {}   recycled = {}", leaves_rewritten, leaves_recycled);
 
-    Ok(items)
+    // TODO this assumes the last page written is still in pb.  it has to be.
+    let seg = try!(chain.done(pw, pb.into_buf()));
+
+    Ok(seg)
 }
 
-fn write_parent_node_tree(
-                       children: Vec<pgitem>,
-                       children_depth: u8,
-                       pw: &mut PageWriter,
-                      ) -> Result<SegmentLocation> {
+struct ParentNodeWriter {
+    pb: PageBuilder,
+    st: ParentState,
+    prev_child: Option<pgitem>,
+    depth: u8,
 
-    fn write_one_set_of_parent_nodes(
-                           children: Vec<pgitem>,
-                           my_depth: u8,
-                           pw: &mut PageWriter,
-                           pb: &mut PageBuilder,
-                          ) -> Result<Vec<pgitem>> {
+    result_one: Option<pgitem>,
+    results_chain: Option<Box<ParentNodeWriter>>,
+}
 
-        fn calc_page_len(prefix_len: usize, sofar: usize) -> usize {
-            2 // page type and flags
-            + 1 // stored depth
-            + 2 // stored count
-            + varint::space_needed_for(prefix_len as u64) 
-            + prefix_len 
-            + sofar // sum of size of all the actual items
-        }
-
-        fn build_parent_page(st: &mut ParentState, 
-                          pb: &mut PageBuilder,
-                          my_depth: u8,
-                          ) -> (KeyWithLocation, Option<KeyWithLocation>, BlockList, usize) {
-            // TODO? assert!(st.items.len() > 1);
-            //println!("build_parent_page, prefixLen: {:?}", st.prefixLen);
-            //println!("build_parent_page, items: {:?}", st.items);
-            pb.Reset();
-            pb.PutByte(PageType::PARENT_NODE.to_u8());
-            pb.PutByte(0u8);
-            pb.PutByte(my_depth);
-            pb.PutVarint(st.prefixLen as u64);
-            if st.prefixLen > 0 {
-                pb.PutArray(&st.items[0].first_key.key[0 .. st.prefixLen]);
-            }
-            pb.PutInt16(st.items.len() as u16);
-            //println!("st.items.len(): {}", st.items.len());
-
-            let mut list = BlockList::new();
-
-            fn put_key(pb: &mut PageBuilder, k: &KeyWithLocation, prefix_len: usize) {
-                match k.location {
-                    KeyLocation::Inline => {
-                        pb.PutArray(&k.key[prefix_len .. ]);
-                    },
-                    KeyLocation::Overflowed(ref blocks) => {
-                        // TODO capacity, no temp vec
-                        let mut v = vec![];
-                        blocks.encode(&mut v);
-                        pb.PutArray(&v);
-                    },
-                }
-            }
-
-            fn put_item(pb: &mut PageBuilder, my_depth: u8, list: &mut BlockList, item: &pgitem, prefix_len: usize) {
-                pb.PutVarint(item.page as u64);
-                list.add_page_no_reorder(item.page);
-                if my_depth == 1 {
-                    // TODO capacity, no temp vec
-                    let mut v = vec![];
-                    item.blocks.encode(&mut v);
-                    pb.PutArray(&v);
-                }
-                list.add_blocklist_no_reorder(&item.blocks);
-
-                pb.PutVarint(item.first_key.len_with_overflow_flag());
-                put_key(pb, &item.first_key, prefix_len);
-
-                match item.last_key {
-                    Some(ref last_key) => {
-                        pb.PutVarint(last_key.len_with_overflow_flag());
-                        put_key(pb, &last_key, prefix_len);
-                    },
-                    None => {
-                        pb.PutVarint(0);
-                    },
-                }
-            }
-
-            // deal with the first item separately
-            let (first_key, last_key_from_first_item) = {
-                let item = st.items.remove(0); 
-                put_item(pb, my_depth, &mut list, &item, st.prefixLen);
-                (item.first_key, item.last_key)
-            };
-
-            if st.items.len() == 0 {
-                // there was only one item in this page
-                list.sort_and_consolidate();
-                (first_key, last_key_from_first_item, list, pb.sofar())
-            } else {
-                if st.items.len() > 1 {
-                    // deal with all the remaining items except the last one
-                    let tmp_count = st.items.len() - 1;
-                    for item in st.items.drain(0 .. tmp_count) {
-                        put_item(pb, my_depth, &mut list, &item, st.prefixLen);
-                    }
-                }
-                assert!(st.items.len() == 1);
-
-                // now the last item
-                let last_key = {
-                    let item = st.items.remove(0); 
-                    put_item(pb, my_depth, &mut list, &item, st.prefixLen);
-                    match item.last_key {
-                        Some(last_key) => last_key,
-                        None => item.first_key,
-                    }
-                };
-                assert!(st.items.is_empty());
-
-                list.sort_and_consolidate();
-                (first_key, Some(last_key), list, pb.sofar())
-            }
-        }
-
-        fn write_parent_page(st: &mut ParentState, 
-                              pb: &mut PageBuilder, 
-                              pw: &mut PageWriter,
-                              my_depth: u8,
-                             ) -> Result<(usize, pgitem)> {
-            // assert st.sofar > 0
-            let (first_key, last_key, blocks, len_page) = build_parent_page(st, pb, my_depth);
-            assert!(st.items.is_empty());
-            //println!("parent blocklist: {:?}", blocks);
-            //println!("parent blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
-            let thisPageNumber = try!(pw.write_page(pb.buf()));
-            let pg = pgitem {
-                page: thisPageNumber, 
-                blocks: blocks,
-                first_key: first_key,
-                last_key: last_key,
-            };
-            st.sofar = 0;
-            st.prefixLen = 0;
-            Ok((len_page, pg))
-        }
-
-        let mut st = ParentState {
+impl ParentNodeWriter {
+    fn new(
+        pgsz: usize, 
+        children_depth: u8,
+        ) -> Self {
+        let st = ParentState {
             prefixLen: 0,
             sofar: 0,
             items: vec![],
         };
 
-        fn calc_prefix_len(st: &ParentState, item: &pgitem) -> usize {
-            if st.items.is_empty() {
-                match item.last_key {
-                    Some(ref last_key) => {
-                        bcmp::PrefixMatch(&*item.first_key.key, &last_key.key, last_key.key.len())
-                    },
-                    None => {
-                        item.first_key.key.len()
-                    },
-                }
-            } else {
-                if st.prefixLen > 0 {
-                    let a =
-                        match &item.first_key.location {
-                            &KeyLocation::Inline => {
-                                bcmp::PrefixMatch(&*st.items[0].first_key.key, &item.first_key.key, st.prefixLen)
-                            },
-                            &KeyLocation::Overflowed(_) => {
-                                // an overflowed key does not change the prefix
-                                st.prefixLen
-                            },
-                        };
-                    let b = 
-                        match item.last_key {
-                            Some(ref last_key) => {
-                                match &last_key.location {
-                                    &KeyLocation::Inline => {
-                                        bcmp::PrefixMatch(&*st.items[0].first_key.key, &last_key.key, a)
-                                    },
-                                    &KeyLocation::Overflowed(_) => {
-                                        // an overflowed key does not change the prefix
-                                        a
-                                    },
-                                }
-                            },
-                            None => {
-                                a
-                            },
-                        };
-                    b
-                } else {
-                    0
-                }
-            }
+        ParentNodeWriter {
+            pb: PageBuilder::new(pgsz),
+            st: st,
+            prev_child: None,
+            depth: children_depth + 1,
+            result_one: None,
+            results_chain: None,
         }
+    }
 
-        let pgsz = pw.page_size();
+    fn calc_page_len(prefix_len: usize, sofar: usize) -> usize {
+        2 // page type and flags
+        + 1 // stored depth
+        + 2 // stored count
+        + varint::space_needed_for(prefix_len as u64) 
+        + prefix_len 
+        + sofar // sum of size of all the actual items
+    }
 
-        let mut prev_child: Option<pgitem> = None;
+    fn put_key(&mut self, k: &KeyWithLocation, prefix_len: usize) {
+        match k.location {
+            KeyLocation::Inline => {
+                self.pb.PutArray(&k.key[prefix_len .. ]);
+            },
+            KeyLocation::Overflowed(ref blocks) => {
+                // TODO capacity, no temp vec
+                let mut v = vec![];
+                blocks.encode(&mut v);
+                self.pb.PutArray(&v);
+            },
+        }
+    }
 
-        let mut new_items = vec![];
-        for child in children {
+    fn put_item(&mut self, list: &mut BlockList, item: &pgitem, prefix_len: usize) {
+        self.pb.PutVarint(item.page as u64);
+        list.add_page_no_reorder(item.page);
+        if self.depth == 1 {
+            // TODO capacity, no temp vec
+            let mut v = vec![];
+            item.blocks.encode(&mut v);
+            self.pb.PutArray(&v);
+        }
+        list.add_blocklist_no_reorder(&item.blocks);
 
-            if cfg!(expensive_check) 
-            {
-                // TODO FYI this code is the only reason we need to derive Clone on
-                // pgitem and its parts
-                match prev_child {
-                    None => {
-                    },
-                    Some(prev_child) => {
-                        let c = child.first_key.key.cmp(&prev_child.first_key.key);
-                        if c != Ordering::Greater {
-                            println!("prev_child first_key: {:?}", prev_child.first_key);
-                            println!("cur child first_key: {:?}", child.first_key);
-                            panic!("unsorted child pages");
-                        }
-                        match &prev_child.last_key {
-                            &Some(ref last_key) => {
-                                let c = child.first_key.key.cmp(&last_key.key);
-                                if c != Ordering::Greater {
-                                    println!("prev_child first_key: {:?}", prev_child.first_key);
-                                    println!("prev_child last_key: {:?}", last_key);
-                                    println!("cur child first_key: {:?}", child.first_key);
-                                    panic!("overlapping child pages");
-                                }
-                            },
-                            &None => {
-                            },
-                        }
-                    },
+        self.pb.PutVarint(item.first_key.len_with_overflow_flag());
+        self.put_key(&item.first_key, prefix_len);
+
+        match item.last_key {
+            Some(ref last_key) => {
+                self.pb.PutVarint(last_key.len_with_overflow_flag());
+                self.put_key(&last_key, prefix_len);
+            },
+            None => {
+                self.pb.PutVarint(0);
+            },
+        }
+    }
+
+    fn build_parent_page(&mut self,
+                      ) -> (KeyWithLocation, Option<KeyWithLocation>, BlockList, usize) {
+        // TODO? assert!(st.items.len() > 1);
+        //println!("build_parent_page, prefixLen: {:?}", st.prefixLen);
+        //println!("build_parent_page, items: {:?}", st.items);
+        self.pb.Reset();
+        self.pb.PutByte(PageType::PARENT_NODE.to_u8());
+        self.pb.PutByte(0u8);
+        self.pb.PutByte(self.depth);
+        self.pb.PutVarint(self.st.prefixLen as u64);
+        if self.st.prefixLen > 0 {
+            self.pb.PutArray(&self.st.items[0].first_key.key[0 .. self.st.prefixLen]);
+        }
+        self.pb.PutInt16(self.st.items.len() as u16);
+        //println!("self.st.items.len(): {}", self.st.items.len());
+
+        let mut list = BlockList::new();
+
+        // deal with the first item separately
+        let (first_key, last_key_from_first_item) = {
+            let item = self.st.items.remove(0); 
+            let prefix_len = self.st.prefixLen;
+            self.put_item(&mut list, &item, prefix_len);
+            (item.first_key, item.last_key)
+        };
+
+        if self.st.items.len() == 0 {
+            // there was only one item in this page
+            list.sort_and_consolidate();
+            (first_key, last_key_from_first_item, list, self.pb.sofar())
+        } else {
+            if self.st.items.len() > 1 {
+                // deal with all the remaining items except the last one
+                let tmp_count = self.st.items.len() - 1;
+                let tmp_vec = self.st.items.drain(0 .. tmp_count).collect::<Vec<_>>();
+                let prefix_len = self.st.prefixLen;
+                for item in tmp_vec {
+                    self.put_item(&mut list, &item, prefix_len);
                 }
-                prev_child = Some(child.clone());
             }
+            assert!(self.st.items.len() == 1);
 
-            // to fit this child into this parent page, we need room for
-            // the root page
-            // the block list
-            // prefixLen, varint
-            // (prefix)
-            // key len 1, varint, shifted for overflow flag
-            // key 1
-            //     if inline, the key, minus prefix
-            //     if overflow, the blocklist (borrowed from child)
-            // key len 2, varint, shifted for overflow flag, 0 if absent
-            // key 2, if present
-            //     if inline, the key, minus prefix
-            //     if overflow, the blocklist (borrowed from child)
-
-            // each key is stored just as it was in the child, inline or overflow.
-            // if it is overflowed, we just store the same blocklist reference.
-
-            // claim:  if both keys fit inlined in the child, they can both
-            // fit inlined here in the parent page.
-
-            let fits = {
-                let would_be_prefix_len = calc_prefix_len(&st, &child);
-                let would_be_sofar = 
-                    if would_be_prefix_len != st.prefixLen {
-                        assert!(st.prefixLen == 0 || would_be_prefix_len < st.prefixLen);
-                        // the prefixLen would change with the addition of this key,
-                        // so we need to recalc sofar
-                        let sum = st.items.iter().map(|lp| lp.need(would_be_prefix_len, my_depth) ).sum();;
-                        sum
-                    } else {
-                        st.sofar
-                    };
-                let would_be_len_page = calc_page_len(would_be_prefix_len, would_be_sofar);
-                if pgsz > would_be_len_page {
-                    let available = pgsz - would_be_len_page;
-                    let fits = available >= child.need(would_be_prefix_len, my_depth);
-                    if !fits && st.items.len() == 0 {
-                        println!("would_be_len_page: {}", would_be_len_page);
-                        println!("would_be_so_far: {}", would_be_sofar);
-                        println!("child: {:?}", child);
-                        println!("child need: {}",child.need(would_be_prefix_len, my_depth));
-                        //println!("child blocklist blocks: {}", child.blocks.len());
-                        //println!("child blocklist pages: {}", child.blocks.count_pages());
-                        //println!("child blocklist encoded_len: {}", child.blocks.encoded_len());
-                        panic!();
-                    }
-                    fits
-                } else {
-                    if st.items.len() == 0 {
-                        println!("would_be_len_page: {}", would_be_len_page);
-                        println!("would_be_so_far: {}", would_be_sofar);
-                        println!("child: {:?}", child);
-                        panic!();
-                    }
-                    false
+            // now the last item
+            let last_key = {
+                let item = self.st.items.remove(0); 
+                let prefix_len = self.st.prefixLen;
+                self.put_item(&mut list, &item, prefix_len);
+                match item.last_key {
+                    Some(last_key) => last_key,
+                    None => item.first_key,
                 }
             };
+            assert!(self.st.items.is_empty());
 
-            if !fits {
-                // if the assert below fires, that's bad.  it means we have a child item which
-                // is too small for a parent page even if it is the only thing on that page.
-                // it probably means the block list for that child item got out of control.
-                assert!(st.items.len() > 0);
-                let should_be = calc_page_len(st.prefixLen, st.sofar);
-                let (len_page, pg) = try!(write_parent_page(&mut st, pb, pw, my_depth));
-                // TODO try!(pg.verify(pw.page_size(), path, f.clone()));
-                new_items.push(pg);
-                //println!("should_be = {}   len_page = {}", should_be, len_page);
-                assert!(should_be == len_page);
-                assert!(st.items.is_empty());
+            list.sort_and_consolidate();
+            (first_key, Some(last_key), list, self.pb.sofar())
+        }
+    }
+
+    fn write_parent_page(&mut self,
+                          pw: &mut PageWriter,
+                         ) -> Result<(usize, pgitem)> {
+        // assert st.sofar > 0
+        let (first_key, last_key, blocks, len_page) = self.build_parent_page();
+        assert!(self.st.items.is_empty());
+        //println!("parent blocklist: {:?}", blocks);
+        //println!("parent blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
+        let thisPageNumber = try!(pw.write_page(self.pb.buf()));
+        // TODO pgitem::new
+        let pg = pgitem {
+            page: thisPageNumber, 
+            blocks: blocks,
+            first_key: first_key,
+            last_key: last_key,
+        };
+        assert!(!pg.blocks.contains_page(pg.page));
+        self.st.sofar = 0;
+        self.st.prefixLen = 0;
+        Ok((len_page, pg))
+    }
+
+    fn calc_prefix_len(&self, item: &pgitem) -> usize {
+        if self.st.items.is_empty() {
+            match item.last_key {
+                Some(ref last_key) => {
+                    bcmp::PrefixMatch(&*item.first_key.key, &last_key.key, last_key.key.len())
+                },
+                None => {
+                    item.first_key.key.len()
+                },
             }
+        } else {
+            if self.st.prefixLen > 0 {
+                let a =
+                    match &item.first_key.location {
+                        &KeyLocation::Inline => {
+                            bcmp::PrefixMatch(&*self.st.items[0].first_key.key, &item.first_key.key, self.st.prefixLen)
+                        },
+                        &KeyLocation::Overflowed(_) => {
+                            // an overflowed key does not change the prefix
+                            self.st.prefixLen
+                        },
+                    };
+                let b = 
+                    match item.last_key {
+                        Some(ref last_key) => {
+                            match &last_key.location {
+                                &KeyLocation::Inline => {
+                                    bcmp::PrefixMatch(&*self.st.items[0].first_key.key, &last_key.key, a)
+                                },
+                                &KeyLocation::Overflowed(_) => {
+                                    // an overflowed key does not change the prefix
+                                    a
+                                },
+                            }
+                        },
+                        None => {
+                            a
+                        },
+                    };
+                b
+            } else {
+                0
+            }
+        }
+    }
 
-            // see if the prefix len actually did change
-            let new_prefix_len = calc_prefix_len(&st, &child);
-            let sofar = 
-                if new_prefix_len != st.prefixLen {
-                    assert!(st.prefixLen == 0 || new_prefix_len < st.prefixLen);
-                    // the prefixLen changed with the addition of this item,
+    fn add_child(&mut self, pw: &mut PageWriter, child: pgitem) -> Result<()> {
+        let pgsz = pw.page_size();
+
+        if cfg!(expensive_check) 
+        {
+            // TODO FYI this code is the only reason we need to derive Clone on
+            // pgitem and its parts
+            match self.prev_child {
+                None => {
+                },
+                Some(ref prev_child) => {
+                    let c = child.first_key.key.cmp(&prev_child.first_key.key);
+                    if c != Ordering::Greater {
+                        println!("prev_child first_key: {:?}", prev_child.first_key);
+                        println!("cur child first_key: {:?}", child.first_key);
+                        panic!("unsorted child pages");
+                    }
+                    match &prev_child.last_key {
+                        &Some(ref last_key) => {
+                            let c = child.first_key.key.cmp(&last_key.key);
+                            if c != Ordering::Greater {
+                                println!("prev_child first_key: {:?}", prev_child.first_key);
+                                println!("prev_child last_key: {:?}", last_key);
+                                println!("cur child first_key: {:?}", child.first_key);
+                                panic!("overlapping child pages");
+                            }
+                        },
+                        &None => {
+                        },
+                    }
+                },
+            }
+            self.prev_child = Some(child.clone());
+        }
+
+        // to fit this child into this parent page, we need room for
+        // the root page
+        // the block list
+        // prefixLen, varint
+        // (prefix)
+        // key len 1, varint, shifted for overflow flag
+        // key 1
+        //     if inline, the key, minus prefix
+        //     if overflow, the blocklist (borrowed from child)
+        // key len 2, varint, shifted for overflow flag, 0 if absent
+        // key 2, if present
+        //     if inline, the key, minus prefix
+        //     if overflow, the blocklist (borrowed from child)
+
+        // each key is stored just as it was in the child, inline or overflow.
+        // if it is overflowed, we just store the same blocklist reference.
+
+        // claim:  if both keys fit inlined in the child, they can both
+        // fit inlined here in the parent page.
+
+        let fits = {
+            let would_be_prefix_len = self.calc_prefix_len(&child);
+            let would_be_sofar = 
+                if would_be_prefix_len != self.st.prefixLen {
+                    assert!(self.st.prefixLen == 0 || would_be_prefix_len < self.st.prefixLen);
+                    // the prefixLen would change with the addition of this key,
                     // so we need to recalc sofar
-                    let sum = st.items.iter().map(|lp| lp.need(new_prefix_len, my_depth) ).sum();;
+                    let sum = self.st.items.iter().map(|lp| lp.need(would_be_prefix_len, self.depth) ).sum();;
                     sum
                 } else {
-                    st.sofar
+                    self.st.sofar
                 };
-            st.sofar = sofar + child.need(new_prefix_len, my_depth);
-            st.prefixLen = new_prefix_len;
-            st.items.push(child);
-        }
+            let would_be_len_page = Self::calc_page_len(would_be_prefix_len, would_be_sofar);
+            if pgsz > would_be_len_page {
+                let available = pgsz - would_be_len_page;
+                let fits = available >= child.need(would_be_prefix_len, self.depth);
+                if !fits && self.st.items.len() == 0 {
+                    println!("would_be_len_page: {}", would_be_len_page);
+                    println!("would_be_so_far: {}", would_be_sofar);
+                    println!("child: {:?}", child);
+                    println!("child need: {}",child.need(would_be_prefix_len, self.depth));
+                    //println!("child blocklist blocks: {}", child.blocks.len());
+                    //println!("child blocklist pages: {}", child.blocks.count_pages());
+                    //println!("child blocklist encoded_len: {}", child.blocks.encoded_len());
+                    panic!();
+                }
+                fits
+            } else {
+                if self.st.items.len() == 0 {
+                    println!("would_be_len_page: {}", would_be_len_page);
+                    println!("would_be_so_far: {}", would_be_sofar);
+                    println!("child: {:?}", child);
+                    panic!();
+                }
+                false
+            }
+        };
 
-        {
-            assert!(st.items.len() > 0);
-            let should_be = calc_page_len(st.prefixLen, st.sofar);
-            let (len_page, pg) = try!(write_parent_page(&mut st, pb, pw, my_depth));
+        if !fits {
+            // if the assert below fires, that's bad.  it means we have a child item which
+            // is too small for a parent page even if it is the only thing on that page.
+            // it probably means the block list for that child item got out of control.
+            assert!(self.st.items.len() > 0);
+            let should_be = Self::calc_page_len(self.st.prefixLen, self.st.sofar);
+            let (len_page, pg) = try!(self.write_parent_page(pw));
             // TODO try!(pg.verify(pw.page_size(), path, f.clone()));
-            new_items.push(pg);
+            try!(self.emit(pw, pg));
             //println!("should_be = {}   len_page = {}", should_be, len_page);
             assert!(should_be == len_page);
-            assert!(st.items.is_empty());
+            assert!(self.st.items.is_empty());
         }
 
-        Ok(new_items)
+        // see if the prefix len actually did change
+        let new_prefix_len = self.calc_prefix_len(&child);
+        let sofar = 
+            if new_prefix_len != self.st.prefixLen {
+                assert!(self.st.prefixLen == 0 || new_prefix_len < self.st.prefixLen);
+                // the prefixLen changed with the addition of this item,
+                // so we need to recalc sofar
+                let sum = self.st.items.iter().map(|lp| lp.need(new_prefix_len, self.depth) ).sum();;
+                sum
+            } else {
+                self.st.sofar
+            };
+        self.st.sofar = sofar + child.need(new_prefix_len, self.depth);
+        self.st.prefixLen = new_prefix_len;
+        self.st.items.push(child);
+
+        Ok(())
     }
 
-    assert!(children.len() > 1);
-
-    // all the leaves are written.
-    // now write the parent pages.
-    // maybe more than one level of them.
-    // keep writing until we have written a level 
-    // which has only one node,
-    // which is the root node.
-
-    let mut children = children;
-    let mut my_depth = children_depth + 1;
-    let mut pb = PageBuilder::new(pw.page_size());
-    while children.len() > 1 {
-        // TODO FWIW, this is where we used to:
-        // before we write this layer of parent nodes, we trim all the
-        // keys to the shortest prefix that will suffice.
-
-        let newChildren = try!(write_one_set_of_parent_nodes(children, my_depth, pw, &mut pb ));
-        my_depth += 1;
-        children = newChildren;
+    fn emit(&mut self, pw: &mut PageWriter, pg: pgitem) -> Result<()> {
+        if self.results_chain.is_some() {
+            assert!(self.result_one.is_none());
+            let mut chain = self.results_chain.as_mut().unwrap();
+            try!(chain.add_child(pw, pg));
+        } else if self.result_one.is_some() {
+            let first = self.result_one.take().unwrap();
+            let mut chain = ParentNodeWriter::new(self.pb.buf.len(), self.depth);
+            try!(chain.add_child(pw, first));
+            try!(chain.add_child(pw, pg));
+            self.results_chain = Some(box chain);
+        } else {
+            self.result_one = Some(pg);
+        }
+        Ok(())
     }
-    let pg = children.remove(0);
-    // TODO this assumes the last page written is still in pb.
-    // it has to be.
-    let buf = pb.into_buf();
-    let seg = pg.into_segment_location(buf);
 
-    Ok(seg)
+    fn flush_page(&mut self, pw: &mut PageWriter) -> Result<()> {
+        let should_be = Self::calc_page_len(self.st.prefixLen, self.st.sofar);
+        let (len_page, pg) = try!(self.write_parent_page(pw));
+        // TODO try!(pg.verify(pw.page_size(), path, f.clone()));
+        try!(self.emit(pw, pg));
+        //println!("should_be = {}   len_page = {}", should_be, len_page);
+        assert!(should_be == len_page);
+        assert!(self.st.items.is_empty());
+        Ok(())
+    }
+
+    fn done(mut self, pw: &mut PageWriter, buf_last_child: Box<[u8]>) -> Result<Option<SegmentLocation>> {
+        if self.result_one.is_none() && self.results_chain.is_none() && self.st.items.len() == 1 {
+            let pg = self.st.items.remove(0);
+            let seg = pg.into_segment_location(buf_last_child);
+            Ok(Some(seg))
+        } else {
+            try!(self.flush_page(pw));
+            assert!(self.st.items.is_empty());
+            if let Some(chain) = self.results_chain {
+                assert!(self.result_one.is_none());
+                // TODO this assumes the last page written is still in pb.  it has to be.
+                let buf = self.pb.into_buf();
+                let seg = try!(chain.done(pw, buf));
+                Ok(seg)
+            } else if let Some(pg) = self.result_one {
+                // TODO this assumes the last page written is still in pb.  it has to be.
+                let buf = self.pb.into_buf();
+                let seg = pg.into_segment_location(buf);
+                Ok(Some(seg))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
 }
 
 fn create_segment<I>(mut pw: PageWriter, 
                         source: I,
                         f: std::rc::Rc<std::cell::RefCell<File>>,
-                       ) -> Result<SegmentLocation> where I: Iterator<Item=Result<kvp>> {
+                       ) -> Result<Option<SegmentLocation>> where I: Iterator<Item=Result<kvp>> {
 
-    let leaves = try!(write_leaves(&mut pw, source));
-
-    let seg = 
-        match leaves {
-            Leaves::Multiple(leaves) => {
-                assert!(leaves.len() > 0);
-                let seg = try!(write_parent_node_tree(leaves, 0, &mut pw ));
-                seg
-            },
-            Leaves::One(seg) => {
-                seg
-            },
-        };
+    let seg = try!(write_leaves(&mut pw, source));
 
     try!(pw.end());
 
@@ -4101,12 +4117,14 @@ impl LeafPage {
         blocks.sort_and_consolidate();
         let first_key = try!(self.first_key_with_location());
         let last_key = try!(self.last_key_with_location());
+        // TODO pgitem::new
         let pg = pgitem {
             page: self.pagenum,
             blocks: blocks,
             first_key: first_key,
             last_key: last_key,
         };
+        assert!(!pg.blocks.contains_page(pg.page));
         Ok(pg)
     }
 
@@ -4935,12 +4953,14 @@ impl ParentPage {
         blocks.sort_and_consolidate();
         let first_key = try!(self.first_key_with_location());
         let last_key = try!(self.last_key_with_location());
+        // TODO pgitem::new
         let pg = pgitem {
             page: self.pagenum,
             blocks: blocks,
             first_key: first_key,
             last_key: last_key,
         };
+        assert!(!pg.blocks.contains_page(pg.page));
         Ok(pg)
     }
 
@@ -4979,12 +4999,14 @@ impl ParentPage {
                 },
             }
         };
+        // TODO pgitem::new
         let pg = pgitem {
             page: self.children[i].page,
             blocks: blocks,
             first_key: first_key,
             last_key: last_key,
         };
+        assert!(!pg.blocks.contains_page(pg.page));
         Ok(pg)
     }
 
@@ -6664,7 +6686,7 @@ impl DatabaseFile {
         InnerPart::read_parent_page(&self.inner, pg)
     }
 
-    pub fn write_segment(&self, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<SegmentLocation> {
+    pub fn write_segment(&self, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<Option<SegmentLocation>> {
         InnerPart::write_segment(&self.inner, pairs)
     }
 
@@ -6981,7 +7003,7 @@ impl InnerPart {
         Ok(())
     }
 
-    fn write_segment(inner: &std::sync::Arc<InnerPart>, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<SegmentLocation> {
+    fn write_segment(inner: &std::sync::Arc<InnerPart>, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<Option<SegmentLocation>> {
         let source = pairs.into_iter().map(|t| {
             let (k, v) = t;
             Ok(kvp {Key:k, Value:v})
@@ -7245,20 +7267,8 @@ impl InnerPart {
                 // so in the case where dest_leaves is empty AND behind is empty,
                 // we could actually call write_leaves here instead.  but that is uncommon
                 // and not a big win anyway.
-                let leaves = try!(write_merge(&mut pw, source, dest_leaves, behind, &inner.path, f.clone()));
-                if leaves.len() == 0 {
-                    None
-                } else if leaves.len() == 1 {
-                    let mut leaves = leaves;
-                    let pg = leaves.remove(0);
-                    // TODO write_merge should return a buf for the last leaf it wrote
-                    let buf = try!(read_and_alloc_page(&f, pg.page, pw.page_size()));
-                    let seg = pg.into_segment_location(buf);
-                    Some(seg)
-                } else {
-                    let seg = try!(write_parent_node_tree(leaves, 0, &mut pw ));
-                    Some(seg)
-                }
+                let seg = try!(write_merge(&mut pw, source, dest_leaves, behind, &inner.path, f.clone()));
+                seg
             } else {
                 None
             };
@@ -7324,7 +7334,14 @@ impl InnerPart {
                         let seg = pg.into_segment_location(buf);
                         MergeFrom::Other{level: level, old_segment: old_segment.root_page, new_segment: seg}
                     } else {
-                        let seg = try!(write_parent_node_tree(remaining_siblings, depth, &mut pw));
+                        let last_sibling = remaining_siblings.len() - 1;
+                        let buf = try!(read_and_alloc_page(&f, remaining_siblings[last_sibling].page, pw.page_size()));
+                        let mut chain = ParentNodeWriter::new(pw.page_size(), depth);
+                        for pg in remaining_siblings {
+                            try!(chain.add_child(&mut pw, pg));
+                        }
+                        let seg = try!(chain.done(&mut pw, buf));
+                        let seg = seg.unwrap();
                         MergeFrom::Other{level: level, old_segment: old_segment.root_page, new_segment: seg}
                     }
                 },

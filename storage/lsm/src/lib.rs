@@ -1474,8 +1474,9 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
     fn commit(mut self: Box<Self>) -> Result<()> {
         if !self.pending.is_empty() {
             let pending = std::mem::replace(&mut self.pending, BTreeMap::new());
-            let seg = try!(self.myconn.conn.write_segment(pending).map_err(elmo::wrap_err));
-            try!(self.tx.commit_segment(seg).map_err(elmo::wrap_err));
+            if let Some(seg) = try!(self.myconn.conn.write_segment(pending).map_err(elmo::wrap_err)) {
+                try!(self.tx.commit_segment(seg).map_err(elmo::wrap_err));
+            }
         }
         Ok(())
     }

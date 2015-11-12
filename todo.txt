@@ -53,10 +53,10 @@ perf problem with storing locations of each page in parent pages?
 
 still need to be concerned about really big segments
 and merge working entirely at the granularity of a leaf.
-I suppose the real issue of a segment with a million
-leaves is that write_leaves() returns them all in a vec.
-need write_leaves() to return an iterator which can be
-passed to write_parent_node_tree().
+a small merge into a segment with a million leaves will
+end up rewriting a lot of parent nodes.  but if we process
+the merge at a higher depth, we will end up rewriting a lot
+more leaves than needed.
 
 look for ways to make elmo index entry encoding more compact
 
