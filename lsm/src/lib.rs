@@ -71,7 +71,7 @@ pub enum Blob {
     Stream(Box<Read>),
     Boxed(Box<[u8]>),
     Tombstone,
-    SameFileOverflow(usize, BlockList),
+    SameFileOverflow(u64, BlockList),
 }
 
 impl Blob {
@@ -913,7 +913,7 @@ impl<'a> KeyRef<'a> {
 pub enum ValueRef<'a> {
     Slice(&'a [u8]),
     // TODO should the file and pgsz be in here?
-    Overflowed(String, usize, usize, BlockList),
+    Overflowed(String, usize, u64, BlockList),
     Tombstone,
 }
 
@@ -922,13 +922,13 @@ pub enum ValueRef<'a> {
 pub enum LiveValueRef<'a> {
     Slice(&'a [u8]),
     // TODO should the file and pgsz be in here?
-    Overflowed(String, usize, usize, BlockList),
+    Overflowed(String, usize, u64, BlockList),
 }
 
 impl<'a> ValueRef<'a> {
-    pub fn len(&self) -> Option<usize> {
+    pub fn len(&self) -> Option<u64> {
         match *self {
-            ValueRef::Slice(a) => Some(a.len()),
+            ValueRef::Slice(a) => Some(a.len() as u64),
             ValueRef::Overflowed(_, _, len, _) => Some(len),
             ValueRef::Tombstone => None,
         }
@@ -959,9 +959,9 @@ impl<'a> std::fmt::Debug for ValueRef<'a> {
 }
 
 impl<'a> LiveValueRef<'a> {
-    pub fn len(&self) -> usize {
+    pub fn len(&self) -> u64 {
         match *self {
-            LiveValueRef::Slice(a) => a.len(),
+            LiveValueRef::Slice(a) => a.len() as u64,
             LiveValueRef::Overflowed(_, _, len, _) => len,
         }
     }
@@ -1009,10 +1009,10 @@ impl<'a> LiveValueRef<'a> {
                 Ok(t)
             },
             LiveValueRef::Overflowed(ref path, pgsz, len, ref blocks) => {
-                let mut a = Vec::with_capacity(len);
+                let mut a = Vec::with_capacity(len as usize);
                 let mut strm = try!(OverflowReader::new(path, pgsz, blocks.blocks[0].firstPage, len));
                 try!(strm.read_to_end(&mut a));
-                assert!(len == a.len());
+                assert!((len as usize) == a.len());
                 let t = try!(func(&a));
                 Ok(t)
             },
@@ -1285,8 +1285,7 @@ pub trait IForwardCursor {
 
     // TODO maybe rm ValueLength.  but LivingCursor uses it as a fast
     // way to detect whether a value is a tombstone or not.
-    fn ValueLength(&self) -> Result<Option<usize>>; // tombstone is None
-    // TODO ValueLength type should be u64
+    fn ValueLength(&self) -> Result<Option<u64>>; // tombstone is None
 
 }
 
@@ -1726,7 +1725,7 @@ impl IForwardCursor for MultiCursor {
         }
     }
 
-    fn ValueLength(&self) -> Result<Option<usize>> {
+    fn ValueLength(&self) -> Result<Option<u64>> {
         match self.cur {
             None => {
                 Err(Error::CursorNotValid)
@@ -2136,7 +2135,7 @@ impl IForwardCursor for MergeCursor {
         }
     }
 
-    fn ValueLength(&self) -> Result<Option<usize>> {
+    fn ValueLength(&self) -> Result<Option<u64>> {
         match self.cur {
             None => {
                 Err(Error::CursorNotValid)
@@ -2262,7 +2261,7 @@ impl IForwardCursor for LivingCursor {
         self.chain.ValueRef()
     }
 
-    fn ValueLength(&self) -> Result<Option<usize>> {
+    fn ValueLength(&self) -> Result<Option<u64>> {
         self.chain.ValueLength()
     }
 
@@ -2789,7 +2788,7 @@ enum ValueLocation {
     Tombstone,
     // when this is a Buffer, this gets ownership of kvp.Value
     Buffer(Box<[u8]>),
-    Overflowed(usize, BlockList),
+    Overflowed(u64, BlockList),
 }
 
 struct LeafPair {
@@ -2815,7 +2814,7 @@ fn write_overflow(
                     ba: &mut Read, 
                     pw: &mut PageWriter,
                     limit : usize,
-                   ) -> Result<(usize, BlockList)> {
+                   ) -> Result<(u64, BlockList)> {
 
     fn write_page(ba: &mut Read, pb: &mut PageBuilder, pgsz: usize, pw: &mut PageWriter, blocks: &mut BlockList, limit: usize) -> Result<(usize, bool)> {
         pb.Reset();
@@ -2848,7 +2847,7 @@ fn write_overflow(
     let mut sofar = 0;
     loop {
         let (put, finished) = try!(write_page(ba, &mut pb, pgsz, pw, &mut blocks, limit));
-        sofar += put;
+        sofar += put as u64;
         if finished {
             break;
         }
@@ -3042,7 +3041,7 @@ fn process_pair_into_leaf(st: &mut LeafState,
             // fraction of the page which would still be pathological.
             let hard_limit = pgsz / 4;
             let (len, blocks) = try!(write_overflow(&mut &*k, pw, hard_limit));
-            assert!(len == k.len());
+            assert!((len as usize) == k.len());
             KeyLocation::Overflowed(blocks)
         }
     };
@@ -3106,7 +3105,7 @@ fn process_pair_into_leaf(st: &mut LeafState,
                     ValueLocation::Buffer(va.into_boxed_slice())
                 } else {
                     let (len, blocks) = try!(write_overflow(&mut (vbuf.chain(strm)), pw, hard_limit_for_value_overflow));
-                    ValueLocation::Overflowed (len, blocks)
+                    ValueLocation::Overflowed(len, blocks)
                 }
             },
             Blob::SameFileOverflow(len, blocks) => {
@@ -3889,18 +3888,18 @@ fn create_segment<I>(mut pw: PageWriter,
 
 struct OverflowReader {
     fs: File,
-    len: usize, // same type as ValueLength(), max len of a single value
+    len: u64,
     firstPage: PageNum, // TODO this will be needed later for Seek trait
     buf: Box<[u8]>,
     currentPage: PageNum,
-    sofarOverall: usize,
+    sofarOverall: u64,
     sofarThisPage: usize,
     bytesOnThisPage: usize,
     offsetOnThisPage: usize,
 }
     
 impl OverflowReader {
-    fn new(path: &str, pgsz: usize, firstPage: PageNum, len: usize) -> Result<OverflowReader> {
+    fn new(path: &str, pgsz: usize, firstPage: PageNum, len: u64) -> Result<OverflowReader> {
         // TODO I wonder if maybe we should defer the opening of the file until
         // somebody actually tries to read from it?  so that constructing a
         // ValueRef object (which contains one of these) would be a lighter-weight
@@ -3967,12 +3966,12 @@ impl OverflowReader {
                 try!(self.ReadPage());
             }
 
-            let available = std::cmp::min(self.bytesOnThisPage - self.sofarThisPage, self.len - self.sofarOverall);
+            let available = std::cmp::min(self.bytesOnThisPage - self.sofarThisPage, (self.len - self.sofarOverall) as usize);
             let num = std::cmp::min(available, wanted);
             for i in 0 .. num {
                 ba[offset + i] = self.buf[self.offsetOnThisPage + self.sofarThisPage + i];
             }
-            self.sofarOverall = self.sofarOverall + num;
+            self.sofarOverall = self.sofarOverall + (num as u64);
             self.sofarThisPage = self.sofarThisPage + num;
             Ok(num)
         }
@@ -4274,13 +4273,13 @@ impl LeafPage {
     }
 
     // TODO shouldn't we have a method that returns the ValueInLeaf?
-    fn value_len<'a>(&'a self, n: usize) -> Result<Option<usize>> {
+    fn value_len<'a>(&'a self, n: usize) -> Result<Option<u64>> {
         match &self.pairs[n].value {
             &ValueInLeaf::Tombstone => {
                 Ok(None)
             },
             &ValueInLeaf::Inline(vlen, _) => {
-                Ok(Some(vlen))
+                Ok(Some(vlen as u64))
             },
             &ValueInLeaf::Overflowed(vlen, _) => {
                 Ok(Some(vlen))
@@ -4390,7 +4389,7 @@ impl IForwardCursor for LeafCursor {
         }
     }
 
-    fn ValueLength(&self) -> Result<Option<usize>> {
+    fn ValueLength(&self) -> Result<Option<u64>> {
         match self.cur {
             None => {
                 Err(Error::CursorNotValid)
@@ -4547,7 +4546,7 @@ impl IForwardCursor for PageCursor {
         }
     }
 
-    fn ValueLength(&self) -> Result<Option<usize>> {
+    fn ValueLength(&self) -> Result<Option<u64>> {
         match self {
             &PageCursor::Leaf(ref c) => c.ValueLength(),
             &PageCursor::Parent(ref c) => c.ValueLength(),
@@ -4660,7 +4659,7 @@ impl KeyInPage {
                 }
             },
             &KeyInPage::Overflowed(klen, ref blocks) => {
-                let mut ostrm = try!(OverflowReader::new(path, pr.len(), blocks.blocks[0].firstPage, klen));
+                let mut ostrm = try!(OverflowReader::new(path, pr.len(), blocks.blocks[0].firstPage, klen as u64));
                 let mut x_k = Vec::with_capacity(klen);
                 try!(ostrm.read_to_end(&mut x_k));
                 let x_k = x_k.into_boxed_slice();
@@ -4701,7 +4700,7 @@ impl KeyInPage {
             },
             &KeyInPage::Overflowed(klen, ref blocks) => {
                 let k = {
-                    let mut ostrm = try!(OverflowReader::new(path, pr.len(), blocks.blocks[0].firstPage, klen));
+                    let mut ostrm = try!(OverflowReader::new(path, pr.len(), blocks.blocks[0].firstPage, klen as u64));
                     let mut x_k = Vec::with_capacity(klen);
                     try!(ostrm.read_to_end(&mut x_k));
                     let x_k = x_k.into_boxed_slice();
@@ -4722,7 +4721,7 @@ impl KeyInPage {
 enum ValueInLeaf {
     Tombstone,
     Inline(usize, usize),
-    Overflowed(usize, BlockList),
+    Overflowed(u64, BlockList),
 }
 
 impl ValueInLeaf {
@@ -4732,13 +4731,13 @@ impl ValueInLeaf {
             if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) { 
                 ValueInLeaf::Tombstone
             } else {
-                let vlen = varint::read(pr, cur) as usize;
+                let vlen = varint::read(pr, cur);
                 if 0 != (vflag & ValueFlag::FLAG_OVERFLOW) {
                     let blocks = BlockList::read(&pr, cur);
-                    ValueInLeaf::Overflowed(vlen, blocks)
+                    ValueInLeaf::Overflowed(vlen as u64, blocks)
                 } else {
-                    let v = ValueInLeaf::Inline(vlen, *cur);
-                    *cur = *cur + vlen;
+                    let v = ValueInLeaf::Inline(vlen as usize, *cur);
+                    *cur = *cur + (vlen as usize);
                     v
                 }
             };
@@ -5600,7 +5599,7 @@ impl IForwardCursor for ParentCursor {
         }
     }
 
-    fn ValueLength(&self) -> Result<Option<usize>> {
+    fn ValueLength(&self) -> Result<Option<u64>> {
         match self.cur {
             None => {
                 Err(Error::CursorNotValid)
@@ -5756,7 +5755,7 @@ impl IForwardCursor for MultiPageCursor {
         }
     }
 
-    fn ValueLength(&self) -> Result<Option<usize>> {
+    fn ValueLength(&self) -> Result<Option<u64>> {
         match self.cur {
             None => {
                 Err(Error::CursorNotValid)

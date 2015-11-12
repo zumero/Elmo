@@ -1,13 +1,7 @@
 
 vec capacities
 
-name Array to Slice
-
-ValueRef not overflowed, block ref
-
 prepare_merge clones too much stuff
-
-value length u64
 
 at some point we should review which asserts we really want in release
 builds and perf check without the rest of them.
@@ -16,9 +10,6 @@ can we have the segment page objects reference the buf in the
 header instead of cloning it?
 
 get rid of pagepool?
-
-add ability to pass overflows through on merge without rewriting them.
-important for large values.
 
 lots of bufadvance and varint read calls should probably return Result
 so they can properly error on invalid pages read from the file.
