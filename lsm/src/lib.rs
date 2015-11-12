@@ -1319,9 +1319,9 @@ pub const SETTINGS_NO_AUTOMERGE: DbSettings =
 
 #[derive(Debug, Clone)]
 pub struct SegmentLocation {
-    root_page: PageNum,
+    pub root_page: PageNum,
     buf: Box<[u8]>,
-    blocks: BlockList,
+    pub blocks: BlockList,
 }
 
 impl SegmentLocation {

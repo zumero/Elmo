@@ -103,16 +103,21 @@ fn list_segments(name: &str) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
     let (fresh, young, levels) = try!(db.list_segments());
     println!("fresh ({}): ", fresh.len());
+
+    fn print_seg(s: &lsm::SegmentLocation) {
+        println!("    {}, {} pages", s.root_page, 1 + s.blocks.count_pages());
+    }
+
     for s in fresh.iter() {
-        println!("{}", s);
+        print_seg(s);
     }
     println!("young ({}): ", young.len());
     for s in young.iter() {
-        println!("{}", s);
+        print_seg(s);
     }
     println!("levels ({}): ", levels.len());
     for s in levels.iter() {
-        println!("{}", s);
+        print_seg(s);
     }
     Ok(())
 }
@@ -208,12 +213,14 @@ fn add_numbers(name: &str, count: u64, start: u64, step: u64) -> Result<(),lsm::
         let val = start + i * step;
         let k = format!("{:08}", val).into_bytes().into_boxed_slice();
         let v = format!("{}", val).into_bytes().into_boxed_slice();
-        pending.insert(k, lsm::Blob::Array(v));
+        pending.insert(k, lsm::Blob::Boxed(v));
     }
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
     let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
-    let lck = try!(db.get_write_lock());
-    try!(lck.commit_segment(seg).map_err(lsm::wrap_err));
+    if let Some(seg) = seg {
+        let lck = try!(db.get_write_lock());
+        try!(lck.commit_segment(seg).map_err(lsm::wrap_err));
+    }
     Ok(())
 }
 
@@ -230,12 +237,14 @@ fn add_random(name: &str, count: u64, seed: usize, klen: usize, vlen: usize) -> 
     for i in 0 .. count {
         let k = make(&mut rng, klen);
         let v = make(&mut rng, vlen);
-        pending.insert(k, lsm::Blob::Array(v));
+        pending.insert(k, lsm::Blob::Boxed(v));
     }
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
     let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
-    let lck = try!(db.get_write_lock());
-    try!(lck.commit_segment(seg).map_err(lsm::wrap_err));
+    if let Some(seg) = seg {
+        let lck = try!(db.get_write_lock());
+        try!(lck.commit_segment(seg).map_err(lsm::wrap_err));
+    }
     Ok(())
 }
 
