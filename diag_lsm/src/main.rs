@@ -224,7 +224,7 @@ fn add_numbers(name: &str, count: u64, start: u64, step: u64) -> Result<(),lsm::
     Ok(())
 }
 
-fn add_random(name: &str, count: u64, seed: usize, klen: usize, vlen: usize) -> Result<(),lsm::Error> {
+fn add_random(name: &str, seed: usize, count_groups: usize, count_per_group: usize, klen: usize, vlen: usize) -> Result<(),lsm::Error> {
     fn make(rng: &mut rand::StdRng, max_len: usize) -> Box<[u8]> {
         let len = (rng.next_u64() as usize) % max_len + 1;
         let mut k = vec![0u8; len].into_boxed_slice();
@@ -233,18 +233,22 @@ fn add_random(name: &str, count: u64, seed: usize, klen: usize, vlen: usize) -> 
     }
 
     let mut rng = rand::StdRng::from_seed(&[seed]);
-    let mut pending = BTreeMap::new();
-    for i in 0 .. count {
-        let k = make(&mut rng, klen);
-        let v = make(&mut rng, vlen);
-        pending.insert(k, lsm::Blob::Boxed(v));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+
+    for _ in 0 .. count_groups {
+        let mut pending = BTreeMap::new();
+        for _ in 0 .. count_per_group {
+            let k = make(&mut rng, klen);
+            let v = make(&mut rng, vlen);
+            pending.insert(k, lsm::Blob::Boxed(v));
+        }
+        let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
+        if let Some(seg) = seg {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(seg).map_err(lsm::wrap_err));
+        }
     }
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
-    let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
-    if let Some(seg) = seg {
-        let lck = try!(db.get_write_lock());
-        try!(lck.commit_segment(seg).map_err(lsm::wrap_err));
-    }
+
     Ok(())
 }
 
@@ -261,15 +265,16 @@ fn result_main() -> Result<(),lsm::Error> {
     let cmd = args[2].as_str();
     match cmd {
         "add_random" => {
-            println!("usage: add_random count seed klen vlen");
-            if args.len() < 7 {
+            println!("usage: add_random seed count_groups count_per_group klen vlen");
+            if args.len() < 8 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
-            let count = args[3].parse::<u64>().unwrap();
-            let seed = args[4].parse::<usize>().unwrap();
-            let klen = args[5].parse::<usize>().unwrap();
-            let vlen = args[6].parse::<usize>().unwrap();
-            add_random(name, count, seed, klen, vlen)
+            let seed = args[3].parse::<usize>().unwrap();
+            let count_groups = args[4].parse::<usize>().unwrap();
+            let count_per_group = args[5].parse::<usize>().unwrap();
+            let klen = args[6].parse::<usize>().unwrap();
+            let vlen = args[7].parse::<usize>().unwrap();
+            add_random(name, seed, count_groups, count_per_group, klen, vlen)
         },
         "add_numbers" => {
             println!("usage: add_numbers count start step");
