@@ -1,4 +1,23 @@
 
+remaining siblings code is just kinda wrong
+
+merge fresh is common and doesn't need write_merge().  just write_leaves().
+
+merge 0 just went from 
+    46371, 22697 pages
+to
+    46696, 395 pages
+    46695, 57 pages
+which has gotta be wrong.
+
+merge fresh doesn't seem to lose keys.
+merge young is fine too.
+merge 0 loses a lot.
+
+initial count looks wrong too.  after 1000 runs of 1000 keys, we should
+have a millon, and we had 977,561.  hmmm. could be updates overwrote
+because we accidentally chosen the same key as before.
+
 vec capacities
 
 prepare_merge clones too much stuff

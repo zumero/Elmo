@@ -43,8 +43,8 @@ fn show_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     Ok(())
 }
 
-fn merge(name: &str, from_level: String) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
+fn merge(name: &str, from_level: String, sleep_s: u32) -> Result<(),lsm::Error> {
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let from_level =
         match from_level.as_str() {
             "fresh" => {
@@ -59,6 +59,8 @@ fn merge(name: &str, from_level: String) -> Result<(),lsm::Error> {
             },
         };
     try!(db.merge(from_level));
+    println!("sleeping for {} s", sleep_s);
+    std::thread::sleep_ms(sleep_s * 1000);
     Ok(())
 }
 
@@ -125,8 +127,9 @@ fn list_segments(name: &str) -> Result<(),lsm::Error> {
 fn list_free_blocks(name: &str) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
     let blocks = try!(db.list_free_blocks());
-    println!("{:?}", blocks);
-    println!("total pages: {}", blocks.count_pages());
+    //println!("{:?}", blocks);
+    println!("count_blocks: {}", blocks.count_blocks());
+    println!("count_pages: {}", blocks.count_pages());
     Ok(())
 }
 
@@ -274,7 +277,10 @@ fn result_main() -> Result<(),lsm::Error> {
             let count_per_group = args[5].parse::<usize>().unwrap();
             let klen = args[6].parse::<usize>().unwrap();
             let vlen = args[7].parse::<usize>().unwrap();
-            add_random(name, seed, count_groups, count_per_group, klen, vlen)
+            try!(add_random(name, seed, count_groups, count_per_group, klen, vlen));
+            println!("sleeping for {} s", 10);
+            std::thread::sleep_ms(10 * 1000);
+            Ok(())
         },
         "add_numbers" => {
             println!("usage: add_numbers count start step");
@@ -323,12 +329,13 @@ fn result_main() -> Result<(),lsm::Error> {
             seek_string(name, key, sop)
         },
         "merge" => {
-            println!("usage: merge from_level");
-            if args.len() < 4 {
+            println!("usage: merge from_level sleep_s");
+            if args.len() < 5 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
             let from_level = args[3].clone();
-            merge(name, from_level)
+            let sleep_s = args[4].parse::<u32>().unwrap();
+            merge(name, from_level, sleep_s)
         },
         "seek_bytes" => {
             println!("usage: seek_bytes sop numbytes b1 b2 b3 ... ");

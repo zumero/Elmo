@@ -5019,7 +5019,6 @@ impl ParentPage {
             // segment.
             Ok(None)
         } else {
-            // TODO dive until depth is 2
             // root is a grandparent.  but we don't know how deep it goes.
             // for now, we choose one of its children (also a parent).
 
@@ -5041,6 +5040,10 @@ impl ParentPage {
             let buf = Lend::new(buf, box done_page);
 
             let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, buf));
+
+            // TODO we want to dive until depth 2, but the approach won't work.
+            // we can't just do remaining siblings unless our immediate parent is
+            // the root.  otherwise, all our cousins get lost.
             let remaining_siblings = try!(self.siblings_for(Some((chosen, chosen))));
             assert!(remaining_siblings.len() == self.children.len() - 1);
             Ok(Some((page, remaining_siblings)))
@@ -6895,12 +6898,9 @@ impl InnerPart {
     }
 
     fn list_free_blocks(inner: &std::sync::Arc<InnerPart>) -> Result<BlockList> {
-        let space = try!(inner.space.lock());
-		let mut blocks = space.free_blocks.clone();
-        for list in space.fresh_free.iter() {
-            blocks.add_blocklist_no_reorder(list);
-        }
-        blocks.sort_and_consolidate();
+        let mut space = try!(inner.space.lock());
+        space.organize_free_blocks();
+		let blocks = space.free_blocks.clone();
         Ok(blocks)
     }
 
@@ -6991,6 +6991,17 @@ impl InnerPart {
                     Ok(cursors)
                 }
 
+                fn clone_from_end(v: &[SegmentLocation], count: usize) -> Vec<SegmentLocation> {
+                    let count = std::cmp::min(count, v.len());
+                    let i = v.len() - count;
+                    let v = &v[i ..];
+                    let mut a = Vec::with_capacity(count);
+                    for s in v {
+                        a.push(s.clone());
+                    }
+                    a
+                }
+
                 match from_level {
                     FromLevel::Fresh => {
                         // TODO constant
@@ -6998,11 +7009,7 @@ impl InnerPart {
                             return Ok(None)
                         }
 
-                        // TODO clone the whole list just to take the last few?  slow.
-                        let mut merge_segments = header.fresh.clone();
-                        merge_segments.reverse();
-                        merge_segments.truncate(16);
-                        merge_segments.reverse();
+                        let merge_segments = clone_from_end(&header.fresh, 16);
 
                         //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
                         let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
@@ -7011,15 +7018,11 @@ impl InnerPart {
                     },
                     FromLevel::Young => {
                         // TODO constant
-                        if header.young.len() < 4 {
+                        if header.young.len() < 1 {
                             return Ok(None)
                         }
 
-                        // TODO clone the whole list just to take the last few?  slow.
-                        let mut merge_segments = header.young.clone();
-                        merge_segments.reverse();
-                        merge_segments.truncate(8);
-                        merge_segments.reverse();
+                        let merge_segments = clone_from_end(&header.young, 2);
 
                         //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
                         let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
@@ -7317,6 +7320,7 @@ impl InnerPart {
     }
 
     fn commit_merge(&self, pm: PendingMerge) -> Result<()> {
+        //println!("commit_merge: {:?}", pm);
         {
             let mut header = try!(self.header.write());
 
