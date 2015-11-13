@@ -1,7 +1,25 @@
 
-remaining siblings code is just kinda wrong
+diag, count keys, avg keys per leaf, count parent nodes,
+avg keys per parent node, etc
 
-merge fresh is common and doesn't need write_merge().  just write_leaves().
+how can something go from 190,000 pages to so much fewer?
+are we ending up with lots of leaves that have lots of empty
+space in them?
+
+merge should release the merge lock each time through
+the loop so others get a chance
+
+need a way to report how many parent nodes got written
+by a merge.  and how many keys got processed from the
+junior section.
+
+file size explodes when multiple writers?  something
+about pagewriter?  block size too big?  is pw.end getting
+called?
+
+fragmentation is getting awful.  really bad.
+
+remaining siblings code is just kinda wrong
 
 merge 0 just went from 
     46371, 22697 pages

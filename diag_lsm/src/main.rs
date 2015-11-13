@@ -87,17 +87,33 @@ fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     println!("depth: {}", page.depth());
     println!("count_items: {}", page.count_items());
     let blocks = try!(page.blocklist_clean());
-    println!("blocks ({} blocks, {} pages): {:?}", blocks.count_blocks(), blocks.count_pages(), blocks);
+    //println!("blocks ({} blocks, {} pages): {:?}", blocks.count_blocks(), blocks.count_pages(), blocks);
+    println!("blocks ({} blocks, {} pages)", blocks.count_blocks(), blocks.count_pages());
     println!("key range: {:?}", try!(page.range()));
     let count = page.count_items();
     println!("items ({}):", count);
-    for i in 0 .. count {
-        let p = page.get_child_pagenum(i);
-        println!("    {}", p);
-        let child_range = try!(page.child_range(i));
-        println!("    {:?}", child_range);
+    if cfg!(expensive_check) 
+    {
+        for i in 0 .. count {
+            let p = page.child_pagenum(i);
+            println!("    {}", p);
+            let child_range = try!(page.child_range(i));
+            println!("    {:?}", child_range);
+        }
+        try!(page.verify_child_keys());
     }
-    try!(page.verify_child_keys());
+    let mut leaf = page.make_leaf_page();
+    let leaves = page.into_iter_leaves();
+    let mut count_leaves = 0;
+    let mut bytes_used_in_leaves = 0;
+    for pg_leaf in leaves {
+        let pg_leaf = try!(pg_leaf);
+        try!(leaf.read_page(pg_leaf.page));
+        count_leaves += 1;
+        bytes_used_in_leaves += leaf.len_on_page();
+    }
+    println!("leaves: {}:", count_leaves);
+    println!("avg leaf len: {}", bytes_used_in_leaves / count_leaves);
     Ok(())
 }
 
@@ -227,6 +243,44 @@ fn add_numbers(name: &str, count: u64, start: u64, step: u64) -> Result<(),lsm::
     Ok(())
 }
 
+fn add_lines(name: &str, file: String, count_groups: usize, count_per_group: usize) -> Result<(),lsm::Error> {
+    use std::io::{self, BufReader};
+    use std::io::prelude::*;
+    use std::fs::File;
+
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+
+    let f = try!(File::open(&file));
+    let f = BufReader::new(f);
+
+    let mut num_groups_sofar = 0;
+
+    let mut pending = BTreeMap::new();
+    for line in f.lines() {
+        let line = try!(line);
+        let k = line.into_bytes().into_boxed_slice();
+        let v = String::from("").into_bytes().into_boxed_slice();
+        if k.len() > 0 {
+            pending.insert(k, lsm::Blob::Boxed(v));
+        }
+        if pending.len() >= count_per_group {
+            let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
+            if let Some(seg) = seg {
+                let lck = try!(db.get_write_lock());
+                try!(lck.commit_segment(seg).map_err(lsm::wrap_err));
+                //println!("commited group");
+            }
+            pending = BTreeMap::new();
+            num_groups_sofar += 1;
+            if num_groups_sofar == count_groups {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn add_random(name: &str, seed: usize, count_groups: usize, count_per_group: usize, klen: usize, vlen: usize) -> Result<(),lsm::Error> {
     fn make(rng: &mut rand::StdRng, max_len: usize) -> Box<[u8]> {
         let len = (rng.next_u64() as usize) % max_len + 1;
@@ -267,6 +321,19 @@ fn result_main() -> Result<(),lsm::Error> {
     let name = args[1].as_str();
     let cmd = args[2].as_str();
     match cmd {
+        "add_lines" => {
+            println!("usage: add_lines file count_groups count_per_group");
+            if args.len() < 6 {
+                return Err(lsm::Error::Misc(String::from("too few args")));
+            }
+            let file = args[3].clone();
+            let count_groups = args[4].parse::<usize>().unwrap();
+            let count_per_group = args[5].parse::<usize>().unwrap();
+            try!(add_lines(name, file, count_groups, count_per_group));
+            println!("sleeping for {} s", 5);
+            std::thread::sleep_ms(5 * 1000);
+            Ok(())
+        },
         "add_random" => {
             println!("usage: add_random seed count_groups count_per_group klen vlen");
             if args.len() < 8 {
