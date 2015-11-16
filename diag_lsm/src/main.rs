@@ -28,14 +28,14 @@ use rand::Rng;
 use rand::SeedableRng;
 
 fn dump_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let page = try!(db.get_page(pgnum));
     println!("{:?}", page);
     Ok(())
 }
 
 fn show_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let cursor = try!(db.open_cursor_on_page(pgnum));
     let pt = cursor.page_type();
     println!("page type: {:?}", pt);
@@ -43,29 +43,8 @@ fn show_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     Ok(())
 }
 
-fn merge(name: &str, from_level: String, sleep_s: u32) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
-    let from_level =
-        match from_level.as_str() {
-            "fresh" => {
-                lsm::FromLevel::Fresh
-            },
-            "young" => {
-                lsm::FromLevel::Young
-            },
-            _ => {
-                let level = from_level.parse::<usize>().unwrap();
-                lsm::FromLevel::Other(level)
-            },
-        };
-    try!(db.merge(from_level));
-    println!("sleeping for {} s", sleep_s);
-    std::thread::sleep_ms(sleep_s * 1000);
-    Ok(())
-}
-
 fn show_leaf_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let mut cursor = try!(db.open_cursor_on_leaf_page(pgnum));
     try!(cursor.First());
     while cursor.IsValid() {
@@ -73,7 +52,7 @@ fn show_leaf_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
             let k = try!(cursor.KeyRef());
             println!("k: {:?}", k);
             let v = try!(cursor.ValueRef());
-            //println!("v: {:?}", v);
+            println!("v: {:?}", v);
             //let q = try!(v.into_boxed_slice());
         }
         try!(cursor.Next());
@@ -82,7 +61,7 @@ fn show_leaf_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
 }
 
 fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let page = try!(db.read_parent_page(pgnum));
     println!("depth: {}", page.depth());
     println!("count_items: {}", page.count_items());
@@ -118,7 +97,7 @@ fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
 }
 
 fn list_segments(name: &str) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let (fresh, young, levels) = try!(db.list_segments());
     println!("fresh ({}): ", fresh.len());
 
@@ -141,16 +120,17 @@ fn list_segments(name: &str) -> Result<(),lsm::Error> {
 }
 
 fn list_free_blocks(name: &str) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let blocks = try!(db.list_free_blocks());
     //println!("{:?}", blocks);
     println!("count_blocks: {}", blocks.count_blocks());
     println!("count_pages: {}", blocks.count_pages());
+    //println!("pages in largest block: {}", blocks.blocks[0].count_pages());
     Ok(())
 }
 
 fn list_keys(name: &str) -> Result<(),lsm::Error> {
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let mut cursor = try!(db.open_cursor());
     try!(cursor.First());
     while cursor.IsValid() {
@@ -176,7 +156,7 @@ fn seek_string(name: &str, key: String, sop: String) -> Result<(),lsm::Error> {
         };
     let k = key.into_bytes().into_boxed_slice();
     let k = lsm::KeyRef::from_boxed_slice(k);
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let mut cursor = try!(db.open_cursor());
     let sr = try!(cursor.SeekRef(&k, sop));
     println!("sr: {:?}", sr);
@@ -200,7 +180,7 @@ fn seek_bytes(name: &str, k: Box<[u8]>, sop: String) -> Result<(),lsm::Error> {
             _ => return Err(lsm::Error::Misc(String::from("invalid sop"))),
         };
     let k = lsm::KeyRef::from_boxed_slice(k);
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let mut cursor = try!(db.open_cursor());
     let sr = try!(cursor.SeekRef(&k, sop));
     println!("RESULT sr: {:?}", sr);
@@ -234,7 +214,7 @@ fn add_numbers(name: &str, count: u64, start: u64, step: u64) -> Result<(),lsm::
         let v = format!("{}", val).into_bytes().into_boxed_slice();
         pending.insert(k, lsm::Blob::Boxed(v));
     }
-    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::SETTINGS_NO_AUTOMERGE));
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
     if let Some(seg) = seg {
         let lck = try!(db.get_write_lock());
@@ -278,7 +258,15 @@ fn add_lines(name: &str, file: String, count_groups: usize, count_per_group: usi
         }
     }
 
-    Ok(())
+    match std::sync::Arc::try_unwrap(db) {
+        Ok(db) => {
+            try!(db.stop());
+            Ok(())
+        },
+        Err(e) => {
+            Err(lsm::Error::Misc(String::from("try_unwrap failed")))
+        },
+    }
 }
 
 fn add_random(name: &str, seed: usize, count_groups: usize, count_per_group: usize, klen: usize, vlen: usize) -> Result<(),lsm::Error> {
@@ -330,8 +318,6 @@ fn result_main() -> Result<(),lsm::Error> {
             let count_groups = args[4].parse::<usize>().unwrap();
             let count_per_group = args[5].parse::<usize>().unwrap();
             try!(add_lines(name, file, count_groups, count_per_group));
-            println!("sleeping for {} s", 5);
-            std::thread::sleep_ms(5 * 1000);
             Ok(())
         },
         "add_random" => {
@@ -345,8 +331,6 @@ fn result_main() -> Result<(),lsm::Error> {
             let klen = args[6].parse::<usize>().unwrap();
             let vlen = args[7].parse::<usize>().unwrap();
             try!(add_random(name, seed, count_groups, count_per_group, klen, vlen));
-            println!("sleeping for {} s", 10);
-            std::thread::sleep_ms(10 * 1000);
             Ok(())
         },
         "add_numbers" => {
@@ -394,15 +378,6 @@ fn result_main() -> Result<(),lsm::Error> {
             let key = args[3].clone();
             let sop = args[4].clone();
             seek_string(name, key, sop)
-        },
-        "merge" => {
-            println!("usage: merge from_level sleep_s");
-            if args.len() < 5 {
-                return Err(lsm::Error::Misc(String::from("too few args")));
-            }
-            let from_level = args[3].clone();
-            let sleep_s = args[4].parse::<u32>().unwrap();
-            merge(name, from_level, sleep_s)
         },
         "seek_bytes" => {
             println!("usage: seek_bytes sop numbytes b1 b2 b3 ... ");

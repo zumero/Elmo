@@ -1299,22 +1299,13 @@ pub trait ICursor : IForwardCursor {
 #[derive(Copy,Clone)]
 pub struct DbSettings {
     pub DefaultPageSize: usize,
-    pub PagesPerBlock: PageNum,
-    pub AutomergeThreads: bool,
+    pub PagesPerBlock: PageCount,
 }
 
 pub const DEFAULT_SETTINGS: DbSettings = 
     DbSettings {
         DefaultPageSize: 4096,
         PagesPerBlock: 256,
-        AutomergeThreads: true,
-    };
-
-pub const SETTINGS_NO_AUTOMERGE: DbSettings = 
-    DbSettings {
-        DefaultPageSize: 4096,
-        PagesPerBlock: 256,
-        AutomergeThreads: false,
     };
 
 #[derive(Debug, Clone)]
@@ -3281,6 +3272,7 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                     mut behind: Vec<PageCursor>,
                     path: &str,
                     f: std::rc::Rc<std::cell::RefCell<File>>,
+                    dest_level: DestLevel,
                     ) -> Result<Option<SegmentLocation>> {
 
     let mut pb = PageBuilder::new(pw.page_size());
@@ -3492,7 +3484,7 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
         }
     }
 
-    //println!("    leaves rewritten = {}   recycled = {}", leaves_rewritten, leaves_recycled);
+    println!("dest,{:?},rewritten,{},recycled,{}", dest_level, leaves_rewritten, leaves_recycled);
 
     // TODO this assumes the last page written is still in pb.  it has to be.
     // TODO unless it wrote no pages?
@@ -6224,6 +6216,13 @@ impl MergeFrom {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum NeedsMerge {
+    No,
+    Yes,
+    Desperate,
+}
+
 #[derive(Debug)]
 pub struct PendingMerge {
     from: MergeFrom,
@@ -6236,6 +6235,13 @@ struct SafePagePool {
     // we keep a pool of page buffers so we can lend them to
     // SegmentCursors.
     pages: Vec<Box<[u8]>>,
+}
+
+struct Senders {
+    notify_fresh: mpsc::Sender<MergeMessage>,
+    notify_young: mpsc::Sender<MergeMessage>,
+    // TODO vec, or boxed slice?
+    notify_levels: Vec<mpsc::Sender<MergeMessage>>,
 }
 
 // there can be only one InnerPart instance per path
@@ -6251,7 +6257,14 @@ struct InnerPart {
 
     space: Mutex<Space>,
     pagepool: Mutex<SafePagePool>,
-    mergelock: Mutex<u32>,
+    senders: Mutex<Senders>,
+
+    // TODO the contents of these mutexes should be something useful
+    mergelock_fresh: Mutex<u32>,
+    mergelock_young: Mutex<u32>,
+    // TODO vec, or boxed slice?
+    mergelock_levels: Vec<Mutex<u32>>,
+
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -6277,64 +6290,46 @@ enum DestLevel {
     Other(usize),
 }
 
-enum NewSegmentMessage {
-    NewSegment,
-    Terminate,
+impl DestLevel {
+    fn as_from_level(&self) -> FromLevel {
+        match self {
+            &DestLevel::Young => FromLevel::Young,
+            &DestLevel::Other(n) => FromLevel::Other(n),
+        }
+    }
 }
 
-enum AutomergeMessage {
-    Merged(usize),
+enum MergeMessage {
+    Work,
     Terminate,
 }
 
 pub struct WriteLock {
     inner: std::sync::Arc<InnerPart>,
-    notify_fresh: mpsc::Sender<NewSegmentMessage>,
-    notify_young: mpsc::Sender<NewSegmentMessage>,
-    notify_automerge: Vec<mpsc::Sender<AutomergeMessage>>,
 }
 
 impl WriteLock {
     pub fn commit_segment(&self, seg: SegmentLocation) -> Result<()> {
         try!(self.inner.commit_segment(seg));
-        try!(self.notify_fresh.send(NewSegmentMessage::NewSegment).map_err(wrap_err));
         Ok(())
     }
 
+// TODO this doesn't need to be public at all now, does it?
     pub fn commit_merge(&self, pm: PendingMerge) -> Result<()> {
-        let dest_level = pm.from.get_dest_level();
-        let count_pages_in_new_segment = 
-            match pm.new_dest_segment {
-                Some(ref pg) => {
-                    pg.blocks.count_pages()
-                },
-                None => {
-                    0
-                },
-            };
         try!(self.inner.commit_merge(pm));
-        match dest_level {
-            DestLevel::Young => {
-                try!(self.notify_young.send(NewSegmentMessage::NewSegment).map_err(wrap_err));
-            },
-            DestLevel::Other(dest_level) => {
-                if dest_level + 1 < NUM_LEVELS {
-                    let size = (count_pages_in_new_segment as u64) * (self.inner.pgsz as u64);
-                    if size > get_level_size(dest_level) {
-                        try!(self.notify_automerge[dest_level].send(AutomergeMessage::Merged(dest_level)).map_err(wrap_err));
-                    }
-                }
-            },
-        }
         Ok(())
     }
 }
 
 pub struct DatabaseFile {
+    // there can be only one of this stuff per path
     inner: std::sync::Arc<InnerPart>,
+    write_lock: std::sync::Arc<Mutex<WriteLock>>,
 
-    // there can be only one of the following per path
-    write_lock: Mutex<WriteLock>,
+    thread_fresh: thread::JoinHandle<()>,
+    thread_young: thread::JoinHandle<()>,
+    // TODO vec, or boxed slice?
+    thread_levels: Vec<thread::JoinHandle<()>>,
 }
 
 impl DatabaseFile {
@@ -6380,6 +6375,32 @@ impl DatabaseFile {
             pages: vec![],
         };
 
+        // each merge level is handled by its own thread.  a Rust channel is used to
+        // notify that thread that there may be merge work to be done, or that it needs
+        // to terminate.
+
+        let (tx_fresh, rx_fresh): (mpsc::Sender<MergeMessage>, mpsc::Receiver<MergeMessage>) = mpsc::channel();
+        let (tx_young, rx_young): (mpsc::Sender<MergeMessage>, mpsc::Receiver<MergeMessage>) = mpsc::channel();
+
+        let mut senders = vec![];
+        let mut receivers = vec![];
+        for level in 0 .. NUM_LEVELS {
+            let (tx, rx): (mpsc::Sender<MergeMessage>, mpsc::Receiver<MergeMessage>) = mpsc::channel();
+            senders.push(tx);
+            receivers.push(rx);
+        }
+
+        let senders = Senders {
+            notify_fresh: tx_fresh,
+            notify_young: tx_young,
+            notify_levels: senders,
+        };
+
+        let mut mergelock_levels = vec![];
+        for level in 0 .. NUM_LEVELS {
+            mergelock_levels.push(Mutex::new(0));
+        }
+
         let inner = InnerPart {
             path: path,
             pgsz: pgsz,
@@ -6387,155 +6408,139 @@ impl DatabaseFile {
             header: RwLock::new(header),
             space: Mutex::new(space),
             pagepool: Mutex::new(pagepool),
-            mergelock: Mutex::new(0),
+            mergelock_fresh: Mutex::new(0),
+            mergelock_young: Mutex::new(0),
+            mergelock_levels: mergelock_levels,
+            senders: Mutex::new(senders),
         };
 
         let inner = std::sync::Arc::new(inner);
 
-// TODO if the settings have turned these threads off, don't create their channels
-
-        // each merge level is handled by its own thread.  a Rust channel is used to
-        // notify that thread that there may be merge work to be done.
-
-        let (tx_fresh, rx_fresh): (mpsc::Sender<NewSegmentMessage>, mpsc::Receiver<NewSegmentMessage>) = mpsc::channel();
-        let (tx_young, rx_young): (mpsc::Sender<NewSegmentMessage>, mpsc::Receiver<NewSegmentMessage>) = mpsc::channel();
-
-        let mut senders = vec![];
-        let mut receivers = vec![];
-        for _level in 0 .. NUM_LEVELS {
-            let (tx, rx): (mpsc::Sender<AutomergeMessage>, mpsc::Receiver<AutomergeMessage>) = mpsc::channel();
-            senders.push(tx);
-            receivers.push(rx);
-        }
-
         let lck = 
             WriteLock { 
                 inner: inner.clone(),
-                notify_fresh: tx_fresh,
-                notify_young: tx_young,
-                notify_automerge: senders,
             };
+
+        let lck = std::sync::Arc::new(Mutex::new(lck));
+
+        fn merge_loop(inner: std::sync::Arc<InnerPart>, write_lock: std::sync::Arc<Mutex<WriteLock>>, rx: mpsc::Receiver<MergeMessage>, from: FromLevel) {
+            loop {
+                match rx.recv() {
+                    Ok(msg) => {
+                        match msg {
+                            MergeMessage::Work => {
+                                match DatabaseFile::merge(&inner, &write_lock, from) {
+                                    Ok(()) => {
+                                    },
+                                    Err(e) => {
+                                        // TODO what now?
+                                        println!("{:?}", e);
+                                        panic!();
+                                    },
+                                }
+                            },
+                            MergeMessage::Terminate => {
+                                break;
+                            },
+                        }
+                    },
+                    Err(e) => {
+                        // TODO what now?
+                        println!("{:?}", e);
+                        panic!();
+                    },
+                }
+            }
+        }
+
+        let thread_fresh = {
+            let inner = inner.clone();
+            let lck = lck.clone();
+            try!(thread::Builder::new().name("fresh".to_string()).spawn(move || merge_loop(inner, lck, rx_fresh, FromLevel::Fresh)))
+        };
+
+        let thread_young = {
+            let inner = inner.clone();
+            let lck = lck.clone();
+            try!(thread::Builder::new().name("young".to_string()).spawn(move || merge_loop(inner, lck, rx_young, FromLevel::Young)))
+        };
+
+        let mut thread_levels = vec![];
+        for (level, rx) in receivers.into_iter().enumerate() {
+            let thread = {
+                let inner = inner.clone();
+                let lck = lck.clone();
+                try!(thread::Builder::new().name(format!("level_{}", level)).spawn(move || merge_loop(inner, lck, rx, FromLevel::Other(level))))
+            };
+            thread_levels.push(thread);
+        }
 
         let db = DatabaseFile {
             inner: inner,
-            write_lock: Mutex::new(lck),
+            write_lock: lck,
+            thread_fresh: thread_fresh,
+            thread_young: thread_young,
+            thread_levels: thread_levels,
         };
         let db = std::sync::Arc::new(db);
-
-        // TODO so when we do send Terminate messages to these threads?
-        // impl Drop for DatabaseFile ? 
-
-// all these closures.  DRY.
-        if settings.AutomergeThreads
-        {
-            {
-                let db = db.clone();
-                thread::spawn(move || {
-                    loop {
-                        match rx_fresh.recv() {
-                            Ok(msg) => {
-                                match msg {
-                                    NewSegmentMessage::NewSegment => {
-                                        match db.merge(FromLevel::Fresh) {
-                                            Ok(()) => {
-                                            },
-                                            Err(e) => {
-                                                // TODO what now?
-                                                println!("{:?}", e);
-                                                panic!();
-                                            },
-                                        }
-                                    },
-                                    NewSegmentMessage::Terminate => {
-                                        break;
-                                    },
-                                }
-                            },
-                            Err(e) => {
-                                // TODO what now?
-                                println!("{:?}", e);
-                                panic!();
-                            },
-                        }
-                    }
-                });
-
-            }
-
-            {
-                let db = db.clone();
-                thread::spawn(move || {
-                    loop {
-                        match rx_young.recv() {
-                            Ok(msg) => {
-                                match msg {
-                                    NewSegmentMessage::NewSegment => {
-                                        match db.merge(FromLevel::Young) {
-                                            Ok(()) => {
-                                            },
-                                            Err(e) => {
-                                                // TODO what now?
-                                                println!("{:?}", e);
-                                                panic!();
-                                            },
-                                        }
-                                    },
-                                    NewSegmentMessage::Terminate => {
-                                        break;
-                                    },
-                                }
-                            },
-                            Err(e) => {
-                                // TODO what now?
-                                println!("{:?}", e);
-                                panic!();
-                            },
-                        }
-                    }
-                });
-
-            }
-
-            for (closure_level, rx) in receivers.into_iter().enumerate() {
-                let db = db.clone();
-                thread::spawn(move || {
-                    loop {
-                        match rx.recv() {
-                            Ok(msg) => {
-                                match msg {
-                                    AutomergeMessage::Merged(level) => {
-                                        assert!(level == closure_level);
-                                        match db.merge(FromLevel::Other(level)) {
-                                            Ok(()) => {
-                                            },
-                                            Err(e) => {
-                                                // TODO what now?
-                                                println!("{:?}", e);
-                                                panic!();
-                                            },
-                                        }
-                                    },
-                                    AutomergeMessage::Terminate => {
-                                        break;
-                                    },
-                                }
-                            },
-                            Err(e) => {
-                                // TODO what now?
-                                println!("{:?}", e);
-                                panic!();
-                            },
-                        }
-                    }
-                });
-
-            }
-        }
 
         Ok(db)
     }
 
-    pub fn merge(&self, level: FromLevel) -> Result<()> {
+    pub fn stop(mut self) -> Result<()> {
+        // these need to be stopped in ascending order.  we can't
+        // have one of them stop while another one is still sending notifications
+        // to it.
+
+        println!("---------------- Stopping fresh");
+        {
+            let senders = try!(self.inner.senders.lock());
+            try!(senders.notify_fresh.send(MergeMessage::Terminate).map_err(wrap_err));
+        }
+
+        match self.thread_fresh.join() {
+            Ok(()) => {
+            },
+            Err(e) => {
+                return Err(Error::Misc(format!("thread join failed: {:?}", e)));
+            },
+        }
+
+        println!("---------------- Stopping young");
+        {
+            let senders = try!(self.inner.senders.lock());
+            try!(senders.notify_young.send(MergeMessage::Terminate).map_err(wrap_err));
+        }
+
+        match self.thread_young.join() {
+            Ok(()) => {
+            },
+            Err(e) => {
+                return Err(Error::Misc(format!("thread join failed: {:?}", e)));
+            },
+        }
+
+        for i in 0 .. NUM_LEVELS {
+            println!("---------------- Stopping level {}", i);
+            {
+                let mut senders = try!(self.inner.senders.lock());
+                let tx = &senders.notify_levels[i];
+                try!(tx.send(MergeMessage::Terminate).map_err(wrap_err));
+            }
+            let j = self.thread_levels.remove(0);
+            match j.join() {
+                Ok(()) => {
+                },
+                Err(e) => {
+                    return Err(Error::Misc(format!("thread join failed: {:?}", e)));
+                },
+            }
+        }
+
+        Ok(())
+    }
+
+    fn merge(inner: &std::sync::Arc<InnerPart>, write_lock: &std::sync::Arc<Mutex<WriteLock>>, level: FromLevel) -> Result<()> {
         // no merge should prevent writes of new segments
         // into fresh.  merges do not need the main write lock
         // until commit_merge() is called.
@@ -6543,50 +6548,86 @@ impl DatabaseFile {
         // but we do need to make sure merges are not stepping
         // on other merges.
 
+        fn guts(inner: &std::sync::Arc<InnerPart>, write_lock: &std::sync::Arc<Mutex<WriteLock>>, level: FromLevel) -> Result<Option<u32>> {
+            match try!(InnerPart::needs_merge(&inner, level)) {
+                NeedsMerge::No => {
+                    Ok(None)
+                },
+                _ => {
+                    match try!(InnerPart::needs_merge(&inner, level.get_dest_level().as_from_level())) {
+                        NeedsMerge::Desperate => {
+                            try!(inner.notify_work(level.get_dest_level().as_from_level()));
+                            Ok(Some(50))
+                        },
+                        _ => {
+                            let pm = try!(InnerPart::prepare_merge(&inner, level));
+                            {
+                                let lck = try!(write_lock.lock());
+                                try!(lck.commit_merge(pm));
+                                Ok(Some(0))
+                            }
+                        },
+                    }
+                },
+            }
+        }
+
         match level {
             FromLevel::Fresh => {
-                // FromLevel::Fresh does not need a merge lock,
-                // since it only inserts something into Young.
-                // TODO but we should have a merge lock on fresh
-                // itself, so that we can never have two merges
-                // happening in fresh.
                 loop {
-                    match try!(self.prepare_merge(level)) {
-                        Some(pm) => {
-                            let lck = try!(self.get_write_lock());
-                            try!(lck.commit_merge(pm));
-                        },
-                        None => {
-                            break;
-                        },
-                    }
+                    let delay = {
+                        let foo = try!(inner.mergelock_fresh.lock());
+                        // no mergelock_young needed here
+                        let delay = 
+                            match try!(guts(&inner, &write_lock, level)) {
+                                Some(delay) => {
+                                    delay
+                                },
+                                None => {
+                                    break;
+                                },
+                            };
+                        delay
+                    };
+                    std::thread::sleep_ms(delay);
                 }
             },
-            _ => {
-                // TODO
-
-                // FromLevel::Young needs a write lock only on
-                // Other(0)
-                // TODO but we should have a merge lock on young
-                // itself, so that we can never have two merges
-                // happening in young.
-
-                // FromLevel::Other(n) needs a write lock on
-                // n and n+1
-
-                // TODO ideally, prepare_merge would be a method
-                // on whatever the lock above was guarding.
+            FromLevel::Young => {
                 loop {
-                    let foo = try!(self.inner.mergelock.lock());
-                    match try!(self.prepare_merge(level)) {
-                        Some(pm) => {
-                            let lck = try!(self.get_write_lock());
-                            try!(lck.commit_merge(pm));
-                        },
-                        None => {
-                            break;
-                        },
-                    }
+                    let delay = {
+                        let foo = try!(inner.mergelock_young.lock());
+                        let bar = try!(inner.mergelock_levels[0].lock());
+                        let delay = 
+                            match try!(guts(&inner, &write_lock, level)) {
+                                Some(delay) => {
+                                    delay
+                                },
+                                None => {
+                                    break;
+                                },
+                            };
+                        delay
+                    };
+                    std::thread::sleep_ms(delay);
+                }
+            },
+            FromLevel::Other(n) => {
+                loop {
+                    let delay = {
+                        let foo = try!(inner.mergelock_levels[n].lock());
+                        let bar = try!(inner.mergelock_levels[n + 1].lock());
+                        let delay = 
+                            match try!(guts(&inner, &write_lock, level)) {
+                                Some(delay) => {
+                                    delay
+                                },
+                                None => {
+                                    break;
+                                },
+                            };
+                        delay
+                    };
+                    std::thread::sleep_ms(delay);
                 }
             },
         }
@@ -6596,6 +6637,14 @@ impl DatabaseFile {
     // TODO func to ask for the write lock without blocking?
 
     pub fn get_write_lock(&self) -> Result<std::sync::MutexGuard<WriteLock>> {
+        while NeedsMerge::Desperate == try!(InnerPart::needs_merge(&self.inner, FromLevel::Fresh)) {
+            // TODO if we need to sleep more than once, do we need to notify_work
+            // every time?
+            try!(self.inner.notify_work(FromLevel::Fresh));
+            println!("fresh too big, sleeping");
+            std::thread::sleep_ms(10);
+        }
+
         let lck = try!(self.write_lock.lock());
         Ok(lck)
     }
@@ -6626,10 +6675,6 @@ impl DatabaseFile {
 
     pub fn write_segment(&self, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<Option<SegmentLocation>> {
         InnerPart::write_segment(&self.inner, pairs)
-    }
-
-    fn prepare_merge(&self, level: FromLevel) -> Result<Option<PendingMerge>> {
-        InnerPart::prepare_merge(&self.inner, level)
     }
 
     pub fn list_segments(&self) -> Result<(Vec<SegmentLocation>, Vec<SegmentLocation>, Vec<SegmentLocation>)> {
@@ -6746,7 +6791,7 @@ impl InnerPart {
             pb
         }
 
-        //println!("header segments: {} -- {} -- {}", hdr.fresh.len(), hdr.young.len(), hdr.levels.len());
+        println!("header,fresh,{},young,{},levels,{}", hdr.fresh.len(), hdr.young.len(), hdr.levels.len());
 
         let mut pb = PageBuilder::new(HEADER_SIZE_IN_BYTES);
         // TODO format version number
@@ -6918,22 +6963,28 @@ impl InnerPart {
     }
 
     fn commit_segment(&self, seg: SegmentLocation) -> Result<()> {
-        let mut header = try!(self.header.write());
+        {
+            let mut header = try!(self.header.write());
 
-        // TODO assert new seg shares no pages with any seg in current state
+            // TODO assert new seg shares no pages with any seg in current state
 
-        let mut newHeader = header.clone();
+            let mut newHeader = header.clone();
 
-        newHeader.fresh.insert(0, seg);
+            newHeader.fresh.insert(0, seg);
 
-        newHeader.changeCounter = newHeader.changeCounter + 1;
+            newHeader.changeCounter = newHeader.changeCounter + 1;
 
-        let mut fs = try!(self.OpenForWriting());
-        try!(self.write_header(&mut header, &mut fs, newHeader));
+            {
+                let mut fs = try!(self.OpenForWriting());
+                try!(self.write_header(&mut header, &mut fs, newHeader));
+            }
+        }
 
         // note that we intentionally do not release the writeLock here.
         // you can change the segment list more than once while holding
         // the writeLock.  the writeLock gets released when you Dispose() it.
+
+        try!(self.notify_work(FromLevel::Fresh));
 
         Ok(())
     }
@@ -6949,11 +7000,94 @@ impl InnerPart {
         Ok(seg)
     }
 
-    fn prepare_merge(inner: &std::sync::Arc<InnerPart>, from_level: FromLevel) -> Result<Option<PendingMerge>> {
+    fn notify_work(&self, from_level: FromLevel) -> Result<()> {
+        let senders = try!(self.senders.lock());
+        match from_level {
+            FromLevel::Fresh => {
+                try!(senders.notify_fresh.send(MergeMessage::Work).map_err(wrap_err));
+            },
+            FromLevel::Young => {
+                try!(senders.notify_young.send(MergeMessage::Work).map_err(wrap_err));
+            },
+            FromLevel::Other(i) => {
+                try!(senders.notify_levels[i].send(MergeMessage::Work).map_err(wrap_err));
+            },
+        }
+        Ok(())
+    }
+
+    fn needs_merge(inner: &std::sync::Arc<InnerPart>, from_level: FromLevel) -> Result<NeedsMerge> {
+        match from_level {
+            FromLevel::Other(i) => {
+                if i == NUM_LEVELS - 1 {
+                    // this level doesn't need a merge because it has nowhere to promote to
+                    return Ok(NeedsMerge::No);
+                }
+            },
+            _ => {
+            },
+        }
+        let header = try!(inner.header.read());
+        match from_level {
+            FromLevel::Fresh => {
+                // TODO constant
+                if header.fresh.len() < 2 {
+                    return Ok(NeedsMerge::No);
+                }
+
+                // TODO constant
+                if header.fresh.len() > 100 {
+                    return Ok(NeedsMerge::Desperate);
+                }
+
+                return Ok(NeedsMerge::Yes);
+            },
+            FromLevel::Young => {
+                // TODO constant
+                if header.young.len() < 4 {
+                    return Ok(NeedsMerge::No);
+                }
+
+                // TODO constant
+                if header.young.len() > 100 {
+                    return Ok(NeedsMerge::Desperate);
+                }
+
+                return Ok(NeedsMerge::Yes);
+            },
+            FromLevel::Other(i) => {
+                if header.levels.len() <= i {
+                    // this level doesn't need a merge because it doesn't exist
+                    return Ok(NeedsMerge::No);
+                }
+                if header.levels[i].buf[2] < 1 {
+                    // we currently require the from segment to be at least a grandparent,
+                    // because we want to promote a parent that is not the root.
+
+                    // this level doesn't need a merge because promoting anything out of it would
+                    // deplete it.
+                    return Ok(NeedsMerge::No);
+                }
+                let size = (header.levels[i].blocks.count_pages() as u64) * (inner.pgsz as u64);
+                if size < get_level_size(i) {
+                    // this level doesn't need a merge because it is doesn't have enough data in it
+                    return Ok(NeedsMerge::No);
+                }
+                // TODO constant
+                if size > 2 * get_level_size(i) {
+                    return Ok(NeedsMerge::Desperate);
+                }
+                return Ok(NeedsMerge::Yes);
+            },
+        }
+    }
+
+    fn prepare_merge(inner: &std::sync::Arc<InnerPart>, from_level: FromLevel) -> Result<PendingMerge> {
         enum MergingFrom {
+            // TODO for Fresh and Young, we should only need to clone root page and blocks, not the buf
             Fresh{segments: Vec<SegmentLocation>},
             Young{segments: Vec<SegmentLocation>},
-            Other{level: usize, old_segment: SegmentLocation, chosen_page: PageNum, depth: u8, blocks: BlockList, survivors: Box<Iterator<Item=Result<pgitem>>>},
+            Other{level: usize, old_segment: PageNum, chosen_page: PageNum, depth: u8, blocks: BlockList, survivors: Box<Iterator<Item=Result<pgitem>>>},
         }
 
         let f = try!(inner.open_file_for_cursor());
@@ -7003,11 +7137,7 @@ impl InnerPart {
                 match from_level {
                     FromLevel::Fresh => {
                         // TODO constant
-                        if header.fresh.len() < 4 {
-                            return Ok(None)
-                        }
-
-                        let merge_segments = clone_from_end(&header.fresh, 16);
+                        let merge_segments = clone_from_end(&header.fresh, 4);
 
                         //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
                         let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
@@ -7016,10 +7146,6 @@ impl InnerPart {
                     },
                     FromLevel::Young => {
                         // TODO constant
-                        if header.young.len() < 2 {
-                            return Ok(None)
-                        }
-
                         let merge_segments = clone_from_end(&header.young, 8);
 
                         //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
@@ -7029,82 +7155,68 @@ impl InnerPart {
                     },
                     FromLevel::Other(level) => {
                         assert!(header.levels.len() > level);
-                        let old_from_segment = header.levels[level].clone();
-                        let pt = try!(PageType::from_u8(old_from_segment.buf[0]));
-                        match pt {
-                            PageType::LEAF_NODE => {
-                                // TODO this should be avoidable by now as well.  the size check on
-                                // notify should have caught it, unless the leaf has big overflows.
-                                // if parent nodes knew their depth, we might have caught it earlier.
-                                return Ok(None);
-                            },
-                            PageType::PARENT_NODE => {
+                        let depth_root = header.levels[level].buf[2];
+
+                        let old_from_segment = header.levels[level].root_page;
+
+                        let (depth_promote, mut candidates) = {
+                            let mut depth_promote =
+                                if depth_root == 0 {
+                                    // TODO gotta catch this case earlier
+                                    unreachable!();
+                                } else if depth_root == 1 {
+                                    0
+                                } else {
+                                    1
+                                };
+                            let mut candidates = None;
+                            loop {
                                 // TODO it's a little silly here to construct a Lend<>
                                 let done_page = move |_| -> () {
                                 };
-                                // TODO and the clone below is silly too
-                                let buf = Lend::new(old_from_segment.buf.clone(), box done_page);
+                                let buf = Lend::new(header.levels[level].buf.clone(), box done_page);
 
-                                let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), old_from_segment.root_page, buf));
-                                let size = (try!(parent.blocklist_unsorted()).count_pages() as u64) * (inner.pgsz as u64);
-                                if size < get_level_size(level) {
-                                    // TODO this should never happen because the size check is done before notify
-                                    //println!("too small to merge");
-                                    return Ok(None);
+                                let root_parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), old_from_segment, buf));
+                                // TODO ouch.  we might end up loading this page more than once?
+
+                                let mut group = try!(DepthIterator::new(root_parent, depth_promote).collect::<Result<Vec<_>>>());
+
+                                if group.len() < 2 {
+                                    assert!(depth_promote > 0);
+                                    depth_promote -= 1;
+                                } else {
+                                    candidates = Some(group);
+                                    break;
                                 }
+                            }
+                            (depth_promote, candidates.unwrap())
+                        };
 
-                                // TODO hmmm.  maybe we should refuse to do this merge if the dest
-                                // level is already too big.  but if we do, we probably want to
-                                // sleep for a bit and try it again.
+                        // TODO we probably need to be more clever about which one we
+                        // choose.  for now, the following hack just tries to make sure
+                        // the choice moves around the key range.
+                        let i_chosen =
+                            match old_from_segment % 3 {
+                                0 => 0,
+                                1 => candidates.len() - 1,
+                                2 => candidates.len() / 2,
+                                _ => unreachable!(),
+                            };
+                        let pg_chosen = candidates.remove(i_chosen);
+                        let survivors = candidates.into_iter().map(|pg| Ok(pg));
+                        let chosen_page = pg_chosen.page;
+                        let now_inactive = pg_chosen.blocks;
+                        let cursor = {
+                            let buf = try!(read_and_alloc_page(&f, chosen_page, inner.pgsz));
+                            // TODO it's a little silly here to construct a Lend<>
+                            let done_page = move |_| -> () {
+                            };
+                            let buf = Lend::new(buf, box done_page);
+                            let cursor = try!(PageCursor::new_already_read_page(&inner.path, f.clone(), chosen_page, buf));
+                            cursor
+                        };
+                        (vec![cursor], MergingFrom::Other{level: level, old_segment: old_from_segment, chosen_page: chosen_page, depth: depth_promote, blocks: now_inactive, survivors: box survivors, })
 
-                                if parent.depth() < 2 {
-                                    //println!("not deep enough to merge");
-                                    return Ok(None);
-                                }
-
-                                // TODO note that we could select a node at any depth we want.  for
-                                // now, we just pick one at depth 1.
-
-                                let depth = 1;
-                                let mut candidates = try!(DepthIterator::new(parent, depth).collect::<Result<Vec<_>>>());
-
-                                // TODO arbitrary constant
-                                if candidates.len() < 3 {
-                                    //println!("not enough candidates to merge");
-                                    return Ok(None);
-                                }
-
-                                // TODO we probably need to be more clever about which one we
-                                // choose.  for now, the following hack just tries to make sure
-                                // the choice moves around the key range.
-                                let i_chosen =
-                                    match old_from_segment.root_page % 3 {
-                                        0 => 0,
-                                        1 => candidates.len() - 1,
-                                        2 => candidates.len() / 2,
-                                        _ => unreachable!(),
-                                    };
-                                let pg_chosen = candidates.remove(i_chosen);
-
-                                let chosen = {
-                                    let buf = try!(read_and_alloc_page(&f, pg_chosen.page, inner.pgsz));
-                                    let done_page = move |_| -> () {
-                                    };
-                                    let buf = Lend::new(buf, box done_page);
-
-                                    let page = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), pg_chosen.page, buf));
-                                    page
-                                };
-
-                                let survivors = candidates.into_iter().map(|pg| Ok(pg));
-                                let chosen_page = chosen.pagenum;
-                                let now_inactive = try!(chosen.blocklist_unsorted());
-                                let cursor = try!(ParentCursor::new(chosen));
-                                let cursor = PageCursor::Parent(cursor);
-                                (vec![cursor], MergingFrom::Other{level: level, old_segment: old_from_segment, chosen_page: chosen_page, depth: depth, blocks: now_inactive, survivors: box survivors, })
-
-                            },
-                        }
                     },
                 }
             };
@@ -7240,8 +7352,7 @@ impl InnerPart {
                 // so in the case where dest_leaves is empty AND behind is empty,
                 // we could actually call write_leaves here instead.  but that is uncommon
                 // and not a big win anyway.
-                //println!("dest_level: {:?}", from_level.get_dest_level(), );
-                let seg = try!(write_merge(&mut pw, source, dest_leaves, behind, &inner.path, f.clone()));
+                let seg = try!(write_merge(&mut pw, source, dest_leaves, behind, &inner.path, f.clone(), from_level.get_dest_level()));
                 seg
             } else {
                 None
@@ -7327,7 +7438,7 @@ impl InnerPart {
                             let buf = try!(read_and_alloc_page(&f, page, pw.page_size()));
                             let seg = try!(chain.done(&mut pw, buf));
                             let seg = seg.unwrap();
-                            MergeFrom::Other{level: level, old_segment: old_segment.root_page, new_segment: seg}
+                            MergeFrom::Other{level: level, old_segment: old_segment, new_segment: seg}
                         },
                         None => {
                             // TODO should never happen.  this means there were no survivors,
@@ -7367,10 +7478,11 @@ impl InnerPart {
                 now_inactive: now_inactive,
             };
         //println!("PendingMerge: {:?}", pm);
-        Ok(Some(pm))
+        Ok(pm)
     }
 
     fn commit_merge(&self, pm: PendingMerge) -> Result<()> {
+        let dest_level = pm.from.get_dest_level();
         //println!("commit_merge: {:?}", pm);
         {
             let mut header = try!(self.header.write());
@@ -7487,6 +7599,9 @@ impl InnerPart {
         // note that we intentionally do not release the writeLock here.
         // you can change the segment list more than once while holding
         // the writeLock.  the writeLock gets released when you Dispose() it.
+
+        try!(self.notify_work(dest_level.as_from_level()));
+
         Ok(())
     }
 

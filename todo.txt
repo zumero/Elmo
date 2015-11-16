@@ -1,13 +1,16 @@
 
+might want to send a Work message as soon as the db is
+loaded.  unless it was opened in a read only mode.
+
+should we keep track of "log" segments?  written but not
+put into the header yet?
+
+still need solution to monster block list.
+
+still need solution to leaf fullness problem.
+
 diag, count keys, avg keys per leaf, count parent nodes,
 avg keys per parent node, etc
-
-how can something go from 190,000 pages to so much fewer?
-are we ending up with lots of leaves that have lots of empty
-space in them?
-
-merge should release the merge lock each time through
-the loop so others get a chance
 
 need a way to report how many parent nodes got written
 by a merge.  and how many keys got processed from the
@@ -16,25 +19,6 @@ junior section.
 file size explodes when multiple writers?  something
 about pagewriter?  block size too big?  is pw.end getting
 called?
-
-fragmentation is getting awful.  really bad.
-
-remaining siblings code is just kinda wrong
-
-merge 0 just went from 
-    46371, 22697 pages
-to
-    46696, 395 pages
-    46695, 57 pages
-which has gotta be wrong.
-
-merge fresh doesn't seem to lose keys.
-merge young is fine too.
-merge 0 loses a lot.
-
-initial count looks wrong too.  after 1000 runs of 1000 keys, we should
-have a millon, and we had 977,561.  hmmm. could be updates overwrote
-because we accidentally chosen the same key as before.
 
 vec capacities
 
