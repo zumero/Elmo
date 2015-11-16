@@ -7105,7 +7105,7 @@ impl InnerPart {
                 // something that is still being read by something else.
                 // two merges promoting the same stuff are not allowed.
 
-                fn get_cursors(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &Vec<SegmentLocation>) -> Result<Vec<PageCursor>> {
+                fn get_cursors(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &[SegmentLocation]) -> Result<Vec<PageCursor>> {
                     let mut cursors = Vec::with_capacity(merge_segments.len());
                     for i in 0 .. merge_segments.len() {
                         let pagenum = merge_segments[i].root_page;
@@ -7123,11 +7123,16 @@ impl InnerPart {
                     Ok(cursors)
                 }
 
-                fn clone_from_end(v: &[SegmentLocation], count: usize) -> Vec<SegmentLocation> {
+                fn slice_from_end(v: &[SegmentLocation], count: usize) -> &[SegmentLocation] {
                     let count = std::cmp::min(count, v.len());
                     let i = v.len() - count;
                     let v = &v[i ..];
-                    let mut a = Vec::with_capacity(count);
+                    v
+                }
+
+                // TODO just the page and blocks
+                fn clone_infos(v: &[SegmentLocation]) -> Vec<SegmentLocation> {
+                    let mut a = Vec::with_capacity(v.len());
                     for s in v {
                         a.push(s.clone());
                     }
@@ -7137,19 +7142,23 @@ impl InnerPart {
                 match from_level {
                     FromLevel::Fresh => {
                         // TODO constant
-                        let merge_segments = clone_from_end(&header.fresh, 4);
+                        let merge_segments = slice_from_end(&header.fresh, 4);
 
                         //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
                         let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
+
+                        let merge_segments = clone_infos(merge_segments);
 
                         (cursors, MergingFrom::Fresh{segments: merge_segments})
                     },
                     FromLevel::Young => {
                         // TODO constant
-                        let merge_segments = clone_from_end(&header.young, 8);
+                        let merge_segments = slice_from_end(&header.young, 8);
 
                         //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
                         let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
+
+                        let merge_segments = clone_infos(merge_segments);
 
                         (cursors, MergingFrom::Young{segments: merge_segments})
                     },

@@ -1,9 +1,12 @@
 
+unless it needs to pass along an Arc clone, methods should
+be &self not &Arc<InnerPart>
+
 might want to send a Work message as soon as the db is
 loaded.  unless it was opened in a read only mode.
 
 should we keep track of "log" segments?  written but not
-put into the header yet?
+put into the header yet?  for recovery?
 
 still need solution to monster block list.
 
@@ -54,8 +57,6 @@ we should provide an object which abstracts the reading of page.
 allows a cache.  or a non-file.
 
 revisit when to check for tombstones during write_merge
-
-need finer grained merge locks?
 
 lsm_diag should just have show_page
 
