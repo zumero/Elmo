@@ -576,6 +576,15 @@ impl std::ops::Index<usize> for BlockList {
     }
 }
 
+fn clone_segment_locations(v: &[SegmentHeaderInfo]) -> Vec<SegmentLocation> {
+    let mut a = Vec::with_capacity(v.len());
+    for s in v {
+        let loc = SegmentLocation::new(s.root_page, s.blocks.clone());
+        a.push(loc);
+    }
+    a
+}
+
 #[inline]
 fn read_page_into_buf(f: &std::rc::Rc<std::cell::RefCell<File>>, page: PageNum, buf: &mut [u8]) -> Result<()> {
     {
@@ -1310,9 +1319,10 @@ pub const DEFAULT_SETTINGS: DbSettings =
 
 #[derive(Debug, Clone)]
 pub struct SegmentHeaderInfo {
+    // TODO could be a SegmentLocation
     pub root_page: PageNum,
-    buf: Box<[u8]>,
     pub blocks: BlockList,
+    buf: Box<[u8]>,
 }
 
 impl SegmentHeaderInfo {
@@ -1321,6 +1331,23 @@ impl SegmentHeaderInfo {
         SegmentHeaderInfo {
             root_page: root_page,
             buf: buf,
+            blocks: blocks,
+        }
+    }
+
+}
+
+#[derive(Debug, Clone)]
+pub struct SegmentLocation {
+    pub root_page: PageNum,
+    pub blocks: BlockList,
+}
+
+impl SegmentLocation {
+    pub fn new(root_page: PageNum, blocks: BlockList) -> Self {
+        assert!(!blocks.contains_page(root_page));
+        SegmentLocation {
+            root_page: root_page,
             blocks: blocks,
         }
     }
@@ -2556,6 +2583,7 @@ mod PageFlag {
 // provide info needed to write parent nodes.
 // TODO rename, revisit pub, etc
 pub struct pgitem {
+    // TODO could be a SegmentLocation
     pub page: PageNum,
     blocks: BlockList,
     // blocks does NOT contain page
@@ -6677,8 +6705,7 @@ impl DatabaseFile {
         InnerPart::write_segment(&self.inner, pairs)
     }
 
-    // TODO don't need page buf
-    pub fn list_segments(&self) -> Result<(Vec<SegmentHeaderInfo>, Vec<SegmentHeaderInfo>, Vec<SegmentHeaderInfo>)> {
+    pub fn list_segments(&self) -> Result<(Vec<SegmentLocation>, Vec<SegmentLocation>, Vec<SegmentLocation>)> {
         InnerPart::list_segments(&self.inner)
     }
 
@@ -6955,12 +6982,11 @@ impl InnerPart {
         Ok(())
     }
 
-    // TODO don't need page buf
-    fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<(Vec<SegmentHeaderInfo>, Vec<SegmentHeaderInfo>, Vec<SegmentHeaderInfo>)> {
+    fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<(Vec<SegmentLocation>, Vec<SegmentLocation>, Vec<SegmentLocation>)> {
         let header = try!(inner.header.read());
-        let fresh = header.fresh.clone();
-        let young = header.young.clone();
-        let levels = header.levels.clone();
+        let fresh = clone_segment_locations(&header.fresh);
+        let young = clone_segment_locations(&header.young);
+        let levels = clone_segment_locations(&header.levels);
         Ok((fresh, young, levels))
     }
 
@@ -7086,9 +7112,8 @@ impl InnerPart {
 
     fn prepare_merge(inner: &std::sync::Arc<InnerPart>, from_level: FromLevel) -> Result<PendingMerge> {
         enum MergingFrom {
-            // TODO for Fresh and Young, we should only need to clone root page and blocks, not the buf
-            Fresh{segments: Vec<SegmentHeaderInfo>},
-            Young{segments: Vec<SegmentHeaderInfo>},
+            Fresh{segments: Vec<SegmentLocation>},
+            Young{segments: Vec<SegmentLocation>},
             Other{level: usize, old_segment: PageNum, chosen_page: PageNum, depth: u8, blocks: BlockList, survivors: Box<Iterator<Item=Result<pgitem>>>},
         }
 
@@ -7132,15 +7157,6 @@ impl InnerPart {
                     v
                 }
 
-                // TODO just the page and blocks
-                fn clone_infos(v: &[SegmentHeaderInfo]) -> Vec<SegmentHeaderInfo> {
-                    let mut a = Vec::with_capacity(v.len());
-                    for s in v {
-                        a.push(s.clone());
-                    }
-                    a
-                }
-
                 match from_level {
                     FromLevel::Fresh => {
                         // TODO constant
@@ -7149,7 +7165,7 @@ impl InnerPart {
                         //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
                         let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
 
-                        let merge_segments = clone_infos(merge_segments);
+                        let merge_segments = clone_segment_locations(merge_segments);
 
                         (cursors, MergingFrom::Fresh{segments: merge_segments})
                     },
@@ -7160,7 +7176,7 @@ impl InnerPart {
                         //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
                         let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
 
-                        let merge_segments = clone_infos(merge_segments);
+                        let merge_segments = clone_segment_locations(merge_segments);
 
                         (cursors, MergingFrom::Young{segments: merge_segments})
                     },
