@@ -1309,16 +1309,16 @@ pub const DEFAULT_SETTINGS: DbSettings =
     };
 
 #[derive(Debug, Clone)]
-pub struct SegmentLocation {
+pub struct SegmentHeaderInfo {
     pub root_page: PageNum,
     buf: Box<[u8]>,
     pub blocks: BlockList,
 }
 
-impl SegmentLocation {
+impl SegmentHeaderInfo {
     pub fn new(root_page: PageNum, buf: Box<[u8]>, blocks: BlockList) -> Self {
         assert!(!blocks.contains_page(root_page));
-        SegmentLocation {
+        SegmentHeaderInfo {
             root_page: root_page,
             buf: buf,
             blocks: blocks,
@@ -2575,8 +2575,8 @@ impl pgitem {
         }
     }
 
-    fn into_segment_location(self, buf: Box<[u8]>) -> SegmentLocation {
-        SegmentLocation::new(self.page, buf, self.blocks)
+    fn into_segment_header_info(self, buf: Box<[u8]>) -> SegmentHeaderInfo {
+        SegmentHeaderInfo::new(self.page, buf, self.blocks)
     }
 
     fn need(&self, prefix_len: usize, depth: u8) -> usize {
@@ -3227,7 +3227,7 @@ fn flush_leaf(st: &mut LeafState,
 fn write_leaves<I: Iterator<Item=Result<kvp>>, >(
                     pw: &mut PageWriter,
                     mut pairs: I,
-                    ) -> Result<Option<SegmentLocation>> {
+                    ) -> Result<Option<SegmentHeaderInfo>> {
 
     let mut pb = PageBuilder::new(pw.page_size());
 
@@ -3273,7 +3273,7 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                     path: &str,
                     f: std::rc::Rc<std::cell::RefCell<File>>,
                     dest_level: DestLevel,
-                    ) -> Result<Option<SegmentLocation>> {
+                    ) -> Result<Option<SegmentHeaderInfo>> {
 
     let mut pb = PageBuilder::new(pw.page_size());
 
@@ -3853,10 +3853,10 @@ impl ParentNodeWriter {
         Ok(())
     }
 
-    fn done(mut self, pw: &mut PageWriter, buf_last_child: Box<[u8]>) -> Result<Option<SegmentLocation>> {
+    fn done(mut self, pw: &mut PageWriter, buf_last_child: Box<[u8]>) -> Result<Option<SegmentHeaderInfo>> {
         if self.result_one.is_none() && self.results_chain.is_none() && self.st.items.len() == 1 {
             let pg = self.st.items.remove(0);
-            let seg = pg.into_segment_location(buf_last_child);
+            let seg = pg.into_segment_header_info(buf_last_child);
             Ok(Some(seg))
         } else {
             try!(self.flush_page(pw));
@@ -3872,7 +3872,7 @@ impl ParentNodeWriter {
                 // TODO this assumes the last page written is still in pb.  it has to be.
                 // TODO unless it wrote no pages?
                 let buf = self.pb.into_buf();
-                let seg = pg.into_segment_location(buf);
+                let seg = pg.into_segment_header_info(buf);
                 Ok(Some(seg))
             } else {
                 Ok(None)
@@ -3885,7 +3885,7 @@ impl ParentNodeWriter {
 fn create_segment<I>(mut pw: PageWriter, 
                         source: I,
                         f: std::rc::Rc<std::cell::RefCell<File>>,
-                       ) -> Result<Option<SegmentLocation>> where I: Iterator<Item=Result<kvp>> {
+                       ) -> Result<Option<SegmentHeaderInfo>> where I: Iterator<Item=Result<kvp>> {
 
     let seg = try!(write_leaves(&mut pw, source));
 
@@ -5783,9 +5783,9 @@ impl IForwardCursor for MultiPageCursor {
 #[derive(Clone)]
 struct HeaderData {
 
-    fresh: Vec<SegmentLocation>,
-    young: Vec<SegmentLocation>,
-    levels: Vec<SegmentLocation>,
+    fresh: Vec<SegmentHeaderInfo>,
+    young: Vec<SegmentHeaderInfo>,
+    levels: Vec<SegmentHeaderInfo>,
 
     changeCounter: u64,
     mergeCounter: u64,
@@ -5817,7 +5817,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
             Ok(a)
         }
 
-        fn fix_segment_list(segments: Vec<PageNum>, pgsz: usize, f: std::rc::Rc<std::cell::RefCell<File>>, path: &str) -> Result<Vec<SegmentLocation>> {
+        fn fix_segment_list(segments: Vec<PageNum>, pgsz: usize, f: std::rc::Rc<std::cell::RefCell<File>>, path: &str) -> Result<Vec<SegmentHeaderInfo>> {
             let mut v = Vec::with_capacity(segments.len());
             for page in segments.iter() {
                 let pagenum = *page;
@@ -5849,7 +5849,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
                 //println!("after block list for segment {} has {} blocks and {} pages", pagenum, blist.count_blocks(), blist.count_pages());
                 //println!("    and encoded_len {}", blist.encoded_len());
 
-                let seg = SegmentLocation::new(pagenum, buf, blist);
+                let seg = SegmentHeaderInfo::new(pagenum, buf, blist);
 
                 v.push(seg);
             }
@@ -5926,7 +5926,7 @@ fn list_all_blocks(h: &HeaderData, pgsz: usize) -> BlockList {
     let headerBlock = PageBlock::new(1, (HEADER_SIZE_IN_BYTES / pgsz) as PageNum);
     blocks.add_block_no_reorder(headerBlock);
 
-    fn do_seglist(segments: &Vec<SegmentLocation>, blocks: &mut BlockList) {
+    fn do_seglist(segments: &Vec<SegmentHeaderInfo>, blocks: &mut BlockList) {
         for seg in segments.iter() {
             blocks.add_page_no_reorder(seg.root_page);
             blocks.add_blocklist_no_reorder(&seg.blocks);
@@ -6203,7 +6203,7 @@ impl Space {
 enum MergeFrom {
     Fresh{segments: Vec<PageNum>},
     Young{segments: Vec<PageNum>},
-    Other{level: usize, old_segment: PageNum, new_segment: SegmentLocation},
+    Other{level: usize, old_segment: PageNum, new_segment: SegmentHeaderInfo},
 }
 
 impl MergeFrom {
@@ -6227,7 +6227,7 @@ enum NeedsMerge {
 pub struct PendingMerge {
     from: MergeFrom,
     old_dest_segment: Option<PageNum>,
-    new_dest_segment: Option<SegmentLocation>,
+    new_dest_segment: Option<SegmentHeaderInfo>,
     now_inactive: BlockList,
 }
 
@@ -6309,7 +6309,7 @@ pub struct WriteLock {
 }
 
 impl WriteLock {
-    pub fn commit_segment(&self, seg: SegmentLocation) -> Result<()> {
+    pub fn commit_segment(&self, seg: SegmentHeaderInfo) -> Result<()> {
         try!(self.inner.commit_segment(seg));
         Ok(())
     }
@@ -6673,11 +6673,12 @@ impl DatabaseFile {
         InnerPart::read_parent_page(&self.inner, pg)
     }
 
-    pub fn write_segment(&self, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<Option<SegmentLocation>> {
+    pub fn write_segment(&self, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<Option<SegmentHeaderInfo>> {
         InnerPart::write_segment(&self.inner, pairs)
     }
 
-    pub fn list_segments(&self) -> Result<(Vec<SegmentLocation>, Vec<SegmentLocation>, Vec<SegmentLocation>)> {
+    // TODO don't need page buf
+    pub fn list_segments(&self) -> Result<(Vec<SegmentHeaderInfo>, Vec<SegmentHeaderInfo>, Vec<SegmentHeaderInfo>)> {
         InnerPart::list_segments(&self.inner)
     }
 
@@ -6777,7 +6778,7 @@ impl InnerPart {
         fn build_segment_list(h: &HeaderData) -> Vec<u8> {
             let mut pb = vec![];
 
-            fn add_list(pb: &mut Vec<u8>, v: &Vec<SegmentLocation>) {
+            fn add_list(pb: &mut Vec<u8>, v: &Vec<SegmentHeaderInfo>) {
                 misc::push_varint(pb, v.len() as u64);
                 for seg in v.iter() {
                     misc::push_varint(pb, seg.root_page as u64);
@@ -6954,7 +6955,8 @@ impl InnerPart {
         Ok(())
     }
 
-    fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<(Vec<SegmentLocation>, Vec<SegmentLocation>, Vec<SegmentLocation>)> {
+    // TODO don't need page buf
+    fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<(Vec<SegmentHeaderInfo>, Vec<SegmentHeaderInfo>, Vec<SegmentHeaderInfo>)> {
         let header = try!(inner.header.read());
         let fresh = header.fresh.clone();
         let young = header.young.clone();
@@ -6962,7 +6964,7 @@ impl InnerPart {
         Ok((fresh, young, levels))
     }
 
-    fn commit_segment(&self, seg: SegmentLocation) -> Result<()> {
+    fn commit_segment(&self, seg: SegmentHeaderInfo) -> Result<()> {
         {
             let mut header = try!(self.header.write());
 
@@ -6989,7 +6991,7 @@ impl InnerPart {
         Ok(())
     }
 
-    fn write_segment(inner: &std::sync::Arc<InnerPart>, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<Option<SegmentLocation>> {
+    fn write_segment(inner: &std::sync::Arc<InnerPart>, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<Option<SegmentHeaderInfo>> {
         let source = pairs.into_iter().map(|t| {
             let (k, v) = t;
             Ok(kvp {Key:k, Value:v})
@@ -7085,8 +7087,8 @@ impl InnerPart {
     fn prepare_merge(inner: &std::sync::Arc<InnerPart>, from_level: FromLevel) -> Result<PendingMerge> {
         enum MergingFrom {
             // TODO for Fresh and Young, we should only need to clone root page and blocks, not the buf
-            Fresh{segments: Vec<SegmentLocation>},
-            Young{segments: Vec<SegmentLocation>},
+            Fresh{segments: Vec<SegmentHeaderInfo>},
+            Young{segments: Vec<SegmentHeaderInfo>},
             Other{level: usize, old_segment: PageNum, chosen_page: PageNum, depth: u8, blocks: BlockList, survivors: Box<Iterator<Item=Result<pgitem>>>},
         }
 
@@ -7105,7 +7107,7 @@ impl InnerPart {
                 // something that is still being read by something else.
                 // two merges promoting the same stuff are not allowed.
 
-                fn get_cursors(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &[SegmentLocation]) -> Result<Vec<PageCursor>> {
+                fn get_cursors(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &[SegmentHeaderInfo]) -> Result<Vec<PageCursor>> {
                     let mut cursors = Vec::with_capacity(merge_segments.len());
                     for i in 0 .. merge_segments.len() {
                         let pagenum = merge_segments[i].root_page;
@@ -7123,7 +7125,7 @@ impl InnerPart {
                     Ok(cursors)
                 }
 
-                fn slice_from_end(v: &[SegmentLocation], count: usize) -> &[SegmentLocation] {
+                fn slice_from_end(v: &[SegmentHeaderInfo], count: usize) -> &[SegmentHeaderInfo] {
                     let count = std::cmp::min(count, v.len());
                     let i = v.len() - count;
                     let v = &v[i ..];
@@ -7131,7 +7133,7 @@ impl InnerPart {
                 }
 
                 // TODO just the page and blocks
-                fn clone_infos(v: &[SegmentLocation]) -> Vec<SegmentLocation> {
+                fn clone_infos(v: &[SegmentHeaderInfo]) -> Vec<SegmentHeaderInfo> {
                     let mut a = Vec::with_capacity(v.len());
                     for s in v {
                         a.push(s.clone());
@@ -7500,7 +7502,7 @@ impl InnerPart {
 
             let mut newHeader = header.clone();
 
-            fn update_header(newHeader: &mut HeaderData, old_dest_segment: Option<PageNum>, new_dest_segment: Option<SegmentLocation>, dest_level: usize) {
+            fn update_header(newHeader: &mut HeaderData, old_dest_segment: Option<PageNum>, new_dest_segment: Option<SegmentHeaderInfo>, dest_level: usize) {
                 match (old_dest_segment, new_dest_segment) {
                     (None, None) => {
                         // a merge resulted in what would have been an empty segment.
@@ -7530,7 +7532,7 @@ impl InnerPart {
                 }
             }
 
-            fn find_segments_in_list(merge: &[PageNum], hdr: &[SegmentLocation]) -> usize {
+            fn find_segments_in_list(merge: &[PageNum], hdr: &[SegmentHeaderInfo]) -> usize {
                 fn slice_within(sub: &[PageNum], within: &[PageNum]) -> usize {
                     match within.iter().position(|&g| g == sub[0]) {
                         Some(ndx_first) => {
