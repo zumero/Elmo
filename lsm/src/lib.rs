@@ -7311,44 +7311,64 @@ impl InnerPart {
             let (behind, behind_rlock) = {
                 // during merge, a tombstone can be removed iff there is nothing
                 // for that key left in the segments behind the dest segment.
-                // so we need cursors on all those segemnts so that write_merge()
+                // so we need cursors on all those segments so that write_merge()
                 // can check.
 
-                // TODO ouch.  getting a clone of every segment isn't such a great idea
-                let mut behind_segments = vec![];
-                let first_level_after = 
+                let (behind_cursors, behind_blocks) = {
+                    fn get_cursor(
+                        path: &str, 
+                        f: std::rc::Rc<std::cell::RefCell<File>>,
+                        seg: &SegmentHeaderInfo,
+                        ) -> Result<PageCursor> {
+
+                        let done_page = move |_| -> () {
+                        };
+                        // TODO and the clone below is silly too
+                        let buf = Lend::new(seg.buf.clone(), box done_page);
+
+                        let cursor = try!(PageCursor::new_already_read_page(path, f, seg.root_page, buf));
+                        Ok(cursor)
+                    }
+
+                    let mut behind_cursors = vec![];
+                    let mut behind_blocks = BlockList::new();
                     match from_level.get_dest_level() {
                         DestLevel::Young => {
                             for i in 0 .. header.young.len() {
-                                behind_segments.push(header.young[i].clone());
+                                let seg = &header.young[i];
+
+                                behind_blocks.add_page_no_reorder(seg.root_page);
+                                behind_blocks.add_blocklist_no_reorder(&seg.blocks);
+
+                                let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
+                                behind_cursors.push(cursor);
                             }
-                            0
+                            for i in 0 .. header.levels.len() {
+                                let seg = &header.levels[i];
+
+                                behind_blocks.add_page_no_reorder(seg.root_page);
+                                behind_blocks.add_blocklist_no_reorder(&seg.blocks);
+
+                                let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
+                                behind_cursors.push(cursor);
+                            }
                         },
                         DestLevel::Other(dest_level) => {
-                            dest_level + 1
+                            for i in dest_level + 1 .. header.levels.len() {
+                                let seg = &header.levels[i];
+
+                                behind_blocks.add_page_no_reorder(seg.root_page);
+                                behind_blocks.add_blocklist_no_reorder(&seg.blocks);
+
+                                let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
+                                behind_cursors.push(cursor);
+                            }
                         },
-                    };
+                    }
+                    behind_blocks.sort_and_consolidate();
+                    (behind_cursors, behind_blocks)
+                };
 
-                for i in first_level_after .. header.levels.len() {
-                    behind_segments.push(header.levels[i].clone());
-                }
-                let mut behind_blocks = BlockList::new();
-                for seg in behind_segments.iter() {
-                    behind_blocks.add_page_no_reorder(seg.root_page);
-                    behind_blocks.add_blocklist_no_reorder(&seg.blocks);
-                }
-                behind_blocks.sort_and_consolidate();
-                let mut behind_cursors = Vec::with_capacity(behind_segments.len());
-                for i in 0 .. behind_segments.len() {
-                    // TODO it's a little silly here to construct a Lend<>
-                    let done_page = move |_| -> () {
-                    };
-                    // TODO and the clone below is silly too
-                    let buf = Lend::new(behind_segments[i].buf.clone(), box done_page);
-
-                    let cursor = try!(PageCursor::new_already_read_page(&inner.path, f.clone(), behind_segments[i].root_page, buf));
-                    behind_cursors.push(cursor);
-                }
                 let behind_rlock =
                     if behind_blocks.is_empty() {
                         None
