@@ -7,9 +7,6 @@ authors = [ "Eric Sink <eric@zumero.com>" ]
 [dependencies.misc]
 path = "../misc"
 
-[dependencies]
-fst = "*"
-
 # The testing profile, used for `cargo test`
 [profile.test]
 opt-level = 3

@@ -28,9 +28,6 @@
 
 extern crate misc;
 
-extern crate fst;
-use fst::SetBuilder;
-
 use misc::endian;
 use misc::varint;
 use misc::Lend;
@@ -3568,7 +3565,7 @@ impl ParentNodeWriter {
         }
     }
 
-    fn put_item(&mut self, list: &mut BlockList, item: &pgitem, prefix_len: usize, total_key_len: &mut usize, actual_key_len: &mut usize) {
+    fn put_item(&mut self, list: &mut BlockList, item: &pgitem, prefix_len: usize) {
         self.pb.PutVarint(item.page as u64);
         list.add_page_no_reorder(item.page);
         if self.depth == 1 {
@@ -3591,31 +3588,6 @@ impl ParentNodeWriter {
                 self.pb.PutVarint(0);
             },
         }
-
-        match &item.first_key.location {
-            &KeyLocation::Inline => {
-                *total_key_len += item.first_key.key.len();
-                *actual_key_len += item.first_key.key.len() - prefix_len;
-            },
-            _ => {
-            },
-        }
-
-        match &item.last_key {
-            &Some(ref last_key) => {
-                match &last_key.location {
-                    &KeyLocation::Inline => {
-                        *total_key_len += last_key.key.len();
-                        *actual_key_len += last_key.key.len() - prefix_len;
-                    },
-                    _ => {
-                    },
-                }
-            },
-            &None => {
-            },
-        }
-
     }
 
     fn build_parent_page(&mut self,
@@ -3628,55 +3600,25 @@ impl ParentNodeWriter {
         self.pb.PutByte(0u8);
         self.pb.PutByte(self.depth);
         self.pb.PutVarint(self.st.prefixLen as u64);
-        let mut total_key_len = 0;
-        let mut actual_key_len = 0;
         if self.st.prefixLen > 0 {
             self.pb.PutArray(&self.st.items[0].first_key.key[0 .. self.st.prefixLen]);
-            actual_key_len += self.st.prefixLen;
         }
-        let count_items = self.st.items.len();
         self.pb.PutInt16(self.st.items.len() as u16);
         //println!("self.st.items.len(): {}", self.st.items.len());
 
         let mut list = BlockList::new();
 
-        let mut build = SetBuilder::memory();
-
         // deal with the first item separately
         let (first_key, last_key_from_first_item) = {
             let item = self.st.items.remove(0); 
             let prefix_len = self.st.prefixLen;
-
-            match &item.first_key.location {
-                &KeyLocation::Inline => {
-                    build.insert(&*item.first_key.key);
-                },
-                _ => {
-                },
-            }
-            match &item.last_key {
-                &Some(ref last_key) => {
-                    match &last_key.location {
-                        &KeyLocation::Inline => {
-                            build.insert(&*last_key.key);
-                        },
-                        _ => {
-                        },
-                    }
-                },
-                _ => {
-                },
-            }
-
-            self.put_item(&mut list, &item, prefix_len, &mut total_key_len, &mut actual_key_len);
+            self.put_item(&mut list, &item, prefix_len);
             (item.first_key, item.last_key)
         };
 
         if self.st.items.len() == 0 {
             // there was only one item in this page
             list.sort_and_consolidate();
-            let v = build.into_inner().unwrap();
-        println!("count_items,{},total_key_len,{},actual_key_len,{},fsa_len,{}", count_items, total_key_len, actual_key_len, v.len());
             (first_key, last_key_from_first_item, list, self.pb.sofar())
         } else {
             if self.st.items.len() > 1 {
@@ -3685,29 +3627,7 @@ impl ParentNodeWriter {
                 let tmp_vec = self.st.items.drain(0 .. tmp_count).collect::<Vec<_>>();
                 let prefix_len = self.st.prefixLen;
                 for item in tmp_vec {
-            match &item.first_key.location {
-                &KeyLocation::Inline => {
-                    build.insert(&*item.first_key.key);
-                },
-                _ => {
-                },
-            }
-            match &item.last_key {
-                &Some(ref last_key) => {
-                    match &last_key.location {
-                        &KeyLocation::Inline => {
-                            build.insert(&*last_key.key);
-                        },
-                        _ => {
-                        },
-                    }
-                },
-                _ => {
-                },
-            }
-
-                    self.put_item(&mut list, &item, prefix_len, &mut total_key_len, &mut
-                                  actual_key_len);
+                    self.put_item(&mut list, &item, prefix_len);
                 }
             }
             assert!(self.st.items.len() == 1);
@@ -3716,36 +3636,13 @@ impl ParentNodeWriter {
             let last_key = {
                 let item = self.st.items.remove(0); 
                 let prefix_len = self.st.prefixLen;
-            match &item.first_key.location {
-                &KeyLocation::Inline => {
-                    build.insert(&*item.first_key.key);
-                },
-                _ => {
-                },
-            }
-            match &item.last_key {
-                &Some(ref last_key) => {
-                    match &last_key.location {
-                        &KeyLocation::Inline => {
-                            build.insert(&*last_key.key);
-                        },
-                        _ => {
-                        },
-                    }
-                },
-                _ => {
-                },
-            }
-
-                self.put_item(&mut list, &item, prefix_len, &mut total_key_len, &mut actual_key_len);
+                self.put_item(&mut list, &item, prefix_len);
                 match item.last_key {
                     Some(last_key) => last_key,
                     None => item.first_key,
                 }
             };
             assert!(self.st.items.is_empty());
-            let v = build.into_inner().unwrap();
-        println!("count_items,{},total_key_len,{},actual_key_len,{},fsa_len,{}", count_items, total_key_len, actual_key_len, v.len());
 
             list.sort_and_consolidate();
             (first_key, Some(last_key), list, self.pb.sofar())
