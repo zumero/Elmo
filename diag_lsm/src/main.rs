@@ -64,15 +64,15 @@ fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let page = try!(db.read_parent_page(pgnum));
     println!("depth: {}", page.depth());
-    println!("count_items: {}", page.count_items());
+    //println!("count_items: {}", page.count_items());
     let blocks = try!(page.blocklist_clean());
     //println!("blocks ({} blocks, {} pages): {:?}", blocks.count_blocks(), blocks.count_pages(), blocks);
     println!("blocks ({} blocks, {} pages)", blocks.count_blocks(), blocks.count_pages());
-    println!("key range: {:?}", try!(page.range()));
+    //println!("key range: {:?}", try!(page.range()));
     let count = page.count_items();
-    println!("items ({}):", count);
     if cfg!(expensive_check) 
     {
+        println!("items ({}):", count);
         for i in 0 .. count {
             let p = page.child_pagenum(i);
             println!("    {}", p);
@@ -81,8 +81,22 @@ fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
         }
         try!(page.verify_child_keys());
     }
+    {
+        let mut cur_depth = page.depth();
+        loop {
+            cur_depth -= 1;
+
+            let page = try!(db.read_parent_page(pgnum));
+            let it = page.into_depth_iter(cur_depth);
+            let count = it.count();
+            println!("nodes at depth {}: {}", cur_depth, count);
+            if cur_depth == 0 {
+                break;
+            }
+        }
+    }
     let mut leaf = page.make_leaf_page();
-    let leaves = page.into_iter_leaves();
+    let leaves = page.into_depth_iter(0);
     let mut count_leaves = 0;
     let mut bytes_used_in_leaves = 0;
     for pg_leaf in leaves {
@@ -91,7 +105,7 @@ fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
         count_leaves += 1;
         bytes_used_in_leaves += leaf.len_on_page();
     }
-    println!("leaves: {}:", count_leaves);
+    //println!("leaves: {}:", count_leaves);
     println!("avg leaf len: {}", bytes_used_in_leaves / count_leaves);
     Ok(())
 }

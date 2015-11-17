@@ -5066,8 +5066,8 @@ impl ParentPage {
         LeafPage::new(&self.path, self.f.clone(), self.pr.len(), )
     }
 
-    pub fn into_iter_leaves(self) -> Box<Iterator<Item=Result<pgitem>>> {
-        let leaves = DepthIterator::new(self, 0);
+    pub fn into_depth_iter(self, depth: u8) -> Box<Iterator<Item=Result<pgitem>>> {
+        let leaves = DepthIterator::new(self, depth);
         box leaves
     }
 

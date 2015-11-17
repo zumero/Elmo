@@ -12,12 +12,6 @@ still need solution to monster block list.
 
 still need solution to leaf fullness problem.
 
-diag, count keys, avg keys per leaf, count parent nodes,
-avg keys per parent node, etc
-
-need a way to report how many parent nodes got written
-by a merge.
-
 file size explodes when multiple writers?  something
 about pagewriter?  block size too big?  is pw.end getting
 called?
