@@ -3288,7 +3288,7 @@ fn write_leaves<I: Iterator<Item=Result<kvp>>, >(
 
     // TODO this assumes the last page written is still in pb.  it has to be.
     // TODO unless it wrote no pages?
-    let seg = try!(chain.done(pw, pb.into_buf()));
+    let (count_parent_nodes, seg) = try!(chain.done(pw, pb.into_buf()));
 
     Ok(seg)
 }
@@ -3499,11 +3499,11 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
         }
     }
 
-    println!("dest,{:?},leaves_rewritten,{},leaves_recycled,{},keys_promoted,{},keys_rewritten,{}", dest_level, leaves_rewritten, leaves_recycled, keys_promoted, keys_rewritten);
-
     // TODO this assumes the last page written is still in pb.  it has to be.
     // TODO unless it wrote no pages?
-    let seg = try!(chain.done(pw, pb.into_buf()));
+    let (count_parent_nodes, seg) = try!(chain.done(pw, pb.into_buf()));
+
+    println!("dest,{:?},leaves_rewritten,{},leaves_recycled,{},keys_promoted,{},keys_rewritten,{},count_parent_nodes,{}", dest_level, leaves_rewritten, leaves_recycled, keys_promoted, keys_rewritten, count_parent_nodes);
 
     Ok(seg)
 }
@@ -3517,7 +3517,7 @@ struct ParentNodeWriter {
     result_one: Option<pgitem>,
     results_chain: Option<Box<ParentNodeWriter>>,
 
-    // TODO this thing should keep track of how many parent pages it wrote
+    count_emit: usize,
 }
 
 impl ParentNodeWriter {
@@ -3538,6 +3538,7 @@ impl ParentNodeWriter {
             depth: children_depth + 1,
             result_one: None,
             results_chain: None,
+            count_emit: 0,
         }
     }
 
@@ -3843,6 +3844,7 @@ impl ParentNodeWriter {
     }
 
     fn emit(&mut self, pw: &mut PageWriter, pg: pgitem) -> Result<()> {
+        self.count_emit += 1;
         if self.results_chain.is_some() {
             assert!(self.result_one.is_none());
             let mut chain = self.results_chain.as_mut().unwrap();
@@ -3872,11 +3874,12 @@ impl ParentNodeWriter {
         Ok(())
     }
 
-    fn done(mut self, pw: &mut PageWriter, buf_last_child: Box<[u8]>) -> Result<Option<SegmentHeaderInfo>> {
+    fn done(mut self, pw: &mut PageWriter, buf_last_child: Box<[u8]>) -> Result<(usize, Option<SegmentHeaderInfo>)> {
         if self.result_one.is_none() && self.results_chain.is_none() && self.st.items.len() == 1 {
             let pg = self.st.items.remove(0);
             let seg = pg.into_segment_header_info(buf_last_child);
-            Ok(Some(seg))
+            assert!(self.count_emit == 0);
+            Ok((self.count_emit, Some(seg)))
         } else {
             try!(self.flush_page(pw));
             assert!(self.st.items.is_empty());
@@ -3885,16 +3888,18 @@ impl ParentNodeWriter {
                 // TODO this assumes the last page written is still in pb.  it has to be.
                 // TODO unless it wrote no pages?
                 let buf = self.pb.into_buf();
-                let seg = try!(chain.done(pw, buf));
-                Ok(seg)
+                let (count_chain, seg) = try!(chain.done(pw, buf));
+                Ok((self.count_emit + count_chain, seg))
             } else if let Some(pg) = self.result_one {
                 // TODO this assumes the last page written is still in pb.  it has to be.
                 // TODO unless it wrote no pages?
                 let buf = self.pb.into_buf();
                 let seg = pg.into_segment_header_info(buf);
-                Ok(Some(seg))
+                assert!(self.count_emit == 1);
+                Ok((self.count_emit, Some(seg)))
             } else {
-                Ok(None)
+                assert!(self.count_emit == 0);
+                Ok((self.count_emit, None))
             }
         }
     }
@@ -7474,7 +7479,7 @@ impl InnerPart {
                     match last_page {
                         Some(page) => {
                             let buf = try!(read_and_alloc_page(&f, page, pw.page_size()));
-                            let seg = try!(chain.done(&mut pw, buf));
+                            let (count_parent_nodes, seg) = try!(chain.done(&mut pw, buf));
                             let seg = seg.unwrap();
                             MergeFrom::Other{level: level, old_segment: old_segment, new_segment: seg}
                         },
