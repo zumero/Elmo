@@ -16,16 +16,13 @@ diag, count keys, avg keys per leaf, count parent nodes,
 avg keys per parent node, etc
 
 need a way to report how many parent nodes got written
-by a merge.  and how many keys got processed from the
-junior section.
+by a merge.
 
 file size explodes when multiple writers?  something
 about pagewriter?  block size too big?  is pw.end getting
 called?
 
 vec capacities
-
-prepare_merge clones too much stuff
 
 at some point we should review which asserts we really want in release
 builds and perf check without the rest of them.

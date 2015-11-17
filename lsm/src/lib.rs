@@ -3318,8 +3318,6 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
         prev_key: None,
     };
 
-    let mut cur_otherleaf = try!(misc::inside_out(leaves.next()));
-
     fn necessary_tombstone(k: &[u8], 
                     behind: &mut Vec<PageCursor>,
                ) -> Result<bool> {
@@ -3349,170 +3347,159 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
 
     let mut chain = ParentNodeWriter::new(pw.page_size(), 0);
 
+    #[derive(Debug)]
+    enum Action {
+        Pairs,
+        LeafPair(usize),
+        RewriteLeaf,
+        RecycleLeaf,
+        Done,
+    }
+
     // TODO how would this algorithm be adjusted to work at a different depth?
     // like, suppose instead of leaves, we were given depth 1 parents?
 
     let mut leafreader = LeafPage::new(path, f.clone(), pw.page_size(), );
 
-    let mut cur_pair = try!(misc::inside_out(pairs.next()));
+    let mut pairs = pairs.peekable();
+    let mut leaves = leaves.peekable();
+
     let mut cur_in_other = None;
+    let mut keys_promoted = 0;
+    let mut keys_rewritten = 0;
     let mut leaves_rewritten = 0;
     let mut leaves_recycled = 0;
+
     loop {
-        // TODO which cases below should check to see if a tombstone can be filtered?
+        let action = 
+            match (pairs.peek(), cur_in_other, leaves.peek()) {
+                (Some(&Err(ref e)), _, _) => {
+                    // TODO have the action return this error
+                    return Err(Error::Misc(String::from("inside error")));
+                },
+                (_, _, Some(&Err(ref e))) => {
+                    // TODO have the action return this error
+                    return Err(Error::Misc(String::from("inside error")));
+                },
+                (Some(&Ok(ref peek_pair)), Some(i), _) => {
+                    // we are in the middle of a leaf being rewritten
 
-        // TODO the way the code below moves things out of cur_pair and cur_otherleaf
-        // and then sometimes has to move them back.  so dorky.
-        match (cur_pair, cur_in_other, cur_otherleaf) {
-            (Some(pair), Some(i), q) => {
-                // we are in the middle of a leaf being rewritten
+                    // TODO if there is an otherleaf, we know that it
+                    // is greater than pair or kvp/i.  assert that.
+                    let c = {
+                        let k = try!(leafreader.key(i));
+                        k.compare_with(&peek_pair.Key)
+                    };
+                    match c {
+                        Ordering::Greater => {
+                            Action::Pairs
+                        },
+                        Ordering::Equal => {
+                            // whatever value is coming from the rewritten leaf, it is superceded
+                            if i + 1 < leafreader.count_keys() {
+                                cur_in_other = Some(i + 1);
+                            } else {
+                                cur_in_other = None;
+                            }
+                            Action::Pairs
+                        },
+                        Ordering::Less => {
+                            if i + 1 < leafreader.count_keys() {
+                                cur_in_other = Some(i + 1);
+                            } else {
+                                cur_in_other = None;
+                            }
+                            Action::LeafPair(i)
+                        },
+                    }
+                },
+                (None, Some(i), _) => {
+                    if i + 1 < leafreader.count_keys() {
+                        cur_in_other = Some(i + 1);
+                    } else {
+                        cur_in_other = None;
+                    }
+                    Action::LeafPair(i)
+                },
+                (Some(&Ok(_)), None, None) => {
+                    Action::Pairs
+                },
+                (None, None, Some(&Ok(_))) => {
+                    Action::RecycleLeaf
+                },
+                (Some(&Ok(ref peek_pair)), None, Some(&Ok(ref peek_pg))) => {
+                    match try!(peek_pg.key_in_range(&peek_pair.Key)) {
+                        KeyInRange::Less => {
+                            Action::Pairs
+                        },
+                        KeyInRange::Greater => {
+                            // TODO we *could* decide to rewrite this leaf anyway.
+                            // like, for example, if the leaf we have been constructing is
+                            // mostly empty.
 
-                // TODO if there is an otherleaf in q, we know that it
-                // is greater than pair or kvp/i.  assert.
-                let c = {
-                    let k = try!(leafreader.key(i));
-                    k.compare_with(&pair.Key)
-                };
-                match c {
-                    Ordering::Greater => {
-                        //println!("otherpair greater, pair from merge: {:?}", pair.Key);
-                        if !pair.Value.is_tombstone() || try!(necessary_tombstone(&pair.Key, &mut behind)) {
-                            if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                                try!(chain.add_child(pw, pg));
-                            }
-                        }
-                        cur_pair = try!(misc::inside_out(pairs.next()));
-                    },
-                    Ordering::Equal => {
-                        //println!("otherpair equal, pair from merge: {:?}", pair.Key);
-                        if !pair.Value.is_tombstone() || try!(necessary_tombstone(&pair.Key, &mut behind)) {
-                            if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                                try!(chain.add_child(pw, pg));
-                            }
-                        }
-                        cur_pair = try!(misc::inside_out(pairs.next()));
-                        // whatever value is coming from the rewritten leaf, it is superceded
-                        if i + 1 < leafreader.count_keys() {
-                            cur_in_other = Some(i + 1);
-                        } else {
-                            cur_in_other = None;
-                        }
-                    },
-                    Ordering::Less => {
-                        let leafpair = try!(leafreader.kvp_for_merge(i));
-                        //println!("otherpair wins: {:?}", leafpair.Key);
-                        if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, leafpair)) {
-                            try!(chain.add_child(pw, pg));
-                        }
-                        if i + 1 < leafreader.count_keys() {
-                            cur_in_other = Some(i + 1);
-                        } else {
-                            cur_in_other = None;
-                        }
-                        cur_pair = Some(pair);
-                    },
+                            Action::RecycleLeaf
+                        },
+                        KeyInRange::EqualFirst | KeyInRange::EqualLast | KeyInRange::Within => {
+                            // TODO technically, EqualFirst could start at 1, since the first key
+                            // of the rewritten page will get skipped anyway because it is equal to
+                            // the current key from the merge.
+
+                            // TODO EqualLast could just ignore the other leaf, since it won't matter.
+
+                            Action::RewriteLeaf
+                        },
+                    }
+                },
+                (None, None, None) => {
+                    Action::Done
+                },
+            };
+        //println!("dest,{:?},action,{:?}", dest_level, action);
+        match action {
+            Action::Pairs => {
+                let pair = try!(misc::inside_out(pairs.next())).unwrap();
+                if !pair.Value.is_tombstone() || try!(necessary_tombstone(&pair.Key, &mut behind)) {
+                    if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
+                        try!(chain.add_child(pw, pg));
+                    }
                 }
-                cur_otherleaf = q;
+                keys_promoted += 1;
             },
-            (None, Some(i), q) => {
-                let pair = try!(leafreader.kvp_for_merge(i));
-                //println!("regular pairs gone, otherpair: {:?}", pair.Key);
-                if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
+            Action::LeafPair(i) => {
+                // TODO hmph.  should probably do tombstone check here?
+                let leafpair = try!(leafreader.kvp_for_merge(i));
+                if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, leafpair)) {
                     try!(chain.add_child(pw, pg));
                 }
-                if i + 1 < leafreader.count_keys() {
-                    cur_in_other = Some(i + 1);
-                } else {
-                    cur_in_other = None;
-                }
-                cur_pair = None;
-                cur_otherleaf = q;
+                keys_rewritten += 1;
             },
-            (Some(pair), None, None) => {
-                //println!("everything else gone, regular pair: {:?}", pair.Key);
-                if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                    try!(chain.add_child(pw, pg));
-                }
-                cur_pair = try!(misc::inside_out(pairs.next()));
-                cur_otherleaf = None;
-            },
-            (None, None, Some(pg)) => {
-                //println!("everything else gone, reusing page: {:?}", pg);
+            Action::RecycleLeaf => {
                 if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
                     try!(chain.add_child(pw, pg));
                 }
+                let pg = try!(misc::inside_out(leaves.next())).unwrap();
                 try!(chain.add_child(pw, pg));
                 leaves_recycled += 1;
-                cur_otherleaf = try!(misc::inside_out(leaves.next()));
-                cur_pair = None;
             },
-            (Some(pair), None, Some(pg)) => {
-                match try!(pg.key_in_range(&pair.Key)) {
-                    KeyInRange::Less => {
-                        //println!("regular pair less than next otherleaf: {:?}", pair.Key);
-                        if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                            try!(chain.add_child(pw, pg));
-                        }
-                        cur_pair = try!(misc::inside_out(pairs.next()));
-                        cur_otherleaf = Some(pg);
-                        assert!(cur_in_other.is_none());
-                    },
-                    KeyInRange::Greater => {
-                        //println!("regular pair passed otherleaf, reusing: {:?}", pg);
-
-                        // TODO we *could* decide to rewrite this leaf anyway.
-                        // like, for example, if the leaf we have been constructing is
-                        // mostly empty.
-
-                        // TODO figure out correct ratio here?
-                        //let min_page_fullness = pw.page_size() / 4;
-                        let min_page_fullness = 0;
-                        if calc_leaf_page_len(st.prefixLen, st.sofarLeaf) > min_page_fullness {
-                            assert!(cur_in_other.is_none());
-                            if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
-                                try!(chain.add_child(pw, pg));
-                            }
-                            try!(chain.add_child(pw, pg));
-                            leaves_recycled += 1;
-                            cur_otherleaf = try!(misc::inside_out(leaves.next()));
-                            cur_pair = Some(pair);
-                        } else {
-                            leaves_rewritten += 1;
-                            try!(leafreader.read_page(pg.page));
-                            cur_in_other = Some(0);
-
-                            cur_otherleaf = try!(misc::inside_out(leaves.next()));
-                            cur_pair = Some(pair);
-                        }
-
-                    },
-                    KeyInRange::EqualFirst | KeyInRange::EqualLast | KeyInRange::Within => {
-                        //println!("regular pair inside otherleaf, rewriting: {:?}", pg);
-                        leaves_rewritten += 1;
-                        try!(leafreader.read_page(pg.page));
-                        cur_in_other = Some(0);
-
-                        // TODO technically, EqualFirst could start at 1, since the first key
-                        // of the rewritten page will get skipped anyway because it is equal to
-                        // the current key from the merge.
-
-                        // TODO EqualLast could just ignore the other leaf, since it won't matter.
-
-                        cur_otherleaf = try!(misc::inside_out(leaves.next()));
-                        cur_pair = Some(pair);
-                    },
-                }
+            Action::RewriteLeaf => {
+                let pg = try!(misc::inside_out(leaves.next())).unwrap();
+                try!(leafreader.read_page(pg.page));
+                cur_in_other = Some(0);
+                leaves_rewritten += 1;
             },
-            (None, None, None) => {
+            Action::Done => {
                 if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
+                    //println!("dest,{:?},child,{:?}", dest_level, pg);
                     try!(chain.add_child(pw, pg));
+                } else {
+                    println!("dest,{:?},empty_done", dest_level);
                 }
                 break;
             },
         }
     }
 
-    println!("dest,{:?},rewritten,{},recycled,{}", dest_level, leaves_rewritten, leaves_recycled);
+    println!("dest,{:?},leaves_rewritten,{},leaves_recycled,{},keys_promoted,{},keys_rewritten,{}", dest_level, leaves_rewritten, leaves_recycled, keys_promoted, keys_rewritten);
 
     // TODO this assumes the last page written is still in pb.  it has to be.
     // TODO unless it wrote no pages?
@@ -3529,6 +3516,8 @@ struct ParentNodeWriter {
 
     result_one: Option<pgitem>,
     results_chain: Option<Box<ParentNodeWriter>>,
+
+    // TODO this thing should keep track of how many parent pages it wrote
 }
 
 impl ParentNodeWriter {
@@ -3871,13 +3860,15 @@ impl ParentNodeWriter {
     }
 
     fn flush_page(&mut self, pw: &mut PageWriter) -> Result<()> {
-        let should_be = Self::calc_page_len(self.st.prefixLen, self.st.sofar);
-        let (len_page, pg) = try!(self.write_parent_page(pw));
-        // TODO try!(pg.verify(pw.page_size(), path, f.clone()));
-        try!(self.emit(pw, pg));
-        //println!("should_be = {}   len_page = {}", should_be, len_page);
-        assert!(should_be == len_page);
-        assert!(self.st.items.is_empty());
+        if !self.st.items.is_empty() {
+            let should_be = Self::calc_page_len(self.st.prefixLen, self.st.sofar);
+            let (len_page, pg) = try!(self.write_parent_page(pw));
+            // TODO try!(pg.verify(pw.page_size(), path, f.clone()));
+            try!(self.emit(pw, pg));
+            //println!("should_be = {}   len_page = {}", should_be, len_page);
+            assert!(should_be == len_page);
+            assert!(self.st.items.is_empty());
+        }
         Ok(())
     }
 
