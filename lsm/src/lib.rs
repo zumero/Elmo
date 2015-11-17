@@ -3458,7 +3458,26 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
         match action {
             Action::Pairs => {
                 let pair = try!(misc::inside_out(pairs.next())).unwrap();
-                if !pair.Value.is_tombstone() || try!(necessary_tombstone(&pair.Key, &mut behind)) {
+                let keep =
+                    match dest_level {
+                        DestLevel::Young | DestLevel::Other(0) => {
+                            if pair.Value.is_tombstone() {
+                                if try!(necessary_tombstone(&pair.Key, &mut behind)) {
+                                    true
+                                } else {
+                                    //println!("dest,{:?},skip_tombstone_promoted", dest_level, );
+                                    false
+                                }
+                            } else {
+                                true
+                            }
+                        },
+                        _ => {
+                            assert!(behind.is_empty());
+                            true
+                        },
+                    };
+                if keep {
                     if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
                         try!(chain.add_child(pw, pg));
                     }
@@ -3466,9 +3485,10 @@ fn write_merge<I: Iterator<Item=Result<kvp>>, J: Iterator<Item=Result<pgitem>>>(
                 keys_promoted += 1;
             },
             Action::LeafPair(i) => {
-                // TODO hmph.  should probably do tombstone check here?
-                let leafpair = try!(leafreader.kvp_for_merge(i));
-                if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, leafpair)) {
+                let pair = try!(leafreader.kvp_for_merge(i));
+                // TODO it is interesting to note that (in not-very-thorough testing), if we
+                // put a tombstone check here, it never skips a tombstone.
+                if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
                     try!(chain.add_child(pw, pg));
                 }
                 keys_rewritten += 1;
@@ -7256,7 +7276,7 @@ impl InnerPart {
 
             // for the dest segment, we need an iterator of its leaves which
             // will be given to write_merge() so that it can be blended with
-            // the stuff from junior.
+            // the stuff being promoted.
             let (dest_leaves, old_dest_segment) = 
                 match from_level.get_dest_level() {
                     DestLevel::Young => {
@@ -7305,80 +7325,89 @@ impl InnerPart {
                 };
 
             let (behind, behind_rlock) = {
-                // during merge, a tombstone can be removed iff there is nothing
-                // for that key left in the segments behind the dest segment.
-                // so we need cursors on all those segments so that write_merge()
-                // can check.
 
-                let (behind_cursors, behind_blocks) = {
-                    fn get_cursor(
-                        path: &str, 
-                        f: std::rc::Rc<std::cell::RefCell<File>>,
-                        seg: &SegmentHeaderInfo,
-                        ) -> Result<PageCursor> {
+                match from_level {
+                    FromLevel::Fresh | FromLevel::Young => {
+                        // during merge, a tombstone can be removed iff there is nothing
+                        // for that key left in the segments behind the dest segment.
+                        // so we need cursors on all those segments so that write_merge()
+                        // can check.
 
-                        let done_page = move |_| -> () {
+                        let (behind_cursors, behind_blocks) = {
+                            fn get_cursor(
+                                path: &str, 
+                                f: std::rc::Rc<std::cell::RefCell<File>>,
+                                seg: &SegmentHeaderInfo,
+                                ) -> Result<PageCursor> {
+
+                                let done_page = move |_| -> () {
+                                };
+                                // TODO and the clone below is silly too
+                                let buf = Lend::new(seg.buf.clone(), box done_page);
+
+                                let cursor = try!(PageCursor::new_already_read_page(path, f, seg.root_page, buf));
+                                Ok(cursor)
+                            }
+
+                            let mut behind_cursors = vec![];
+                            let mut behind_blocks = BlockList::new();
+                            match from_level.get_dest_level() {
+                                DestLevel::Young => {
+                                    for i in 0 .. header.young.len() {
+                                        let seg = &header.young[i];
+
+                                        behind_blocks.add_page_no_reorder(seg.root_page);
+                                        behind_blocks.add_blocklist_no_reorder(&seg.blocks);
+
+                                        let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
+                                        behind_cursors.push(cursor);
+                                    }
+                                    for i in 0 .. header.levels.len() {
+                                        let seg = &header.levels[i];
+
+                                        behind_blocks.add_page_no_reorder(seg.root_page);
+                                        behind_blocks.add_blocklist_no_reorder(&seg.blocks);
+
+                                        let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
+                                        behind_cursors.push(cursor);
+                                    }
+                                },
+                                DestLevel::Other(dest_level) => {
+                                    for i in dest_level + 1 .. header.levels.len() {
+                                        let seg = &header.levels[i];
+
+                                        behind_blocks.add_page_no_reorder(seg.root_page);
+                                        behind_blocks.add_blocklist_no_reorder(&seg.blocks);
+
+                                        let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
+                                        behind_cursors.push(cursor);
+                                    }
+                                },
+                            }
+                            behind_blocks.sort_and_consolidate();
+                            (behind_cursors, behind_blocks)
                         };
-                        // TODO and the clone below is silly too
-                        let buf = Lend::new(seg.buf.clone(), box done_page);
 
-                        let cursor = try!(PageCursor::new_already_read_page(path, f, seg.root_page, buf));
-                        Ok(cursor)
-                    }
+                        let behind_rlock =
+                            if behind_blocks.is_empty() {
+                                None
+                            } else {
+                                // we do need read locks for all these cursors to protect them from going
+                                // away while we are writing the merge.
+                                let rlock = {
+                                    let mut space = try!(inner.space.lock());
+                                    let rlock = space.add_rlock(behind_blocks);
+                                    rlock
+                                };
+                                Some(rlock)
+                            };
+                        (behind_cursors, behind_rlock)
+                    },
+                    _ => {
+                        (vec![], None)
+                    },
+                }
 
-                    let mut behind_cursors = vec![];
-                    let mut behind_blocks = BlockList::new();
-                    match from_level.get_dest_level() {
-                        DestLevel::Young => {
-                            for i in 0 .. header.young.len() {
-                                let seg = &header.young[i];
-
-                                behind_blocks.add_page_no_reorder(seg.root_page);
-                                behind_blocks.add_blocklist_no_reorder(&seg.blocks);
-
-                                let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
-                                behind_cursors.push(cursor);
-                            }
-                            for i in 0 .. header.levels.len() {
-                                let seg = &header.levels[i];
-
-                                behind_blocks.add_page_no_reorder(seg.root_page);
-                                behind_blocks.add_blocklist_no_reorder(&seg.blocks);
-
-                                let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
-                                behind_cursors.push(cursor);
-                            }
-                        },
-                        DestLevel::Other(dest_level) => {
-                            for i in dest_level + 1 .. header.levels.len() {
-                                let seg = &header.levels[i];
-
-                                behind_blocks.add_page_no_reorder(seg.root_page);
-                                behind_blocks.add_blocklist_no_reorder(&seg.blocks);
-
-                                let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
-                                behind_cursors.push(cursor);
-                            }
-                        },
-                    }
-                    behind_blocks.sort_and_consolidate();
-                    (behind_cursors, behind_blocks)
-                };
-
-                let behind_rlock =
-                    if behind_blocks.is_empty() {
-                        None
-                    } else {
-                        // we do need read locks for all these cursors to protect them from going
-                        // away while we are writing the merge.
-                        let rlock = {
-                            let mut space = try!(inner.space.lock());
-                            let rlock = space.add_rlock(behind_blocks);
-                            rlock
-                        };
-                        Some(rlock)
-                    };
-                (behind_cursors, behind_rlock)
             };
 
             (cursor, from, dest_leaves, old_dest_segment, behind, behind_rlock)

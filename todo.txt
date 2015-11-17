@@ -1,4 +1,10 @@
 
+consider fsa for storing keys instead of prefix compression.
+dependency on BurntSushi fst crate?  or just extract code
+parts we need and adapt?
+
+think about memmap for cursors
+
 unless it needs to pass along an Arc clone, methods should
 be &self not &Arc<InnerPart>
 
@@ -22,7 +28,11 @@ at some point we should review which asserts we really want in release
 builds and perf check without the rest of them.
 
 can we have the segment page objects reference the buf in the
-header instead of cloning it?
+header instead of cloning it?  Arc<buf> ?  but then how do we deal
+with ParentPage that wants to walk through all of its children without
+realloc on each one?  separate implementations?  one form of the
+page object borrows its buf (from the one in the SegmentHeaderInfo).
+the other one owns its buf (so it can read a different page into it).
 
 get rid of pagepool?
 
