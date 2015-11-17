@@ -607,7 +607,7 @@ fn get_level_size(i: usize) -> u64 {
     for _ in 0 .. i + 1 {
         // TODO tune this factor.
         // for leveldb, it is 10.
-        n *= 2;
+        n *= 10;
     }
     n * 1024 * 1024
 }
@@ -4951,6 +4951,7 @@ impl ParentPage {
         Ok(res)
     }
 
+    #[cfg(remove_me)]
     fn pgitem(&self) -> Result<pgitem> {
         let mut blocks = try!(self.blocklist_unsorted());
         blocks.sort_and_consolidate();

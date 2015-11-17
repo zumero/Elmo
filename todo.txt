@@ -1,4 +1,38 @@
 
+perf problem when we run the 5M URL thing with 10x levels.
+most CPU time being used by BlockList::sort_and_consolidate
+within write_parent_page() called by merge, and some from
+calls from prepare_merge() itself.  
+
+this looks like a problem:
+
+dest,Other(2),leaves_rewritten,0,leaves_recycled,45409,keys_promoted,348,keys_rewritten,0,count_parent_nodes,639
+
+writing 639 new parent nodes just to promote a little bit of stuff into level 2.
+no leaves getting rewritten.
+
+blocklists are a problem.  the bigger the segment, the bigger
+the blocklist gets.  may need to stop always dealing with the
+blocklist for a whole segment at a time?  instead of subtract
+blocklist to figure out what was recycled during a merge,
+keep track of recycled nodes?
+
+can we somehow get the blocklist to be smaller?  reduce fragmentation?
+or is that simply a tradeoff with recycling?  in other words, if the
+only way to reduce fragmentation is to rewrite more stuff during
+merge, that's not good.
+
+maybe the level factor should be less than 10x so that the segments
+stay smaller and so the blocklists stay smaller.  but then reads get
+slower because more segments.
+
+can read locks go back to "segment" granularity?  open_cursor
+and behind cursors are fine.  PendingMerge.now_inactive will have
+to be a little different.  it is a list of stuff that got rewritten,
+but those are partial segments, and we need each bit of it to be
+keyed off the segment num they were owned by, so that a read lock
+can prevent them from being freed.
+
 consider fsa for storing keys instead of prefix compression.
 dependency on BurntSushi fst crate?  or just extract code
 parts we need and adapt?

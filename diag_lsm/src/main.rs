@@ -160,6 +160,22 @@ fn list_keys(name: &str) -> Result<(),lsm::Error> {
     Ok(())
 }
 
+fn list_keys_as_strings(name: &str) -> Result<(),lsm::Error> {
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let mut cursor = try!(db.open_cursor());
+    try!(cursor.First());
+    while cursor.IsValid() {
+        {
+            let k = try!(cursor.KeyRef());
+            let k = k.into_boxed_slice();
+            let s = try!(std::str::from_utf8(&k));
+            println!("{}", s);
+        }
+        try!(cursor.Next());
+    }
+    Ok(())
+}
+
 fn seek_string(name: &str, key: String, sop: String) -> Result<(),lsm::Error> {
     let sop = 
         match sop.as_str() {
@@ -248,16 +264,18 @@ fn add_lines(name: &str, file: String, count_groups: usize, count_per_group: usi
     let f = BufReader::new(f);
 
     let mut num_groups_sofar = 0;
+    let mut num_in_group = 0;
 
     let mut pending = BTreeMap::new();
     for line in f.lines() {
         let line = try!(line);
+        num_in_group += 1;
         let k = line.into_bytes().into_boxed_slice();
-        let v = String::from("").into_bytes().into_boxed_slice();
         if k.len() > 0 {
+            let v = String::from("").into_bytes().into_boxed_slice();
             pending.insert(k, lsm::Blob::Boxed(v));
         }
-        if pending.len() >= count_per_group {
+        if num_in_group >= count_per_group {
             let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
             if let Some(seg) = seg {
                 let lck = try!(db.get_write_lock());
@@ -265,6 +283,7 @@ fn add_lines(name: &str, file: String, count_groups: usize, count_per_group: usi
                 //println!("commited group");
             }
             pending = BTreeMap::new();
+            num_in_group = 0;
             num_groups_sofar += 1;
             if num_groups_sofar == count_groups {
                 break;
@@ -281,6 +300,52 @@ fn add_lines(name: &str, file: String, count_groups: usize, count_per_group: usi
             Err(lsm::Error::Misc(String::from("try_unwrap failed")))
         },
     }
+}
+
+fn sqlite_lines(name: &str, file: String, count_groups: usize, count_per_group: usize) -> Result<(),lsm::Error> {
+    use std::io::{self, BufReader};
+    use std::io::prelude::*;
+    use std::fs::File;
+    extern crate sqlite3;
+
+    let access = sqlite3::access::ByFilename { flags: sqlite3::access::flags::OPEN_READWRITE | sqlite3::access::flags::OPEN_CREATE, filename: name};
+    let db = try!(sqlite3::DatabaseConnection::new(access).map_err(lsm::wrap_err));
+
+    try!(db.exec("BEGIN IMMEDIATE TRANSACTION").map_err(lsm::wrap_err));
+    // TODO this should use WITHOUT_ROWID
+    try!(db.exec("CREATE TABLE lines (s BLOB PRIMARY KEY)").map_err(lsm::wrap_err));
+    try!(db.exec("COMMIT TRANSACTION").map_err(lsm::wrap_err));
+
+    let mut stmt = try!(db.prepare("INSERT OR IGNORE INTO lines (s) VALUES (?)").map_err(lsm::wrap_err));
+
+    let f = try!(File::open(&file));
+    let f = BufReader::new(f);
+
+    let mut num_groups_sofar = 0;
+    let mut num_in_group = 0;
+
+    try!(db.exec("BEGIN IMMEDIATE TRANSACTION").map_err(lsm::wrap_err));
+    for line in f.lines() {
+        let line = try!(line);
+        num_in_group += 1;
+        let k = line.into_bytes().into_boxed_slice();
+        if k.len() > 0 {
+            stmt.clear_bindings();
+            try!(stmt.bind_blob(1, &k).map_err(lsm::wrap_err));
+            try!(stmt.step().map_err(lsm::wrap_err));
+            stmt.reset();
+        }
+        if num_in_group >= count_per_group {
+            try!(db.exec("COMMIT TRANSACTION").map_err(lsm::wrap_err));
+            num_groups_sofar += 1;
+            num_in_group = 0;
+            if num_groups_sofar == count_groups {
+                break;
+            }
+            try!(db.exec("BEGIN IMMEDIATE TRANSACTION").map_err(lsm::wrap_err));
+        }
+    }
+    Ok(())
 }
 
 fn add_random(name: &str, seed: usize, count_groups: usize, count_per_group: usize, klen: usize, vlen: usize) -> Result<(),lsm::Error> {
@@ -332,6 +397,17 @@ fn result_main() -> Result<(),lsm::Error> {
             let count_groups = args[4].parse::<usize>().unwrap();
             let count_per_group = args[5].parse::<usize>().unwrap();
             try!(add_lines(name, file, count_groups, count_per_group));
+            Ok(())
+        },
+        "sqlite_lines" => {
+            println!("usage: sqlite_lines file count_groups count_per_group");
+            if args.len() < 6 {
+                return Err(lsm::Error::Misc(String::from("too few args")));
+            }
+            let file = args[3].clone();
+            let count_groups = args[4].parse::<usize>().unwrap();
+            let count_per_group = args[5].parse::<usize>().unwrap();
+            try!(sqlite_lines(name, file, count_groups, count_per_group));
             Ok(())
         },
         "add_random" => {
@@ -422,6 +498,9 @@ fn result_main() -> Result<(),lsm::Error> {
         },
         "list_keys" => {
             list_keys(name)
+        },
+        "list_keys_as_strings" => {
+            list_keys_as_strings(name)
         },
         "list_segments" => {
             list_segments(name)
