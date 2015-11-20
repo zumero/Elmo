@@ -3512,21 +3512,22 @@ fn merge_rewrite_leaf(
     #[derive(Debug)]
     enum Action {
         Pairs,
-        LeafPair(usize),
+        LeafPair,
     }
 
-    let mut cur_in_other = Some(0); // TODO no need for this to be an option
+    let mut i = 0;
     let mut keys_promoted = 0;
     let mut keys_rewritten = 0;
 
-    loop {
+    let len = leafreader.count_keys();
+    while i < len {
         let action = 
-            match (pairs.peek(), cur_in_other) {
-                (Some(&Err(ref e)), _) => {
+            match pairs.peek() {
+                Some(&Err(ref e)) => {
                     // TODO have the action return this error
                     return Err(Error::Misc(format!("inside error pairs: {}", e)));
                 },
-                (Some(&Ok(ref peek_pair)), Some(i)) => {
+                Some(&Ok(ref peek_pair)) => {
                     // we are in the middle of a leaf being rewritten
 
                     // TODO if there is an otherleaf, we know that it
@@ -3550,36 +3551,16 @@ fn merge_rewrite_leaf(
                                 _ => {
                                 },
                             }
-                            if i + 1 < leafreader.count_keys() {
-                                cur_in_other = Some(i + 1);
-                            } else {
-                                cur_in_other = None;
-                            }
+                            i += 1;
                             Action::Pairs
                         },
                         Ordering::Less => {
-                            if i + 1 < leafreader.count_keys() {
-                                cur_in_other = Some(i + 1);
-                            } else {
-                                cur_in_other = None;
-                            }
-                            Action::LeafPair(i)
+                            Action::LeafPair
                         },
                     }
                 },
-                (None, Some(i)) => {
-                    if i + 1 < leafreader.count_keys() {
-                        cur_in_other = Some(i + 1);
-                    } else {
-                        cur_in_other = None;
-                    }
-                    Action::LeafPair(i)
-                },
-                (Some(&Ok(_)), None) => {
-                    break;
-                },
-                (None, None) => {
-                    break;
+                None => {
+                    Action::LeafPair
                 },
             };
         //println!("dest,{:?},action,{:?}", dest_level, action);
@@ -3589,7 +3570,7 @@ fn merge_rewrite_leaf(
                 try!(merge_process_pair(pair, st, pb, pw, vbuf, behind, chain, dest_level));
                 keys_promoted += 1;
             },
-            Action::LeafPair(i) => {
+            Action::LeafPair => {
                 let pair = try!(leafreader.kvp_for_merge(i));
                 // TODO it is interesting to note that (in not-very-thorough testing), if we
                 // put a tombstone check here, it never skips a tombstone.
@@ -3597,6 +3578,7 @@ fn merge_rewrite_leaf(
                     try!(chain.add_child(pw, pg));
                 }
                 keys_rewritten += 1;
+                i += 1;
             },
         }
     }
