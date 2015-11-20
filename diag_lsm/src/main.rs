@@ -70,7 +70,7 @@ fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     println!("blocks ({} blocks, {} pages)", blocks.count_blocks(), blocks.count_pages());
     //println!("key range: {:?}", try!(page.range()));
     let count = page.count_items();
-    if cfg!(expensive_check) 
+    //if cfg!(expensive_check) 
     {
         println!("items ({}):", count);
         for i in 0 .. count {
@@ -79,31 +79,28 @@ fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
             let child_range = try!(page.child_range(i));
             println!("    {:?}", child_range);
         }
-        try!(page.verify_child_keys());
+        //try!(page.verify_child_keys());
     }
+    if cfg!(expensive_check) 
     {
-        let mut cur_depth = page.depth();
-        loop {
-            cur_depth -= 1;
-
-            let page = try!(db.read_parent_page(pgnum));
-            let it = page.into_depth_iter(cur_depth);
-            let count = it.count();
-            println!("nodes at depth {}: {}", cur_depth, count);
-            if cur_depth == 0 {
-                break;
-            }
+        let page = try!(db.read_parent_page(pgnum));
+        let it = page.into_node_iter(0);
+        for r in it {
+            let (depth, node) = try!(r);
+            println!("depth: {}  pagenum: {}", depth, node);
         }
     }
     let mut leaf = page.make_leaf_page();
-    let leaves = page.into_depth_iter(0);
+    let leaves = page.into_node_iter(0);
     let mut count_leaves = 0;
     let mut bytes_used_in_leaves = 0;
-    for pg_leaf in leaves {
-        let pg_leaf = try!(pg_leaf);
-        try!(leaf.read_page(pg_leaf.page));
-        count_leaves += 1;
-        bytes_used_in_leaves += leaf.len_on_page();
+    for r in leaves {
+        let (depth, node) = try!(r);
+        if depth == 0 {
+            try!(leaf.read_page(node));
+            count_leaves += 1;
+            bytes_used_in_leaves += leaf.len_on_page();
+        }
     }
     //println!("leaves: {}:", count_leaves);
     println!("avg leaf len: {}", bytes_used_in_leaves / count_leaves);
@@ -120,15 +117,18 @@ fn list_segments(name: &str) -> Result<(),lsm::Error> {
     }
 
     for s in fresh.iter() {
-        print_seg(s);
+        //print_seg(s);
+        println!("    {:?}", s);
     }
     println!("young ({}): ", young.len());
     for s in young.iter() {
-        print_seg(s);
+        //print_seg(s);
+        println!("    {:?}", s);
     }
     println!("levels ({}): ", levels.len());
     for s in levels.iter() {
-        print_seg(s);
+        //print_seg(s);
+        println!("    {:?}", s);
     }
     Ok(())
 }
@@ -373,7 +373,15 @@ fn add_random(name: &str, seed: usize, count_groups: usize, count_per_group: usi
         }
     }
 
-    Ok(())
+    match std::sync::Arc::try_unwrap(db) {
+        Ok(db) => {
+            try!(db.stop());
+            Ok(())
+        },
+        Err(e) => {
+            Err(lsm::Error::Misc(String::from("try_unwrap failed")))
+        },
+    }
 }
 
 fn result_main() -> Result<(),lsm::Error> {

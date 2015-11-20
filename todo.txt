@@ -1,4 +1,40 @@
 
+parent node writer gets in trouble, overflows its stack,
+when it has to deal with lots of pages that only hold one
+key.
+
+how could the following happen?  was it an overflow that newcode
+thought was eaten/skipped but actually got used?
+
+Young: inactive mismatch: segment 4641
+old count: 0
+new count: 1
+old: BlockList { blocks: [] }
+new: BlockList { blocks: [PageBlock { firstPage: 4641, lastPage: 4641 }] }
+only_in_old: BlockList { blocks: [] }
+only_in_new: BlockList { blocks: [PageBlock { firstPage: 4641, lastPage: 4641 }] }
+
+occasional mis match of inactive lists.  hard to repro.
+off by 1 page in one case.
+
+once saw in inside error.
+
+second run of test suite into same db is really slow.
+probably fragmentation and blocklist stuff.
+
+do we have no cases involving an overflowed key?
+
+previously saw some cases where the new inactive code
+had pages NOT found by the old inactive code.  that's
+gotta be bad.
+
+use the new inactive result as the final, not the old one.
+but they gotta match.
+
+on a merge from Other(n) to Other(n+1), we have been rewriting
+the parent nodes but not adding the old set of parent nodes
+to the inactive list.
+
 perf problem when we run the 5M URL thing with 10x levels.
 most CPU time being used by BlockList::sort_and_consolidate
 within write_parent_page() called by merge, and some from
