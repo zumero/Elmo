@@ -630,7 +630,7 @@ fn get_level_size(i: usize) -> u64 {
     for _ in 0 .. i + 1 {
         // TODO tune this factor.
         // for leveldb, it is 10.
-        n *= 2;
+        n *= 10;
     }
     n * 1024 * 1024
 }
@@ -3430,31 +3430,17 @@ struct WroteMerge {
     overflows_freed: Vec<BlockList>, // TODO in rewritten leaves
 }
 
-fn write_merge<J: Iterator<Item=Result<pgitem>>>(
-                    pw: &mut PageWriter,
-                    pairs: &mut CursorIterator,
-                    mut leaves: J,
-                    behind: &mut Vec<PageCursor>,
-                    path: &str,
-                    f: std::rc::Rc<std::cell::RefCell<File>>,
-                    dest_level: DestLevel,
-                    ) -> Result<WroteMerge> {
-
-    let mut pb = PageBuilder::new(pw.page_size());
-
-    // TODO this is a buffer just for the purpose of being reused
-    // in cases where the blob is provided as a stream, and we need
-    // read a bit of it to figure out if it might fit inline rather
-    // than overflow.
-    let mut vbuf = vec![0; pw.page_size()].into_boxed_slice(); 
-
-    let mut st = LeafState {
-        sofarLeaf: 0,
-        keys_in_this_leaf: Vec::new(),
-        prefixLen: 0,
-        prev_key: None,
-    };
-
+fn merge_process_pair(
+    pair: kvp,
+    st: &mut LeafState,
+    pb: &mut PageBuilder,
+    pw: &mut PageWriter,
+    vbuf: &mut [u8],
+    behind: &mut Vec<PageCursor>,
+    chain: &mut ParentNodeWriter,
+    dest_level: DestLevel,
+    ) -> Result<()>
+{
     fn necessary_tombstone(k: &[u8], 
                     behind: &mut Vec<PageCursor>,
                ) -> Result<bool> {
@@ -3482,43 +3468,65 @@ fn write_merge<J: Iterator<Item=Result<pgitem>>>(
         Ok(false)
     }
 
-    let mut chain = ParentNodeWriter::new(pw.page_size(), 0);
+    let keep =
+        match dest_level {
+            DestLevel::Young | DestLevel::Other(0) => {
+                if pair.Value.is_tombstone() {
+                    if try!(necessary_tombstone(&pair.Key, behind)) {
+                        true
+                    } else {
+                        //println!("dest,{:?},skip_tombstone_promoted", dest_level, );
+                        false
+                    }
+                } else {
+                    true
+                }
+            },
+            _ => {
+                assert!(behind.is_empty());
+                true
+            },
+        };
+    if keep {
+        if let Some(pg) = try!(process_pair_into_leaf(st, pb, pw, vbuf, pair)) {
+            try!(chain.add_child(pw, pg));
+        }
+    }
+
+    Ok(())
+}
+
+fn merge_rewrite_leaf(
+                    st: &mut LeafState,
+                    pb: &mut PageBuilder,
+                    pw: &mut PageWriter,
+                    vbuf: &mut [u8],
+                    pairs: &mut CursorIterator,
+                    leafreader: &mut LeafPage,
+                    behind: &mut Vec<PageCursor>,
+                    chain: &mut ParentNodeWriter,
+                    overflows_freed: &mut Vec<BlockList>,
+                    dest_level: DestLevel,
+                    ) -> Result<(usize, usize)> {
 
     #[derive(Debug)]
     enum Action {
         Pairs,
         LeafPair(usize),
-        RewriteLeaf,
-        RecycleLeaf,
-        Done,
     }
 
-    // TODO how would this algorithm be adjusted to work at a different depth?
-    // like, suppose instead of leaves, we were given depth 1 parents?
-
-    let mut leafreader = LeafPage::new(path, f.clone(), pw.page_size(), );
-
-    let mut leaves = leaves.peekable();
-
-    let mut cur_in_other = None;
+    let mut cur_in_other = Some(0); // TODO no need for this to be an option
     let mut keys_promoted = 0;
     let mut keys_rewritten = 0;
-    let mut leaves_recycled = 0;
-    let mut leaves_rewritten = vec![];
-    let mut overflows_freed = vec![];
 
     loop {
         let action = 
-            match (pairs.peek(), cur_in_other, leaves.peek()) {
-                (Some(&Err(ref e)), _, _) => {
+            match (pairs.peek(), cur_in_other) {
+                (Some(&Err(ref e)), _) => {
                     // TODO have the action return this error
                     return Err(Error::Misc(format!("inside error pairs: {}", e)));
                 },
-                (_, _, Some(&Err(ref e))) => {
-                    // TODO have the action return this error
-                    return Err(Error::Misc(format!("inside error other: {}", e)));
-                },
-                (Some(&Ok(ref peek_pair)), Some(i), _) => {
+                (Some(&Ok(ref peek_pair)), Some(i)) => {
                     // we are in the middle of a leaf being rewritten
 
                     // TODO if there is an otherleaf, we know that it
@@ -3559,7 +3567,7 @@ fn write_merge<J: Iterator<Item=Result<pgitem>>>(
                         },
                     }
                 },
-                (None, Some(i), _) => {
+                (None, Some(i)) => {
                     if i + 1 < leafreader.count_keys() {
                         cur_in_other = Some(i + 1);
                     } else {
@@ -3567,13 +3575,105 @@ fn write_merge<J: Iterator<Item=Result<pgitem>>>(
                     }
                     Action::LeafPair(i)
                 },
-                (Some(&Ok(_)), None, None) => {
+                (Some(&Ok(_)), None) => {
+                    break;
+                },
+                (None, None) => {
+                    break;
+                },
+            };
+        //println!("dest,{:?},action,{:?}", dest_level, action);
+        match action {
+            Action::Pairs => {
+                let pair = try!(misc::inside_out(pairs.next())).unwrap();
+                try!(merge_process_pair(pair, st, pb, pw, vbuf, behind, chain, dest_level));
+                keys_promoted += 1;
+            },
+            Action::LeafPair(i) => {
+                let pair = try!(leafreader.kvp_for_merge(i));
+                // TODO it is interesting to note that (in not-very-thorough testing), if we
+                // put a tombstone check here, it never skips a tombstone.
+                if let Some(pg) = try!(process_pair_into_leaf(st, pb, pw, vbuf, pair)) {
+                    try!(chain.add_child(pw, pg));
+                }
+                keys_rewritten += 1;
+            },
+        }
+    }
+
+    //println!("dest,{:?},keys_promoted,{},keys_rewritten,{}", dest_level, keys_promoted, keys_rewritten);
+
+    Ok((keys_promoted, keys_rewritten))
+}
+
+fn write_merge<J: Iterator<Item=Result<pgitem>>>(
+                    pw: &mut PageWriter,
+                    pairs: &mut CursorIterator,
+                    mut leaves: J,
+                    behind: &mut Vec<PageCursor>,
+                    path: &str,
+                    f: std::rc::Rc<std::cell::RefCell<File>>,
+                    dest_level: DestLevel,
+                    ) -> Result<WroteMerge> {
+
+    // TODO could pb and vbuf move into LeafState?
+
+    let mut pb = PageBuilder::new(pw.page_size());
+
+    // TODO this is a buffer just for the purpose of being reused
+    // in cases where the blob is provided as a stream, and we need
+    // read a bit of it to figure out if it might fit inline rather
+    // than overflow.
+    let mut vbuf = vec![0; pw.page_size()].into_boxed_slice(); 
+
+    let mut st = LeafState {
+        sofarLeaf: 0,
+        keys_in_this_leaf: Vec::new(),
+        prefixLen: 0,
+        prev_key: None,
+    };
+
+    let mut chain = ParentNodeWriter::new(pw.page_size(), 0);
+
+    #[derive(Debug)]
+    enum Action {
+        Pairs,
+        RewriteLeaf,
+        RecycleLeaf,
+        Done,
+    }
+
+    // TODO how would this algorithm be adjusted to work at a different depth?
+    // like, suppose instead of leaves, we were given depth 1 parents?
+
+    let mut leafreader = LeafPage::new(path, f.clone(), pw.page_size(), );
+
+    let mut leaves = leaves.peekable();
+
+    let mut keys_promoted = 0;
+    let mut keys_rewritten = 0;
+    let mut leaves_recycled = 0;
+    let mut leaves_rewritten = vec![];
+    let mut overflows_freed = vec![];
+
+    loop {
+        let action = 
+            match (pairs.peek(), leaves.peek()) {
+                (Some(&Err(ref e)), _) => {
+                    // TODO have the action return this error
+                    return Err(Error::Misc(format!("inside error pairs: {}", e)));
+                },
+                (_, Some(&Err(ref e))) => {
+                    // TODO have the action return this error
+                    return Err(Error::Misc(format!("inside error other: {}", e)));
+                },
+                (Some(&Ok(_)), None) => {
                     Action::Pairs
                 },
-                (None, None, Some(&Ok(_))) => {
+                (None, Some(&Ok(_))) => {
                     Action::RecycleLeaf
                 },
-                (Some(&Ok(ref peek_pair)), None, Some(&Ok(ref peek_pg))) => {
+                (Some(&Ok(ref peek_pair)), Some(&Ok(ref peek_pg))) => {
                     match try!(peek_pg.key_in_range(&peek_pair.Key)) {
                         KeyInRange::Less => {
                             Action::Pairs
@@ -3596,7 +3696,7 @@ fn write_merge<J: Iterator<Item=Result<pgitem>>>(
                         },
                     }
                 },
-                (None, None, None) => {
+                (None, None) => {
                     Action::Done
                 },
             };
@@ -3604,40 +3704,8 @@ fn write_merge<J: Iterator<Item=Result<pgitem>>>(
         match action {
             Action::Pairs => {
                 let pair = try!(misc::inside_out(pairs.next())).unwrap();
-                let keep =
-                    match dest_level {
-                        DestLevel::Young | DestLevel::Other(0) => {
-                            if pair.Value.is_tombstone() {
-                                if try!(necessary_tombstone(&pair.Key, behind)) {
-                                    true
-                                } else {
-                                    //println!("dest,{:?},skip_tombstone_promoted", dest_level, );
-                                    false
-                                }
-                            } else {
-                                true
-                            }
-                        },
-                        _ => {
-                            assert!(behind.is_empty());
-                            true
-                        },
-                    };
-                if keep {
-                    if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                        try!(chain.add_child(pw, pg));
-                    }
-                }
+                try!(merge_process_pair(pair, &mut st, &mut pb, pw, &mut vbuf, behind, &mut chain, dest_level));
                 keys_promoted += 1;
-            },
-            Action::LeafPair(i) => {
-                let pair = try!(leafreader.kvp_for_merge(i));
-                // TODO it is interesting to note that (in not-very-thorough testing), if we
-                // put a tombstone check here, it never skips a tombstone.
-                if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-                    try!(chain.add_child(pw, pg));
-                }
-                keys_rewritten += 1;
             },
             Action::RecycleLeaf => {
                 if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
@@ -3651,7 +3719,9 @@ fn write_merge<J: Iterator<Item=Result<pgitem>>>(
                 let pg = try!(misc::inside_out(leaves.next())).unwrap();
                 leaves_rewritten.push(pg.page);
                 try!(leafreader.read_page(pg.page));
-                cur_in_other = Some(0);
+                let (leaf_keys_promoted, leaf_keys_rewritten) = try!(merge_rewrite_leaf(&mut st, &mut pb, pw, &mut vbuf, pairs, &mut leafreader, behind, &mut chain, &mut overflows_freed, dest_level));
+                keys_promoted += leaf_keys_promoted;
+                keys_rewritten += leaf_keys_rewritten;
             },
             Action::Done => {
                 if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
