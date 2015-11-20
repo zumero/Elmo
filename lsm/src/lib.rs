@@ -5108,64 +5108,6 @@ impl Iterator for DepthIterator {
     }
 }
 
-// TODO is this used?
-struct DepthNumIterator {
-    stack: Vec<(ParentPage, usize)>,
-    depth: u8,
-}
-
-impl DepthNumIterator {
-    fn new(top: ParentPage, depth: u8) -> Self {
-        assert!(top.depth() > depth);
-        DepthNumIterator {
-            stack: vec![(top, 0)],
-            depth: depth,
-        }
-    }
-
-    fn get_next(&mut self) -> Result<Option<PageNum>> {
-        loop {
-            match self.stack.pop() {
-                None => {
-                    return Ok(None);
-                },
-                Some((parent, cur)) => {
-                    if parent.depth() == self.depth + 1 {
-                        let pg = parent.child_pagenum(cur);
-                        if cur + 1 < parent.count_items() {
-                            self.stack.push((parent, cur + 1));
-                        }
-                        return Ok(Some(pg));
-                    } else {
-                        let child = try!(parent.fetch_item_parent(cur));
-                        if cur + 1 < parent.count_items() {
-                            self.stack.push((parent, cur + 1));
-                        }
-                        self.stack.push((child, 0));
-                    }
-                },
-            }
-        }
-    }
-}
-
-impl Iterator for DepthNumIterator {
-    type Item = Result<PageNum>;
-    fn next(&mut self) -> Option<Result<PageNum>> {
-        match self.get_next() {
-            Ok(None) => {
-                None
-            },
-            Ok(Some(pg)) => {
-                Some(Ok(pg))
-            },
-            Err(e) => {
-                Some(Err(e))
-            },
-        }
-    }
-}
-
 struct NodeIterator {
     stack: Vec<(ParentPage, Option<usize>)>,
     min_depth: u8,
