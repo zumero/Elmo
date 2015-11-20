@@ -3428,12 +3428,11 @@ struct WroteMerge {
     segment: Option<SegmentHeaderInfo>,
     leaves_rewritten: Vec<PageNum>,
     overflows_freed: Vec<BlockList>, // TODO in rewritten leaves
-    overflows_eaten: Vec<(PageNum, BlockList)>, // TODO within cursor iterator
 }
 
 fn write_merge<J: Iterator<Item=Result<pgitem>>>(
                     pw: &mut PageWriter,
-                    mut pairs: CursorIterator,
+                    pairs: &mut CursorIterator,
                     mut leaves: J,
                     mut behind: Vec<PageCursor>,
                     path: &str,
@@ -3678,8 +3677,6 @@ fn write_merge<J: Iterator<Item=Result<pgitem>>>(
         segment: seg,
         leaves_rewritten: leaves_rewritten,
         overflows_freed: overflows_freed,
-
-        overflows_eaten: pairs.eaten(),
     };
     Ok(wrote)
 }
@@ -7896,18 +7893,20 @@ impl InnerPart {
             let mut cursor = cursor;
             try!(cursor.First());
             if cursor.IsValid() {
-                let source = CursorIterator::new(cursor);
+                let mut source = CursorIterator::new(cursor);
                 match into {
                     MergingInto::None => {
                         let leaves: Box<Iterator<Item=Result<pgitem>>> = box std::iter::empty();
-                        let wrote = try!(write_merge(&mut pw, source, leaves, behind, &inner.path, f.clone(), from_level.get_dest_level()));
+                        let wrote = try!(write_merge(&mut pw, &mut source, leaves, behind, &inner.path, f.clone(), from_level.get_dest_level()));
                         assert!(wrote.leaves_rewritten.is_empty());
                         // TODO asserts here
-                        (wrote.segment, wrote.overflows_eaten, MergedInto::None)
+                        let overflows_eaten = source.eaten();
+                        (wrote.segment, overflows_eaten, MergedInto::None)
                     },
                     MergingInto::Level{old_segment, leaves, parents, ..} => {
-                        let wrote = try!(write_merge(&mut pw, source, leaves, behind, &inner.path, f.clone(), from_level.get_dest_level()));
+                        let wrote = try!(write_merge(&mut pw, &mut source, leaves, behind, &inner.path, f.clone(), from_level.get_dest_level()));
                         // TODO asserts here
+                        let overflows_eaten = source.eaten();
                         let into = MergedInto::Level{
                             level: from_level.get_dest_level(),
                             old_segment: old_segment, 
@@ -7915,7 +7914,7 @@ impl InnerPart {
                             leaves_rewritten: wrote.leaves_rewritten, 
                             overflows_freed: wrote.overflows_freed, 
                         };
-                        (wrote.segment, wrote.overflows_eaten, into)
+                        (wrote.segment, overflows_eaten, into)
                     },
                 }
             } else {
