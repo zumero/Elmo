@@ -1,4 +1,12 @@
 
+now seeing occasional failure of cursor1.js
+leaf has invalid page type
+add panic
+
+inactive list still match?
+
+make sure recycle of middle nodes is working as I think it is
+
 parent node writer gets in trouble, overflows its stack,
 when it has to deal with lots of pages that only hold one
 key.

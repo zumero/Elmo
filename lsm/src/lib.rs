@@ -595,36 +595,6 @@ fn read_and_alloc_page(f: &std::rc::Rc<std::cell::RefCell<File>>, page: PageNum,
     Ok(buf)
 }
 
-// TODO function is inherently inefficient when called on a segment that
-// is in the header, because it loads and allocs the root page, a copy
-// of which is already in the header.
-fn get_blocklist_for_segment_including_root(
-    page: PageNum,
-    pgsz: usize,
-    path: &str,
-    f: std::rc::Rc<std::cell::RefCell<File>>,
-    ) -> Result<BlockList> {
-    let buf = try!(read_and_alloc_page(&f, page, pgsz));
-    let done_page = move |_| -> () {
-    };
-    let buf = Lend::new(buf, box done_page);
-
-    let pt = try!(PageType::from_u8(buf[0]));
-    let mut blocks =
-        match pt {
-            PageType::LEAF_NODE => {
-                let page = try!(LeafPage::new_already_read_page(path, f.clone(), page, buf));
-                page.blocklist_unsorted()
-            },
-            PageType::PARENT_NODE => {
-                let parent = try!(ParentPage::new_already_read_page(path, f.clone(), page, buf));
-                try!(parent.blocklist_unsorted())
-            },
-        };
-    blocks.add_page_no_reorder(page);
-    Ok(blocks)
-}
-
 fn get_level_size(i: usize) -> u64 {
     let mut n = 1;
     for _ in 0 .. i + 1 {
@@ -3403,30 +3373,32 @@ fn write_leaves<I: Iterator<Item=Result<kvp>>, >(
         prev_key: None,
     };
 
-    let mut chain = ParentNodeWriter::new(pw.page_size(), 0);
+    let mut chain = ParentNodeWriter::new(pw.page_size(), 1);
 
     for result_pair in pairs {
         let pair = try!(result_pair);
         if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
             //try!(pg.verify(pw.page_size(), path, f.clone()));
-            try!(chain.add_child(pw, pg));
+            try!(chain.add_child(pw, pg, 0));
         }
     }
     if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
         //try!(pg.verify(pw.page_size(), path, f.clone()));
-        try!(chain.add_child(pw, pg));
+        try!(chain.add_child(pw, pg, 0));
     }
 
     // TODO this assumes the last page written is still in pb.  it has to be.
     // TODO unless it wrote no pages?
     let (count_parent_nodes, seg) = try!(chain.done(pw, pb.into_buf()));
 
+    let seg = seg.map(|(seg, depth)| seg);
+
     Ok(seg)
 }
 
 struct WroteMerge {
     segment: Option<SegmentHeaderInfo>,
-    leaves_rewritten: Vec<PageNum>,
+    nodes_rewritten: Vec<PageNum>,
     overflows_freed: Vec<BlockList>, // TODO in rewritten leaves
 }
 
@@ -3489,7 +3461,7 @@ fn merge_process_pair(
         };
     if keep {
         if let Some(pg) = try!(process_pair_into_leaf(st, pb, pw, vbuf, pair)) {
-            try!(chain.add_child(pw, pg));
+            try!(chain.add_child(pw, pg, 0));
         }
     }
 
@@ -3502,7 +3474,7 @@ fn merge_rewrite_leaf(
                     pw: &mut PageWriter,
                     vbuf: &mut [u8],
                     pairs: &mut CursorIterator,
-                    leafreader: &mut LeafPage,
+                    leafreader: &LeafPage,
                     behind: &mut Vec<PageCursor>,
                     chain: &mut ParentNodeWriter,
                     overflows_freed: &mut Vec<BlockList>,
@@ -3575,7 +3547,7 @@ fn merge_rewrite_leaf(
                 // TODO it is interesting to note that (in not-very-thorough testing), if we
                 // put a tombstone check here, it never skips a tombstone.
                 if let Some(pg) = try!(process_pair_into_leaf(st, pb, pw, vbuf, pair)) {
-                    try!(chain.add_child(pw, pg));
+                    try!(chain.add_child(pw, pg, 0));
                 }
                 keys_rewritten += 1;
                 i += 1;
@@ -3588,146 +3560,207 @@ fn merge_rewrite_leaf(
     Ok((keys_promoted, keys_rewritten))
 }
 
-fn write_merge<J: Iterator<Item=Result<pgitem>>>(
+fn merge_rewrite_parent(
+                    st: &mut LeafState,
+                    pb: &mut PageBuilder,
                     pw: &mut PageWriter,
+                    vbuf: &mut [u8],
                     pairs: &mut CursorIterator,
-                    mut leaves: J,
+                    leaf: &mut LeafPage,
+                    parent: &ParentPage,
                     behind: &mut Vec<PageCursor>,
-                    path: &str,
-                    f: std::rc::Rc<std::cell::RefCell<File>>,
+                    chain: &mut ParentNodeWriter,
+                    overflows_freed: &mut Vec<BlockList>,
+                    nodes_rewritten: &mut Vec<PageNum>,
                     dest_level: DestLevel,
-                    ) -> Result<WroteMerge> {
-
-    // TODO could pb and vbuf move into LeafState?
-
-    let mut pb = PageBuilder::new(pw.page_size());
-
-    // TODO this is a buffer just for the purpose of being reused
-    // in cases where the blob is provided as a stream, and we need
-    // read a bit of it to figure out if it might fit inline rather
-    // than overflow.
-    let mut vbuf = vec![0; pw.page_size()].into_boxed_slice(); 
-
-    let mut st = LeafState {
-        sofarLeaf: 0,
-        keys_in_this_leaf: Vec::new(),
-        prefixLen: 0,
-        prev_key: None,
-    };
-
-    let mut chain = ParentNodeWriter::new(pw.page_size(), 0);
+                    ) -> Result<(usize, usize, usize)> {
 
     #[derive(Debug)]
     enum Action {
         Pairs,
-        RewriteLeaf,
-        RecycleLeaf,
-        Done,
+        RewriteNode,
+        RecycleNode,
     }
-
-    // TODO how would this algorithm be adjusted to work at a different depth?
-    // like, suppose instead of leaves, we were given depth 1 parents?
-
-    let mut leafreader = LeafPage::new(path, f.clone(), pw.page_size(), );
-
-    let mut leaves = leaves.peekable();
 
     let mut keys_promoted = 0;
     let mut keys_rewritten = 0;
-    let mut leaves_recycled = 0;
-    let mut leaves_rewritten = vec![];
-    let mut overflows_freed = vec![];
+    let mut nodes_recycled = 0;
 
-    loop {
+    let len = parent.count_items();
+    let mut i = 0;
+    while i < len {
         let action = 
-            match (pairs.peek(), leaves.peek()) {
-                (Some(&Err(ref e)), _) => {
+            match pairs.peek() {
+                Some(&Err(ref e)) => {
                     // TODO have the action return this error
                     return Err(Error::Misc(format!("inside error pairs: {}", e)));
                 },
-                (_, Some(&Err(ref e))) => {
-                    // TODO have the action return this error
-                    return Err(Error::Misc(format!("inside error other: {}", e)));
+                None => {
+                    Action::RecycleNode
                 },
-                (Some(&Ok(_)), None) => {
-                    Action::Pairs
-                },
-                (None, Some(&Ok(_))) => {
-                    Action::RecycleLeaf
-                },
-                (Some(&Ok(ref peek_pair)), Some(&Ok(ref peek_pg))) => {
-                    match try!(peek_pg.key_in_range(&peek_pair.Key)) {
+                Some(&Ok(ref peek_pair)) => {
+                    match try!(parent.key_in_child_range(i, &KeyRef::Slice(&peek_pair.Key))) {
                         KeyInRange::Less => {
                             Action::Pairs
                         },
                         KeyInRange::Greater => {
-                            // TODO we *could* decide to rewrite this leaf anyway.
-                            // like, for example, if the leaf we have been constructing is
+                            // TODO we *could* decide to rewrite this node anyway.
+
+                            // TODO for example, if the leaf we have been constructing is
                             // mostly empty.
 
-                            Action::RecycleLeaf
+                            // TODO or maybe by size?  a parent knows the page size of its
+                            // children.
+                            let child_count_pages = parent.child_count_pages(i);
+
+                            Action::RecycleNode
                         },
                         KeyInRange::EqualFirst | KeyInRange::EqualLast | KeyInRange::Within => {
-                            // TODO technically, EqualFirst could start at 1, since the first key
-                            // of the rewritten page will get skipped anyway because it is equal to
-                            // the current key from the merge.
+                            // TODO EqualLast could just ignore the node, since it won't matter.
+                            // but it *will* need to be checked for overflows that got shadowed.
 
-                            // TODO EqualLast could just ignore the other leaf, since it won't matter.
-
-                            Action::RewriteLeaf
+                            Action::RewriteNode
                         },
                     }
-                },
-                (None, None) => {
-                    Action::Done
                 },
             };
         //println!("dest,{:?},action,{:?}", dest_level, action);
         match action {
             Action::Pairs => {
                 let pair = try!(misc::inside_out(pairs.next())).unwrap();
-                try!(merge_process_pair(pair, &mut st, &mut pb, pw, &mut vbuf, behind, &mut chain, dest_level));
+                try!(merge_process_pair(pair, st, pb, pw, vbuf, behind, chain, dest_level));
                 keys_promoted += 1;
             },
-            Action::RecycleLeaf => {
-                if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
-                    try!(chain.add_child(pw, pg));
+            Action::RecycleNode => {
+                //println!("recycling node of depth {}", parent.depth() - 1);
+                if let Some(pg) = try!(flush_leaf(st, pb, pw)) {
+                    try!(chain.add_child(pw, pg, 0));
                 }
-                let pg = try!(misc::inside_out(leaves.next())).unwrap();
-                try!(chain.add_child(pw, pg));
-                leaves_recycled += 1;
+                let pg = try!(parent.child_pgitem(i));
+                try!(chain.add_child(pw, pg, parent.depth() - 1));
+                nodes_recycled += 1;
+                i += 1;
             },
-            Action::RewriteLeaf => {
-                let pg = try!(misc::inside_out(leaves.next())).unwrap();
-                leaves_rewritten.push(pg.page);
-                try!(leafreader.read_page(pg.page));
-                let (leaf_keys_promoted, leaf_keys_rewritten) = try!(merge_rewrite_leaf(&mut st, &mut pb, pw, &mut vbuf, pairs, &mut leafreader, behind, &mut chain, &mut overflows_freed, dest_level));
-                keys_promoted += leaf_keys_promoted;
-                keys_rewritten += leaf_keys_rewritten;
-            },
-            Action::Done => {
-                if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
-                    //println!("dest,{:?},child,{:?}", dest_level, pg);
-                    try!(chain.add_child(pw, pg));
+            Action::RewriteNode => {
+                //println!("rewriting node of depth {}", parent.depth() - 1);
+                nodes_rewritten.push(parent.child_pagenum(i));
+                if parent.depth() == 1 {
+                    let pg = try!(parent.child_pgitem(i));
+                    try!(leaf.read_page(pg.page));
+                    let (sub_keys_promoted, sub_keys_rewritten) = try!(merge_rewrite_leaf(st, pb, pw, vbuf, pairs, leaf, behind, chain, overflows_freed, dest_level));
+                    keys_promoted += sub_keys_promoted;
+                    keys_rewritten += sub_keys_rewritten;
                 } else {
-                    //println!("dest,{:?},empty_done", dest_level);
+                    let sub = try!(parent.fetch_item_parent(i));
+                    let (sub_keys_promoted, sub_keys_rewritten, sub_nodes_recycled) = try!(merge_rewrite_parent(st, pb, pw, vbuf, pairs, leaf, &sub, behind, chain, overflows_freed, nodes_rewritten, dest_level));
+                    keys_promoted += sub_keys_promoted;
+                    keys_rewritten += sub_keys_rewritten;
+                    nodes_recycled += sub_nodes_recycled;
                 }
-                break;
+                i += 1;
             },
         }
     }
 
-// TODO currently key overflows never get reused, do they?
+    Ok((keys_promoted, keys_rewritten, nodes_recycled))
+}
+
+fn write_merge(
+                pw: &mut PageWriter,
+                pairs: &mut CursorIterator,
+                into: &MergingInto,
+                behind: &mut Vec<PageCursor>,
+                path: &str,
+                f: std::rc::Rc<std::cell::RefCell<File>>,
+                dest_level: DestLevel,
+                ) -> Result<WroteMerge> {
+
+    // TODO could/should pb and vbuf move into LeafState?
+
+    // TODO this is a buffer just for the purpose of being reused
+    // in cases where the blob is provided as a stream, and we need
+    // read a bit of it to figure out if it might fit inline rather
+    // than overflow.
+    let mut vbuf = vec![0; pw.page_size()].into_boxed_slice(); 
+    let mut pb = PageBuilder::new(pw.page_size());
+    let mut st = LeafState {
+        sofarLeaf: 0,
+        keys_in_this_leaf: Vec::new(),
+        prefixLen: 0,
+        prev_key: None,
+    };
+    let mut chain = ParentNodeWriter::new(pw.page_size(), 1);
+    let mut nodes_rewritten = vec![];
+    let mut overflows_freed = vec![];
+    let mut keys_promoted = 0;
+    let mut keys_rewritten = 0;
+    let mut nodes_recycled = 0;
+
+    match *into {
+        MergingInto::None => {
+            // nothing to do here
+        },
+        MergingInto::Leaf(ref leaf) => {
+            let (sub_keys_promoted, sub_keys_rewritten) = try!(merge_rewrite_leaf(&mut st, &mut pb, pw, &mut vbuf, pairs, leaf, behind, &mut chain, &mut overflows_freed, dest_level));
+            keys_promoted = sub_keys_promoted;
+            keys_rewritten = sub_keys_rewritten;
+            nodes_rewritten.push(leaf.pagenum);
+        },
+        MergingInto::Parent(ref parent) => {
+            let mut leaf = LeafPage::new(path, f.clone(), pw.page_size(), );
+            let (sub_keys_promoted, sub_keys_rewritten, sub_nodes_recycled) = try!(merge_rewrite_parent(&mut st, &mut pb, pw, &mut vbuf, pairs, &mut leaf, parent, behind, &mut chain, &mut overflows_freed, &mut nodes_rewritten, dest_level));
+            keys_promoted = sub_keys_promoted;
+            keys_rewritten = sub_keys_rewritten;
+            nodes_recycled = sub_nodes_recycled;
+            nodes_rewritten.push(parent.pagenum);
+        },
+    }
+
+    // any pairs left need to get processed
+    for pair in pairs {
+        let pair = try!(pair);
+        try!(merge_process_pair(pair, &mut st, &mut pb, pw, &mut vbuf, behind, &mut chain, dest_level));
+        keys_promoted += 1;
+    }
+
+    if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
+        //println!("dest,{:?},child,{:?}", dest_level, pg);
+        try!(chain.add_child(pw, pg, 0));
+    }
 
     // TODO this assumes the last page written is still in pb.  it has to be.
     // TODO unless it wrote no pages?
     let (count_parent_nodes, seg) = try!(chain.done(pw, pb.into_buf()));
+    let starting_depth =
+        match *into {
+            MergingInto::None => {
+                None
+            },
+            MergingInto::Leaf(_) => {
+                Some(0)
+            },
+            MergingInto::Parent(ref p) => {
+                Some(p.depth())
+            },
+        };
 
-    println!("dest,{:?},leaves_rewritten,{},leaves_recycled,{},keys_promoted,{},keys_rewritten,{},count_parent_nodes,{}", dest_level, leaves_rewritten.len(), leaves_recycled, keys_promoted, keys_rewritten, count_parent_nodes);
+    let ending_depth =
+        match seg {
+            Some((_, depth)) => {
+                Some(depth)
+            },
+            None => {
+                None
+            },
+        };
+
+    let seg = seg.map(|(seg, depth)| seg);
+
+    //println!("dest,{:?},nodes_rewritten,{},nodes_recycled,{},keys_promoted,{},keys_rewritten,{},count_parent_nodes,{},starting_depth,{:?},ending_depth,{:?}", dest_level, nodes_rewritten.len(), nodes_recycled, keys_promoted, keys_rewritten, count_parent_nodes, starting_depth, ending_depth);
 
     let wrote = WroteMerge {
         segment: seg,
-        leaves_rewritten: leaves_rewritten,
+        nodes_rewritten: nodes_rewritten,
         overflows_freed: overflows_freed,
     };
     Ok(wrote)
@@ -3737,7 +3770,7 @@ struct ParentNodeWriter {
     pb: PageBuilder,
     st: ParentState,
     prev_child: Option<pgitem>,
-    depth: u8,
+    my_depth: u8,
 
     result_one: Option<pgitem>,
     results_chain: Option<Box<ParentNodeWriter>>,
@@ -3748,7 +3781,7 @@ struct ParentNodeWriter {
 impl ParentNodeWriter {
     fn new(
         pgsz: usize, 
-        children_depth: u8,
+        my_depth: u8,
         ) -> Self {
         let st = ParentState {
             prefixLen: 0,
@@ -3760,7 +3793,7 @@ impl ParentNodeWriter {
             pb: PageBuilder::new(pgsz),
             st: st,
             prev_child: None,
-            depth: children_depth + 1,
+            my_depth: my_depth,
             result_one: None,
             results_chain: None,
             count_emit: 0,
@@ -3795,7 +3828,7 @@ impl ParentNodeWriter {
         *count_pages += 1;
         match &item.blocks {
             &BlocksForParent::List(ref blocks) => {
-                assert!(self.depth == 1);
+                assert!(self.my_depth == 1);
                 // TODO capacity, no temp vec
                 let mut v = vec![];
                 blocks.encode(&mut v);
@@ -3803,7 +3836,7 @@ impl ParentNodeWriter {
                 *count_pages += blocks.count_pages();
             },
             &BlocksForParent::Count(count) => {
-                assert!(self.depth > 1);
+                assert!(self.my_depth > 1);
                 self.pb.PutVarint(count as u64);
                 *count_pages += count;
             },
@@ -3831,7 +3864,7 @@ impl ParentNodeWriter {
         self.pb.Reset();
         self.pb.PutByte(PageType::PARENT_NODE.to_u8());
         self.pb.PutByte(0u8);
-        self.pb.PutByte(self.depth);
+        self.pb.PutByte(self.my_depth);
         self.pb.PutVarint(self.st.prefixLen as u64);
         if self.st.prefixLen > 0 {
             self.pb.PutArray(&self.st.items[0].first_key.key[0 .. self.st.prefixLen]);
@@ -3947,7 +3980,7 @@ impl ParentNodeWriter {
         }
     }
 
-    fn add_child(&mut self, pw: &mut PageWriter, child: pgitem) -> Result<()> {
+    fn add_child_to_current(&mut self, pw: &mut PageWriter, child: pgitem) -> Result<()> {
         let pgsz = pw.page_size();
 
         if cfg!(expensive_check) 
@@ -4009,7 +4042,7 @@ impl ParentNodeWriter {
                     assert!(self.st.prefixLen == 0 || would_be_prefix_len < self.st.prefixLen);
                     // the prefixLen would change with the addition of this key,
                     // so we need to recalc sofar
-                    let sum = self.st.items.iter().map(|lp| lp.need(would_be_prefix_len, self.depth) ).sum();;
+                    let sum = self.st.items.iter().map(|lp| lp.need(would_be_prefix_len, self.my_depth) ).sum();;
                     sum
                 } else {
                     self.st.sofar
@@ -4017,12 +4050,12 @@ impl ParentNodeWriter {
             let would_be_len_page = Self::calc_page_len(would_be_prefix_len, would_be_sofar);
             if pgsz > would_be_len_page {
                 let available = pgsz - would_be_len_page;
-                let fits = available >= child.need(would_be_prefix_len, self.depth);
+                let fits = available >= child.need(would_be_prefix_len, self.my_depth);
                 if !fits && self.st.items.len() == 0 {
                     println!("would_be_len_page: {}", would_be_len_page);
                     println!("would_be_so_far: {}", would_be_sofar);
                     println!("child: {:?}", child);
-                    println!("child need: {}",child.need(would_be_prefix_len, self.depth));
+                    println!("child need: {}",child.need(would_be_prefix_len, self.my_depth));
                     //println!("child blocklist blocks: {}", child.blocks.len());
                     //println!("child blocklist pages: {}", child.blocks.count_pages());
                     //println!("child blocklist encoded_len: {}", child.blocks.encoded_len());
@@ -4049,6 +4082,7 @@ impl ParentNodeWriter {
             let should_be = Self::calc_page_len(self.st.prefixLen, self.st.sofar);
             let (len_page, pg) = try!(self.write_parent_page(pw));
             // TODO try!(pg.verify(pw.page_size(), path, f.clone()));
+            self.count_emit += 1;
             try!(self.emit(pw, pg));
             //println!("should_be = {}   len_page = {}", should_be, len_page);
             assert!(should_be == len_page);
@@ -4062,31 +4096,58 @@ impl ParentNodeWriter {
                 assert!(self.st.prefixLen == 0 || new_prefix_len < self.st.prefixLen);
                 // the prefixLen changed with the addition of this item,
                 // so we need to recalc sofar
-                let sum = self.st.items.iter().map(|lp| lp.need(new_prefix_len, self.depth) ).sum();;
+                let sum = self.st.items.iter().map(|lp| lp.need(new_prefix_len, self.my_depth) ).sum();;
                 sum
             } else {
                 self.st.sofar
             };
-        self.st.sofar = sofar + child.need(new_prefix_len, self.depth);
+        self.st.sofar = sofar + child.need(new_prefix_len, self.my_depth);
         self.st.prefixLen = new_prefix_len;
         self.st.items.push(child);
 
         Ok(())
     }
 
-    fn emit(&mut self, pw: &mut PageWriter, pg: pgitem) -> Result<()> {
-        self.count_emit += 1;
+    fn add_child(&mut self, pw: &mut PageWriter, child: pgitem, depth: u8) -> Result<()> {
+        if depth == self.my_depth - 1 {
+            try!(self.add_child_to_current(pw, child));
+        } else if depth == self.my_depth {
+            try!(self.flush_page(pw));
+            try!(self.emit(pw, child));
+        } else {
+            try!(self.flush_page(pw));
+            try!(self.require_chain(pw));
+            let mut chain = self.results_chain.as_mut().unwrap();
+            try!(chain.add_child(pw, child, depth));
+        }
+        Ok(())
+    }
+
+    fn require_chain(&mut self, pw: &mut PageWriter) -> Result<()> {
         if self.results_chain.is_some() {
             assert!(self.result_one.is_none());
-            let mut chain = self.results_chain.as_mut().unwrap();
-            try!(chain.add_child(pw, pg));
         } else if self.result_one.is_some() {
             let first = self.result_one.take().unwrap();
             //println!("adding a depth level: {}", self.depth);
-            let mut chain = ParentNodeWriter::new(self.pb.buf.len(), self.depth);
-            try!(chain.add_child(pw, first));
-            try!(chain.add_child(pw, pg));
+            let mut chain = ParentNodeWriter::new(self.pb.buf.len(), self.my_depth + 1);
+            try!(chain.add_child(pw, first, self.my_depth));
             self.results_chain = Some(box chain);
+        } else {
+            let mut chain = ParentNodeWriter::new(self.pb.buf.len(), self.my_depth + 1);
+            self.results_chain = Some(box chain);
+        }
+        Ok(())
+    }
+
+    fn emit(&mut self, pw: &mut PageWriter, pg: pgitem) -> Result<()> {
+        if self.results_chain.is_some() {
+            assert!(self.result_one.is_none());
+            let mut chain = self.results_chain.as_mut().unwrap();
+            try!(chain.add_child(pw, pg, self.my_depth));
+        } else if self.result_one.is_some() {
+            try!(self.require_chain(pw));
+            assert!(self.results_chain.is_some());
+            try!(self.emit(pw, pg));
         } else {
             self.result_one = Some(pg);
         }
@@ -4098,6 +4159,7 @@ impl ParentNodeWriter {
             let should_be = Self::calc_page_len(self.st.prefixLen, self.st.sofar);
             let (len_page, pg) = try!(self.write_parent_page(pw));
             // TODO try!(pg.verify(pw.page_size(), path, f.clone()));
+            self.count_emit += 1;
             try!(self.emit(pw, pg));
             //println!("should_be = {}   len_page = {}", should_be, len_page);
             assert!(should_be == len_page);
@@ -4106,12 +4168,12 @@ impl ParentNodeWriter {
         Ok(())
     }
 
-    fn done(mut self, pw: &mut PageWriter, buf_last_child: Box<[u8]>) -> Result<(usize, Option<SegmentHeaderInfo>)> {
+    fn done(mut self, pw: &mut PageWriter, buf_last_child: Box<[u8]>) -> Result<(usize, Option<(SegmentHeaderInfo, u8)>)> {
         if self.result_one.is_none() && self.results_chain.is_none() && self.st.items.len() == 1 {
             let pg = self.st.items.remove(0);
             let seg = SegmentHeaderInfo::new(pg.page, buf_last_child);
             assert!(self.count_emit == 0);
-            Ok((self.count_emit, Some(seg)))
+            Ok((self.count_emit, Some((seg, self.my_depth - 1))))
         } else {
             try!(self.flush_page(pw));
             assert!(self.st.items.is_empty());
@@ -4128,7 +4190,7 @@ impl ParentNodeWriter {
                 let buf = self.pb.into_buf();
                 let seg = SegmentHeaderInfo::new(pg.page, buf);
                 assert!(self.count_emit == 1);
-                Ok((self.count_emit, Some(seg)))
+                Ok((self.count_emit, Some((seg, self.my_depth))))
             } else {
                 assert!(self.count_emit == 0);
                 Ok((self.count_emit, None))
@@ -4418,6 +4480,7 @@ impl LeafPage {
         let mut cur = 0;
         let pt = try!(PageType::from_u8(misc::buf_advance::get_byte(pr, &mut cur)));
         if pt != PageType::LEAF_NODE {
+            panic!();
             return Err(Error::CorruptFile("leaf has invalid page type"));
         }
         cur = cur + 1; // skip flags
@@ -5316,6 +5379,18 @@ impl ParentPage {
             let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, buf));
             page.blocklist_unsorted_no_overflows()
             // TODO assert that count matches the blocklist?
+        }
+    }
+
+    fn child_count_pages(&self, i: usize) -> PageCount {
+        match self.children[i].blocks {
+            BlocksForParent::List(ref blocks) => {
+                blocks.count_pages()
+            },
+            BlocksForParent::Count(n) => {
+                assert!(self.depth() > 1);
+                n
+            },
         }
     }
 
@@ -6611,6 +6686,22 @@ impl Space {
 
 }
 
+enum MergingInto {
+    None,
+    Leaf(LeafPage),
+    Parent(ParentPage),
+}
+
+impl MergingInto {
+    fn old_segment(&self) -> Option<PageNum> {
+        match *self {
+            MergingInto::None => None,
+            MergingInto::Leaf(ref page) => Some(page.pagenum),
+            MergingInto::Parent(ref page) => Some(page.pagenum),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum MergeFrom {
     Fresh{segments: Vec<PageNum>},
@@ -7222,7 +7313,7 @@ impl InnerPart {
             pb
         }
 
-        println!("header,fresh,{},young,{},levels,{}", hdr.fresh.len(), hdr.young.len(), hdr.levels.len());
+        //println!("header,fresh,{},young,{},levels,{}", hdr.fresh.len(), hdr.young.len(), hdr.levels.len());
 
         let mut pb = PageBuilder::new(HEADER_SIZE_IN_BYTES);
         // TODO format version number
@@ -7562,16 +7653,6 @@ impl InnerPart {
             },
         }
 
-        enum MergingInto {
-            None,
-            Level{
-                level: usize,  // TODO why is this here?
-                old_segment: PageNum, 
-                leaves: Box<Iterator<Item=Result<pgitem>>>, 
-                parents: Vec<PageNum>, 
-            },
-        }
-
         let f = try!(inner.open_file_for_cursor());
 
         let (cursor, from, into, behind, behind_rlock) = {
@@ -7789,49 +7870,11 @@ impl InnerPart {
                                 PageType::LEAF_NODE => {
                                     //println!("root of the dest segment is a leaf");
                                     let leaf = try!(LeafPage::new_already_read_page(&inner.path, f.clone(), dest_segment.root_page, buf));
-                                    let pg = try!(leaf.pgitem());
-                                    let dest_leaves: Box<Iterator<Item=Result<pgitem>>> = box vec![Ok(pg)].into_iter();
-                                    // TODO MergingInto::Leaf ?
-                                    MergingInto::Level{
-                                        level: dest_level, 
-                                        old_segment: dest_segment.root_page, 
-                                        leaves: dest_leaves, 
-                                        parents: vec![],
-                                    }
+                                    MergingInto::Leaf(leaf)
                                 },
                                 PageType::PARENT_NODE => {
                                     let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), dest_segment.root_page, buf));
-                                    let depth = parent.depth();
-                                    // TODO for large segments, probably need to reconsider decision
-                                    // to go all the way down to the leaves level.  A 5 GB segment
-                                    // would have over a million leaves.
-                                    let dest_leaves: Box<Iterator<Item=Result<pgitem>>> = box DepthIterator::new(parent, 0);
-
-                                    let dest_parents =
-                                        if depth == 1 {
-                                            vec![dest_segment.root_page]
-                                        } else {
-                                            // TODO it's a little silly here to construct a Lend<>
-                                            let done_page = move |_| -> () {
-                                            };
-                                            // TODO and the clone below is silly too
-                                            let buf = Lend::new(dest_segment.buf.clone(), box done_page);
-
-                                            let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), dest_segment.root_page, buf));
-                                            let dest_parents = 
-                                                NodeIterator::new(parent, 1)
-                                                .map(|r| r.map(|(depth, pagenum)| pagenum))
-                                                .collect::<Result<Vec<_>>>();
-                                            let dest_parents = try!(dest_parents);
-                                            dest_parents
-                                        };
-
-                                    MergingInto::Level{
-                                        level: dest_level, 
-                                        old_segment: dest_segment.root_page, 
-                                        leaves: dest_leaves, 
-                                        parents: dest_parents,
-                                    }
+                                    MergingInto::Parent(parent)
                                 },
                             }
 
@@ -7929,49 +7972,19 @@ impl InnerPart {
 
         let mut pw = try!(PageWriter::new(inner.clone()));
 
-        enum MergedInto {
-            None,
-            Level{
-                level: DestLevel, 
-                old_segment: PageNum, 
-                parents: Vec<PageNum>, 
-                leaves_rewritten: Vec<PageNum>, 
-                overflows_freed: Vec<BlockList>, 
-            },
-        }
-
-        let (new_dest_segment, overflows_eaten, into) = {
+        let (new_dest_segment, nodes_rewritten, overflows_freed, overflows_eaten) = {
             // note that cursor.First() should NOT have already been called
             let mut cursor = cursor;
             try!(cursor.First());
             if cursor.IsValid() {
                 let mut source = CursorIterator::new(cursor);
                 let mut behind = behind;
-                match into {
-                    MergingInto::None => {
-                        let leaves: Box<Iterator<Item=Result<pgitem>>> = box std::iter::empty();
-                        let wrote = try!(write_merge(&mut pw, &mut source, leaves, &mut behind, &inner.path, f.clone(), from_level.get_dest_level()));
-                        assert!(wrote.leaves_rewritten.is_empty());
-                        // TODO asserts here
-                        let overflows_eaten = source.eaten();
-                        (wrote.segment, overflows_eaten, MergedInto::None)
-                    },
-                    MergingInto::Level{old_segment, leaves, parents, ..} => {
-                        let wrote = try!(write_merge(&mut pw, &mut source, leaves, &mut behind, &inner.path, f.clone(), from_level.get_dest_level()));
-                        // TODO asserts here
-                        let overflows_eaten = source.eaten();
-                        let into = MergedInto::Level{
-                            level: from_level.get_dest_level(),
-                            old_segment: old_segment, 
-                            parents: parents, 
-                            leaves_rewritten: wrote.leaves_rewritten, 
-                            overflows_freed: wrote.overflows_freed, 
-                        };
-                        (wrote.segment, overflows_eaten, into)
-                    },
-                }
+                let wrote = try!(write_merge(&mut pw, &mut source, &into, &mut behind, &inner.path, f.clone(), from_level.get_dest_level()));
+                let overflows_eaten = source.eaten();
+                (wrote.segment, wrote.nodes_rewritten, wrote.overflows_freed, overflows_eaten)
             } else {
-                (None, vec![], MergedInto::None)
+// TODO returning None and 3 empty vecs is silly
+                (None, vec![], vec![], vec![])
             }
         };
 
@@ -7987,11 +8000,14 @@ impl InnerPart {
 
         let old_dest_segment = 
             match &into {
-                &MergedInto::None => {
+                &MergingInto::None => {
                     None
                 },
-                &MergedInto::Level{old_segment, ..} => {
-                    Some(old_segment)
+                &MergingInto::Leaf(ref leaf) => {
+                    Some(leaf.pagenum)
+                },
+                &MergingInto::Parent(ref parent) => {
+                    Some(parent.pagenum)
                 },
             };
 
@@ -8047,13 +8063,10 @@ impl InnerPart {
                     now_inactive.insert(old_segment, blocks);
                 },
             }
-            match into {
-                MergedInto::Level{old_segment, parents, leaves_rewritten, overflows_freed, ..} => {
+            match into.old_segment() {
+                Some(old_segment) => {
                     let mut blocks = BlockList::new();
-                    for pgnum in leaves_rewritten {
-                        blocks.add_page_no_reorder(pgnum);
-                    }
-                    for pgnum in parents {
+                    for pgnum in nodes_rewritten {
                         blocks.add_page_no_reorder(pgnum);
                     }
                     for b in overflows_freed {
@@ -8061,7 +8074,7 @@ impl InnerPart {
                     }
                     now_inactive.insert(old_segment, blocks);
                 },
-                MergedInto::None => {
+                None => {
                 },
             }
             now_inactive
@@ -8084,7 +8097,7 @@ impl InnerPart {
                 MergingFrom::Other{level, old_segment, chosen_depth, survivors, ..} => {
                     let mut survivors = survivors.peekable();
 
-                    let mut chain = ParentNodeWriter::new(pw.page_size(), chosen_depth);
+                    let mut chain = ParentNodeWriter::new(pw.page_size(), chosen_depth + 1);
                     let mut last_page = None;
                     loop {
                         match survivors.next() {
@@ -8094,7 +8107,7 @@ impl InnerPart {
                             },
                             Some(Ok(pg)) => {
                                 let pgnum = pg.page;
-                                try!(chain.add_child(&mut pw, pg));
+                                try!(chain.add_child(&mut pw, pg, chosen_depth));
                                 if survivors.peek().is_none() {
                                     last_page = Some(pgnum);
                                     break;
@@ -8109,6 +8122,7 @@ impl InnerPart {
                         Some(page) => {
                             let buf = try!(read_and_alloc_page(&f, page, pw.page_size()));
                             let (count_parent_nodes, seg) = try!(chain.done(&mut pw, buf));
+                            let seg = seg.map(|(seg, depth)| seg);
                             let seg = seg.unwrap();
                             MergeFrom::Other{
                                 level: level, 
@@ -8129,6 +8143,36 @@ impl InnerPart {
 
         if cfg!(expensive_check) 
         {
+            // TODO function is inherently inefficient when called on a segment that
+            // is in the header, because it loads and allocs the root page, a copy
+            // of which is already in the header.
+            fn get_blocklist_for_segment_including_root(
+                page: PageNum,
+                pgsz: usize,
+                path: &str,
+                f: std::rc::Rc<std::cell::RefCell<File>>,
+                ) -> Result<BlockList> {
+                let buf = try!(read_and_alloc_page(&f, page, pgsz));
+                let done_page = move |_| -> () {
+                };
+                let buf = Lend::new(buf, box done_page);
+
+                let pt = try!(PageType::from_u8(buf[0]));
+                let mut blocks =
+                    match pt {
+                        PageType::LEAF_NODE => {
+                            let page = try!(LeafPage::new_already_read_page(path, f.clone(), page, buf));
+                            page.blocklist_unsorted()
+                        },
+                        PageType::PARENT_NODE => {
+                            let parent = try!(ParentPage::new_already_read_page(path, f.clone(), page, buf));
+                            try!(parent.blocklist_unsorted())
+                        },
+                    };
+                blocks.add_page_no_reorder(page);
+                Ok(blocks)
+            }
+
             let old_now_inactive = {
                 let mut now_inactive = HashMap::new();
                 match from {
@@ -8225,9 +8269,29 @@ impl InnerPart {
 
                         match new_dest_segment {
                             Some(ref seg) => {
-                                //let blocks = try!(seg.blocklist_unsorted(&inner.path, f.clone()));
+                                let blocks = try!(seg.blocklist_unsorted(&inner.path, f.clone()));
                                 //println!("new_dest_segment: {:?}", blocks);
                                 println!("new_dest_segment: {:?}", seg.root_page);
+                                if !only_in_old.is_empty() {
+                                    for pb in only_in_old.blocks.iter() {
+                                        for pg in pb.firstPage .. pb.lastPage + 1 {
+                                            if blocks.contains_page(pg) {
+                                                println!("new dest segment contains page {}, old code is wrong?", pg);
+                                                println!("new_dest_segment blocks: {:?}", blocks);
+                                            }
+                                        }
+                                    }
+                                }
+                                if !only_in_new.is_empty() {
+                                    for pb in only_in_new.blocks.iter() {
+                                        for pg in pb.firstPage .. pb.lastPage + 1 {
+                                            if blocks.contains_page(pg) {
+                                                println!("new dest segment contains page {}, new code is wrong?", pg);
+                                                println!("new_dest_segment blocks: {:?}", blocks);
+                                            }
+                                        }
+                                    }
+                                }
                             },
                             None => {
                                 println!("new_dest_segment: None");
