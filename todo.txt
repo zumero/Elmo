@@ -69,10 +69,6 @@ shrink much, and ends up with a lot of empty blocks in it.
 
 allow block allocation policy that always selects the earliest block?
 
-experiment with write_merge and decisions to reuse leaves.
-allow specifying the minimum number of consecutive leaves to 
-be reused?
-
 maybe everywhere we read a page (cursors), instead of a file,
 we should provide an object which abstracts the reading of page.
 allows a cache.  or a non-file.

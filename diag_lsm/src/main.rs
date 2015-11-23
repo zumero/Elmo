@@ -18,6 +18,7 @@
 #![feature(iter_arith)]
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 extern crate lsm;
 use lsm::ICursor;
@@ -70,7 +71,7 @@ fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     //println!("blocks ({} blocks, {} pages)", blocks.count_blocks(), blocks.count_pages());
     //println!("key range: {:?}", try!(page.range()));
     let count = page.count_items();
-    //if cfg!(expensive_check) 
+    if cfg!(expensive_check) 
     {
         println!("items ({}):", count);
         for i in 0 .. count {
@@ -81,29 +82,69 @@ fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
         }
         //try!(page.verify_child_keys());
     }
-    if cfg!(expensive_check) 
+    //if cfg!(expensive_check) 
     {
+        let mut stats = HashMap::new();
         let page = try!(db.read_parent_page(pgnum));
+        let mut leaf = page.make_leaf_page();
+        let mut parent = page.make_parent_page();
         let it = page.into_node_iter(0);
+
+        #[derive(Debug)]
+        struct Stats {
+            count_nodes: usize,
+            count_items: usize,
+            len: usize,
+        }
+
         for r in it {
             let (depth, node) = try!(r);
-            println!("depth: {}  pagenum: {}", depth, node);
+            let (count_items, len) =
+                if depth == 0 {
+                    try!(leaf.read_page(node));
+                    let count_items = leaf.count_keys();
+                    let len = leaf.len_on_page();
+                    (count_items, len)
+                } else {
+                    try!(parent.read_page(node));
+                    let count_items = parent.count_items();
+                    let len = parent.len_on_page();
+                    (count_items, len)
+                };
+            match stats.entry(depth) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let v = Stats {
+                        count_nodes: 1,
+                        count_items: count_items,
+                        len: len,
+                    };
+                    e.insert(v);
+                },
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let st = e.get_mut();
+                    st.count_nodes += 1;
+                    st.count_items += count_items;
+                    st.len += len;
+                },
+            }
         }
-    }
-    let mut leaf = page.make_leaf_page();
-    let leaves = page.into_node_iter(0);
-    let mut count_leaves = 0;
-    let mut bytes_used_in_leaves = 0;
-    for r in leaves {
-        let (depth, node) = try!(r);
-        if depth == 0 {
-            try!(leaf.read_page(node));
-            count_leaves += 1;
-            bytes_used_in_leaves += leaf.len_on_page();
+        let mut depth = 0;
+        loop {
+            match stats.get(&depth) {
+                Some(stats) => {
+                    println!("Depth {}:", depth);
+                    println!("    {} nodes", stats.count_nodes);
+                    println!("    {} items per node", stats.count_items / stats.count_nodes);
+                    println!("    {} len per node", stats.len / stats.count_nodes);
+                },
+                None => {
+                    break;
+                },
+            }
+            depth += 1;
         }
+        //println!("stats: {:?}", stats);
     }
-    //println!("leaves: {}:", count_leaves);
-    println!("avg leaf len: {}", bytes_used_in_leaves / count_leaves);
     Ok(())
 }
 

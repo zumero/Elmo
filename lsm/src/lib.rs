@@ -3773,8 +3773,6 @@ fn write_merge(
         try!(chain.add_child(pw, pg, 0));
     }
 
-    // TODO this assumes the last page written is still in pb.  it has to be.
-    // TODO unless it wrote no pages?
     let (count_parent_nodes, seg) = try!(chain.done(pw, pb.into_buf()));
     let starting_depth =
         match *into {
@@ -3801,7 +3799,7 @@ fn write_merge(
 
     let seg = seg.map(|(seg, depth)| seg);
 
-    //println!("dest,{:?},nodes_rewritten,{},nodes_recycled,{},keys_promoted,{},keys_rewritten,{},count_parent_nodes,{},starting_depth,{:?},ending_depth,{:?}", dest_level, nodes_rewritten.len(), nodes_recycled, keys_promoted, keys_rewritten, count_parent_nodes, starting_depth, ending_depth);
+    println!("dest,{:?},nodes_rewritten,{},nodes_recycled,{},keys_promoted,{},keys_rewritten,{},count_parent_nodes,{},starting_depth,{:?},ending_depth,{:?}", dest_level, nodes_rewritten.len(), nodes_recycled, keys_promoted, keys_rewritten, count_parent_nodes, starting_depth, ending_depth);
 
     let wrote = WroteMerge {
         segment: seg,
@@ -4427,7 +4425,7 @@ impl LeafPage {
         res
     }
 
-    fn count_keys(&self) -> usize {
+    pub fn count_keys(&self) -> usize {
         self.pairs.len()
     }
 
@@ -5340,6 +5338,7 @@ pub struct ParentPage {
     prefix: Option<Box<[u8]>>,
     children: Vec<ParentPageItem>,
 
+    bytes_used_on_page: usize,
 }
 
 impl ParentPage {
@@ -5349,7 +5348,7 @@ impl ParentPage {
            buf: Lend<Box<[u8]>>
           ) -> Result<ParentPage> {
 
-        let (prefix, children) = try!(Self::parse_page(pagenum, &buf));
+        let (prefix, children, bytes_used_on_page) = try!(Self::parse_page(pagenum, &buf));
         assert!(children.len() > 0);
 
         let res = ParentPage {
@@ -5361,6 +5360,7 @@ impl ParentPage {
             prefix: prefix,
             children: children,
 
+            bytes_used_on_page: bytes_used_on_page,
         };
 
         if cfg!(expensive_check) 
@@ -5369,6 +5369,36 @@ impl ParentPage {
         }
 
         Ok(res)
+    }
+
+    fn new(path: &str, 
+           f: std::rc::Rc<std::cell::RefCell<File>>,
+           pgsz: usize,
+          ) -> ParentPage {
+
+        // TODO it's a little silly here to construct a Lend<>
+        let buf = vec![0; pgsz].into_boxed_slice();
+        let done_page = move |_| -> () {
+        };
+        let mut buf = Lend::new(buf, box done_page);
+
+        let res = ParentPage {
+            path: String::from(path),
+            f: f,
+            pr: buf,
+            pagenum: 0,
+
+            prefix: None,
+            children: vec![],
+
+            bytes_used_on_page: 0,
+        };
+
+        res
+    }
+
+    pub fn len_on_page(&self) -> usize {
+        self.bytes_used_on_page
     }
 
     #[cfg(remove_me)]
@@ -5534,6 +5564,11 @@ impl ParentPage {
 // TODO name
     pub fn make_leaf_page(&self) -> LeafPage {
         LeafPage::new(&self.path, self.f.clone(), self.pr.len(), )
+    }
+
+// TODO name
+    pub fn make_parent_page(&self) -> ParentPage {
+        ParentPage::new(&self.path, self.f.clone(), self.pr.len(), )
     }
 
     pub fn into_node_iter(self, min_depth: u8) -> Box<Iterator<Item=Result<(u8, PageNum)>>> {
@@ -5708,7 +5743,7 @@ impl ParentPage {
         Ok(range)
     }
 
-    fn parse_page(pgnum: PageNum, pr: &[u8]) -> Result<(Option<Box<[u8]>>, Vec<ParentPageItem>)> {
+    fn parse_page(pgnum: PageNum, pr: &[u8]) -> Result<(Option<Box<[u8]>>, Vec<ParentPageItem>, usize)> {
         let mut cur = 0;
         let pt = try!(PageType::from_u8(misc::buf_advance::get_byte(pr, &mut cur)));
         if  pt != PageType::PARENT_NODE {
@@ -5762,11 +5797,11 @@ impl ParentPage {
 
         //println!("children parsed: {:?}", children);
 
-        Ok((prefix, children))
+        Ok((prefix, children, cur))
     }
 
     fn count_pages(pgnum: PageNum, buf: &[u8]) -> Result<PageCount> {
-        let (_, children) = try!(Self::parse_page(pgnum, buf));
+        let (_, children, _) = try!(Self::parse_page(pgnum, buf));
         let mut count_pages = 0;
         for item in children {
             match item.blocks {
@@ -5781,7 +5816,7 @@ impl ParentPage {
         Ok(count_pages)
     }
 
-    fn read_page(&mut self, pgnum: PageNum) -> Result<()> {
+    pub fn read_page(&mut self, pgnum: PageNum) -> Result<()> {
         // TODO
         // this code is the only reason this object needs to own its buffer.
         // for the top Leaf/Parent Page object, the one corresponding to a
@@ -5790,9 +5825,10 @@ impl ParentPage {
         // page to another without re-allocating memory.
         try!(read_page_into_buf(&self.f, pgnum, &mut self.pr));
         self.pagenum = pgnum;
-        let (prefix, children) = try!(Self::parse_page(pgnum, &self.pr));
+        let (prefix, children, bytes_used_on_page) = try!(Self::parse_page(pgnum, &self.pr));
         self.prefix = prefix;
         self.children = children;
+        self.bytes_used_on_page = bytes_used_on_page;
 
         Ok(())
     }
