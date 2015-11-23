@@ -7617,12 +7617,12 @@ impl InnerPart {
         match from_level {
             FromLevel::Fresh => {
                 // TODO constant
-                if header.fresh.len() < 2 {
+                if header.fresh.len() < 4 {
                     return Ok(NeedsMerge::No);
                 }
 
                 // TODO constant
-                if header.fresh.len() > 100 {
+                if header.fresh.len() > 256 {
                     return Ok(NeedsMerge::Desperate);
                 }
 
@@ -7635,7 +7635,7 @@ impl InnerPart {
                 }
 
                 // TODO constant
-                if header.young.len() > 100 {
+                if header.young.len() > 32 {
                     return Ok(NeedsMerge::Desperate);
                 }
 
@@ -7669,7 +7669,7 @@ impl InnerPart {
                     return Ok(NeedsMerge::No);
                 }
                 // TODO constant
-                if size > 2 * get_level_size(i) {
+                if size > 4 * get_level_size(i) {
                     return Ok(NeedsMerge::Desperate);
                 }
                 return Ok(NeedsMerge::Yes);
@@ -7745,7 +7745,7 @@ impl InnerPart {
                 match from_level {
                     FromLevel::Fresh => {
                         // TODO constant
-                        let merge_segments = slice_from_end(&header.fresh, 4);
+                        let merge_segments = slice_from_end(&header.fresh, 8);
 
                         //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
                         let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));

@@ -1,149 +1,23 @@
 
-new theory of the crime:
-
-page P is a member of segment A
-
-open an rlock on segment A
-
-merge happens and segment A becomes inactive.  page P
-gets recycled into segment B.
-
-it is fine for segment A to become inactive while there
-is a cursor on it.  it remains valid for reading as long
-as its pages don't get freed and reused, which is what
-the rlock is for.
-
-another merge happens and segment B becomes inactive.
-this time page P does not get recycled.  the merge code
-puts P on the inactive list, subject to any rlocks on
-segment B.  but rlocks on segment A need to matter for
-page P as well.
-
-this would not be a problem if rlocks had a blocklist,
-kind of like before.
-
-maybe segments need a way to specify that they share
-paged from other segments.  for rlock purposes, you can't 
-release a segment until its rlocks are gone and also any rlocks
-for segments it stole its pages from.
-
-Space could have, in addition to a list of rlocks, a list of
-segment dependencies.  when you get an add_inactive for segment
-X, if X is dependent on Y, zombie it.
-
-when the last rlock for a segment gets released (say Y),
-look for segments dependent on it.  
-
-merge code knows that the dependency always comes from the
-old version of the dest segment.
-
-but overflows can be reused from any segment during merge.
-
---------
-
-disable the heavy asserts and debugging code to make the
-bug easier to repro.
-
-go back a couple of commits and see where the bug got
-introduced.
-
-or maybe it has been there a long time but only now is
-visible because the merge is faster.
-
-one rwlock per segment in the header, instead of one for
-the whole header?
-
-adding more debug printfs tends to make the problem less
-likely to show up.  :-(
-
-getting/printing the blocklists at the end of prepare_merge,
-seems to slow things down enough to avoid the bug.  this
-change also included prints in the rlock code.
-
-do we need an rlock on the stuff being promoted?
-
-now seeing occasional failure of cursor1.js
-leaf has invalid page type
-add panic
-
-definitely some sort of file corruption.
-hard to repro.
-freed a segment that was actually still in use?
-pb doesn't actually have the right page in it?
-
-inactive list still match?
-
 make sure recycle of middle nodes is working as I think it is
 
 parent node writer gets in trouble, overflows its stack,
 when it has to deal with lots of pages that only hold one
 key.
 
-how could the following happen?  was it an overflow that newcode
-thought was eaten/skipped but actually got used?
-
-Young: inactive mismatch: segment 4641
-old count: 0
-new count: 1
-old: BlockList { blocks: [] }
-new: BlockList { blocks: [PageBlock { firstPage: 4641, lastPage: 4641 }] }
-only_in_old: BlockList { blocks: [] }
-only_in_new: BlockList { blocks: [PageBlock { firstPage: 4641, lastPage: 4641 }] }
-
-occasional mis match of inactive lists.  hard to repro.
-off by 1 page in one case.
-
-once saw in inside error.
-
 second run of test suite into same db is really slow.
-probably fragmentation and blocklist stuff.
+probably fragmentation and blocklist stuff?
 
-do we have no cases involving an overflowed key?
-
-previously saw some cases where the new inactive code
-had pages NOT found by the old inactive code.  that's
-gotta be bad.
-
-use the new inactive result as the final, not the old one.
-but they gotta match.
-
-on a merge from Other(n) to Other(n+1), we have been rewriting
-the parent nodes but not adding the old set of parent nodes
-to the inactive list.
-
-perf problem when we run the 5M URL thing with 10x levels.
-most CPU time being used by BlockList::sort_and_consolidate
-within write_parent_page() called by merge, and some from
-calls from prepare_merge() itself.  
-
-this looks like a problem:
-
-dest,Other(2),leaves_rewritten,0,leaves_recycled,45409,keys_promoted,348,keys_rewritten,0,count_parent_nodes,639
-
-writing 639 new parent nodes just to promote a little bit of stuff into level 2.
-no leaves getting rewritten.
-
-blocklists are a problem.  the bigger the segment, the bigger
-the blocklist gets.  may need to stop always dealing with the
-blocklist for a whole segment at a time?  instead of subtract
-blocklist to figure out what was recycled during a merge,
-keep track of recycled nodes?
+do we have no test cases involving an overflowed key?
 
 can we somehow get the blocklist to be smaller?  reduce fragmentation?
 or is that simply a tradeoff with recycling?  in other words, if the
 only way to reduce fragmentation is to rewrite more stuff during
-merge, that's not good.
+merge, that's sad.
 
 maybe the level factor should be less than 10x so that the segments
 stay smaller and so the blocklists stay smaller.  but then reads get
 slower because more segments.
-
-can read locks go back to "segment" granularity?  open_cursor
-and behind cursors are fine.  PendingMerge.now_inactive will have
-to be a little different.  it is a list of stuff that got rewritten,
-but those are partial segments, and we need each bit of it to be
-keyed off the segment num they were owned by, so that a read lock
-can prevent them from being freed.
 
 consider fsa for storing keys instead of prefix compression.
 dependency on BurntSushi fst crate?  or just extract code
@@ -197,7 +71,7 @@ allow block allocation policy that always selects the earliest block?
 
 experiment with write_merge and decisions to reuse leaves.
 allow specifying the minimum number of consecutive leaves to 
-be reused.
+be reused?
 
 maybe everywhere we read a page (cursors), instead of a file,
 we should provide an object which abstracts the reading of page.
@@ -221,13 +95,6 @@ perf problem with storing locations of each page in parent pages?
     which means the btree gets deeper
     store locations elsewhere?
     sidecar page for every parent page, just to store locations?
-
-still need to be concerned about really big segments
-and merge working entirely at the granularity of a leaf.
-a small merge into a segment with a million leaves will
-end up rewriting a lot of parent nodes.  but if we process
-the merge at a higher depth, we will end up rewriting a lot
-more leaves than needed.
 
 look for ways to make elmo index entry encoding more compact
 
@@ -261,9 +128,6 @@ not sure a parent page with only one item in it makes much sense
 
 code for calc/build/write leaf and parent has gotten awfully similar
 
-go back to only one key in parent page?  just keep the last key of 
-each item?
-
 multiple prefixes, so we can have better compression of keys in
 parent page?
 
@@ -281,7 +145,7 @@ figure out proper limits for how much should be at each level.
 currently using geometric like leveldb, sometimes with the
 factor as low as 2.
 
-fix all the lsm tests
+fix/rewrite all the lsm cargo tests
 
 update rust nightly?
 
