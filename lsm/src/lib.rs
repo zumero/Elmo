@@ -6437,6 +6437,8 @@ struct Space {
     // cannot yet be freed because there is an rlock on them,
     // those blocks go into zombies.
     zombies: HashMap<PageNum, BlockList>,
+
+    dependencies: HashMap<PageNum, HashSet<PageNum>>,
 }
 
 impl Space {
@@ -6450,12 +6452,55 @@ impl Space {
     }
 
     fn has_rlock(&self, pgnum: PageNum) -> bool {
+        // TODO we might want a reverse index on this to make it faster
         for h in self.rlocks.values() {
             if h.contains(&pgnum) {
                 return true;
             }
         }
         false
+    }
+
+    fn maybe_release_segment(&mut self, seg: PageNum) {
+        if self.dependencies.contains_key(&seg) || self.has_rlock(seg) {
+            // anything that still has an rlock (directly or
+            // indirectly through a dependency) has gotta be
+            // left alone.
+            return;
+        }
+
+        // OK, this segment
+        // finally no longer exists.  It is no longer in the
+        // header (or it wouldn't be here), and there are no
+        // longer any direct or indirect rlocks on it.
+
+        // Any zombies waiting directly on this segment can now
+        // be freed.
+
+        // Also, any dependencies waiting on this segment can
+        // be removed and released as well.
+
+        match self.zombies.remove(&seg) {
+            Some(blocks) => {
+                self.add_free_blocks(blocks);
+            },
+            None => {
+            },
+        }
+
+        let mut recurse = vec![];
+        for (other, ref mut deps) in self.dependencies.iter_mut() {
+            if deps.remove(&seg) {
+                if deps.is_empty() {
+                    recurse.push(*other);
+                }
+            }
+        }
+
+        for seg in recurse {
+            self.dependencies.remove(&seg);
+            self.maybe_release_segment(seg);
+        }
     }
 
     fn release_rlock(&mut self, rlock: u64) {
@@ -6469,43 +6514,14 @@ impl Space {
                 },
             };
         //println!("release rlock on {:?}", segments);
-        if self.zombies.is_empty() {
-            // if there are no zombies, there is nothing more to do here
-            return;
-        }
-        // the rlock we released might not be the only one for those
-        // segments.  anything that still has an rlock has gotta be
-        // left alone.
-
-        let segments = 
-            segments
-            .into_iter()
-            .filter(|seg| !self.has_rlock(*seg))
-            .collect::<HashSet<_>>();
-        //println!("stuff without other rlocks: {:?}", segments);
-        if segments.is_empty() {
+        if self.zombies.is_empty() && self.dependencies.is_empty() {
+            // if there are no zombies or deps, there is nothing more to do here
             return;
         }
 
-        // OK, now anything in segments which is also in zombies
-        // can be added to the free list and removed from zombies.
-
-        let freeable_keys = 
-            segments
-            .into_iter()
-            .filter(|seg| self.zombies.contains_key(seg))
-            .collect::<HashSet<_>>();
-        if freeable_keys.is_empty() {
-            return;
+        for seg in segments {
+            self.maybe_release_segment(seg);
         }
-        //println!("stuff in zombies: {:?}", freeable_keys);
-
-        let mut free_blocks = BlockList::new();
-        for seg in freeable_keys {
-            let blocks = self.zombies.remove(&seg).unwrap();
-            free_blocks.add_blocklist_no_reorder(&blocks);
-        }
-        self.add_free_blocks(free_blocks);
     }
 
     fn add_inactive(&mut self, mut blocks: HashMap<PageNum, BlockList>) {
@@ -6516,7 +6532,7 @@ impl Space {
             let new_zombie_segments = 
                 segments
                 .into_iter()
-                .filter(|seg| self.has_rlock(*seg))
+                .filter(|seg| self.dependencies.contains_key(seg) || self.has_rlock(*seg) )
                 .collect::<HashSet<_>>();
             for pg in new_zombie_segments {
                 let b = blocks.remove(&pg).unwrap();
@@ -6530,6 +6546,19 @@ impl Space {
                 }
             }
         }
+    }
+
+    fn add_dependencies(&mut self, seg: PageNum, depends_on: Vec<PageNum>) {
+        let depends_on = 
+            depends_on
+            .into_iter()
+            .filter(|seg| self.has_rlock(*seg))
+            .collect::<HashSet<_>>();
+        if depends_on.is_empty() {
+            return;
+        }
+        assert!(!self.dependencies.contains_key(&seg));
+        self.dependencies.insert(seg, depends_on);
     }
 
     fn add_free_blocks(&mut self, blocks: BlockList) {
@@ -6909,6 +6938,7 @@ impl DatabaseFile {
             next_rlock: 1,
             rlocks: HashMap::new(),
             zombies: HashMap::new(),
+            dependencies: HashMap::new(),
         };
 
         let pagepool = SafePagePool {
@@ -8438,10 +8468,50 @@ impl InnerPart {
                 ndx
             }
 
+            let deps = 
+                // TODO this code assumes that the new dest segment might have
+                // recycled something from ANY of the promoted segments OR from
+                // the old dest segment.  this is a little bit pessimistic.
+                // a node page can only be recycled from the old dest, but overflows
+                // could have been recycled from anywhere.  the write_merge() code
+                // could keep track of things more closely, but that would probably
+                // be a low bang for the buck.
+                match pm.new_dest_segment {
+                    None => {
+                        None
+                    },
+                    Some(ref new_seg) => {
+                        let mut deps = vec![];
+                        match pm.from {
+                            MergeFrom::Fresh{ref segments} => {
+                                for seg in segments {
+                                    deps.push(*seg);
+                                }
+                            },
+                            MergeFrom::Young{ref segments} => {
+                                for seg in segments {
+                                    deps.push(*seg);
+                                }
+                            },
+                            MergeFrom::Other{old_segment, ..} => {
+                                deps.push(old_segment);
+                            },
+                        }
+                        match pm.old_dest_segment {
+                            Some(seg) => {
+                                deps.push(seg);
+                            },
+                            None => {
+                            },
+                        }
+                        Some((new_seg.root_page, deps))
+                    },
+                };
+
             match pm.from {
-                MergeFrom::Fresh{segments} => {
-                    let ndx = find_segments_in_list(&segments, &header.fresh);
-                    for _ in &segments {
+                MergeFrom::Fresh{ref segments} => {
+                    let ndx = find_segments_in_list(segments, &header.fresh);
+                    for _ in segments {
                         newHeader.fresh.remove(ndx);
                     }
 
@@ -8458,9 +8528,9 @@ impl InnerPart {
                         },
                     }
                 },
-                MergeFrom::Young{segments} => {
-                    let ndx = find_segments_in_list(&segments, &header.young);
-                    for _ in &segments {
+                MergeFrom::Young{ref segments} => {
+                    let ndx = find_segments_in_list(segments, &header.young);
+                    for _ in segments {
                         newHeader.young.remove(ndx);
                     }
 
@@ -8480,14 +8550,15 @@ impl InnerPart {
 
             let mut fs = try!(self.OpenForWriting());
             try!(self.write_header(&mut header, &mut fs, newHeader));
-        }
+            //println!("merge committed");
 
-        //println!("merge committed");
-
-        if !pm.now_inactive.is_empty() {
             let mut space = try!(self.space.lock());
             space.add_inactive(pm.now_inactive);
+            if let Some(deps) = deps {
+                space.add_dependencies(deps.0, deps.1);
+            }
         }
+
 
         // note that we intentionally do not release the writeLock here.
         // you can change the segment list more than once while holding

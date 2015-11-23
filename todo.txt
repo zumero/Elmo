@@ -37,6 +37,8 @@ look for segments dependent on it.
 merge code knows that the dependency always comes from the
 old version of the dest segment.
 
+but overflows can be reused from any segment during merge.
+
 --------
 
 disable the heavy asserts and debugging code to make the

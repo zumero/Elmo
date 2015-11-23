@@ -219,37 +219,6 @@ let all_tests = [
     "jstests/core/oro.js"; // batchSize, cursor, explain
     // "jstests/core/find9.js"; // huge
     "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
-    "jstests/core/cursor1.js";
     "jstests/core/cursor2.js";
     "jstests/core/cursor3.js";
     "jstests/core/cursor4.js";
