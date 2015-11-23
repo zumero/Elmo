@@ -1,4 +1,45 @@
 
+fix this:
+
+depth: 8
+Depth 0:
+    6189 nodes
+    141 items per node
+    3361 len per node
+Depth 1:
+    210 nodes
+    29 items per node
+    2740 len per node
+Depth 2:
+    114 nodes
+    1 items per node
+    279 len per node
+Depth 3:
+    94 nodes
+    1 items per node
+    200 len per node
+Depth 4:
+    74 nodes
+    1 items per node
+    208 len per node
+Depth 5:
+    52 nodes
+    1 items per node
+    232 len per node
+Depth 6:
+    31 nodes
+    1 items per node
+    280 len per node
+Depth 7:
+    12 nodes
+    2 items per node
+    484 len per node
+Depth 8:
+    1 nodes
+    12 items per node
+    2298 len per node
+
+
 make sure recycle of middle nodes is working as I think it is
 
 parent node writer gets in trouble, overflows its stack,
