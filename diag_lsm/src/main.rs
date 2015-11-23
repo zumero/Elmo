@@ -65,9 +65,9 @@ fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     let page = try!(db.read_parent_page(pgnum));
     println!("depth: {}", page.depth());
     //println!("count_items: {}", page.count_items());
-    let blocks = try!(page.blocklist_clean());
+    //let blocks = try!(page.blocklist_clean());
     //println!("blocks ({} blocks, {} pages): {:?}", blocks.count_blocks(), blocks.count_pages(), blocks);
-    println!("blocks ({} blocks, {} pages)", blocks.count_blocks(), blocks.count_pages());
+    //println!("blocks ({} blocks, {} pages)", blocks.count_blocks(), blocks.count_pages());
     //println!("key range: {:?}", try!(page.range()));
     let count = page.count_items();
     //if cfg!(expensive_check) 

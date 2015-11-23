@@ -1,7 +1,73 @@
 
+new theory of the crime:
+
+page P is a member of segment A
+
+open an rlock on segment A
+
+merge happens and segment A becomes inactive.  page P
+gets recycled into segment B.
+
+it is fine for segment A to become inactive while there
+is a cursor on it.  it remains valid for reading as long
+as its pages don't get freed and reused, which is what
+the rlock is for.
+
+another merge happens and segment B becomes inactive.
+this time page P does not get recycled.  the merge code
+puts P on the inactive list, subject to any rlocks on
+segment B.  but rlocks on segment A need to matter for
+page P as well.
+
+this would not be a problem if rlocks had a blocklist,
+kind of like before.
+
+maybe segments need a way to specify that they share
+paged from other segments.  for rlock purposes, you can't 
+release a segment until its rlocks are gone and also any rlocks
+for segments it stole its pages from.
+
+Space could have, in addition to a list of rlocks, a list of
+segment dependencies.  when you get an add_inactive for segment
+X, if X is dependent on Y, zombie it.
+
+when the last rlock for a segment gets released (say Y),
+look for segments dependent on it.  
+
+merge code knows that the dependency always comes from the
+old version of the dest segment.
+
+--------
+
+disable the heavy asserts and debugging code to make the
+bug easier to repro.
+
+go back a couple of commits and see where the bug got
+introduced.
+
+or maybe it has been there a long time but only now is
+visible because the merge is faster.
+
+one rwlock per segment in the header, instead of one for
+the whole header?
+
+adding more debug printfs tends to make the problem less
+likely to show up.  :-(
+
+getting/printing the blocklists at the end of prepare_merge,
+seems to slow things down enough to avoid the bug.  this
+change also included prints in the rlock code.
+
+do we need an rlock on the stuff being promoted?
+
 now seeing occasional failure of cursor1.js
 leaf has invalid page type
 add panic
+
+definitely some sort of file corruption.
+hard to repro.
+freed a segment that was actually still in use?
+pb doesn't actually have the right page in it?
 
 inactive list still match?
 

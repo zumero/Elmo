@@ -1358,11 +1358,12 @@ impl SegmentHeaderInfo {
         let pt = try!(PageType::from_u8(self.buf[0]));
         match pt {
             PageType::LEAF_NODE => {
+                //println!("leaf: {}", self.root_page);
                 // TODO
                 Ok(0)
             },
             PageType::PARENT_NODE => {
-                let count_pages = try!(ParentPage::count_pages(&self.buf));
+                let count_pages = try!(ParentPage::count_pages(self.root_page, &self.buf));
                 Ok(count_pages)
             },
         }
@@ -1495,8 +1496,9 @@ mod bcmp {
 }
 
 struct PageBuilder {
-    cur : usize,
-    buf : Box<[u8]>,
+    cur: usize,
+    buf: Box<[u8]>,
+    last_page_written: PageNum,
 }
 
 // TODO bundling cur with the buf almost seems sad, because there are
@@ -1505,15 +1507,19 @@ struct PageBuilder {
 impl PageBuilder {
     fn new(pgsz : usize) -> PageBuilder { 
         let ba = vec![0; pgsz as usize].into_boxed_slice();
-        PageBuilder { cur: 0, buf:ba } 
+        PageBuilder { 
+            cur: 0, 
+            buf: ba,
+            last_page_written: 0,
+        } 
     }
 
     fn buf(&self) -> &[u8] {
         &self.buf
     }
 
-    fn into_buf(self) -> Box<[u8]> {
-        self.buf
+    fn into_buf(self) -> (PageNum, Box<[u8]>) {
+        (self.last_page_written, self.buf)
     }
 
     fn Reset(&mut self) {
@@ -1522,6 +1528,11 @@ impl PageBuilder {
 
     fn sofar(&self) -> usize {
         self.cur
+    }
+
+    fn write_page(&mut self, pw: &mut PageWriter) -> Result<()> {
+        self.last_page_written = try!(pw.write_page(self.buf()));
+        Ok(())
     }
 
     fn Write(&self, strm: &mut Write) -> io::Result<()> {
@@ -3079,11 +3090,11 @@ fn write_leaf(st: &mut LeafState,
     //println!("leaf blocklist: {:?}", blocks);
     //println!("leaf blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
     assert!(st.keys_in_this_leaf.is_empty());
-    let thisPageNumber = try!(pw.write_page(pb.buf()));
-    assert!(!blocks.contains_page(thisPageNumber));
+    try!(pb.write_page(pw));
+    assert!(!blocks.contains_page(pb.last_page_written));
     // TODO pgitem::new
     let pg = pgitem {
-        page: thisPageNumber, 
+        page: pb.last_page_written, 
         blocks: BlocksForParent::List(blocks),
         first_key: first_key,
         last_key: last_key
@@ -3387,8 +3398,6 @@ fn write_leaves<I: Iterator<Item=Result<kvp>>, >(
         try!(chain.add_child(pw, pg, 0));
     }
 
-    // TODO this assumes the last page written is still in pb.  it has to be.
-    // TODO unless it wrote no pages?
     let (count_parent_nodes, seg) = try!(chain.done(pw, pb.into_buf()));
 
     let seg = seg.map(|(seg, depth)| seg);
@@ -3921,10 +3930,10 @@ impl ParentNodeWriter {
         assert!(self.st.items.is_empty());
         //println!("parent blocklist: {:?}", blocks);
         //println!("parent blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
-        let thisPageNumber = try!(pw.write_page(self.pb.buf()));
+        try!(self.pb.write_page(pw));
         // TODO pgitem::new
         let pg = pgitem {
-            page: thisPageNumber, 
+            page: self.pb.last_page_written, 
             blocks: BlocksForParent::Count(count_pages),
             first_key: first_key,
             last_key: last_key,
@@ -4168,9 +4177,11 @@ impl ParentNodeWriter {
         Ok(())
     }
 
-    fn done(mut self, pw: &mut PageWriter, buf_last_child: Box<[u8]>) -> Result<(usize, Option<(SegmentHeaderInfo, u8)>)> {
+    fn done(mut self, pw: &mut PageWriter, last_child: (PageNum, Box<[u8]>)) -> Result<(usize, Option<(SegmentHeaderInfo, u8)>)> {
         if self.result_one.is_none() && self.results_chain.is_none() && self.st.items.len() == 1 {
             let pg = self.st.items.remove(0);
+            let (pgnum_of_buf, buf_last_child) = last_child;
+            assert!(pg.page == pgnum_of_buf);
             let seg = SegmentHeaderInfo::new(pg.page, buf_last_child);
             assert!(self.count_emit == 0);
             Ok((self.count_emit, Some((seg, self.my_depth - 1))))
@@ -4179,15 +4190,12 @@ impl ParentNodeWriter {
             assert!(self.st.items.is_empty());
             if let Some(chain) = self.results_chain {
                 assert!(self.result_one.is_none());
-                // TODO this assumes the last page written is still in pb.  it has to be.
-                // TODO unless it wrote no pages?
                 let buf = self.pb.into_buf();
                 let (count_chain, seg) = try!(chain.done(pw, buf));
                 Ok((self.count_emit + count_chain, seg))
             } else if let Some(pg) = self.result_one {
-                // TODO this assumes the last page written is still in pb.  it has to be.
-                // TODO unless it wrote no pages?
-                let buf = self.pb.into_buf();
+                let (pgnum_of_buf, buf) = self.pb.into_buf();
+                assert!(pgnum_of_buf == pg.page);
                 let seg = SegmentHeaderInfo::new(pg.page, buf);
                 assert!(self.count_emit == 1);
                 Ok((self.count_emit, Some((seg, self.my_depth))))
@@ -4343,7 +4351,7 @@ impl LeafPage {
           ) -> Result<LeafPage> {
 
         let mut pairs = vec![];
-        let (prefix, bytes_used_on_page) = try!(Self::parse_page(&buf, &mut pairs));
+        let (prefix, bytes_used_on_page) = try!(Self::parse_page(pagenum, &buf, &mut pairs));
 
         let mut res = LeafPage {
             path: String::from(path),
@@ -4474,12 +4482,13 @@ impl LeafPage {
         Ok(pg)
     }
 
-    fn parse_page(pr: &[u8], pairs: &mut Vec<PairInLeaf>) -> Result<(Option<Box<[u8]>>, usize)> {
+    fn parse_page(pgnum: PageNum, pr: &[u8], pairs: &mut Vec<PairInLeaf>) -> Result<(Option<Box<[u8]>>, usize)> {
         let mut prefix = None;
 
         let mut cur = 0;
         let pt = try!(PageType::from_u8(misc::buf_advance::get_byte(pr, &mut cur)));
         if pt != PageType::LEAF_NODE {
+            println!("bad leaf page num: {}", pgnum);
             panic!();
             return Err(Error::CorruptFile("leaf has invalid page type"));
         }
@@ -4539,9 +4548,10 @@ impl LeafPage {
         // segment, we want it to borrow the buffer in the header.
         // but for a child, we want to be able to switch it from one
         // page to another without re-allocating memory.
+        //println!("leaf read page: {}", pgnum);
         try!(read_page_into_buf(&self.f, pgnum, &mut self.pr));
         self.pagenum = pgnum;
-        let (prefix, bytes_used_on_page) = try!(Self::parse_page(&self.pr, &mut self.pairs));
+        let (prefix, bytes_used_on_page) = try!(Self::parse_page(pgnum, &self.pr, &mut self.pairs));
         self.prefix = prefix;
         self.bytes_used_on_page = bytes_used_on_page;
         Ok(())
@@ -5303,7 +5313,7 @@ impl ParentPage {
            buf: Lend<Box<[u8]>>
           ) -> Result<ParentPage> {
 
-        let (prefix, children) = try!(Self::parse_page(&buf));
+        let (prefix, children) = try!(Self::parse_page(pagenum, &buf));
         assert!(children.len() > 0);
 
         let res = ParentPage {
@@ -5662,10 +5672,11 @@ impl ParentPage {
         Ok(range)
     }
 
-    fn parse_page(pr: &[u8]) -> Result<(Option<Box<[u8]>>, Vec<ParentPageItem>)> {
+    fn parse_page(pgnum: PageNum, pr: &[u8]) -> Result<(Option<Box<[u8]>>, Vec<ParentPageItem>)> {
         let mut cur = 0;
         let pt = try!(PageType::from_u8(misc::buf_advance::get_byte(pr, &mut cur)));
         if  pt != PageType::PARENT_NODE {
+            println!("bad parent pagenum is {}", pgnum);
             panic!();
             return Err(Error::CorruptFile("parent page has invalid page type"));
         }
@@ -5718,8 +5729,8 @@ impl ParentPage {
         Ok((prefix, children))
     }
 
-    fn count_pages(buf: &[u8]) -> Result<PageCount> {
-        let (_, children) = try!(Self::parse_page(buf));
+    fn count_pages(pgnum: PageNum, buf: &[u8]) -> Result<PageCount> {
+        let (_, children) = try!(Self::parse_page(pgnum, buf));
         let mut count_pages = 0;
         for item in children {
             match item.blocks {
@@ -5743,7 +5754,7 @@ impl ParentPage {
         // page to another without re-allocating memory.
         try!(read_page_into_buf(&self.f, pgnum, &mut self.pr));
         self.pagenum = pgnum;
-        let (prefix, children) = try!(Self::parse_page(&self.pr));
+        let (prefix, children) = try!(Self::parse_page(pgnum, &self.pr));
         self.prefix = prefix;
         self.children = children;
 
@@ -5909,6 +5920,7 @@ impl ParentCursor {
     }
 
     fn set_child(&mut self, i: usize) -> Result<()> {
+        //println!("set_child i={}  child_pagenum={}   self_pagenum={}", i, self.page.child_pagenum(i), self.page.pagenum);
         match self.cur {
             Some(n) => {
                 // TODO any chance this is a problem?
@@ -6429,6 +6441,7 @@ struct Space {
 
 impl Space {
     fn add_rlock(&mut self, segments: HashSet<PageNum>) -> u64 {
+        //println!("add_rlock: {:?}", segments);
         let rlock = self.next_rlock;
         self.next_rlock += 1;
         let was = self.rlocks.insert(rlock, segments);
@@ -6455,6 +6468,7 @@ impl Space {
                     segments
                 },
             };
+        //println!("release rlock on {:?}", segments);
         if self.zombies.is_empty() {
             // if there are no zombies, there is nothing more to do here
             return;
@@ -6468,6 +6482,7 @@ impl Space {
             .into_iter()
             .filter(|seg| !self.has_rlock(*seg))
             .collect::<HashSet<_>>();
+        //println!("stuff without other rlocks: {:?}", segments);
         if segments.is_empty() {
             return;
         }
@@ -6483,6 +6498,7 @@ impl Space {
         if freeable_keys.is_empty() {
             return;
         }
+        //println!("stuff in zombies: {:?}", freeable_keys);
 
         let mut free_blocks = BlockList::new();
         for seg in freeable_keys {
@@ -6504,10 +6520,12 @@ impl Space {
                 .collect::<HashSet<_>>();
             for pg in new_zombie_segments {
                 let b = blocks.remove(&pg).unwrap();
+                //println!("seg {} has rlock so zombie: {:?}", pg, b);
                 self.zombies.insert(pg, b);
             }
             if !blocks.is_empty() {
                 for (pg, b) in blocks {
+                    //println!("no rlock on {}, so free: {:?}", pg, b);
                     self.add_free_blocks(b);
                 }
             }
@@ -7613,7 +7631,8 @@ impl InnerPart {
                 }
                 // TODO this is a fairly expensive way to count the pages under a parent.
 // store the count in SegmentHeaderInfo ?
-                let count_pages = try!(ParentPage::count_pages(&header.levels[i].buf)) as u64;
+                // TODO Call count_pages method
+                let count_pages = try!(ParentPage::count_pages(header.levels[i].root_page, &header.levels[i].buf)) as u64;
                 let size = count_pages * (inner.pgsz as u64);
                 if size < get_level_size(i) {
                     // this level doesn't need a merge because it is doesn't have enough data in it
@@ -8121,7 +8140,7 @@ impl InnerPart {
                     match last_page {
                         Some(page) => {
                             let buf = try!(read_and_alloc_page(&f, page, pw.page_size()));
-                            let (count_parent_nodes, seg) = try!(chain.done(&mut pw, buf));
+                            let (count_parent_nodes, seg) = try!(chain.done(&mut pw, (page, buf)));
                             let seg = seg.map(|(seg, depth)| seg);
                             let seg = seg.unwrap();
                             MergeFrom::Other{
@@ -8252,6 +8271,50 @@ impl InnerPart {
                     old_blocks.sort_and_consolidate();
                     new_blocks.sort_and_consolidate();
 
+                    if cfg!(expensive_check) 
+                    {
+                        match new_dest_segment {
+                            Some(ref new_dest_segment) => {
+                                let mut blocks = try!(new_dest_segment.blocklist_unsorted(&inner.path, f.clone()));
+                                blocks.add_page_no_reorder(new_dest_segment.root_page);
+
+                                let both = blocks.remove_anything_in(&new_blocks);
+                                if !both.is_empty() {
+                                    println!("{:?}: inactive problem: segment {}", from_level, seg);
+                                    println!("new: {:?}", new_blocks);
+                                    println!("new inactive but in new dest ({}): {:?}", new_dest_segment.root_page, both);
+                                    panic!();
+                                }
+
+                            },
+                            None => {
+                                //println!("new_dest_segment: None");
+                            },
+                        }
+                    }
+
+                    if cfg!(expensive_check) 
+                    {
+                        match from {
+                            MergeFrom::Other{ref new_segment, ..} => {
+                                let mut blocks = try!(new_segment.blocklist_unsorted(&inner.path, f.clone()));
+                                blocks.add_page_no_reorder(new_segment.root_page);
+
+                                let both = blocks.remove_anything_in(&new_blocks);
+                                if !both.is_empty() {
+                                    println!("{:?}: inactive problem: segment {}", from_level, seg);
+                                    println!("new: {:?}", new_blocks);
+                                    println!("new inactive but in new from ({}): {:?}", new_segment.root_page, both);
+                                    panic!();
+                                }
+
+                            },
+                            _ => {
+                                //println!("new_from_segment: None");
+                            },
+                        }
+                    }
+
                     if old_blocks.count_pages() != new_blocks.count_pages() {
                         println!("{:?}: inactive mismatch: segment {}", from_level, seg);
                         println!("old count: {:?}", old_blocks.count_pages());
@@ -8267,48 +8330,36 @@ impl InnerPart {
                         only_in_new.remove_anything_in(&old_blocks);
                         println!("only_in_new: {:?}", only_in_new);
 
-                        match new_dest_segment {
-                            Some(ref seg) => {
-                                let blocks = try!(seg.blocklist_unsorted(&inner.path, f.clone()));
-                                //println!("new_dest_segment: {:?}", blocks);
-                                println!("new_dest_segment: {:?}", seg.root_page);
-                                if !only_in_old.is_empty() {
-                                    for pb in only_in_old.blocks.iter() {
-                                        for pg in pb.firstPage .. pb.lastPage + 1 {
-                                            if blocks.contains_page(pg) {
-                                                println!("new dest segment contains page {}, old code is wrong?", pg);
-                                                println!("new_dest_segment blocks: {:?}", blocks);
-                                            }
-                                        }
-                                    }
-                                }
-                                if !only_in_new.is_empty() {
-                                    for pb in only_in_new.blocks.iter() {
-                                        for pg in pb.firstPage .. pb.lastPage + 1 {
-                                            if blocks.contains_page(pg) {
-                                                println!("new dest segment contains page {}, new code is wrong?", pg);
-                                                println!("new_dest_segment blocks: {:?}", blocks);
-                                            }
-                                        }
-                                    }
-                                }
-                            },
-                            None => {
-                                println!("new_dest_segment: None");
-                            },
-                        }
-                        match from {
-                            MergeFrom::Other{ref new_segment, ..} => {
-                                println!("new_from_segment: {:?}", new_segment.root_page);
-                            },
-                            _ => {
-                                println!("new_from_segment: None");
-                            },
-                        }
-
                         panic!("inactive mismatch");
                     }
                 }
+            }
+        }
+
+        //println!("now_inactive: {:?}", now_inactive);
+
+        if cfg!(expensive_check) 
+        {
+            match new_dest_segment {
+                Some(ref new_dest_segment) => {
+                    let mut blocks = try!(new_dest_segment.blocklist_unsorted(&inner.path, f.clone()));
+                    blocks.add_page_no_reorder(new_dest_segment.root_page);
+                    println!("new dest segment: {} -- {:?}", new_dest_segment.root_page, blocks);
+                },
+                None => {
+                    //println!("new_dest_segment: None");
+                },
+            }
+
+            match from {
+                MergeFrom::Other{ref new_segment, ..} => {
+                    let mut blocks = try!(new_segment.blocklist_unsorted(&inner.path, f.clone()));
+                    blocks.add_page_no_reorder(new_segment.root_page);
+                    println!("new from segment: {} -- {:?}", new_segment.root_page, blocks);
+                },
+                _ => {
+                    //println!("new_dest_segment: None");
+                },
             }
         }
 
@@ -8703,6 +8754,7 @@ impl PageWriter {
     fn write_page(&mut self, buf: &[u8]) -> Result<PageNum> {
         let pg = try!(self.get_page());
         try!(self.do_write(buf, pg));
+        //println!("wrote page {}", pg);
         Ok(pg)
     }
 
