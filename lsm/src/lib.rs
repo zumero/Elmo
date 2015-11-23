@@ -3588,7 +3588,7 @@ fn merge_rewrite_parent(
     enum Action {
         Pairs,
         RewriteNode,
-        RecycleNode,
+        RecycleNodes(usize),
     }
 
     let mut keys_promoted = 0;
@@ -3605,7 +3605,7 @@ fn merge_rewrite_parent(
                     return Err(Error::Misc(format!("inside error pairs: {}", e)));
                 },
                 None => {
-                    Action::RecycleNode
+                    Action::RecycleNodes(1)
                 },
                 Some(&Ok(ref peek_pair)) => {
                     match try!(parent.key_in_child_range(i, &KeyRef::Slice(&peek_pair.Key))) {
@@ -3613,16 +3613,50 @@ fn merge_rewrite_parent(
                             Action::Pairs
                         },
                         KeyInRange::Greater => {
-                            // TODO we *could* decide to rewrite this node anyway.
+                            // this node can be recycled.
+                            // but we can decide to rewrite it anyway.
 
                             // TODO for example, if the leaf we have been constructing is
                             // mostly empty.
 
                             // TODO or maybe by size?  a parent knows the page size of its
                             // children.
-                            let child_count_pages = parent.child_count_pages(i);
 
-                            Action::RecycleNode
+                            let child_nodes_remaining = len - i;
+                            if child_nodes_remaining == 1 {
+                                Action::RecycleNodes(1)
+                            } else {
+                                let consecutive_child_nodes_skippable = {
+                                    let mut j = i;
+                                    let mut count = 0;
+                                    while j < len {
+                                        match try!(parent.key_in_child_range(j, &KeyRef::Slice(&peek_pair.Key))) {
+                                            KeyInRange::Greater => {
+                                                count += 1;
+                                            },
+                                            _ => {
+                                                break;
+                                            },
+                                        }
+                                        j += 1;
+                                    }
+                                    count
+                                };
+                                let child_count_pages = parent.child_count_pages(i);
+
+                                let min_skip = 
+                                    // TODO this should be a config setting
+                                    match parent.depth() {
+                                        1 => 4,
+                                        _ => 1,
+                                    };
+
+                                if consecutive_child_nodes_skippable >= min_skip {
+                                    Action::RecycleNodes(consecutive_child_nodes_skippable)
+                                } else {
+                                    Action::RewriteNode
+                                }
+                            }
                         },
                         KeyInRange::EqualFirst | KeyInRange::EqualLast | KeyInRange::Within => {
                             // TODO EqualLast could just ignore the node, since it won't matter.
@@ -3640,15 +3674,17 @@ fn merge_rewrite_parent(
                 try!(merge_process_pair(pair, st, pb, pw, vbuf, behind, chain, dest_level));
                 keys_promoted += 1;
             },
-            Action::RecycleNode => {
+            Action::RecycleNodes(n) => {
                 //println!("recycling node of depth {}", parent.depth() - 1);
                 if let Some(pg) = try!(flush_leaf(st, pb, pw)) {
                     try!(chain.add_child(pw, pg, 0));
                 }
-                let pg = try!(parent.child_pgitem(i));
-                try!(chain.add_child(pw, pg, parent.depth() - 1));
-                nodes_recycled += 1;
-                i += 1;
+                for _ in 0 .. n {
+                    let pg = try!(parent.child_pgitem(i));
+                    try!(chain.add_child(pw, pg, parent.depth() - 1));
+                    nodes_recycled += 1;
+                    i += 1;
+                }
             },
             Action::RewriteNode => {
                 //println!("rewriting node of depth {}", parent.depth() - 1);
@@ -7211,7 +7247,7 @@ impl DatabaseFile {
             // TODO if we need to sleep more than once, do we need to notify_work
             // every time?
             try!(self.inner.notify_work(FromLevel::Fresh));
-            println!("fresh too big, sleeping");
+            //println!("fresh too big, sleeping");
             std::thread::sleep_ms(10);
         }
 
