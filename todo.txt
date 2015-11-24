@@ -1,4 +1,29 @@
 
+if we rewrite 2 nodes in a row at the same depth, what
+happens?  is it a nice seamless transition, or is that
+where the depth increase problem comes from?
+
+or to put it another way, it seems unfortunate that the
+consecutive recycleable node check cannot look at the
+next set of cousins.
+
+OTOH, if those don't need to be rewritten, why should
+they be?  so why does the depth keep rising as we move
+to the right?
+
+I'm not sure we should always start the merge algorithm
+at the top of the btree.  in a tree of depth 5, for example,
+it might make more sense to only try recylcling 0, 1 and 2
+while just doing a rewrite of 3 and 4 and 5.  when we always
+rewrote the all parent nodes, only recycling leaves, the
+problem was that large segments have a LOT of depth 1 parents.
+but we could just choose the first depth that has a manageable
+size.
+
+but the current merge code can't really cope with the idea of
+saying "deal with all the nodes at depth 3, across the whole
+tree".
+
 fix this:
 
 depth: 8
