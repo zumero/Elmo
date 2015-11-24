@@ -61,6 +61,28 @@ fn show_leaf_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     Ok(())
 }
 
+fn graph_parent_page(name: &str, pgnum: u32, depth: u8) -> Result<(),lsm::Error> {
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let page = try!(db.read_parent_page(pgnum));
+    {
+        let it = page.into_node_iter(depth);
+
+        println!("digraph {} {{", pgnum);
+        for r in it {
+            let nd = try!(r);
+            match nd.parent {
+                Some(parent) => {
+                    println!("{} -> {};", parent, nd.page);
+                },
+                None => {
+                },
+            }
+        }
+        println!("}}");
+    }
+    Ok(())
+}
+
 fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let page = try!(db.read_parent_page(pgnum));
@@ -71,7 +93,7 @@ fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     //println!("blocks ({} blocks, {} pages)", blocks.count_blocks(), blocks.count_pages());
     //println!("key range: {:?}", try!(page.range()));
     let count = page.count_items();
-    if cfg!(expensive_check) 
+    //if cfg!(expensive_check) 
     {
         println!("items ({}):", count);
         for i in 0 .. count {
@@ -98,20 +120,20 @@ fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
         }
 
         for r in it {
-            let (depth, node) = try!(r);
+            let nd = try!(r);
             let (count_items, len) =
-                if depth == 0 {
-                    try!(leaf.read_page(node));
+                if nd.depth == 0 {
+                    try!(leaf.read_page(nd.page));
                     let count_items = leaf.count_keys();
                     let len = leaf.len_on_page();
                     (count_items, len)
                 } else {
-                    try!(parent.read_page(node));
+                    try!(parent.read_page(nd.page));
                     let count_items = parent.count_items();
                     let len = parent.len_on_page();
                     (count_items, len)
                 };
-            match stats.entry(depth) {
+            match stats.entry(nd.depth) {
                 std::collections::hash_map::Entry::Vacant(e) => {
                     let v = Stats {
                         count_nodes: 1,
@@ -508,6 +530,15 @@ fn result_main() -> Result<(),lsm::Error> {
             }
             let pgnum = args[3].parse::<u32>().unwrap();
             show_parent_page(name, pgnum)
+        },
+        "graph_parent_page" => {
+            println!("usage: graph_parent_page pagenum depth");
+            if args.len() < 5 {
+                return Err(lsm::Error::Misc(String::from("too few args")));
+            }
+            let pgnum = args[3].parse::<u32>().unwrap();
+            let depth = args[4].parse::<u8>().unwrap();
+            graph_parent_page(name, pgnum, depth)
         },
         "seek_string" => {
             println!("usage: seek_string key sop");

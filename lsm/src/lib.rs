@@ -4118,8 +4118,8 @@ impl ParentNodeWriter {
 
         if !fits {
             // if the assert below fires, that's bad.  it means we have a child item which
-            // is too small for a parent page even if it is the only thing on that page.
-            // it probably means the block list for that child item got out of control.
+            // is too big for a parent page even if it is the only thing on that page.
+            // TODO how could this happen?
             //println!("emitting a parent page of depth {} with {} items", self.depth, self.st.items.len());
             assert!(self.st.items.len() > 0);
             let should_be = Self::calc_page_len(self.st.prefixLen, self.st.sofar);
@@ -5264,8 +5264,14 @@ impl Iterator for DepthIterator {
     }
 }
 
+pub struct Node {
+    pub depth: u8,
+    pub page: PageNum,
+    pub parent: Option<PageNum>,
+}
+
 struct NodeIterator {
-    stack: Vec<(ParentPage, Option<usize>)>,
+    stack: Vec<(ParentPage, Option<PageNum>, Option<usize>)>,
     min_depth: u8,
 }
 
@@ -5273,38 +5279,49 @@ impl NodeIterator {
     fn new(top: ParentPage, min_depth: u8) -> Self {
         assert!(top.depth() >= min_depth);
         NodeIterator {
-            stack: vec![(top, None)],
+            stack: vec![(top, None, None)],
             min_depth: min_depth,
         }
     }
 
-    fn get_next(&mut self) -> Result<Option<(u8, PageNum)>> {
+    fn get_next(&mut self) -> Result<Option<Node>> {
         loop {
             match self.stack.pop() {
                 None => {
                     return Ok(None);
                 },
-                Some((parent, None)) => {
+                Some((parent, above, None)) => {
                     let depth = parent.depth();
                     let page = parent.pagenum;
                     if depth > self.min_depth {
-                        self.stack.push((parent, Some(0)));
+                        self.stack.push((parent, above, Some(0)));
                     }
-                    return Ok(Some((depth, page)));
+                    let nd = Node {
+                        depth: depth,
+                        page: page,
+                        parent: above,
+                    };
+                    return Ok(Some(nd));
                 },
-                Some((parent, Some(cur))) => {
+                Some((parent, above, Some(cur))) => {
+                    let cur_pagenum = parent.pagenum;
                     if parent.depth() == self.min_depth + 1 {
                         let pg = parent.child_pagenum(cur);
+                        let nd = Node {
+                            depth: self.min_depth,
+                            page: pg,
+                            parent: Some(cur_pagenum),
+                        };
                         if cur + 1 < parent.children.len() {
-                            self.stack.push((parent, Some(cur + 1)));
+                            self.stack.push((parent, above, Some(cur + 1)));
                         }
-                        return Ok(Some((self.min_depth, pg)));
+                        return Ok(Some(nd));
                     } else {
                         let child = try!(parent.fetch_item_parent(cur));
                         if cur + 1 < parent.children.len() {
-                            self.stack.push((parent, Some(cur + 1)));
+                            self.stack.push((parent, above, Some(cur + 1)));
                         }
-                        self.stack.push((child, None));
+                        self.stack.push((child, Some(cur_pagenum), None));
                     }
                 },
             }
@@ -5313,14 +5330,14 @@ impl NodeIterator {
 }
 
 impl Iterator for NodeIterator {
-    type Item = Result<(u8, PageNum)>;
-    fn next(&mut self) -> Option<Result<(u8, PageNum)>> {
+    type Item = Result<Node>;
+    fn next(&mut self) -> Option<Result<Node>> {
         match self.get_next() {
             Ok(None) => {
                 None
             },
-            Ok(Some(pg)) => {
-                Some(Ok(pg))
+            Ok(Some(nd)) => {
+                Some(Ok(nd))
             },
             Err(e) => {
                 Some(Err(e))
@@ -5571,7 +5588,7 @@ impl ParentPage {
         ParentPage::new(&self.path, self.f.clone(), self.pr.len(), )
     }
 
-    pub fn into_node_iter(self, min_depth: u8) -> Box<Iterator<Item=Result<(u8, PageNum)>>> {
+    pub fn into_node_iter(self, min_depth: u8) -> Box<Iterator<Item=Result<Node>>> {
         box NodeIterator::new(self, min_depth)
     }
 
@@ -7939,7 +7956,7 @@ impl InnerPart {
                             let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), old_from_segment.root_page, buf));
                             let dest_parents = 
                                 NodeIterator::new(parent, depth_promote + 1)
-                                .map(|r| r.map(|(depth, pagenum)| pagenum))
+                                .map(|r| r.map(|nd| nd.page))
                                 .collect::<Result<Vec<_>>>();
                             let dest_parents = try!(dest_parents);
                             dest_parents
