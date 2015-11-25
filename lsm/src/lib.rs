@@ -2679,9 +2679,32 @@ mod PageFlag {
 }
 
 #[derive(Debug, Clone)]
-enum BlocksForParent {
-    List(BlockList),
-    Count(PageCount),
+enum ChildInfo {
+    Leaf(BlockList),
+    Parent{
+        count_pages: PageCount, 
+        //count_items: usize, 
+        //count_bytes: usize,
+    },
+}
+
+impl ChildInfo {
+    fn need(&self) -> usize {
+        match self {
+            &ChildInfo::Leaf(ref blocks) => {
+                blocks.encoded_len()
+            },
+            &ChildInfo::Parent{
+                count_pages, 
+                //count_items, 
+                //count_bytes,
+            } => {
+                varint::space_needed_for(count_pages as u64)
+                //+ varint::space_needed_for(count_items as u64)
+                //+ varint::space_needed_for(count_bytes as u64)
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2691,8 +2714,7 @@ enum BlocksForParent {
 // TODO ChildItem?
 pub struct pgitem {
     pub page: PageNum,
-    blocks: BlocksForParent,
-    // blocks does NOT contain page
+    info: ChildInfo,
 
     first_key: KeyWithLocation,
     last_key: Option<KeyWithLocation>,
@@ -2713,17 +2735,7 @@ impl pgitem {
     fn need(&self, prefix_len: usize, depth: u8) -> usize {
         let needed = 
             varint::space_needed_for(self.page as u64) 
-            //if cfg!(child_block_list) 
-            + match &self.blocks {
-                &BlocksForParent::List(ref blocks) => {
-                    assert!(depth == 1);
-                    blocks.encoded_len()
-                },
-                &BlocksForParent::Count(count) => {
-                    assert!(depth > 1);
-                    varint::space_needed_for(count as u64)
-                },
-            }
+            + self.info.need()
             + self.first_key.need(prefix_len)
             + 
             match self.last_key {
@@ -3095,7 +3107,7 @@ fn write_leaf(st: &mut LeafState,
     // TODO pgitem::new
     let pg = pgitem {
         page: pb.last_page_written, 
-        blocks: BlocksForParent::List(blocks),
+        info: ChildInfo::Leaf(blocks),
         first_key: first_key,
         last_key: last_key
     };
@@ -3564,8 +3576,6 @@ fn merge_rewrite_leaf(
         }
     }
 
-    //println!("dest,{:?},keys_promoted,{},keys_rewritten,{}", dest_level, keys_promoted, keys_rewritten);
-
     Ok((keys_promoted, keys_rewritten))
 }
 
@@ -3616,46 +3626,35 @@ fn merge_rewrite_parent(
                             // this node can be recycled.
                             // but we can decide to rewrite it anyway.
 
-                            // TODO for example, if the leaf we have been constructing is
-                            // mostly empty.
-
-                            // TODO or maybe by size?  a parent knows the page size of its
-                            // children.
-
-                            let child_nodes_remaining = len - i;
-                            if child_nodes_remaining == 1 {
-                                Action::RecycleNodes(1)
-                            } else {
-                                let consecutive_child_nodes_skippable = {
-                                    let mut j = i;
-                                    let mut count = 0;
-                                    while j < len {
-                                        match try!(parent.key_in_child_range(j, &KeyRef::Slice(&peek_pair.Key))) {
-                                            KeyInRange::Greater => {
-                                                count += 1;
-                                            },
-                                            _ => {
-                                                break;
-                                            },
-                                        }
-                                        j += 1;
+                            let consecutive_child_nodes_recycleable = {
+                                let mut j = i;
+                                let mut count = 0;
+                                while j < len {
+                                    match try!(parent.key_in_child_range(j, &KeyRef::Slice(&peek_pair.Key))) {
+                                        KeyInRange::Greater => {
+                                            count += 1;
+                                        },
+                                        _ => {
+                                            break;
+                                        },
                                     }
-                                    count
-                                };
-                                let child_count_pages = parent.child_count_pages(i);
-
-                                let min_skip = 
-                                    // TODO this should be a config setting
-                                    match parent.depth() {
-                                        1 => 4,
-                                        _ => 1,
-                                    };
-
-                                if consecutive_child_nodes_skippable >= min_skip {
-                                    Action::RecycleNodes(consecutive_child_nodes_skippable)
-                                } else {
-                                    Action::RewriteNode
+                                    j += 1;
                                 }
+                                count
+                            };
+                            let child_count_pages = parent.child_count_pages(i);
+
+                            // TODO this should be a config setting
+                            let min_recycle =
+                                match parent.depth() {
+                                    1 => 2,
+                                    2 => 2,
+                                    _ => 1,
+                                };
+                            if consecutive_child_nodes_recycleable >= min_recycle {
+                                Action::RecycleNodes(consecutive_child_nodes_recycleable)
+                            } else {
+                                Action::RewriteNode
                             }
                         },
                         KeyInRange::EqualFirst | KeyInRange::EqualLast | KeyInRange::Within => {
@@ -3752,12 +3751,33 @@ fn write_merge(
             nodes_rewritten.push(leaf.pagenum);
         },
         MergingInto::Parent(ref parent) => {
+// TODO tune this
+            let rewrite_level = 
+                match parent.depth() {
+                    1 => 1,
+                    2 => 2,
+                    3 => 2,
+                    4 => 2,
+                    5 => 3,
+                    6 => 3,
+                    _ => 3,
+                };
+            let mut mine = parent.make_parent_page();
+            try!(mine.read_page(parent.pagenum));
+            let it = mine.into_node_iter(rewrite_level);
             let mut leaf = LeafPage::new(path, f.clone(), pw.page_size(), );
-            let (sub_keys_promoted, sub_keys_rewritten, sub_nodes_recycled) = try!(merge_rewrite_parent(&mut st, &mut pb, pw, &mut vbuf, pairs, &mut leaf, parent, behind, &mut chain, &mut overflows_freed, &mut nodes_rewritten, dest_level));
-            keys_promoted = sub_keys_promoted;
-            keys_rewritten = sub_keys_rewritten;
-            nodes_recycled = sub_nodes_recycled;
-            nodes_rewritten.push(parent.pagenum);
+            let mut sub = parent.make_parent_page();
+            for r in it {
+                let nd = try!(r);
+                if nd.depth == rewrite_level {
+                    try!(sub.read_page(nd.page));
+                    let (sub_keys_promoted, sub_keys_rewritten, sub_nodes_recycled) = try!(merge_rewrite_parent(&mut st, &mut pb, pw, &mut vbuf, pairs, &mut leaf, &sub, behind, &mut chain, &mut overflows_freed, &mut nodes_rewritten, dest_level));
+                    keys_promoted += sub_keys_promoted;
+                    keys_rewritten += sub_keys_rewritten;
+                    nodes_recycled += sub_nodes_recycled;
+                }
+                nodes_rewritten.push(nd.page);
+            }
         },
     }
 
@@ -3799,7 +3819,7 @@ fn write_merge(
 
     let seg = seg.map(|(seg, depth)| seg);
 
-    println!("dest,{:?},nodes_rewritten,{},nodes_recycled,{},keys_promoted,{},keys_rewritten,{},count_parent_nodes,{},starting_depth,{:?},ending_depth,{:?}", dest_level, nodes_rewritten.len(), nodes_recycled, keys_promoted, keys_rewritten, count_parent_nodes, starting_depth, ending_depth);
+    //println!("dest,{:?},nodes_rewritten,{},nodes_recycled,{},keys_promoted,{},keys_rewritten,{},count_parent_nodes,{},starting_depth,{:?},ending_depth,{:?}", dest_level, nodes_rewritten.len(), nodes_recycled, keys_promoted, keys_rewritten, count_parent_nodes, starting_depth, ending_depth);
 
     let wrote = WroteMerge {
         segment: seg,
@@ -3866,22 +3886,28 @@ impl ParentNodeWriter {
         }
     }
 
-    fn put_item(&mut self, count_pages: &mut PageCount, item: &pgitem, prefix_len: usize) {
+    fn put_item(&mut self, total_count_pages: &mut PageCount, item: &pgitem, prefix_len: usize) {
         self.pb.PutVarint(item.page as u64);
-        *count_pages += 1;
-        match &item.blocks {
-            &BlocksForParent::List(ref blocks) => {
+        *total_count_pages += 1;
+        match &item.info {
+            &ChildInfo::Leaf(ref blocks) => {
                 assert!(self.my_depth == 1);
                 // TODO capacity, no temp vec
                 let mut v = vec![];
                 blocks.encode(&mut v);
                 self.pb.PutArray(&v);
-                *count_pages += blocks.count_pages();
+                *total_count_pages += blocks.count_pages();
             },
-            &BlocksForParent::Count(count) => {
+            &ChildInfo::Parent{
+                count_pages, 
+                //count_items, 
+                //count_bytes,
+            } => {
                 assert!(self.my_depth > 1);
-                self.pb.PutVarint(count as u64);
-                *count_pages += count;
+                self.pb.PutVarint(count_pages as u64);
+                //self.pb.PutVarint(count_items as u64);
+                //self.pb.PutVarint(count_bytes as u64);
+                *total_count_pages += count_pages;
             },
         }
 
@@ -3900,7 +3926,7 @@ impl ParentNodeWriter {
     }
 
     fn build_parent_page(&mut self,
-                      ) -> (KeyWithLocation, Option<KeyWithLocation>, PageCount, usize) {
+                      ) -> (KeyWithLocation, Option<KeyWithLocation>, PageCount, usize, usize) {
         // TODO? assert!(st.items.len() > 1);
         //println!("build_parent_page, prefixLen: {:?}", st.prefixLen);
         //println!("build_parent_page, items: {:?}", st.items);
@@ -3912,7 +3938,8 @@ impl ParentNodeWriter {
         if self.st.prefixLen > 0 {
             self.pb.PutArray(&self.st.items[0].first_key.key[0 .. self.st.prefixLen]);
         }
-        self.pb.PutInt16(self.st.items.len() as u16);
+        let count_items = self.st.items.len();
+        self.pb.PutInt16(count_items as u16);
         //println!("self.st.items.len(): {}", self.st.items.len());
 
         let mut count_pages = 0;
@@ -3927,7 +3954,8 @@ impl ParentNodeWriter {
 
         if self.st.items.len() == 0 {
             // there was only one item in this page
-            (first_key, last_key_from_first_item, count_pages, self.pb.sofar())
+            assert!(count_items == 1);
+            (first_key, last_key_from_first_item, count_pages, count_items, self.pb.sofar())
         } else {
             if self.st.items.len() > 1 {
                 // deal with all the remaining items except the last one
@@ -3952,7 +3980,7 @@ impl ParentNodeWriter {
             };
             assert!(self.st.items.is_empty());
 
-            (first_key, Some(last_key), count_pages, self.pb.sofar())
+            (first_key, Some(last_key), count_pages, count_items, self.pb.sofar())
         }
     }
 
@@ -3960,7 +3988,7 @@ impl ParentNodeWriter {
                           pw: &mut PageWriter,
                          ) -> Result<(usize, pgitem)> {
         // assert st.sofar > 0
-        let (first_key, last_key, count_pages, len_page) = self.build_parent_page();
+        let (first_key, last_key, count_pages, count_items, count_bytes) = self.build_parent_page();
         assert!(self.st.items.is_empty());
         //println!("parent blocklist: {:?}", blocks);
         //println!("parent blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
@@ -3968,13 +3996,17 @@ impl ParentNodeWriter {
         // TODO pgitem::new
         let pg = pgitem {
             page: self.pb.last_page_written, 
-            blocks: BlocksForParent::Count(count_pages),
+            info: ChildInfo::Parent{
+                count_pages: count_pages, 
+                //count_items: count_items, 
+                //count_bytes: count_bytes,
+            },
             first_key: first_key,
             last_key: last_key,
         };
         self.st.sofar = 0;
         self.st.prefixLen = 0;
-        Ok((len_page, pg))
+        Ok((count_bytes, pg))
     }
 
     fn calc_prefix_len(&self, item: &pgitem) -> usize {
@@ -4123,12 +4155,11 @@ impl ParentNodeWriter {
             //println!("emitting a parent page of depth {} with {} items", self.depth, self.st.items.len());
             assert!(self.st.items.len() > 0);
             let should_be = Self::calc_page_len(self.st.prefixLen, self.st.sofar);
-            let (len_page, pg) = try!(self.write_parent_page(pw));
+            let (count_bytes, pg) = try!(self.write_parent_page(pw));
             // TODO try!(pg.verify(pw.page_size(), path, f.clone()));
             self.count_emit += 1;
+            assert!(should_be == count_bytes);
             try!(self.emit(pw, pg));
-            //println!("should_be = {}   len_page = {}", should_be, len_page);
-            assert!(should_be == len_page);
             assert!(self.st.items.is_empty());
         }
 
@@ -4152,6 +4183,7 @@ impl ParentNodeWriter {
     }
 
     fn add_child(&mut self, pw: &mut PageWriter, child: pgitem, depth: u8) -> Result<()> {
+        //println!("add_child: my_depth: {}, child_depth: {}, child_page: {} {}", self.my_depth, depth, child.page, if child.blocks.underfull() { "UNDERFULL" } else { "" } );
         if depth == self.my_depth - 1 {
             try!(self.add_child_to_current(pw, child));
         } else if depth == self.my_depth {
@@ -4200,12 +4232,11 @@ impl ParentNodeWriter {
     fn flush_page(&mut self, pw: &mut PageWriter) -> Result<()> {
         if !self.st.items.is_empty() {
             let should_be = Self::calc_page_len(self.st.prefixLen, self.st.sofar);
-            let (len_page, pg) = try!(self.write_parent_page(pw));
+            let (count_bytes, pg) = try!(self.write_parent_page(pw));
             // TODO try!(pg.verify(pw.page_size(), path, f.clone()));
             self.count_emit += 1;
+            assert!(should_be == count_bytes);
             try!(self.emit(pw, pg));
-            //println!("should_be = {}   len_page = {}", should_be, len_page);
-            assert!(should_be == len_page);
             assert!(self.st.items.is_empty());
         }
         Ok(())
@@ -4220,6 +4251,7 @@ impl ParentNodeWriter {
             assert!(self.count_emit == 0);
             Ok((self.count_emit, Some((seg, self.my_depth - 1))))
         } else {
+            //println!("my_depth: {}, calling flush_page from done", self.my_depth);
             try!(self.flush_page(pw));
             assert!(self.st.items.is_empty());
             if let Some(chain) = self.results_chain {
@@ -4509,7 +4541,7 @@ impl LeafPage {
         // TODO pgitem::new
         let pg = pgitem {
             page: self.pagenum,
-            blocks: BlocksForParent::List(blocks),
+            info: ChildInfo::Leaf(blocks),
             first_key: first_key,
             last_key: last_key,
         };
@@ -5175,7 +5207,7 @@ struct PairInLeaf {
 pub struct ParentPageItem {
     page: PageNum,
 
-    blocks: BlocksForParent,
+    blocks: ChildInfo,
 
     // blocks does NOT contain page
 
@@ -5437,11 +5469,11 @@ impl ParentPage {
 
     fn child_blocklist(&self, i: usize) -> Result<BlockList> {
         match self.children[i].blocks {
-            BlocksForParent::List(ref blocks) => {
+            ChildInfo::Leaf(ref blocks) => {
                 assert!(self.depth() == 1);
                 Ok(blocks.clone())
             },
-            BlocksForParent::Count(_) => {
+            ChildInfo::Parent{..} => {
                 assert!(self.depth() > 1);
                 let pagenum = self.children[i].page;
 
@@ -5477,12 +5509,12 @@ impl ParentPage {
 
     fn child_count_pages(&self, i: usize) -> PageCount {
         match self.children[i].blocks {
-            BlocksForParent::List(ref blocks) => {
+            ChildInfo::Leaf(ref blocks) => {
                 blocks.count_pages()
             },
-            BlocksForParent::Count(n) => {
+            ChildInfo::Parent{count_pages, ..} => {
                 assert!(self.depth() > 1);
-                n
+                count_pages
             },
         }
     }
@@ -5503,7 +5535,7 @@ impl ParentPage {
         // TODO pgitem::new
         let pg = pgitem {
             page: self.children[i].page,
-            blocks: self.children[i].blocks.clone(),
+            info: self.children[i].blocks.clone(),
             first_key: first_key,
             last_key: last_key,
         };
@@ -5794,9 +5826,16 @@ impl ParentPage {
 
             let blocks = 
                 if depth == 1 {
-                    BlocksForParent::List((BlockList::read(pr, &mut cur)))
+                    ChildInfo::Leaf((BlockList::read(pr, &mut cur)))
                 } else {
-                    BlocksForParent::Count(varint::read(pr, &mut cur) as PageCount)
+                    let count_pages = varint::read(pr, &mut cur) as PageCount;
+                    //let count_items = varint::read(pr, &mut cur) as usize;
+                    //let count_bytes = varint::read(pr, &mut cur) as usize;
+                    ChildInfo::Parent{
+                        count_pages: count_pages, 
+                        //count_items: count_items, 
+                        //count_bytes: count_bytes,
+                    }
                 };
 
             let key_1 = try!(KeyInPage::read(pr, &mut cur, prefix_len));
@@ -5819,18 +5858,18 @@ impl ParentPage {
 
     fn count_pages(pgnum: PageNum, buf: &[u8]) -> Result<PageCount> {
         let (_, children, _) = try!(Self::parse_page(pgnum, buf));
-        let mut count_pages = 0;
+        let mut total_count_pages = 0;
         for item in children {
             match item.blocks {
-                BlocksForParent::List(blocks) => {
-                    count_pages += blocks.count_pages();
+                ChildInfo::Leaf(blocks) => {
+                    total_count_pages += blocks.count_pages();
                 },
-                BlocksForParent::Count(count) => {
-                    count_pages += count;
+                ChildInfo::Parent{count_pages, ..} => {
+                    total_count_pages += count_pages;
                 },
             }
         }
-        Ok(count_pages)
+        Ok(total_count_pages)
     }
 
     pub fn read_page(&mut self, pgnum: PageNum) -> Result<()> {

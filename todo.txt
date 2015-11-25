@@ -1,4 +1,15 @@
 
+can we say that a parent node should never have a single
+child that is also a parent?  because if that happens, 
+why not just replace the parent with its child?  except
+all leaves need to be at the same depth.
+
+if we are rewriting a node, that means we could not or
+chose not to rewrite the parent of that node.
+
+every time we recycle a node, we flush the current page
+in progress, at every level, down to that node's depth.
+
 if we rewrite 2 nodes in a row at the same depth, what
 happens?  is it a nice seamless transition, or is that
 where the depth increase problem comes from?
