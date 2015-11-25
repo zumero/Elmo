@@ -3744,6 +3744,8 @@ fn write_merge(
                 dest_level: DestLevel,
                 ) -> Result<WroteMerge> {
 
+    let t1 = time::PreciseTime::now();
+
     // TODO could/should pb and vbuf move into LeafState?
 
     // TODO this is a buffer just for the purpose of being reused
@@ -3844,7 +3846,10 @@ fn write_merge(
 
     let seg = seg.map(|(seg, depth)| seg);
 
-    //println!("dest,{:?},nodes_rewritten,{},nodes_recycled,{},keys_promoted,{},keys_rewritten,{},count_parent_nodes,{},starting_depth,{:?},ending_depth,{:?}", dest_level, nodes_rewritten.len(), nodes_recycled, keys_promoted, keys_rewritten, count_parent_nodes, starting_depth, ending_depth);
+    let t2 = time::PreciseTime::now();
+    let elapsed = t1.to(t2);
+
+    println!("dest,{:?},nodes_rewritten,{},nodes_recycled,{},keys_promoted,{},keys_rewritten,{},count_parent_nodes,{},starting_depth,{:?},ending_depth,{:?},ms,{}", dest_level, nodes_rewritten.len(), nodes_recycled, keys_promoted, keys_rewritten, count_parent_nodes, starting_depth, ending_depth, elapsed.num_milliseconds());
 
     let wrote = WroteMerge {
         segment: seg,
@@ -8175,11 +8180,7 @@ impl InnerPart {
             if cursor.IsValid() {
                 let mut source = CursorIterator::new(cursor);
                 let mut behind = behind;
-                let t1 = time::PreciseTime::now();
                 let wrote = try!(write_merge(&mut pw, &mut source, &into, &mut behind, &inner.path, f.clone(), from_level.get_dest_level()));
-                let t2 = time::PreciseTime::now();
-                let elapsed = t1.to(t2);
-                println!("{:?}: {} ms", from_level, elapsed.num_milliseconds());
                 let overflows_eaten = source.eaten();
                 (wrote.segment, wrote.nodes_rewritten, wrote.overflows_freed, overflows_eaten)
             } else {
