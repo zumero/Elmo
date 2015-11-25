@@ -1,82 +1,15 @@
 
-can we say that a parent node should never have a single
-child that is also a parent?  because if that happens, 
-why not just replace the parent with its child?  except
-all leaves need to be at the same depth.
+maybe the level factor should be less than 10x so that the segments
+stay smaller and so the blocklists stay smaller.  but then reads get
+slower because more segments.  nonetheless, it is interesting to
+note that the 5M URL test is MUCH faster when the factor is 2
+instead of 10.
 
 if we are rewriting a node, that means we could not or
-chose not to rewrite the parent of that node.
+chose not to recycle the parent of that node.
 
 every time we recycle a node, we flush the current page
 in progress, at every level, down to that node's depth.
-
-if we rewrite 2 nodes in a row at the same depth, what
-happens?  is it a nice seamless transition, or is that
-where the depth increase problem comes from?
-
-or to put it another way, it seems unfortunate that the
-consecutive recycleable node check cannot look at the
-next set of cousins.
-
-OTOH, if those don't need to be rewritten, why should
-they be?  so why does the depth keep rising as we move
-to the right?
-
-I'm not sure we should always start the merge algorithm
-at the top of the btree.  in a tree of depth 5, for example,
-it might make more sense to only try recylcling 0, 1 and 2
-while just doing a rewrite of 3 and 4 and 5.  when we always
-rewrote the all parent nodes, only recycling leaves, the
-problem was that large segments have a LOT of depth 1 parents.
-but we could just choose the first depth that has a manageable
-size.
-
-but the current merge code can't really cope with the idea of
-saying "deal with all the nodes at depth 3, across the whole
-tree".
-
-fix this:
-
-depth: 8
-Depth 0:
-    6189 nodes
-    141 items per node
-    3361 len per node
-Depth 1:
-    210 nodes
-    29 items per node
-    2740 len per node
-Depth 2:
-    114 nodes
-    1 items per node
-    279 len per node
-Depth 3:
-    94 nodes
-    1 items per node
-    200 len per node
-Depth 4:
-    74 nodes
-    1 items per node
-    208 len per node
-Depth 5:
-    52 nodes
-    1 items per node
-    232 len per node
-Depth 6:
-    31 nodes
-    1 items per node
-    280 len per node
-Depth 7:
-    12 nodes
-    2 items per node
-    484 len per node
-Depth 8:
-    1 nodes
-    12 items per node
-    2298 len per node
-
-
-make sure recycle of middle nodes is working as I think it is
 
 parent node writer gets in trouble, overflows its stack,
 when it has to deal with lots of pages that only hold one
@@ -91,10 +24,6 @@ can we somehow get the blocklist to be smaller?  reduce fragmentation?
 or is that simply a tradeoff with recycling?  in other words, if the
 only way to reduce fragmentation is to rewrite more stuff during
 merge, that's sad.
-
-maybe the level factor should be less than 10x so that the segments
-stay smaller and so the blocklists stay smaller.  but then reads get
-slower because more segments.
 
 consider fsa for storing keys instead of prefix compression.
 dependency on BurntSushi fst crate?  or just extract code
@@ -112,8 +41,6 @@ should we keep track of "log" segments?  written but not
 put into the header yet?  for recovery?
 
 still need solution to monster block list.
-
-still need solution to leaf fullness problem.
 
 file size explodes when multiple writers?  something
 about pagewriter?  block size too big?  is pw.end getting

@@ -27,6 +27,7 @@
 #![allow(non_camel_case_types)]
 
 extern crate misc;
+extern crate time;
 
 use misc::endian;
 use misc::varint;
@@ -600,7 +601,7 @@ fn get_level_size(i: usize) -> u64 {
     for _ in 0 .. i + 1 {
         // TODO tune this factor.
         // for leveldb, it is 10.
-        n *= 10;
+        n *= 2;
     }
     n * 1024 * 1024
 }
@@ -1328,16 +1329,40 @@ pub trait ICursor : IForwardCursor {
 
 }
 
-#[derive(Copy,Clone)]
+#[derive(Copy, Clone)]
 pub struct DbSettings {
-    pub DefaultPageSize: usize,
-    pub PagesPerBlock: PageCount,
+    pub default_page_size: usize,
+    pub pages_per_block: PageCount,
+    pub min_segments_promote_fresh: usize,
+    pub max_segments_promote_fresh: usize,
+    pub min_segments_promote_young: usize,
+    pub max_segments_promote_young: usize,
+    pub sleep_desperate_fresh: u32,
+    pub sleep_desperate_young: u32,
+    pub sleep_desperate_level: u32,
+    pub desperate_fresh: usize,
+    pub desperate_young: usize,
+    pub desperate_level_factor: u64,
+    // TODO min consecutive recycle
+    // TODO fresh free
+    // TODO level factor
+    // TODO what to promote from level N to N+1
 }
 
 pub const DEFAULT_SETTINGS: DbSettings = 
     DbSettings {
-        DefaultPageSize: 4096,
-        PagesPerBlock: 256,
+        default_page_size: 4096,
+        pages_per_block: 256,
+        min_segments_promote_fresh: 4,
+        max_segments_promote_fresh: 8,
+        min_segments_promote_young: 4,
+        max_segments_promote_young: 8,
+        sleep_desperate_fresh: 20,
+        sleep_desperate_young: 20,
+        sleep_desperate_level: 50,
+        desperate_fresh: 256,
+        desperate_young: 32,
+        desperate_level_factor: 4,
     };
 
 #[derive(Debug, Clone)]
@@ -6500,7 +6525,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
         Ok((h, pgsz, nextAvailablePage))
     } else {
         // TODO shouldn't this use settings passed in?
-        let defaultPageSize = DEFAULT_SETTINGS.DefaultPageSize;
+        let defaultPageSize = DEFAULT_SETTINGS.default_page_size;
         let h = {
             HeaderData {
                 fresh: vec![],
@@ -7060,7 +7085,7 @@ impl DatabaseFile {
             path: path.clone(),
             page_size: pgsz,
             nextPage: first_available_page, 
-            pages_per_block: settings.PagesPerBlock,
+            pages_per_block: settings.pages_per_block,
             fresh_free: vec![],
             free_blocks: blocks,
             next_rlock: 1,
@@ -7255,7 +7280,7 @@ impl DatabaseFile {
                     match try!(InnerPart::needs_merge(&inner, level.get_dest_level().as_from_level())) {
                         NeedsMerge::Desperate => {
                             try!(inner.notify_work(level.get_dest_level().as_from_level()));
-                            Ok(Some(50))
+                            Ok(Some(inner.settings.sleep_desperate_level))
                         },
                         _ => {
                             let pm = try!(InnerPart::prepare_merge(&inner, level));
@@ -7340,7 +7365,7 @@ impl DatabaseFile {
             // every time?
             try!(self.inner.notify_work(FromLevel::Fresh));
             //println!("fresh too big, sleeping");
-            std::thread::sleep_ms(10);
+            std::thread::sleep_ms(self.inner.settings.sleep_desperate_fresh);
         }
 
         let lck = try!(self.write_lock.lock());
@@ -7744,26 +7769,22 @@ impl InnerPart {
         let header = try!(inner.header.read());
         match from_level {
             FromLevel::Fresh => {
-                // TODO constant
-                if header.fresh.len() < 4 {
+                if header.fresh.len() < inner.settings.min_segments_promote_fresh {
                     return Ok(NeedsMerge::No);
                 }
 
-                // TODO constant
-                if header.fresh.len() > 256 {
+                if header.fresh.len() > inner.settings.desperate_fresh {
                     return Ok(NeedsMerge::Desperate);
                 }
 
                 return Ok(NeedsMerge::Yes);
             },
             FromLevel::Young => {
-                // TODO constant
-                if header.young.len() < 4 {
+                if header.young.len() < inner.settings.min_segments_promote_young {
                     return Ok(NeedsMerge::No);
                 }
 
-                // TODO constant
-                if header.young.len() > 32 {
+                if header.young.len() > inner.settings.desperate_young {
                     return Ok(NeedsMerge::Desperate);
                 }
 
@@ -7796,8 +7817,7 @@ impl InnerPart {
                     // this level doesn't need a merge because it is doesn't have enough data in it
                     return Ok(NeedsMerge::No);
                 }
-                // TODO constant
-                if size > 4 * get_level_size(i) {
+                if size > inner.settings.desperate_level_factor * get_level_size(i) {
                     return Ok(NeedsMerge::Desperate);
                 }
                 return Ok(NeedsMerge::Yes);
@@ -7872,8 +7892,7 @@ impl InnerPart {
 
                 match from_level {
                     FromLevel::Fresh => {
-                        // TODO constant
-                        let merge_segments = slice_from_end(&header.fresh, 8);
+                        let merge_segments = slice_from_end(&header.fresh, inner.settings.max_segments_promote_fresh);
 
                         //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
                         let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
@@ -7898,8 +7917,7 @@ impl InnerPart {
                         (cursors, MergingFrom::Fresh{segments: merge_segments})
                     },
                     FromLevel::Young => {
-                        // TODO constant
-                        let merge_segments = slice_from_end(&header.young, 8);
+                        let merge_segments = slice_from_end(&header.young, inner.settings.max_segments_promote_young);
 
                         //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
                         let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
@@ -7937,6 +7955,7 @@ impl InnerPart {
                                 } else if depth_root == 1 {
                                     0
                                 } else {
+                                    // TODO config setting?
                                     1
                                 };
                             let mut candidates = None;
@@ -8156,7 +8175,11 @@ impl InnerPart {
             if cursor.IsValid() {
                 let mut source = CursorIterator::new(cursor);
                 let mut behind = behind;
+                let t1 = time::PreciseTime::now();
                 let wrote = try!(write_merge(&mut pw, &mut source, &into, &mut behind, &inner.path, f.clone(), from_level.get_dest_level()));
+                let t2 = time::PreciseTime::now();
+                let elapsed = t1.to(t2);
+                println!("{:?}: {} ms", from_level, elapsed.num_milliseconds());
                 let overflows_eaten = source.eaten();
                 (wrote.segment, wrote.nodes_rewritten, wrote.overflows_freed, overflows_eaten)
             } else {
@@ -8274,6 +8297,9 @@ impl InnerPart {
                 MergingFrom::Other{level, old_segment, chosen_depth, survivors, ..} => {
                     let mut survivors = survivors.peekable();
 
+                    // TODO we might want the ability to reuse parent nodes like write_merge does,
+                    // rather than rewriting everything from depth 2 up.  selecting a depth 1
+                    // item to promote out of a depth 5 segment could be expensive.
                     let mut chain = ParentNodeWriter::new(pw.page_size(), chosen_depth + 1);
                     let mut last_page = None;
                     loop {
