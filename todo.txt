@@ -1,9 +1,28 @@
 
+write merge can be a little smarter and can start at the
+top for recycling decisions.  basically, when rewriting
+a parent, find all the child nodes that need to be rewritten
+and rewrote them, but only to the depth they were at
+before.  don't allow them to increase in depth.  this
+means that each one might result in more than one after
+the merge.  after that, combine them with the rest of
+the child nodes (the ones recycled, not being rewritten),
+and write a new parent, again stopping at the depth
+we started with so we can return to the caller.
+
+commit 5M urls in one transaction.  we will need ways of
+dealing with large segments in fresh and young.  can't
+promote whole segment.  writing segment would need to be
+done in batches, but can't keep page in ram for lots of
+batches.
+
+verify that the new code does inactive stuff right
+
 maybe the level factor should be less than 10x so that the segments
 stay smaller and so the blocklists stay smaller.  but then reads get
 slower because more segments.  nonetheless, it is interesting to
 note that the 5M URL test is MUCH faster when the factor is 2
-instead of 10.
+instead of 10.  why?
 
 if we are rewriting a node, that means we could not or
 chose not to recycle the parent of that node.

@@ -3435,9 +3435,22 @@ fn write_leaves<I: Iterator<Item=Result<kvp>>, >(
         try!(chain.add_child(pw, pg, 0));
     }
 
-    let (count_parent_nodes, seg) = try!(chain.done(pw, pb.into_buf()));
+    let (count_parent_nodes, seg) = try!(chain.done(pw));
 
-    let seg = seg.map(|(seg, depth)| seg);
+    let seg = seg.map(
+        move |seg| {
+            match seg.buf {
+                Some(buf) => {
+                    SegmentHeaderInfo::new(seg.root_page, buf)
+                },
+                None => {
+                    let (pb_seg, pb_buf) = pb.into_buf();
+                    assert!(pb_seg == seg.root_page);
+                    SegmentHeaderInfo::new(seg.root_page, pb_buf)
+                },
+            }
+        }
+     );
 
     Ok(seg)
 }
@@ -3446,6 +3459,14 @@ struct WroteMerge {
     segment: Option<SegmentHeaderInfo>,
     nodes_rewritten: Vec<PageNum>,
     overflows_freed: Vec<BlockList>, // TODO in rewritten leaves
+}
+
+struct WroteSurvivors {
+    // TODO segment None can never happen, because a merge from
+    // level N to N+1 is not allowed to deplete N, because that
+    // would mean that N did not need to be merged.
+    segment: Option<SegmentHeaderInfo>,
+    nodes_rewritten: Vec<PageNum>,
 }
 
 fn merge_process_pair(
@@ -3820,7 +3841,7 @@ fn write_merge(
         try!(chain.add_child(pw, pg, 0));
     }
 
-    let (count_parent_nodes, seg) = try!(chain.done(pw, pb.into_buf()));
+    let (count_parent_nodes, seg) = try!(chain.done(pw));
     let starting_depth =
         match *into {
             MergingInto::None => {
@@ -3836,25 +3857,188 @@ fn write_merge(
 
     let ending_depth =
         match seg {
-            Some((_, depth)) => {
-                Some(depth)
+            Some(ref seg) => {
+                Some(seg.depth)
             },
             None => {
                 None
             },
         };
 
-    let seg = seg.map(|(seg, depth)| seg);
+    let seg = seg.map(
+        move |seg| {
+            match seg.buf {
+                Some(buf) => {
+                    SegmentHeaderInfo::new(seg.root_page, buf)
+                },
+                None => {
+                    let (pb_seg, pb_buf) = pb.into_buf();
+                    assert!(pb_seg == seg.root_page);
+                    SegmentHeaderInfo::new(seg.root_page, pb_buf)
+                },
+            }
+        }
+     );
 
     let t2 = time::PreciseTime::now();
     let elapsed = t1.to(t2);
 
-    println!("dest,{:?},nodes_rewritten,{},nodes_recycled,{},keys_promoted,{},keys_rewritten,{},count_parent_nodes,{},starting_depth,{:?},ending_depth,{:?},ms,{}", dest_level, nodes_rewritten.len(), nodes_recycled, keys_promoted, keys_rewritten, count_parent_nodes, starting_depth, ending_depth, elapsed.num_milliseconds());
+    println!("merge,dest,{:?},nodes_rewritten,{},nodes_recycled,{},keys_promoted,{},keys_rewritten,{},count_parent_nodes,{},starting_depth,{:?},ending_depth,{:?},ms,{}", dest_level, nodes_rewritten.len(), nodes_recycled, keys_promoted, keys_rewritten, count_parent_nodes, starting_depth, ending_depth, elapsed.num_milliseconds());
 
     let wrote = WroteMerge {
         segment: seg,
         nodes_rewritten: nodes_rewritten,
         overflows_freed: overflows_freed,
+    };
+    Ok(wrote)
+}
+
+fn survivors_rewrite_immediate_parent_of_skip(
+                    pw: &mut PageWriter,
+                    skip_pagenum: PageNum,
+                    skip_depth: u8,
+                    parent: &ParentPage,
+                    chain: &mut ParentNodeWriter,
+                    ) -> Result<usize> {
+
+    assert!(parent.depth() == skip_depth + 1);
+
+    let mut nodes_recycled = 0;
+
+    let len = parent.count_items();
+    for i in 0 .. len {
+        if parent.child_pagenum(i) == skip_pagenum {
+            // skip
+        } else {
+            let pg = try!(parent.child_pgitem(i));
+            try!(chain.add_child(pw, pg, parent.depth() - 1));
+            nodes_recycled += 1;
+        }
+    }
+
+    assert!(nodes_recycled == len - 1);
+
+    Ok(nodes_recycled)
+}
+
+fn survivors_rewrite_ancestor(
+                    pw: &mut PageWriter,
+                    skip_pagenum: PageNum,
+                    skip_depth: u8,
+                    skip_range: &KeyRange,
+                    parent: &ParentPage,
+                    chain: &mut ParentNodeWriter,
+                    nodes_rewritten: &mut Vec<PageNum>,
+                    ) -> Result<usize> {
+
+    assert!(parent.depth() > skip_depth + 1);
+
+    let mut nodes_recycled = 0;
+
+    let len = parent.count_items();
+    for i in 0 .. len {
+        match try!(parent.child_overlaps(i, skip_range)) {
+            Overlap::Less | Overlap::Greater => {
+                let pg = try!(parent.child_pgitem(i));
+                try!(chain.add_child(pw, pg, parent.depth() - 1));
+                nodes_recycled += 1;
+            },
+            Overlap::Yes => {
+                nodes_rewritten.push(parent.child_pagenum(i));
+                let sub = try!(parent.fetch_item_parent(i));
+                let sub_nodes_recycled = try!(survivors_rewrite_node(pw, skip_pagenum, skip_depth, skip_range, &sub, chain, nodes_rewritten));
+                nodes_recycled += sub_nodes_recycled;
+            },
+        }
+    }
+
+    Ok(nodes_recycled)
+}
+
+fn survivors_rewrite_node(
+                    pw: &mut PageWriter,
+                    skip_pagenum: PageNum,
+                    skip_depth: u8,
+                    skip_range: &KeyRange,
+                    parent: &ParentPage,
+                    chain: &mut ParentNodeWriter,
+                    nodes_rewritten: &mut Vec<PageNum>,
+                    ) -> Result<usize> {
+    if parent.depth() - 1 == skip_depth {
+        survivors_rewrite_immediate_parent_of_skip(pw, skip_pagenum, skip_depth, parent, chain)
+    } else if parent.depth() - 1 > skip_depth {
+        survivors_rewrite_ancestor(pw, skip_pagenum, skip_depth, skip_range, parent, chain, nodes_rewritten, )
+    } else {
+        panic!();
+    }
+}
+
+fn write_survivors(
+                pw: &mut PageWriter,
+                skip_pagenum: PageNum,
+                parent: &ParentPage,
+                path: &str,
+                f: std::rc::Rc<std::cell::RefCell<File>>,
+                dest_level: DestLevel,
+                ) -> Result<WroteSurvivors> {
+
+    let t1 = time::PreciseTime::now();
+
+// TODO depth and range should probably have been figured out by the caller
+    let (skip_depth, skip_range) = {
+        let buf = try!(read_and_alloc_page(&f, skip_pagenum, pw.page_size()));
+        let done_page = move |_| -> () {
+        };
+        let buf = Lend::new(buf, box done_page);
+
+        let pt = try!(PageType::from_u8(buf[0]));
+            match pt {
+                PageType::LEAF_NODE => {
+                    let page = try!(LeafPage::new_already_read_page(path, f.clone(), skip_pagenum, buf));
+                    (0, try!(page.range()).into_keyrange())
+                },
+                PageType::PARENT_NODE => {
+                    let depth = buf[2];
+                    let page = try!(ParentPage::new_already_read_page(path, f.clone(), skip_pagenum, buf));
+                    (depth, try!(page.range()).into_keyrange())
+                },
+            }
+    };
+
+    let mut chain = ParentNodeWriter::new(pw.page_size(), 1);
+    let mut nodes_rewritten = vec![];
+
+    let nodes_recycled = try!(survivors_rewrite_node(pw, skip_pagenum, skip_depth, &skip_range, parent, &mut chain, &mut nodes_rewritten, ));
+    nodes_rewritten.push(parent.pagenum);
+
+    let (count_parent_nodes, seg) = try!(chain.done(pw));
+
+    let seg = 
+        match seg {
+            Some(seg) => {
+                match seg.buf {
+                    Some(buf) => {
+                        Some(SegmentHeaderInfo::new(seg.root_page, buf))
+                    },
+                    None => {
+                        let buf = try!(read_and_alloc_page(&f, seg.root_page, pw.page_size()));
+                        Some(SegmentHeaderInfo::new(seg.root_page, buf))
+                    },
+                }
+            },
+            None => {
+                None
+            },
+        };
+
+    let t2 = time::PreciseTime::now();
+    let elapsed = t1.to(t2);
+
+    println!("survivors,dest,{:?},nodes_rewritten,{},nodes_recycled,{},count_parent_nodes,{},ms,{}", dest_level, nodes_rewritten.len(), nodes_recycled, count_parent_nodes, elapsed.num_milliseconds());
+
+    let wrote = WroteSurvivors {
+        segment: seg,
+        nodes_rewritten: nodes_rewritten,
     };
     Ok(wrote)
 }
@@ -4272,33 +4456,78 @@ impl ParentNodeWriter {
         Ok(())
     }
 
-    fn done(mut self, pw: &mut PageWriter, last_child: (PageNum, Box<[u8]>)) -> Result<(usize, Option<(SegmentHeaderInfo, u8)>)> {
+    fn done(mut self, pw: &mut PageWriter, ) -> Result<(usize, Option<ParentNodeSegment>)> {
         if self.result_one.is_none() && self.results_chain.is_none() && self.st.items.len() == 1 {
+            // we were given only one child.  instead of writing a parent node,
+            // we just return it.  since we didn't write it, we don't have a buffer
+            // for it.
             let pg = self.st.items.remove(0);
-            let (pgnum_of_buf, buf_last_child) = last_child;
-            assert!(pg.page == pgnum_of_buf);
-            let seg = SegmentHeaderInfo::new(pg.page, buf_last_child);
+            let seg = ParentNodeSegment::new(pg.page, None, self.my_depth - 1);
             assert!(self.count_emit == 0);
-            Ok((self.count_emit, Some((seg, self.my_depth - 1))))
+            Ok((self.count_emit, Some(seg)))
         } else {
             //println!("my_depth: {}, calling flush_page from done", self.my_depth);
             try!(self.flush_page(pw));
             assert!(self.st.items.is_empty());
             if let Some(chain) = self.results_chain {
                 assert!(self.result_one.is_none());
-                let buf = self.pb.into_buf();
-                let (count_chain, seg) = try!(chain.done(pw, buf));
+                let (count_chain, seg) = try!(chain.done(pw));
+                let (pb_page, pb_buf) = self.pb.into_buf();
+                let seg = seg.map(
+                    |seg| {
+                        match seg.buf {
+                            Some(buf) => {
+                                ParentNodeSegment::new(seg.root_page, Some(buf), seg.depth)
+                            },
+                            None => {
+                                let buf =
+                                    if pb_page == seg.root_page {
+                                        Some(pb_buf)
+                                    } else {
+                                        None
+                                    };
+                                ParentNodeSegment::new(seg.root_page, buf, seg.depth)
+                            },
+                        }
+                    }
+                 );
                 Ok((self.count_emit + count_chain, seg))
             } else if let Some(pg) = self.result_one {
                 let (pgnum_of_buf, buf) = self.pb.into_buf();
-                assert!(pgnum_of_buf == pg.page);
-                let seg = SegmentHeaderInfo::new(pg.page, buf);
-                assert!(self.count_emit == 1);
-                Ok((self.count_emit, Some((seg, self.my_depth))))
+                let buf =
+                    if pgnum_of_buf == pg.page {
+                        Some(buf)
+                    } else {
+                        None
+                    };
+                let seg = ParentNodeSegment::new(pg.page, buf, self.my_depth);
+                Ok((self.count_emit, Some(seg)))
             } else {
                 assert!(self.count_emit == 0);
                 Ok((self.count_emit, None))
             }
+        }
+    }
+
+}
+
+#[derive(Debug, Clone)]
+pub struct ParentNodeSegment {
+    root_page: PageNum,
+    // this is kinda like SegmentHeaderInfo, but the buffer is optional,
+    // since ParentNodeWriter sometimes doesn't have the buffer already, 
+    // and when that happens, it just returns None and forces the caller
+    // to fill it in.
+    buf: Option<Box<[u8]>>,
+    depth: u8,
+}
+
+impl ParentNodeSegment {
+    pub fn new(root_page: PageNum, buf: Option<Box<[u8]>>, depth: u8) -> Self {
+        ParentNodeSegment {
+            root_page: root_page,
+            buf: buf,
+            depth: depth,
         }
     }
 
@@ -5900,6 +6129,39 @@ impl ParentPage {
             }
         }
         Ok(total_count_pages)
+    }
+
+    fn any_node_at_depth(&self, depth: u8) -> Result<PageNum> {
+        // we need to pick a child, and it kinda doesn't matter which
+        // one, but we don't need the number to be really random, and we
+        // don't want to take a dependency on time or rand just for this,
+        // so we use the page number as a lame source of randomness.
+
+        // TODO this should return the key range, rather than forcing
+        // write_survivors to re-read the page to get it.
+
+        // TODO later, we probably want to be more clever.  leveldb 
+        // remembers the key range of the last compaction and picks up
+        // where it left off.  we also will eventually want the ability
+        // to have two merges going on in the same level in different
+        // threads, which should be fine if the key ranges do not overlap
+        // the same stuff, and if we can fix up the parent node at the end.
+        let i = ((self.pagenum as u32) % (self.children.len() as u32)) as usize;
+        let pagenum = self.child_pagenum(i);
+        if self.depth() - 1 == depth {
+            Ok(pagenum)
+        } else {
+            assert!(self.depth() - 1 > depth);
+            assert!(self.depth() > 1);
+
+            let buf = try!(read_and_alloc_page(&self.f, pagenum, self.pr.len()));
+            let done_page = move |_| -> () {
+            };
+            let buf = Lend::new(buf, box done_page);
+
+            let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, buf));
+            page.any_node_at_depth(depth)
+        }
     }
 
     pub fn read_page(&mut self, pgnum: PageNum) -> Result<()> {
@@ -7804,20 +8066,12 @@ impl InnerPart {
                 if pt == PageType::LEAF_NODE {
                     return Ok(NeedsMerge::No);
                 }
-                if header.levels[i].buf[2] < 1 {
-// TODO this check is silly now.  leaf check done above.  comment below wrong.
-                    // we currently require the from segment to be at least a grandparent,
-                    // because we want to promote a parent that is not the root.
-
-                    // this level doesn't need a merge because promoting anything out of it would
-                    // deplete it.
-                    return Ok(NeedsMerge::No);
-                }
+                assert!(pt == PageType::PARENT_NODE);
+                let depth = header.levels[i].buf[2];
                 // TODO this is a fairly expensive way to count the pages under a parent.
-// store the count in SegmentHeaderInfo ?
-                // TODO Call count_pages method
-                let count_pages = try!(ParentPage::count_pages(header.levels[i].root_page, &header.levels[i].buf)) as u64;
-                let size = count_pages * (inner.pgsz as u64);
+                // store the count in SegmentHeaderInfo ?
+                let count_pages = try!(header.levels[i].count_pages());
+                let size = (count_pages as u64) * (inner.pgsz as u64);
                 if size < get_level_size(i) {
                     // this level doesn't need a merge because it is doesn't have enough data in it
                     return Ok(NeedsMerge::No);
@@ -7846,12 +8100,10 @@ impl InnerPart {
             },
             Other{
                 level: usize,  // TODO why is this here?
-                old_segment: PageNum, 
+                old_segment: ParentPage, 
                 chosen_page: PageNum, 
-                chosen_depth: u8, 
                 chosen_node_pages: BlockList, 
-                parents: Vec<PageNum>, 
-                survivors: Box<Iterator<Item=Result<pgitem>>>,
+                // TODO depth and key range for chosen page
             },
         }
 
@@ -7948,60 +8200,30 @@ impl InnerPart {
                     },
                     FromLevel::Other(level) => {
                         assert!(header.levels.len() > level);
-                        let depth_root = header.levels[level].buf[2];
-
                         let old_from_segment = &header.levels[level];
-
-                        let (depth_promote, mut candidates) = {
-                            let mut depth_promote =
-                                if depth_root == 0 {
-                                    // TODO gotta catch this case earlier
-                                    unreachable!();
-                                } else if depth_root == 1 {
-                                    0
-                                } else {
-                                    // TODO config setting?
-                                    1
-                                };
-                            let mut candidates = None;
-                            loop {
-                                // TODO it's a little silly here to construct a Lend<>
-                                let done_page = move |_| -> () {
-                                };
-                                let buf = Lend::new(header.levels[level].buf.clone(), box done_page);
-
-                                let root_parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), old_from_segment.root_page, buf));
-                                // TODO ouch.  we might end up loading this page more than once?
-                                // because DepthIterator takes ownership of it.
-
-                                let mut group = try!(DepthIterator::new(root_parent, depth_promote).collect::<Result<Vec<_>>>());
-
-                                if group.len() < 2 {
-                                    assert!(depth_promote > 0);
-                                    depth_promote -= 1;
-                                } else {
-                                    candidates = Some(group);
-                                    break;
-                                }
-                            }
-                            (depth_promote, candidates.unwrap())
-                        };
-
-                        // TODO we probably need to be more clever about which one we
-                        // choose.  for now, the following hack just tries to make sure
-                        // the choice moves around the key range.
-                        let i_chosen =
-                            match old_from_segment.root_page % 3 {
-                                0 => 0,
-                                1 => candidates.len() - 1,
-                                2 => candidates.len() / 2,
-                                _ => unreachable!(),
+                        let pt = try!(PageType::from_u8(old_from_segment.buf[0]));
+                        assert!(pt == PageType::PARENT_NODE);
+                        let depth_root = old_from_segment.buf[2];
+                        //println!("old_from_segment: {}, depth: {}", old_from_segment.root_page, depth_root);
+                        assert!(depth_root >= 1);
+                        let depth_promote =
+                            if depth_root == 1 {
+                                0
+                            } else {
+                                // TODO config setting?
+                                1
                             };
-                        let pg_chosen = candidates.remove(i_chosen);
-                        //println!("chosen_page: {:?}", pg_chosen.page);
-                        //println!("survivors will be: {:?}", candidates);
-                        let survivors = candidates.into_iter().map(|pg| Ok(pg));
-                        let chosen_page = pg_chosen.page;
+                        //println!("depth_promote: {}", depth_promote);
+
+                        // TODO it's a little silly here to construct a Lend<>
+                        let done_page = move |_| -> () {
+                        };
+                        let buf = Lend::new(old_from_segment.buf.clone(), box done_page);
+                        let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), old_from_segment.root_page, buf));
+
+                        let chosen_page = try!(parent.any_node_at_depth(depth_promote));
+                        //println!("chosen_page: {}", chosen_page);
+
                         let cursor = {
                             let buf = try!(read_and_alloc_page(&f, chosen_page, inner.pgsz));
                             // TODO it's a little silly here to construct a Lend<>
@@ -8011,30 +8233,15 @@ impl InnerPart {
                             let cursor = try!(PageCursor::new_already_read_page(&inner.path, f.clone(), chosen_page, buf));
                             cursor
                         };
-                        let parents = {
-                            // TODO it's a little silly here to construct a Lend<>
-                            let done_page = move |_| -> () {
-                            };
-                            let buf = Lend::new(header.levels[level].buf.clone(), box done_page);
-                            let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), old_from_segment.root_page, buf));
-                            let dest_parents = 
-                                NodeIterator::new(parent, depth_promote + 1)
-                                .map(|r| r.map(|nd| nd.page))
-                                .collect::<Result<Vec<_>>>();
-                            let dest_parents = try!(dest_parents);
-                            dest_parents
-                        };
-                        //println!("parents above chosen and survivors: {:?}", parents);
-// TODO use node iterator
+
+                        // TODO use node iterator
                         let chosen_node_pages = try!(cursor.blocklist_unsorted_no_overflows());
                         let from = MergingFrom::Other{
                             level: level, 
-                            old_segment: old_from_segment.root_page, 
+                            old_segment: parent, 
                             chosen_page: chosen_page, 
-                            chosen_depth: depth_promote, 
+                            // TODO include the depth of the chosen page and its key range here
                             chosen_node_pages: chosen_node_pages, 
-                            survivors: box survivors, 
-                            parents: parents, 
                         };
                         (vec![cursor], from)
 
@@ -8173,7 +8380,7 @@ impl InnerPart {
 
         let mut pw = try!(PageWriter::new(inner.clone()));
 
-        let (new_dest_segment, nodes_rewritten, overflows_freed, overflows_eaten) = {
+        let (new_dest_segment, dest_nodes_rewritten, overflows_freed, overflows_eaten) = {
             // note that cursor.First() should NOT have already been called
             let mut cursor = cursor;
             try!(cursor.First());
@@ -8223,7 +8430,7 @@ impl InnerPart {
         //     the new from segment
         //     inactive
 
-        let now_inactive: HashMap<PageNum, BlockList> = {
+        let mut now_inactive: HashMap<PageNum, BlockList> = {
             let mut now_inactive = HashMap::new();
             match from {
                 MergingFrom::Fresh{ref segments} => {
@@ -8252,22 +8459,14 @@ impl InnerPart {
                         now_inactive.insert(seg.root_page, blocks);
                     }
                 },
-                MergingFrom::Other{old_segment, chosen_page, ref chosen_node_pages, ref parents, ..} => {
-                    let mut blocks = chosen_node_pages.clone();
-                    blocks.add_page_no_reorder(chosen_page);
-                    // add all the old parent nodes above the survivors
-                    for pgnum in parents {
-                        blocks.add_page_no_reorder(*pgnum);
-                    }
-                    // TODO need overflows_eaten here?  probably not, because
-                    // this case always has only one thing in the merge cursor, right?
-                    now_inactive.insert(old_segment, blocks);
+                MergingFrom::Other{..} => {
+                    // this is done below
                 },
             }
             match into.old_segment() {
                 Some(old_segment) => {
                     let mut blocks = BlockList::new();
-                    for pgnum in nodes_rewritten {
+                    for pgnum in dest_nodes_rewritten {
                         blocks.add_page_no_reorder(pgnum);
                     }
                     for b in overflows_freed {
@@ -8295,51 +8494,25 @@ impl InnerPart {
                         segments: segments,
                     }
                 },
-                MergingFrom::Other{level, old_segment, chosen_depth, survivors, ..} => {
-                    let mut survivors = survivors.peekable();
-
-                    // TODO we might want the ability to reuse parent nodes like write_merge does,
-                    // rather than rewriting everything from depth 2 up.  selecting a depth 1
-                    // item to promote out of a depth 5 segment could be expensive.
-                    let mut chain = ParentNodeWriter::new(pw.page_size(), chosen_depth + 1);
-                    let mut last_page = None;
-                    loop {
-                        match survivors.next() {
-                            None => {
-                                // should have caught this on peek
-                                unreachable!();
-                            },
-                            Some(Ok(pg)) => {
-                                let pgnum = pg.page;
-                                try!(chain.add_child(&mut pw, pg, chosen_depth));
-                                if survivors.peek().is_none() {
-                                    last_page = Some(pgnum);
-                                    break;
-                                }
-                            },
-                            Some(Err(e)) => {
-                                return Err(e);
-                            },
-                        }
+                MergingFrom::Other{level, old_segment, chosen_page, chosen_node_pages, ..} => {
+                    let wrote = try!(write_survivors(&mut pw, chosen_page, &old_segment, &inner.path, f.clone(), from_level.get_dest_level()));
+                    let from = 
+                        MergeFrom::Other {
+                            level: level,
+                            old_segment: old_segment.pagenum,
+                            new_segment: wrote.segment.unwrap(),
+                        };
+                    let mut blocks = chosen_node_pages;
+                    blocks.add_page_no_reorder(chosen_page);
+                    //println!("write_survivors chosen_page: {:?}", chosen_page);
+                    //println!("write_survivors promoting: {:?}", blocks);
+                    //println!("write_survivors rewritten: {:?}", wrote.nodes_rewritten);
+                    for pgnum in wrote.nodes_rewritten {
+                        blocks.add_page_no_reorder(pgnum);
                     }
-                    match last_page {
-                        Some(page) => {
-                            let buf = try!(read_and_alloc_page(&f, page, pw.page_size()));
-                            let (count_parent_nodes, seg) = try!(chain.done(&mut pw, (page, buf)));
-                            let seg = seg.map(|(seg, depth)| seg);
-                            let seg = seg.unwrap();
-                            MergeFrom::Other{
-                                level: level, 
-                                old_segment: old_segment, 
-                                new_segment: seg
-                            }
-                        },
-                        None => {
-                            // TODO should never happen.  this means there were no survivors,
-                            // so we chose the root of the segment, which should not happen.
-                            unreachable!();
-                        },
-                    }
+                    assert!(!now_inactive.contains_key(&old_segment.pagenum));
+                    now_inactive.insert(old_segment.pagenum, blocks);
+                    from
                 },
             };
 
