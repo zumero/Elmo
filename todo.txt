@@ -1,8 +1,14 @@
 
+should process_pair_into_leaf() itself be faster, or is
+it showing up in the profiler simply because it is getting 
+called a lot?  the prefix len calculations probably have
+some room for improvement.  don't call calc_prefix_len()
+twice.  if it changed for some reason, remember that.
+
+too many open/close of the file for PageWriter as well.
+
 need to make merges more parallelizable.  two merges in
 the same level but different key range.
-
-need to not open/close the file for writing so often.
 
 write merge can be a little smarter and can start at the
 top for recycling decisions.  basically, when rewriting
@@ -41,7 +47,7 @@ maybe the level factor should be less than 10x so that the segments
 stay smaller and so the blocklists stay smaller.  but then reads get
 slower because more segments.  nonetheless, it is interesting to
 note that the 5M URL test is MUCH faster when the factor is 2
-instead of 10.  why?
+instead of 10.  why?  It's just another way of deferring writes?
 
 if we are rewriting a node, that means we could not or
 chose not to recycle the parent of that node.
