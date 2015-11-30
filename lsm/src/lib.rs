@@ -2089,12 +2089,15 @@ impl ICursor for MultiCursor {
 
 struct MergeCursor { 
     subcursors: Box<[PageCursor]>, 
+
+    // the case where there is only one subcursor is handled specially.
+    // there is no need to sort.  sorted is left empty, and cur is Some(0).
+
     sorted: Box<[(usize, Option<Ordering>)]>,
     cur: Option<usize>, 
 
     overflows_eaten: Vec<(PageNum, BlockList)>,
 
-    // TODO optimize the case where there is only one subcursor
 }
 
 impl MergeCursor {
@@ -2103,9 +2106,9 @@ impl MergeCursor {
     }
 
     fn sort(&mut self) -> Result<()> {
-        if self.subcursors.is_empty() {
-            return Ok(())
-        }
+        // this function should never be called in the case where there is
+        // only one subcursor.
+        assert!(self.subcursors.len() > 1);
 
         // TODO this memory allocation is expensive.
 
@@ -2207,30 +2210,33 @@ impl MergeCursor {
         Ok(())
     }
 
-    fn sorted_first(&self) -> Option<usize> {
+    fn findMin(&mut self) -> Result<Option<usize>> {
+        // this function should never be called in the case where there is
+        // only one subcursor.
+        assert!(self.subcursors.len() > 1);
+
+        try!(self.sort());
         let n = self.sorted[0].0;
         if self.sorted[0].1.is_some() {
-            Some(n)
+            Ok(Some(n))
         } else {
-            None
-        }
-    }
-
-    fn findMin(&mut self) -> Result<Option<usize>> {
-        if self.subcursors.is_empty() {
             Ok(None)
-        } else {
-            try!(self.sort());
-            Ok(self.sorted_first())
         }
     }
 
     fn new(subs: Vec<PageCursor>) -> MergeCursor {
+        assert!(subs.len() > 0);
         let s = subs.into_boxed_slice();
-        let mut sorted = Vec::with_capacity(s.len());
-        for i in 0 .. s.len() {
-            sorted.push((i, None));
-        }
+        let sorted = 
+            if s.len() > 1 {
+                let mut sorted = Vec::with_capacity(s.len());
+                for i in 0 .. s.len() {
+                    sorted.push((i, None));
+                }
+                sorted
+            } else {
+                vec![]
+            };
         MergeCursor { 
             subcursors: s, 
             sorted: sorted.into_boxed_slice(), 
@@ -2253,7 +2259,11 @@ impl IForwardCursor for MergeCursor {
         for i in 0 .. self.subcursors.len() {
             try!(self.subcursors[i].First());
         }
-        self.cur = try!(self.findMin());
+        if self.subcursors.len() > 1 {
+            self.cur = try!(self.findMin());
+        } else {
+            self.cur = Some(0);
+        }
         Ok(())
     }
 
@@ -2296,61 +2306,67 @@ impl IForwardCursor for MergeCursor {
                 Err(Error::CursorNotValid)
             },
             Some(icur) => {
-                // we need to fix every cursor to point to its min
-                // value > icur.
+                if self.subcursors.len() > 1 {
+                    // we need to fix every cursor to point to its min
+                    // value > icur.
 
-                // if perf didn't matter, this would be simple.
-                // call Next on icur.  and call Seek(GE) (and maybe Next)
-                // on every other cursor.
+                    // if perf didn't matter, this would be simple.
+                    // call Next on icur.  and call Seek(GE) (and maybe Next)
+                    // on every other cursor.
 
-                // because we keep the list sorted,
-                // each cursor is at most
-                // one step away.
+                    // because we keep the list sorted,
+                    // each cursor is at most
+                    // one step away.
 
-                // we know that every valid cursor
-                // is pointing at a key which is either == to icur, or
-                // it is already the min key > icur.
+                    // we know that every valid cursor
+                    // is pointing at a key which is either == to icur, or
+                    // it is already the min key > icur.
 
-                assert!(icur == self.sorted[0].0);
-                // immediately after that, there may (or may not be) some
-                // entries which were Ordering:Equal to cur.  call Next on
-                // each of these.
+                    assert!(icur == self.sorted[0].0);
+                    // immediately after that, there may (or may not be) some
+                    // entries which were Ordering:Equal to cur.  call Next on
+                    // each of these.
 
-                for i in 1 .. self.sorted.len() {
-                    //println!("sorted[{}] : {:?}", i, self.sorted[i]);
-                    let (n, c) = self.sorted[i];
-                    match c {
-                        None => {
-                            break;
-                        },
-                        Some(c) => {
-                            if c == Ordering::Equal {
-                                {
-                                    let v = try!(self.subcursors[n].ValueRef());
-                                    match v {
-                                        ValueRef::Overflowed(path, pgsz, len, blocks) => {
-                                            let k = try!(self.subcursors[n].KeyRef());
-                                            //println!("eaten: {:?} -- {:?}", k, blocks);
-                                            self.overflows_eaten.push((self.subcursors[n].pagenum(), blocks));
-                                        },
-                                        _ => {
-                                        },
-                                    }
-                                }
-                                try!(self.subcursors[n].Next());
-                            } else {
+                    for i in 1 .. self.sorted.len() {
+                        //println!("sorted[{}] : {:?}", i, self.sorted[i]);
+                        let (n, c) = self.sorted[i];
+                        match c {
+                            None => {
                                 break;
-                            }
-                        },
+                            },
+                            Some(c) => {
+                                if c == Ordering::Equal {
+                                    {
+                                        let v = try!(self.subcursors[n].ValueRef());
+                                        match v {
+                                            ValueRef::Overflowed(path, pgsz, len, blocks) => {
+                                                let k = try!(self.subcursors[n].KeyRef());
+                                                //println!("eaten: {:?} -- {:?}", k, blocks);
+                                                self.overflows_eaten.push((self.subcursors[n].pagenum(), blocks));
+                                            },
+                                            _ => {
+                                            },
+                                        }
+                                    }
+                                    try!(self.subcursors[n].Next());
+                                } else {
+                                    break;
+                                }
+                            },
+                        }
                     }
+
+                    // now the current cursor
+                    try!(self.subcursors[icur].Next());
+
+                    // now re-sort
+                    self.cur = try!(self.findMin());
+                    Ok(())
+                } else {
+                    assert!(icur == 0);
+                    try!(self.subcursors[icur].Next());
+                    Ok(())
                 }
-
-                // now the current cursor
-                try!(self.subcursors[icur].Next());
-
-                // now re-sort
-                self.cur = try!(self.findMin());
-                Ok(())
             },
         }
     }
@@ -3319,28 +3335,6 @@ fn process_pair_into_leaf(st: &mut LeafState,
         }
     }
 
-    let would_be_prefix_len = calc_prefix_len(&st, &k, &kloc);
-    assert!(would_be_prefix_len <= k.len());
-    let would_be_sofar = 
-        if would_be_prefix_len != st.prefixLen {
-            assert!(st.prefixLen == 0 || would_be_prefix_len < st.prefixLen);
-            // the prefixLen would change with the addition of this key,
-            // so we need to recalc sofar
-            let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(would_be_prefix_len) ).sum();;
-            sum
-        } else {
-            st.sofarLeaf
-        };
-    let fits = {
-        let would_be_len_page = calc_leaf_page_len(would_be_prefix_len, would_be_sofar);
-        if pgsz > would_be_len_page {
-            let available = pgsz - would_be_len_page;
-            let needed = kloc.need(&k, would_be_prefix_len) + vloc.need();
-            available >= needed
-        } else {
-            false
-        }
-    };
     // note that the LeafPair struct gets ownership of the key provided
     // from above.
     let kwloc = KeyWithLocation {
@@ -3351,6 +3345,29 @@ fn process_pair_into_leaf(st: &mut LeafState,
                 key: kwloc,
                 value: vloc,
                 };
+
+    let would_be_prefix_len = calc_prefix_len(&st, &lp.key.key, &lp.key.location);
+    assert!(would_be_prefix_len <= lp.key.key.len());
+    let would_be_sofar_before_this_pair = 
+        if would_be_prefix_len != st.prefixLen {
+            assert!(st.prefixLen == 0 || would_be_prefix_len < st.prefixLen);
+            // the prefixLen would change with the addition of this key,
+            // so we need to recalc sofar
+            let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(would_be_prefix_len) ).sum();;
+            sum
+        } else {
+            st.sofarLeaf
+        };
+    let fits = {
+        let would_be_len_page_before_this_pair = calc_leaf_page_len(would_be_prefix_len, would_be_sofar_before_this_pair);
+        if pgsz > would_be_len_page_before_this_pair {
+            let available_for_this_pair = pgsz - would_be_len_page_before_this_pair;
+            let needed_for_this_pair = lp.need(would_be_prefix_len);
+            available_for_this_pair >= needed_for_this_pair
+        } else {
+            false
+        }
+    };
     let wrote =
         if !fits {
             assert!(st.keys_in_this_leaf.len() > 0);
@@ -3365,7 +3382,7 @@ fn process_pair_into_leaf(st: &mut LeafState,
             Some(pg)
         } else {
             st.prefixLen = would_be_prefix_len;
-            st.sofarLeaf = would_be_sofar + lp.need(st.prefixLen);
+            st.sofarLeaf = would_be_sofar_before_this_pair + lp.need(st.prefixLen);
             None
         };
 
