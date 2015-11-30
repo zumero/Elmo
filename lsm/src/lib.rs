@@ -3319,19 +3319,19 @@ fn process_pair_into_leaf(st: &mut LeafState,
         }
     }
 
+    let would_be_prefix_len = calc_prefix_len(&st, &k, &kloc);
+    assert!(would_be_prefix_len <= k.len());
+    let would_be_sofar = 
+        if would_be_prefix_len != st.prefixLen {
+            assert!(st.prefixLen == 0 || would_be_prefix_len < st.prefixLen);
+            // the prefixLen would change with the addition of this key,
+            // so we need to recalc sofar
+            let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(would_be_prefix_len) ).sum();;
+            sum
+        } else {
+            st.sofarLeaf
+        };
     let fits = {
-        let would_be_prefix_len = calc_prefix_len(&st, &k, &kloc);
-        assert!(would_be_prefix_len <= k.len());
-        let would_be_sofar = 
-            if would_be_prefix_len != st.prefixLen {
-                assert!(st.prefixLen == 0 || would_be_prefix_len < st.prefixLen);
-                // the prefixLen would change with the addition of this key,
-                // so we need to recalc sofar
-                let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(would_be_prefix_len) ).sum();;
-                sum
-            } else {
-                st.sofarLeaf
-            };
         let would_be_len_page = calc_leaf_page_len(would_be_prefix_len, would_be_sofar);
         if pgsz > would_be_len_page {
             let available = pgsz - would_be_len_page;
@@ -3341,32 +3341,6 @@ fn process_pair_into_leaf(st: &mut LeafState,
             false
         }
     };
-
-    let wrote =
-        if !fits {
-            assert!(st.keys_in_this_leaf.len() > 0);
-            let should_be = calc_leaf_page_len(st.prefixLen, st.sofarLeaf);
-            let (len_page, pg) = try!(write_leaf(st, pb, pw));
-            //println!("should_be = {}   len_page = {}", should_be, len_page);
-            assert!(should_be == len_page);
-            Some(pg)
-        } else {
-            None
-        };
-
-    // see if the prefix len actually did change
-    let new_prefix_len = calc_prefix_len(&st, &k, &kloc);
-    assert!(new_prefix_len <= k.len());
-    let sofar = 
-        if new_prefix_len != st.prefixLen {
-            assert!(st.prefixLen == 0 || new_prefix_len < st.prefixLen);
-            // the prefixLen will change with the addition of this key,
-            // so we need to recalc sofar
-            let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(new_prefix_len) ).sum();;
-            sum
-        } else {
-            st.sofarLeaf
-        };
     // note that the LeafPair struct gets ownership of the key provided
     // from above.
     let kwloc = KeyWithLocation {
@@ -3377,9 +3351,24 @@ fn process_pair_into_leaf(st: &mut LeafState,
                 key: kwloc,
                 value: vloc,
                 };
+    let wrote =
+        if !fits {
+            assert!(st.keys_in_this_leaf.len() > 0);
+            let should_be = calc_leaf_page_len(st.prefixLen, st.sofarLeaf);
+            let (len_page, pg) = try!(write_leaf(st, pb, pw));
+            //println!("should_be = {}   len_page = {}", should_be, len_page);
+            assert!(should_be == len_page);
+            assert!(st.sofarLeaf == 0);
+            assert!(st.prefixLen == 0);
+            assert!(st.keys_in_this_leaf.is_empty());
+            st.sofarLeaf = lp.need(st.prefixLen);
+            Some(pg)
+        } else {
+            st.prefixLen = would_be_prefix_len;
+            st.sofarLeaf = would_be_sofar + lp.need(st.prefixLen);
+            None
+        };
 
-    st.sofarLeaf = sofar + lp.need(new_prefix_len);
-    st.prefixLen = new_prefix_len;
     st.keys_in_this_leaf.push(lp);
 
     Ok(wrote)
