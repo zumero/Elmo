@@ -6695,13 +6695,17 @@ impl IForwardCursor for MultiPageCursor {
 
 #[derive(Clone)]
 struct HeaderData {
-
     fresh: Vec<SegmentHeaderInfo>,
     young: Vec<SegmentHeaderInfo>,
     levels: Vec<SegmentHeaderInfo>,
 
     changeCounter: u64,
     mergeCounter: u64,
+}
+
+struct HeaderStuff {
+    data: HeaderData,
+    f: File,
 }
 
 // TODO how big should the header be?  this defines the minimum size of a
@@ -7223,7 +7227,7 @@ struct InnerPart {
     // TODO are we concerned here about readers starving the
     // writers?  In other words, so many cursors that a merge
     // cannot get committed?
-    header: RwLock<HeaderData>,
+    header: RwLock<HeaderStuff>,
 
     space: Mutex<Space>,
     pagepool: Mutex<SafePagePool>,
@@ -7390,6 +7394,17 @@ impl DatabaseFile {
         for level in 0 .. NUM_LEVELS {
             mergelock_levels.push(Mutex::new(0));
         }
+
+        let file_header_write = 
+            try!(OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path));
+
+        let header = HeaderStuff {
+            data: header,
+            f: file_header_write,
+        };
 
         let inner = InnerPart {
             path: path,
@@ -7684,6 +7699,54 @@ impl DatabaseFile {
     }
 }
 
+impl HeaderStuff {
+    fn write_header(&mut self, hdr: HeaderData, pgsz: usize) -> Result<()> {
+
+        fn build_segment_list(h: &HeaderData) -> Vec<u8> {
+            let mut pb = vec![];
+
+            fn add_list(pb: &mut Vec<u8>, v: &Vec<SegmentHeaderInfo>) {
+                misc::push_varint(pb, v.len() as u64);
+                for seg in v.iter() {
+                    misc::push_varint(pb, seg.root_page as u64);
+                }
+            }
+
+            add_list(&mut pb, &h.fresh);
+            add_list(&mut pb, &h.young);
+            add_list(&mut pb, &h.levels);
+
+            pb
+        }
+
+        //println!("header,fresh,{},young,{},levels,{}", hdr.fresh.len(), hdr.young.len(), hdr.levels.len());
+
+        let mut pb = PageBuilder::new(HEADER_SIZE_IN_BYTES);
+        // TODO format version number
+        // TODO aren't there some settings that should go in here?
+        pb.PutInt32(pgsz as u32);
+
+        pb.PutVarint(hdr.changeCounter);
+        pb.PutVarint(hdr.mergeCounter);
+
+        let pbSegList = build_segment_list(&hdr);
+
+        // TODO the + 1 in the following line is probably no longer needed.
+        // I think it used to be the flag indicating header overflow.
+        if pb.Available() >= (pbSegList.len() + 1) {
+            pb.PutArray(&pbSegList);
+        } else {
+            return Err(Error::Misc(String::from("header too big")));
+        }
+
+        try!(self.f.seek(SeekFrom::Start(0)));
+        try!(pb.Write(&mut self.f));
+        try!(self.f.flush());
+        self.data = hdr;
+        Ok(())
+    }
+}
+
 impl InnerPart {
 
     fn return_page_to_pool(&self, page: Box<[u8]>) {
@@ -7758,55 +7821,6 @@ impl InnerPart {
     // level
     // all in varints
 
-    fn write_header(&self, 
-                   dest: &mut HeaderData, 
-                   fs: &mut File, 
-                   hdr: HeaderData
-                  ) -> Result<()> {
-
-        fn build_segment_list(h: &HeaderData) -> Vec<u8> {
-            let mut pb = vec![];
-
-            fn add_list(pb: &mut Vec<u8>, v: &Vec<SegmentHeaderInfo>) {
-                misc::push_varint(pb, v.len() as u64);
-                for seg in v.iter() {
-                    misc::push_varint(pb, seg.root_page as u64);
-                }
-            }
-
-            add_list(&mut pb, &h.fresh);
-            add_list(&mut pb, &h.young);
-            add_list(&mut pb, &h.levels);
-
-            pb
-        }
-
-        //println!("header,fresh,{},young,{},levels,{}", hdr.fresh.len(), hdr.young.len(), hdr.levels.len());
-
-        let mut pb = PageBuilder::new(HEADER_SIZE_IN_BYTES);
-        // TODO format version number
-        pb.PutInt32(self.pgsz as u32);
-
-        pb.PutVarint(hdr.changeCounter);
-        pb.PutVarint(hdr.mergeCounter);
-
-        let pbSegList = build_segment_list(&hdr);
-
-        // TODO the + 1 in the following line is probably no longer needed.
-        // I think it used to be the flag indicating header overflow.
-        if pb.Available() >= (pbSegList.len() + 1) {
-            pb.PutArray(&pbSegList);
-        } else {
-            return Err(Error::Misc(String::from("header too big")));
-        }
-
-        try!(fs.seek(SeekFrom::Start(0)));
-        try!(pb.Write(fs));
-        try!(fs.flush());
-        *dest = hdr;
-        Ok(())
-    }
-
     fn get_loaner_page(inner: &std::sync::Arc<InnerPart>) -> Result<Lend<Box<[u8]>>> {
         let page = {
             match inner.pagepool.try_lock() {
@@ -7875,7 +7889,8 @@ impl InnerPart {
     }
 
     fn open_cursor(inner: &std::sync::Arc<InnerPart>) -> Result<LivingCursor> {
-        let header = try!(inner.header.read());
+        let headerstuff = try!(inner.header.read());
+        let header = &headerstuff.data;
         let f = try!(inner.open_file_for_cursor());
 
         let cursors = 
@@ -7949,7 +7964,8 @@ impl InnerPart {
     }
 
     fn list_segments(inner: &std::sync::Arc<InnerPart>) -> Result<(Vec<(PageNum, PageCount)>, Vec<(PageNum, PageCount)>, Vec<(PageNum, PageCount)>)> {
-        let header = try!(inner.header.read());
+        let headerstuff = try!(inner.header.read());
+        let header = &headerstuff.data;
 
         fn do_group(segments: &[SegmentHeaderInfo]) -> Result<Vec<(PageNum, PageCount)>> {
             let mut v = vec![];
@@ -7969,20 +7985,17 @@ impl InnerPart {
 
     fn commit_segment(&self, seg: SegmentHeaderInfo) -> Result<()> {
         {
-            let mut header = try!(self.header.write());
+            let mut headerstuff = try!(self.header.write());
 
             // TODO assert new seg shares no pages with any seg in current state
 
-            let mut newHeader = header.clone();
+            let mut newHeader = headerstuff.data.clone();
 
             newHeader.fresh.insert(0, seg);
 
             newHeader.changeCounter = newHeader.changeCounter + 1;
 
-            {
-                let mut fs = try!(self.OpenForWriting());
-                try!(self.write_header(&mut header, &mut fs, newHeader));
-            }
+            try!(headerstuff.write_header(newHeader, self.pgsz));
         }
 
         // note that we intentionally do not release the writeLock here.
@@ -8033,7 +8046,8 @@ impl InnerPart {
             _ => {
             },
         }
-        let header = try!(inner.header.read());
+        let headerstuff = try!(inner.header.read());
+        let header = &headerstuff.data;
         match from_level {
             FromLevel::Fresh => {
                 if header.fresh.len() < inner.settings.min_segments_promote_fresh {
@@ -8110,7 +8124,8 @@ impl InnerPart {
         let f = try!(inner.open_file_for_cursor());
 
         let (cursor, from, into, behind, behind_rlock) = {
-            let header = try!(inner.header.read());
+            let headerstuff = try!(inner.header.read());
+            let header = &headerstuff.data;
 
             let (cursors, from) = {
                 // find all the stuff that is getting promoted.  
@@ -8736,11 +8751,11 @@ impl InnerPart {
         let dest_level = pm.from.get_dest_level();
         //println!("commit_merge: {:?}", pm);
         {
-            let mut header = try!(self.header.write());
+            let mut headerstuff = try!(self.header.write());
 
             // TODO assert new seg shares no pages with any seg in current state
 
-            let mut newHeader = header.clone();
+            let mut newHeader = headerstuff.data.clone();
 
             fn update_header(newHeader: &mut HeaderData, old_dest_segment: Option<PageNum>, new_dest_segment: Option<SegmentHeaderInfo>, dest_level: usize) {
                 match (old_dest_segment, new_dest_segment) {
@@ -8838,7 +8853,7 @@ impl InnerPart {
 
             match pm.from {
                 MergeFrom::Fresh{ref segments} => {
-                    let ndx = find_segments_in_list(segments, &header.fresh);
+                    let ndx = find_segments_in_list(segments, &headerstuff.data.fresh);
                     for _ in segments {
                         newHeader.fresh.remove(ndx);
                     }
@@ -8857,7 +8872,7 @@ impl InnerPart {
                     }
                 },
                 MergeFrom::Young{ref segments} => {
-                    let ndx = find_segments_in_list(segments, &header.young);
+                    let ndx = find_segments_in_list(segments, &headerstuff.data.young);
                     for _ in segments {
                         newHeader.young.remove(ndx);
                     }
@@ -8876,8 +8891,7 @@ impl InnerPart {
 
             newHeader.mergeCounter = newHeader.mergeCounter + 1;
 
-            let mut fs = try!(self.OpenForWriting());
-            try!(self.write_header(&mut header, &mut fs, newHeader));
+            try!(headerstuff.write_header(newHeader, self.pgsz));
             //println!("merge committed");
 
             let mut space = try!(self.space.lock());
@@ -8886,7 +8900,6 @@ impl InnerPart {
                 space.add_dependencies(deps.0, deps.1);
             }
         }
-
 
         // note that we intentionally do not release the writeLock here.
         // you can change the segment list more than once while holding

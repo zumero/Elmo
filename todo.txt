@@ -1,8 +1,13 @@
 
+need to make merges more parallelizable.  two merges in
+the same level but different key range.
+
+need to not open/close the file for writing so often.
+
 write merge can be a little smarter and can start at the
 top for recycling decisions.  basically, when rewriting
 a parent, find all the child nodes that need to be rewritten
-and rewrote them, but only to the depth they were at
+and rewrite them, but only to the depth they were at
 before.  don't allow them to increase in depth.  this
 means that each one might result in more than one after
 the merge.  after that, combine them with the rest of
@@ -10,11 +15,25 @@ the child nodes (the ones recycled, not being rewritten),
 and write a new parent, again stopping at the depth
 we started with so we can return to the caller.
 
+but this is kinda what ParentNodeWriter is supposed to do.
+why doesn't it work that way?  maybe:  if we are currently
+recycling nodes at N and then we have to rewrite one, we
+need to continue at N, not jump to N + 1.
+
+maybe we just need ParentNodeWriter to stop flushing the
+current just because it got a recycle of something at a
+higher depth.  just pass it along, but sort all the results
+by key range on done().
+
 commit 5M urls in one transaction.  we will need ways of
 dealing with large segments in fresh and young.  can't
 promote whole segment.  writing segment would need to be
 done in batches, but can't keep page in ram for lots of
-batches.
+batches.  in this sense, promote from young needs to be
+not much different than promote from N.
+
+and maybe promote from N to N+1 needs the ability to
+leave N empty (edge case).
 
 verify that the new code does inactive stuff right
 
@@ -127,8 +146,6 @@ rotate through the key space?
 
 having last_key be an Option<> is so tedious
 
-rm dead page class
-
 rm dead MultiPageCursor?  or will we need this later for cases
 where we are merging from Other level N to N+1 and want to select 
 more than a leaf and less then a parent?
@@ -162,7 +179,8 @@ tune block sizes for perf?
 
 figure out proper limits for how much should be at each level.
 currently using geometric like leveldb, sometimes with the
-factor as low as 2.
+factor as low as 2.  lower multipler means faster writes and
+slower reads.
 
 fix/rewrite all the lsm cargo tests
 
@@ -208,7 +226,8 @@ more complicated.
 
 reduce malloc
 
-are we using Arc too much now?
+are we using Arc too much now?  are there places we could sweep back
+through and replace Arc with &T ?
 
 https://github.com/zslayton/lifeguard
 
