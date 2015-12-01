@@ -1,4 +1,23 @@
 
+tree of depth 4.  if you insert a key that fits between
+everything, it will end up with its own very thin parent
+lineage.  one leaf, a parent with only one child,
+another parent with only one child, and so on.  eventually,
+it will either fit under a parent where it fits, or it
+will be a sibling, causing the depth to grow.  we look
+at this from the perspective of always recycling a node
+when we can, but we should probably be asking a different
+question.  just because a new key will fit in between
+two nodes, should it?  does the answer depend on the
+level?  if a level has N nodes and it can stay at N
+nodes with the new key added, shouldn't we rewrite
+to avoid depth increasing?
+
+that's what the newer rewrite_level code kinda does.
+it ensures that at some point not too far up, we decide
+to rewrite the level, to make sure we don't have this
+problem.
+
 too many open/close of the file for PageWriter as well.
 
 need to make merges more parallelizable.  two merges in
