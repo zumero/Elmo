@@ -1,10 +1,4 @@
 
-should process_pair_into_leaf() itself be faster, or is
-it showing up in the profiler simply because it is getting 
-called a lot?  the prefix len calculations probably have
-some room for improvement.  don't call calc_prefix_len()
-twice.  if it changed for some reason, remember that.
-
 too many open/close of the file for PageWriter as well.
 
 need to make merges more parallelizable.  two merges in
@@ -30,6 +24,10 @@ maybe we just need ParentNodeWriter to stop flushing the
 current just because it got a recycle of something at a
 higher depth.  just pass it along, but sort all the results
 by key range on done().
+
+the other thing ParentNodeWriter got us was not having to
+keep all the leaves in memory.  it's more like a stream,
+processing things as we go.
 
 commit 5M urls in one transaction.  we will need ways of
 dealing with large segments in fresh and young.  can't
