@@ -613,11 +613,11 @@ fn split3<T>(a: &mut [T], i: usize) -> (&mut [T], &mut [T], &mut [T]) {
 }
 
 pub enum KeyRef<'a> {
+    // TODO consider a type representing an overflow reference with len and blocks?
     // TODO should the file and pgsz be in here?
     //Overflowed(String, usize, u64, BlockList),
 
     Boxed(Box<[u8]>),
-    // TODO consider a type representing an overflow reference with len and blocks?
 
     // the other two are references into the page
     Prefixed(&'a [u8],&'a [u8]),
@@ -1500,6 +1500,15 @@ mod bcmp {
         let lim = min(len, max);
         let mut i = 0;
         while i < lim && x[i] == y[i] {
+            i = i + 1;
+        }
+        i
+    }
+
+    pub fn prefix_match2(x: &[u8], y: &[u8]) -> usize {
+        let len = min(x.len(), y.len());
+        let mut i = 0;
+        while i < len && x[i] == y[i] {
             i = i + 1;
         }
         i
@@ -2991,6 +3000,8 @@ struct LeafState {
     sofarLeaf: usize,
     keys_in_this_leaf: Vec<LeafPair>,
     prefixLen: usize,
+    // TODO why do we need prev_key here?  can't we just look at the
+    // last entry of keys_in_this_leaf ?
     prev_key: Option<Box<[u8]>>,
 
 }

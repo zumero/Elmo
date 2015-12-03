@@ -1,4 +1,41 @@
 
+status quo (one prefix for the whole page)
+prefix chain
+fsa
+
+KeyRef::Prefixed
+search in page without uncompressing all keys
+nth key
+work to get one key
+cost to build
+
+status quo is the only one that supports KeyRef::Prefixed.
+most forms of compression in general will require that
+the key be constructed/allocated in order to return it
+for a cursor.
+
+prefix chain is probably cheaper to build than the others.
+status quo sometimes needs to go back and recalc when the
+prefix len changes.  fsa will be the most expensive to 
+build, probably by far.
+
+fsa will very nicely support search in the page without
+decompressing all the keys.  status quo mostly does too.  
+prefix chain will not.
+
+prefix chain won't support nth key unless we decompress
+them all.  fsa won't support nth key at all.  would need
+to change all uses to something more like an iterator
+model.
+
+prefix chain is ugly for overflowed keys.  is the prefix
+always referring to the previous key?  even if it was
+overflowed?  if so, the overflowed key always has to be
+read in order to construct any keys after it.
+
+actually, fsa has trouble with overflowed keys too.
+how does an overflowed key fit in there?
+
 tree of depth 4.  if you insert a key that fits between
 everything, it will end up with its own very thin parent
 lineage.  one leaf, a parent with only one child,
