@@ -1,11 +1,67 @@
 
+parent node writer gets in trouble, overflows its stack,
+when it has to deal with lots of pages that only hold one
+key.  problem is that if only one key fits in the leaf,
+then only one key fits in its parent, so the generation
+of parent nodes is the same size, so depth increases
+forever.  maybe we need to overflow keys unless two of
+them can fit in a parent page.  or maybe a parent page
+needs the ability to overflow a key even if the leaf
+did not, just to ensure that at least two keys fit in
+every parent.
+
 most of the largest merges are from Young to Other(0).  need
 to be more careful about how much we merge from Young at
 one time.
 
+too many open/close of the file for PageWriter as well.
+
+need to make merges more parallelizable.  two merges in
+the same level but different key range.
+
+maybe the level factor should be less than 10x so that the segments
+stay smaller and so the blocklists stay smaller.  but then reads get
+slower because more segments.  nonetheless, it is interesting to
+note that the 5M URL test is MUCH faster when the factor is 2
+instead of 10.  why?  It's just another way of deferring writes?
+
+unless it needs to pass along an Arc clone, methods should
+be &self not &Arc<InnerPart>
+
+where should I be using AsRef?  From/Into ?
+
+bufadvance and PageBuilder should use trait implementations 
+for Read and Write on slices/vecs
+
+vec capacities
+
+can we have the segment page objects reference the buf in the
+header instead of cloning it?  Arc<buf> ?  but then how do we deal
+with ParentPage that wants to walk through all of its children without
+realloc on each one?  separate implementations?  one form of the
+page object borrows its buf (from the one in the SegmentHeaderInfo).
+the other one owns its buf (so it can read a different page into it).
+
+get rid of pagepool?
+
+lots of bufadvance and varint read calls should probably return Result
+so they can properly error on invalid pages read from the file.
+or, when parsing a page, check before calling them.
+
 so a new leaf can't squeeze between two parents anymore.
 what does this mean for the merge problem where we had
 parent nodes underfull and depth increasing to the right?
+
+need to figure out a place to call truncate_file_if_possible()
+every so often.
+
+how to choose a page from the merge source when merging Other?
+is a parent too big?  a leaf too small?  
+rotate through the key space?
+
+rm dead MultiPageCursor?  or will we need this later for cases
+where we are merging from Other level N to N+1 and want to select 
+more than a leaf and less then a parent?
 
 removing the rewrite_level (which should be rewrite_depth)
 code now shows that the depth increasing to the right
@@ -50,6 +106,11 @@ read in order to construct any keys after it.
 actually, fsa has trouble with overflowed keys too.
 how does an overflowed key fit in there?
 
+could maybe just alternate?  even number keys are stored
+without prefix compression.  odds ones are prefixed against
+the one just before it.
+
+the following isn't true anymore:
 tree of depth 4.  if you insert a key that fits between
 everything, it will end up with its own very thin parent
 lineage.  one leaf, a parent with only one child,
@@ -68,11 +129,6 @@ that's what the newer rewrite_level code kinda does.
 it ensures that at some point not too far up, we decide
 to rewrite the level, to make sure we don't have this
 problem.
-
-too many open/close of the file for PageWriter as well.
-
-need to make merges more parallelizable.  two merges in
-the same level but different key range.
 
 write merge can be a little smarter and can start at the
 top for recycling decisions.  basically, when rewriting
@@ -109,23 +165,11 @@ not much different than promote from N.
 and maybe promote from N to N+1 needs the ability to
 leave N empty (edge case).
 
-verify that the new code does inactive stuff right
-
-maybe the level factor should be less than 10x so that the segments
-stay smaller and so the blocklists stay smaller.  but then reads get
-slower because more segments.  nonetheless, it is interesting to
-note that the 5M URL test is MUCH faster when the factor is 2
-instead of 10.  why?  It's just another way of deferring writes?
-
 if we are rewriting a node, that means we could not or
 chose not to recycle the parent of that node.
 
 every time we recycle a node, we flush the current page
 in progress, at every level, down to that node's depth.
-
-parent node writer gets in trouble, overflows its stack,
-when it has to deal with lots of pages that only hold one
-key.
 
 second run of test suite into same db is really slow.
 probably fragmentation and blocklist stuff?
@@ -143,14 +187,6 @@ parts we need and adapt?
 
 think about memmap for cursors
 
-unless it needs to pass along an Arc clone, methods should
-be &self not &Arc<InnerPart>
-
-where should I be using AsRef?  From/Into ?
-
-bufadvance and PageBuilder should use trait implementations 
-for Read and Write on slices/vecs
-
 might want to send a Work message as soon as the db is
 loaded.  unless it was opened in a read only mode.
 
@@ -163,26 +199,8 @@ file size explodes when multiple writers?  something
 about pagewriter?  block size too big?  is pw.end getting
 called?
 
-vec capacities
-
 at some point we should review which asserts we really want in release
 builds and perf check without the rest of them.
-
-can we have the segment page objects reference the buf in the
-header instead of cloning it?  Arc<buf> ?  but then how do we deal
-with ParentPage that wants to walk through all of its children without
-realloc on each one?  separate implementations?  one form of the
-page object borrows its buf (from the one in the SegmentHeaderInfo).
-the other one owns its buf (so it can read a different page into it).
-
-get rid of pagepool?
-
-lots of bufadvance and varint read calls should probably return Result
-so they can properly error on invalid pages read from the file.
-or, when parsing a page, check before calling them.
-
-need to figure out a place to call truncate_file_if_possible()
-every so often.
 
 avoiding rewrites of leaves has a downside:  once something is
 high up in the file, it probably won't move, the file doesn't
@@ -204,28 +222,11 @@ need them at all?  would need parent nodes fit calculations
 to account for the size of the encoded block lists.  
 do we need this anyway?
 
-perf problem with storing locations of each page in parent pages?
-    seek doesn't need them.
-    next/prev doesn't need them.
-    so most of the time, they're not needed.
-    but they take up space, so lots fewer things fit in a parent page
-    which means the btree gets deeper
-    store locations elsewhere?
-    sidecar page for every parent page, just to store locations?
-
 look for ways to make elmo index entry encoding more compact
 
 at some point, review all decisions about what actually gets stored
 in the parent page and make sure it's worth it.  full
 block list?  should we store the number of descendant leaves?
-
-how to choose a page from the merge source when merging Other?
-is a parent too big?  a leaf too small?  
-rotate through the key space?
-
-rm dead MultiPageCursor?  or will we need this later for cases
-where we are merging from Other level N to N+1 and want to select 
-more than a leaf and less then a parent?
 
 header can get really small.  so small that we no longer want to 
 waste 4096 bytes or an entire page on it?  it would need to live on

@@ -4145,23 +4145,28 @@ impl ParentNodeWriter {
 
         // to fit this child into this parent page, we need room for
         // the root page
-        // the block list
-        // prefixLen, varint
-        // (prefix)
-        // key len 1, varint, shifted for overflow flag
-        // key 1
-        //     if inline, the key, minus prefix
-        //     if overflow, the blocklist (borrowed from child)
-        // key len 2, varint, shifted for overflow flag, 0 if absent
-        // key 2, if present
+        // the block list (if child is a leaf) or the page count
+        // key len, varint, shifted for overflow flag
+        // key
         //     if inline, the key, minus prefix
         //     if overflow, the blocklist (borrowed from child)
 
-        // each key is stored just as it was in the child, inline or overflow.
+        // the key is stored just as it was in the child, inline or overflow.
         // if it is overflowed, we just store the same blocklist reference.
 
-        // claim:  if both keys fit inlined in the child, they can both
+        // claim:  if the key fit inlined in the child, it will
         // fit inlined here in the parent page.
+
+        // TODO we probably need to do this differently.  a parent page
+        // the can only fit one item is not useful.  so the maximum size of
+        // an inline key in a parent page needs to be configured to ensure
+        // that at least two will fit.  so if we are adding the first key
+        // to this parent, we can only use about half the available space,
+        // because the next one might be the same size.  alternatively, we
+        // could say that the first one gets to use as much as it wants
+        // as long as it leaves enough for an overflow, and then, when
+        // calculating whether the second one will fit, we have to overflow
+        // it to make sure that the parent has two items.
 
         let fits = {
             let would_be_prefix_len = self.calc_prefix_len(&child);
@@ -4207,6 +4212,9 @@ impl ParentNodeWriter {
             // TODO how could this happen?
             //println!("emitting a parent page of depth {} with {} items", self.depth, self.st.items.len());
             assert!(self.st.items.len() > 0);
+            
+            // TODO assert that more than one item is in the parent
+
             let should_be = Self::calc_page_len(self.st.prefixLen, self.st.sofar);
             let (count_bytes, pg) = try!(self.write_parent_page(pw));
             // TODO try!(pg.verify(pw.page_size(), path, f.clone()));

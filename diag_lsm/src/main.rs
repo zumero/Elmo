@@ -430,6 +430,7 @@ fn add_random(name: &str, seed: usize, count_groups: usize, count_per_group: usi
             pending.insert(k, lsm::Blob::Boxed(v));
         }
         let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
+        //println!("wrote segment: {:?}", seg);
         if let Some(seg) = seg {
             let lck = try!(db.get_write_lock());
             try!(lck.commit_segment(seg).map_err(lsm::wrap_err));
