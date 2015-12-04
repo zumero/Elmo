@@ -3132,6 +3132,24 @@ fn process_pair_into_leaf(st: &mut LeafState,
     const LEAF_PAGE_OVERHEAD: usize = 2 + 2;
 
     let vloc = {
+        // TODO maybe the max value inline should be configured low enough to
+        // ensure that two keys with no prefix can fit in a parent page.  but
+        // this is tricky, as the extra child info stuff per item in a parent
+        // page can be hard to predict.
+
+        // alternatively, we could set the max value inline to ensure that
+        // enough room is left in a parent page to store an overflowed item,
+        // but that has some of the same issues, and it also introduces the
+        // possibility that a key might be inline in the leaf but overflowed
+        // in the parent.
+
+        // also, we could look at the previous key.  the only screw case is
+        // when we get 2 or more keys in a row which can't fit in a parent
+        // page, so we end up with one parent per leaf, which means the
+        // depth of the btree grows forever.  so we could look for this case
+        // specifically, and when we see two long keys in a row, overflow the
+        // second one.
+
         let maxValueInline = {
             // TODO use calc_leaf_page_len
             let fixed_costs_on_new_page =
@@ -4158,7 +4176,7 @@ impl ParentNodeWriter {
         // fit inlined here in the parent page.
 
         // TODO we probably need to do this differently.  a parent page
-        // the can only fit one item is not useful.  so the maximum size of
+        // that can only fit one item is not useful.  so the maximum size of
         // an inline key in a parent page needs to be configured to ensure
         // that at least two will fit.  so if we are adding the first key
         // to this parent, we can only use about half the available space,
@@ -4207,22 +4225,20 @@ impl ParentNodeWriter {
         };
 
         if !fits {
-            // if the assert below fires, that's bad.  it means we have a child item which
-            // is too big for a parent page even if it is the only thing on that page.
-            // TODO how could this happen?
-            //println!("emitting a parent page of depth {} with {} items", self.depth, self.st.items.len());
-            assert!(self.st.items.len() > 0);
+            // if it was not possible to put a second item into this page,
+            // then one of them should have been overflowed.
+            assert!(self.st.items.len() > 1);
             
-            // TODO assert that more than one item is in the parent
-
             let should_be = Self::calc_page_len(self.st.prefixLen, self.st.sofar);
             let (count_bytes, pg) = try!(self.write_parent_page(pw));
-            // TODO try!(pg.verify(pw.page_size(), path, f.clone()));
             self.count_emit += 1;
             assert!(should_be == count_bytes);
             try!(self.emit(pw, pg));
             assert!(self.st.items.is_empty());
         }
+
+        // TODO change this code to be more like the leaf version, only calc the
+        // prefix len once.
 
         // see if the prefix len actually did change
         let new_prefix_len = self.calc_prefix_len(&child);

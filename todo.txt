@@ -1,4 +1,6 @@
 
+should the default page size be 4K or 8K ?
+
 parent node writer gets in trouble, overflows its stack,
 when it has to deal with lots of pages that only hold one
 key.  problem is that if only one key fits in the leaf,
