@@ -1327,7 +1327,8 @@ impl SegmentHeaderInfo {
         }
     }
 
-    fn count_pages(&self) -> Result<PageCount> {
+    // note that the resulting count here does not include the root page
+    fn count_pages_for_list_segments(&self) -> Result<PageCount> {
         let pt = try!(PageType::from_u8(self.buf[0]));
         match pt {
             PageType::LEAF_NODE => {
@@ -2725,8 +2726,10 @@ mod PageFlag {
 
 #[derive(Debug, Clone)]
 enum ChildInfo {
+    // this block list does not include the child page itself
     Leaf(BlockList),
     Parent{
+        // this count does not include the child page itself
         count_pages: PageCount, 
         //count_items: usize, 
         //count_bytes: usize,
@@ -5210,7 +5213,7 @@ pub struct ParentPageItem {
 
     blocks: ChildInfo, // TODO misnamed
 
-    // blocks does NOT contain page
+    // the ChildInfo does NOT contain page, whether it is a block list or a page count
 
     last_key: KeyInPage,
 }
@@ -5483,12 +5486,6 @@ impl ParentPage {
         Ok(list)
     }
 
-    pub fn blocklist_clean(&self) -> Result<BlockList> {
-        let mut blocks = try!(self.blocklist_unsorted());
-        blocks.sort_and_consolidate();
-        Ok(blocks)
-    }
-
     pub fn count_items(&self) -> usize {
         self.children.len()
     }
@@ -5559,12 +5556,12 @@ impl ParentPage {
                         //count_bytes: count_bytes,
                     }
                 };
+            //println!("childinfo: {:?}", blocks);
 
             let last_key = try!(KeyInPage::read(pr, &mut cur, prefix_len));
 
             let pg = ParentPageItem {
                 page: page, 
-                //if cfg!(child_block_list) 
                 blocks: blocks,
                 last_key: last_key,
             };
@@ -5588,6 +5585,7 @@ impl ParentPage {
                     total_count_pages += count_pages;
                 },
             }
+            total_count_pages += 1;
         }
         Ok(total_count_pages)
     }
@@ -7283,7 +7281,7 @@ impl InnerPart {
         fn do_group(segments: &[SegmentHeaderInfo]) -> Result<Vec<(PageNum, PageCount)>> {
             let mut v = vec![];
             for seg in segments.iter() {
-                let count = try!(seg.count_pages());
+                let count = try!(seg.count_pages_for_list_segments());
                 v.push((seg.root_page, count));
             }
             Ok(v)
@@ -7405,8 +7403,13 @@ impl InnerPart {
                 assert!(pt == PageType::PARENT_NODE);
                 let depth = header.levels[i].buf[2];
                 // TODO this is a fairly expensive way to count the pages under a parent.
+                // it parses the parent page out of the buffer.
                 // store the count in SegmentHeaderInfo ?
-                let count_pages = try!(header.levels[i].count_pages());
+
+                // TODO is page count the right way to decide if a level is big enough
+                // to need a merge?  key count?  leaf count?
+
+                let count_pages = try!(ParentPage::count_pages(header.levels[i].root_page, &header.levels[i].buf));
                 let size = (count_pages as u64) * (inner.pgsz as u64);
                 if size < get_level_size(i) {
                     // this level doesn't need a merge because it is doesn't have enough data in it

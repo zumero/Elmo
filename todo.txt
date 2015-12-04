@@ -13,9 +13,6 @@ problem is mostly better, but perhaps not entirely.
 the 5M url test doesn't show it unless the consecutive
 nodes for recycle setting for depth 1 is at 1 instead of 2.
 
-saw cases where the page count in the parent page looks 
-wrong.  zero.
-
 status quo (one prefix for the whole page)
 prefix chain
 fsa
