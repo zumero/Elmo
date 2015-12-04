@@ -75,6 +75,25 @@ pub enum Blob {
     SameFileOverflow(u64, BlockList),
 }
 
+impl std::fmt::Debug for Blob {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            &Blob::Tombstone => {
+                write!(f, "Tombstone")
+            },
+            &Blob::Stream(_) => {
+                write!(f, "Stream")
+            },
+            &Blob::Boxed(ref a) => {
+                write!(f, "{:?}", a)
+            },
+            &Blob::SameFileOverflow(_, _) => {
+                write!(f, "SameFileOverflow")
+            },
+        }
+    }
+}
+
 impl Blob {
     fn is_tombstone(&self) -> bool {
         match self {
@@ -162,85 +181,6 @@ impl<T> From<std::sync::PoisonError<T>> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-// TODO maybe KeyRange should just go away, always use the KeyRef form?
-#[derive(Debug)]
-pub struct KeyRange {
-    // TODO consider enum to support case where min=max
-    min: Box<[u8]>,
-    max: Box<[u8]>,
-}
-
-impl KeyRange {
-    fn overlaps(&self, other: &KeyRange) -> Overlap {
-        match bcmp::Compare(&self.min, &other.max) {
-            Ordering::Greater => {
-                Overlap::Greater
-            },
-            Ordering::Equal => {
-                Overlap::Yes
-            },
-            Ordering::Less => {
-                match bcmp::Compare(&self.max, &other.min) {
-                    Ordering::Less => {
-                        Overlap::Less
-                    },
-                    Ordering::Greater | Ordering::Equal => {
-                        Overlap::Yes
-                    },
-                }
-            },
-        }
-    }
-
-}
-
-#[derive(Debug)]
-pub struct KeyRangeRef<'a> {
-    // TODO consider enum to support case where min=max
-    min: KeyRef<'a>,
-    max: KeyRef<'a>,
-}
-
-impl<'a> KeyRangeRef<'a> {
-    fn into_keyrange(self) -> KeyRange {
-        KeyRange {
-            min: self.min.into_boxed_slice(),
-            max: self.max.into_boxed_slice(),
-        }
-    }
-    
-    fn grow(self, cur: KeyRange) -> KeyRange {
-        let min = self.min.min_with(cur.min);
-        let max = self.max.max_with(cur.max);
-        let range = KeyRange {
-            min: min,
-            max: max,
-        };
-        range
-    }
-
-    fn overlaps(&self, other: &KeyRange) -> Overlap {
-        match self.min.compare_with(&other.max) {
-            Ordering::Greater => {
-                Overlap::Greater
-            },
-            Ordering::Equal => {
-                Overlap::Yes
-            },
-            Ordering::Less => {
-                match self.max.compare_with(&other.min) {
-                    Ordering::Less => {
-                        Overlap::Less
-                    },
-                    Ordering::Greater | Ordering::Equal => {
-                        Overlap::Yes
-                    },
-                }
-            },
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum BlockRequest {
     Any,
@@ -273,7 +213,7 @@ impl BlockRequest {
 
 // kvp is the struct used to provide key-value pairs downward,
 // for storage into the database.
-struct kvp {
+pub struct kvp {
     // TODO note that there is no provision here for SameFileOverflow from a merge
     Key: Box<[u8]>,
     Value: Blob,
@@ -283,7 +223,7 @@ struct kvp {
 pub struct BlockList {
     // TODO we could keep track of how this is sorted if
     // we put this in a module to make the blocks field private.
-    blocks: Vec<PageBlock>,
+    pub blocks: Vec<PageBlock>,
 }
 
 impl BlockList {
@@ -1040,8 +980,8 @@ impl<'a> std::fmt::Debug for LiveValueRef<'a> {
 
 #[derive(Hash,PartialEq,Eq,Copy,Clone,Debug)]
 pub struct PageBlock {
-    firstPage: PageNum,
-    lastPage: PageNum,
+    pub firstPage: PageNum,
+    pub lastPage: PageNum,
 }
 
 #[derive(Debug)]
@@ -1189,8 +1129,16 @@ impl CursorIterator {
         }
     }
 
-    fn eaten(self) -> Vec<(PageNum, BlockList)> {
-        self.csr.eaten()
+    fn count_keys_shadowed(&self) -> usize {
+        self.csr.count_keys_shadowed()
+    }
+
+    fn count_keys_yielded(&self) -> usize {
+        self.csr.count_keys_yielded()
+    }
+
+    fn overflows_eaten(self) -> Vec<(PageNum, BlockList)> {
+        self.csr.overflows_eaten()
     }
 
     fn peek(&mut self) -> Option<&Result<kvp>> {
@@ -1383,7 +1331,7 @@ impl SegmentHeaderInfo {
         let pt = try!(PageType::from_u8(self.buf[0]));
         match pt {
             PageType::LEAF_NODE => {
-                //println!("leaf: {}", self.root_page);
+                //println!("SegmentHeaderInfo, count_pages, leaf: {}", self.root_page);
                 // TODO
                 Ok(0)
             },
@@ -1439,6 +1387,37 @@ impl SegmentHeaderInfo {
                 },
             };
         Ok(blocks)
+    }
+
+    // TODO this is only used for diag purposes
+    fn count_keys(&self, 
+                          path: &str,
+                          f: std::rc::Rc<std::cell::RefCell<File>>,
+                          ) -> Result<usize> {
+        let done_page = move |_| -> () {
+        };
+        let buf = Lend::new(self.buf.clone(), box done_page);
+
+        let pt = try!(PageType::from_u8(self.buf[0]));
+        let count =
+            match pt {
+                PageType::LEAF_NODE => {
+                    let page = try!(LeafPage::new_already_read_page(path, f.clone(), self.root_page, buf));
+                    page.count_keys()
+                },
+                PageType::PARENT_NODE => {
+                    let parent = try!(ParentPage::new_already_read_page(path, f.clone(), self.root_page, buf));
+                    let mut cursor = try!(ParentCursor::new(parent));
+                    let mut count = 0;
+                    try!(cursor.First());
+                    while cursor.IsValid() {
+                        count += 1;
+                        try!(cursor.Next());
+                    }
+                    count
+                },
+            };
+        Ok(count)
     }
 
 }
@@ -1880,6 +1859,7 @@ impl IForwardCursor for MultiCursor {
     }
 
     fn Next(&mut self) -> Result<()> {
+        //println!("MC Next");
         match self.cur {
             None => {
                 Err(Error::CursorNotValid)
@@ -2106,11 +2086,20 @@ struct MergeCursor {
     cur: Option<usize>, 
 
     overflows_eaten: Vec<(PageNum, BlockList)>,
-
+    count_keys_yielded: usize,
+    count_keys_shadowed: usize,
 }
 
 impl MergeCursor {
-    fn eaten(self) -> Vec<(PageNum, BlockList)> {
+    fn count_keys_yielded(&self) -> usize {
+        self.count_keys_yielded
+    }
+
+    fn count_keys_shadowed(&self) -> usize {
+        self.count_keys_shadowed
+    }
+
+    fn overflows_eaten(self) -> Vec<(PageNum, BlockList)> {
         self.overflows_eaten
     }
 
@@ -2251,6 +2240,8 @@ impl MergeCursor {
             sorted: sorted.into_boxed_slice(), 
             cur: None, 
             overflows_eaten: vec![],
+            count_keys_shadowed: 0,
+            count_keys_yielded: 0,
         }
     }
 
@@ -2315,6 +2306,7 @@ impl IForwardCursor for MergeCursor {
                 Err(Error::CursorNotValid)
             },
             Some(icur) => {
+                self.count_keys_yielded += 1;
                 if self.subcursors.len() > 1 {
                     // we need to fix every cursor to point to its min
                     // value > icur.
@@ -2345,6 +2337,8 @@ impl IForwardCursor for MergeCursor {
                             },
                             Some(c) => {
                                 if c == Ordering::Equal {
+                                    //println!("MergeCursor shadowed: {:?}", k, );
+                                    self.count_keys_shadowed += 1;
                                     {
                                         let v = try!(self.subcursors[n].ValueRef());
                                         match v {
@@ -2446,6 +2440,7 @@ impl IForwardCursor for LivingCursor {
     }
 
     fn Next(&mut self) -> Result<()> {
+        //println!("LC Next");
         try!(self.chain.Next());
         try!(self.skipTombstonesForward());
         Ok(())
@@ -2599,7 +2594,7 @@ impl RangeCursor {
         self.chain.IsValid() 
             && {
                 let k = self.chain.KeyRef().unwrap();
-                //println!("bounds checking: {:?}", k);
+                //println!("RC bounds checking: {:?}", k);
                 self.min.is_in_bounds(&k) && self.max.is_in_bounds(&k)
             }
     }
@@ -2766,18 +2761,16 @@ pub struct pgitem {
     pub page: PageNum,
     info: ChildInfo,
 
-    first_key: KeyWithLocation,
-    last_key: Option<KeyWithLocation>,
+    last_key: KeyWithLocation,
 }
 
 impl pgitem {
     #[cfg(remove_me)]
-    fn new(page: PageNum, blocks: BlockList, first_key: KeyWithLocation, last_key: Option<KeyWithLocation>) -> pgitem {
+    fn new(page: PageNum, blocks: BlockList, last_key: KeyWithLocation) -> pgitem {
         assert!(!blocks.contains_page(page));
         pgitem {
             page: page,
             blocks: blocks,
-            first_key: first_key,
             last_key: last_key,
         }
     }
@@ -2786,107 +2779,9 @@ impl pgitem {
         let needed = 
             varint::space_needed_for(self.page as u64) 
             + self.info.need()
-            + self.first_key.need(prefix_len)
-            + 
-            match self.last_key {
-                Some(ref last_key) => {
-                    last_key.need(prefix_len)
-                },
-                None => {
-                    varint::space_needed_for(0)
-                },
-            };
+            + self.last_key.need(prefix_len)
+            ;
         needed
-    }
-
-    fn key_in_range(&self, k: &[u8]) -> Result<KeyInRange> {
-        match self.last_key {
-            Some(ref last_key) => {
-                match k.cmp(&last_key.key) {
-                    Ordering::Less => {
-                        match k.cmp(&self.first_key.key) {
-                            Ordering::Less => {
-                                Ok(KeyInRange::Less)
-                            },
-                            Ordering::Equal => {
-                                Ok(KeyInRange::EqualFirst)
-                            },
-                            Ordering::Greater => {
-                                Ok(KeyInRange::Within)
-                            },
-                        }
-                    },
-                    Ordering::Equal => {
-                        return Ok(KeyInRange::EqualLast);
-                    },
-                    Ordering::Greater => {
-                        return Ok(KeyInRange::Greater);
-                    },
-                }
-            },
-            None => {
-                match k.cmp(&self.first_key.key) {
-                    Ordering::Less => {
-                        Ok(KeyInRange::Less)
-                    },
-                    Ordering::Equal => {
-                        Ok(KeyInRange::EqualFirst)
-                    },
-                    Ordering::Greater => {
-                        Ok(KeyInRange::Greater)
-                    },
-                }
-            },
-        }
-    }
-
-    fn verify(&self,
-              pgsz: usize,
-              path: &str, 
-              f: std::rc::Rc<std::cell::RefCell<File>>,
-             ) -> Result<()> {
-
-        let buf = try!(read_and_alloc_page(&f, self.page, pgsz));
-        let done_page = move |_| -> () {
-        };
-        let buf = Lend::new(buf, box done_page);
-
-        let pt = try!(PageType::from_u8(buf[0]));
-        match pt {
-            PageType::LEAF_NODE => {
-                let page = try!(LeafPage::new_already_read_page(path, f.clone(), self.page, buf));
-                let range = try!(page.range()).into_keyrange();
-                assert!(Ordering::Equal == range.min.cmp(&self.first_key.key));
-                match self.last_key {
-                    Some(ref last_key) => {
-                        assert!(Ordering::Equal == range.max.cmp(&last_key.key));
-                    },
-                    None => {
-                        assert!(page.count_keys() == 1);
-                    },
-                }
-            },
-            PageType::PARENT_NODE => {
-                let parent = try!(ParentPage::new_already_read_page(path, f.clone(), self.page, buf));
-                let range = try!(parent.range()).into_keyrange();
-                assert!(Ordering::Equal == range.min.cmp(&self.first_key.key));
-                match self.last_key {
-                    Some(ref last_key) => {
-                        assert!(Ordering::Equal == range.max.cmp(&last_key.key));
-                    },
-                    None => {
-                        assert!(parent.count_items() == 1);
-                        assert!(parent.children[0].last_key.is_none());
-                        // TODO and assert the only child also has only one key
-                        let pg = try!(parent.child_pgitem(0));
-                        assert!(pg.last_key.is_none());
-                        try!(pg.verify(pgsz, path, f.clone()));
-                    },
-                }
-                try!(parent.verify_child_keys());
-            },
-        }
-        Ok(())
     }
 
 }
@@ -3062,7 +2957,7 @@ fn calc_leaf_page_len(prefix_len: usize, sofar: usize) -> usize {
     + sofar // sum of size of all the actual items
 }
 
-fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (KeyWithLocation, Option<KeyWithLocation>, BlockList, usize) {
+fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (KeyWithLocation, BlockList, usize) {
     pb.Reset();
     pb.PutByte(PageType::LEAF_NODE.to_u8());
     pb.PutByte(0u8); // flags
@@ -3113,44 +3008,28 @@ fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (KeyWithLocation, Opt
 
     let mut blocks = BlockList::new();
 
-    // deal with the first key separately
-    let first_key = {
+    // deal with all the keys except the last one
+    for lp in st.keys_in_this_leaf.drain(0 .. count_keys_in_this_leaf - 1) {
+        f(pb, st.prefixLen, &lp, &mut blocks);
+    }
+
+    // now the last key
+    assert!(st.keys_in_this_leaf.len() == 1);
+    let last_key = {
         let lp = st.keys_in_this_leaf.remove(0); 
-        assert!(st.keys_in_this_leaf.len() == count_keys_in_this_leaf - 1);
+        assert!(st.keys_in_this_leaf.is_empty());
         f(pb, st.prefixLen, &lp, &mut blocks);
         lp.key
     };
-
-    if st.keys_in_this_leaf.len() == 0 {
-        // there was only one key in this leaf.
-        blocks.sort_and_consolidate();
-        (first_key, None, blocks, pb.sofar())
-    } else {
-        if st.keys_in_this_leaf.len() > 1 {
-            // deal with all the remaining keys except the last one
-            for lp in st.keys_in_this_leaf.drain(0 .. count_keys_in_this_leaf - 2) {
-                f(pb, st.prefixLen, &lp, &mut blocks);
-            }
-        }
-        assert!(st.keys_in_this_leaf.len() == 1);
-
-        // now the last key
-        let last_key = {
-            let lp = st.keys_in_this_leaf.remove(0); 
-            assert!(st.keys_in_this_leaf.is_empty());
-            f(pb, st.prefixLen, &lp, &mut blocks);
-            lp.key
-        };
-        blocks.sort_and_consolidate();
-        (first_key, Some(last_key), blocks, pb.sofar())
-    }
+    blocks.sort_and_consolidate();
+    (last_key, blocks, pb.sofar())
 }
 
 fn write_leaf(st: &mut LeafState, 
                 pb: &mut PageBuilder, 
                 pw: &mut PageWriter,
                ) -> Result<(usize, pgitem)> {
-    let (first_key, last_key, blocks, len_page) = build_leaf(st, pb);
+    let (last_key, blocks, len_page) = build_leaf(st, pb);
     //println!("leaf blocklist: {:?}", blocks);
     //println!("leaf blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
     assert!(st.keys_in_this_leaf.is_empty());
@@ -3160,7 +3039,6 @@ fn write_leaf(st: &mut LeafState,
     let pg = pgitem {
         page: pb.last_page_written, 
         info: ChildInfo::Leaf(blocks),
-        first_key: first_key,
         last_key: last_key
     };
     st.sofarLeaf = 0;
@@ -3476,6 +3354,10 @@ struct WroteMerge {
     segment: Option<SegmentHeaderInfo>,
     nodes_rewritten: Vec<PageNum>,
     overflows_freed: Vec<BlockList>, // TODO in rewritten leaves
+    keys_promoted: usize,
+    keys_rewritten: usize,
+    keys_shadowed: usize,
+    tombstones_removed: usize,
 }
 
 struct WroteSurvivors {
@@ -3483,7 +3365,7 @@ struct WroteSurvivors {
     // level N to N+1 is not allowed to deplete N, because that
     // would mean that N did not need to be merged.
     segment: Option<SegmentHeaderInfo>,
-    nodes_rewritten: Vec<PageNum>,
+    nodes_rewritten: Vec<PageNum>, // TODO not needed?
 }
 
 fn merge_process_pair(
@@ -3495,7 +3377,7 @@ fn merge_process_pair(
     behind: &mut Vec<PageCursor>,
     chain: &mut ParentNodeWriter,
     dest_level: DestLevel,
-    ) -> Result<()>
+    ) -> Result<bool>
 {
     fn necessary_tombstone(k: &[u8], 
                     behind: &mut Vec<PageCursor>,
@@ -3549,9 +3431,10 @@ fn merge_process_pair(
         }
     }
 
-    Ok(())
+    Ok(keep)
 }
 
+// TODO return tuple too large
 fn merge_rewrite_leaf(
                     st: &mut LeafState,
                     pb: &mut PageBuilder,
@@ -3563,7 +3446,7 @@ fn merge_rewrite_leaf(
                     chain: &mut ParentNodeWriter,
                     overflows_freed: &mut Vec<BlockList>,
                     dest_level: DestLevel,
-                    ) -> Result<(usize, usize)> {
+                    ) -> Result<(usize, usize, usize, usize)> {
 
     #[derive(Debug)]
     enum Action {
@@ -3574,6 +3457,8 @@ fn merge_rewrite_leaf(
     let mut i = 0;
     let mut keys_promoted = 0;
     let mut keys_rewritten = 0;
+    let mut keys_shadowed = 0;
+    let mut tombstones_removed = 0;
 
     let len = leafreader.count_keys();
     while i < len {
@@ -3597,7 +3482,7 @@ fn merge_rewrite_leaf(
                             Action::Pairs
                         },
                         Ordering::Equal => {
-                            // whatever value is coming from the rewritten leaf, it is superceded
+                            // whatever value is coming from the rewritten leaf, it is shadowed
 // TODO if the key was overflowed, we need that too.
                             let pair = try!(leafreader.kvp_for_merge(i));
                             match &pair.Value {
@@ -3607,6 +3492,7 @@ fn merge_rewrite_leaf(
                                 _ => {
                                 },
                             }
+                            keys_shadowed += 1;
                             i += 1;
                             Action::Pairs
                         },
@@ -3623,8 +3509,11 @@ fn merge_rewrite_leaf(
         match action {
             Action::Pairs => {
                 let pair = try!(misc::inside_out(pairs.next())).unwrap();
-                try!(merge_process_pair(pair, st, pb, pw, vbuf, behind, chain, dest_level));
-                keys_promoted += 1;
+                if try!(merge_process_pair(pair, st, pb, pw, vbuf, behind, chain, dest_level)) {
+                    keys_promoted += 1;
+                } else {
+                    tombstones_removed += 1;
+                }
             },
             Action::LeafPair => {
                 let pair = try!(leafreader.kvp_for_merge(i));
@@ -3639,9 +3528,10 @@ fn merge_rewrite_leaf(
         }
     }
 
-    Ok((keys_promoted, keys_rewritten))
+    Ok((keys_promoted, keys_rewritten, keys_shadowed, tombstones_removed))
 }
 
+// TODO return tuple too large
 fn merge_rewrite_parent(
                     st: &mut LeafState,
                     pb: &mut PageBuilder,
@@ -3655,20 +3545,25 @@ fn merge_rewrite_parent(
                     overflows_freed: &mut Vec<BlockList>,
                     nodes_rewritten: &mut Vec<PageNum>,
                     dest_level: DestLevel,
-                    ) -> Result<(usize, usize, usize)> {
+                    ) -> Result<(usize, usize, usize, usize, usize)> {
 
     #[derive(Debug)]
     enum Action {
-        Pairs,
         RewriteNode,
         RecycleNodes(usize),
     }
 
     let mut keys_promoted = 0;
     let mut keys_rewritten = 0;
+    let mut keys_shadowed = 0;
+    let mut tombstones_removed = 0;
+
     let mut nodes_recycled = 0;
 
     let len = parent.count_items();
+// TODO doesn't i increment every time through the loop now?
+// since Action::Pairs is gone.
+// switch to for loop?
     let mut i = 0;
     while i < len {
         let action = 
@@ -3681,20 +3576,21 @@ fn merge_rewrite_parent(
                     Action::RecycleNodes(1)
                 },
                 Some(&Ok(ref peek_pair)) => {
-                    match try!(parent.key_in_child_range(i, &KeyRef::Slice(&peek_pair.Key))) {
-                        KeyInRange::Less => {
-                            Action::Pairs
+                    let k = &KeyRef::Slice(&peek_pair.Key);
+                    match try!(parent.cmp_with_child_last_key(i, k)) {
+                        Ordering::Less | Ordering::Equal => {
+                            Action::RewriteNode
                         },
-                        KeyInRange::Greater => {
+                        Ordering::Greater => {
                             // this node can be recycled.
                             // but we can decide to rewrite it anyway.
 
                             let consecutive_child_nodes_recycleable = {
-                                let mut j = i;
-                                let mut count = 0;
+                                let mut j = i + 1;
+                                let mut count = 1;
                                 while j < len {
-                                    match try!(parent.key_in_child_range(j, &KeyRef::Slice(&peek_pair.Key))) {
-                                        KeyInRange::Greater => {
+                                    match try!(parent.cmp_with_child_last_key(j, k)) {
+                                        Ordering::Greater => {
                                             count += 1;
                                         },
                                         _ => {
@@ -3705,7 +3601,6 @@ fn merge_rewrite_parent(
                                 }
                                 count
                             };
-                            let child_count_pages = parent.child_count_pages(i);
 
                             // TODO this should be a config setting
                             let min_recycle =
@@ -3720,22 +3615,11 @@ fn merge_rewrite_parent(
                                 Action::RewriteNode
                             }
                         },
-                        KeyInRange::EqualFirst | KeyInRange::EqualLast | KeyInRange::Within => {
-                            // TODO EqualLast could just ignore the node, since it won't matter.
-                            // but it *will* need to be checked for overflows that got shadowed.
-
-                            Action::RewriteNode
-                        },
                     }
                 },
             };
         //println!("dest,{:?},action,{:?}", dest_level, action);
         match action {
-            Action::Pairs => {
-                let pair = try!(misc::inside_out(pairs.next())).unwrap();
-                try!(merge_process_pair(pair, st, pb, pw, vbuf, behind, chain, dest_level));
-                keys_promoted += 1;
-            },
             Action::RecycleNodes(n) => {
                 //println!("recycling node of depth {}", parent.depth() - 1);
                 if let Some(pg) = try!(flush_leaf(st, pb, pw)) {
@@ -3754,22 +3638,33 @@ fn merge_rewrite_parent(
                 if parent.depth() == 1 {
                     let pg = try!(parent.child_pgitem(i));
                     try!(leaf.read_page(pg.page));
-                    let (sub_keys_promoted, sub_keys_rewritten) = try!(merge_rewrite_leaf(st, pb, pw, vbuf, pairs, leaf, behind, chain, overflows_freed, dest_level));
+                    let (sub_keys_promoted, sub_keys_rewritten, sub_keys_shadowed, sub_tombstones_removed) = try!(merge_rewrite_leaf(st, pb, pw, vbuf, pairs, leaf, behind, chain, overflows_freed, dest_level));
+
+                    // in the case where we rewrote a page that didn't really NEED to be,
+                    // the following assert is not true
+                    //assert!(sub_keys_promoted > 0 || sub_tombstones_removed > 0);
+
+                    assert!(sub_keys_rewritten > 0 || sub_keys_shadowed > 0);
+
                     keys_promoted += sub_keys_promoted;
                     keys_rewritten += sub_keys_rewritten;
+                    keys_shadowed += sub_keys_shadowed;
+                    tombstones_removed += sub_tombstones_removed;
                 } else {
                     let sub = try!(parent.fetch_item_parent(i));
-                    let (sub_keys_promoted, sub_keys_rewritten, sub_nodes_recycled) = try!(merge_rewrite_parent(st, pb, pw, vbuf, pairs, leaf, &sub, behind, chain, overflows_freed, nodes_rewritten, dest_level));
+                    let (sub_keys_promoted, sub_keys_rewritten, sub_keys_shadowed, sub_tombstones_removed, sub_nodes_recycled) = try!(merge_rewrite_parent(st, pb, pw, vbuf, pairs, leaf, &sub, behind, chain, overflows_freed, nodes_rewritten, dest_level));
                     keys_promoted += sub_keys_promoted;
                     keys_rewritten += sub_keys_rewritten;
+                    keys_shadowed += sub_keys_shadowed;
                     nodes_recycled += sub_nodes_recycled;
+                    tombstones_removed += sub_tombstones_removed;
                 }
                 i += 1;
             },
         }
     }
 
-    Ok((keys_promoted, keys_rewritten, nodes_recycled))
+    Ok((keys_promoted, keys_rewritten, keys_shadowed, tombstones_removed, nodes_recycled))
 }
 
 fn write_merge(
@@ -3803,6 +3698,8 @@ fn write_merge(
     let mut overflows_freed = vec![];
     let mut keys_promoted = 0;
     let mut keys_rewritten = 0;
+    let mut keys_shadowed = 0;
+    let mut tombstones_removed = 0;
     let mut nodes_recycled = 0;
 
     match *into {
@@ -3810,9 +3707,11 @@ fn write_merge(
             // nothing to do here
         },
         MergingInto::Leaf(ref leaf) => {
-            let (sub_keys_promoted, sub_keys_rewritten) = try!(merge_rewrite_leaf(&mut st, &mut pb, pw, &mut vbuf, pairs, leaf, behind, &mut chain, &mut overflows_freed, dest_level));
+            let (sub_keys_promoted, sub_keys_rewritten, sub_keys_shadowed, sub_tombstones_removed) = try!(merge_rewrite_leaf(&mut st, &mut pb, pw, &mut vbuf, pairs, leaf, behind, &mut chain, &mut overflows_freed, dest_level));
             keys_promoted = sub_keys_promoted;
             keys_rewritten = sub_keys_rewritten;
+            keys_shadowed = sub_keys_shadowed;
+            tombstones_removed = sub_tombstones_removed;
             nodes_rewritten.push(leaf.pagenum);
         },
         MergingInto::Parent(ref parent) => {
@@ -3836,9 +3735,11 @@ fn write_merge(
                 let nd = try!(r);
                 if nd.depth == rewrite_level {
                     try!(sub.read_page(nd.page));
-                    let (sub_keys_promoted, sub_keys_rewritten, sub_nodes_recycled) = try!(merge_rewrite_parent(&mut st, &mut pb, pw, &mut vbuf, pairs, &mut leaf, &sub, behind, &mut chain, &mut overflows_freed, &mut nodes_rewritten, dest_level));
+                    let (sub_keys_promoted, sub_keys_rewritten, sub_keys_shadowed, sub_tombstones_removed, sub_nodes_recycled) = try!(merge_rewrite_parent(&mut st, &mut pb, pw, &mut vbuf, pairs, &mut leaf, &sub, behind, &mut chain, &mut overflows_freed, &mut nodes_rewritten, dest_level));
                     keys_promoted += sub_keys_promoted;
                     keys_rewritten += sub_keys_rewritten;
+                    keys_shadowed += sub_keys_shadowed;
+                    tombstones_removed += sub_tombstones_removed;
                     nodes_recycled += sub_nodes_recycled;
                 }
                 nodes_rewritten.push(nd.page);
@@ -3849,8 +3750,11 @@ fn write_merge(
     // any pairs left need to get processed
     for pair in pairs {
         let pair = try!(pair);
-        try!(merge_process_pair(pair, &mut st, &mut pb, pw, &mut vbuf, behind, &mut chain, dest_level));
-        keys_promoted += 1;
+        if try!(merge_process_pair(pair, &mut st, &mut pb, pw, &mut vbuf, behind, &mut chain, dest_level)) {
+            keys_promoted += 1;
+        } else {
+            tombstones_removed += 1;
+        }
     }
 
     if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
@@ -3906,6 +3810,10 @@ fn write_merge(
         segment: seg,
         nodes_rewritten: nodes_rewritten,
         overflows_freed: overflows_freed,
+        keys_promoted: keys_promoted,
+        keys_rewritten: keys_rewritten,
+        keys_shadowed: keys_shadowed,
+        tombstones_removed: tombstones_removed,
     };
     Ok(wrote)
 }
@@ -3940,9 +3848,8 @@ fn survivors_rewrite_immediate_parent_of_skip(
 
 fn survivors_rewrite_ancestor(
                     pw: &mut PageWriter,
-                    skip_pagenum: PageNum,
+                    skip: &HashMap<u8, PageNum>,
                     skip_depth: u8,
-                    skip_range: &KeyRange,
                     parent: &ParentPage,
                     chain: &mut ParentNodeWriter,
                     nodes_rewritten: &mut Vec<PageNum>,
@@ -3953,19 +3860,18 @@ fn survivors_rewrite_ancestor(
     let mut nodes_recycled = 0;
 
     let len = parent.count_items();
+    let this_skip = skip[&(parent.depth() - 1)];
     for i in 0 .. len {
-        match try!(parent.child_overlaps(i, skip_range)) {
-            Overlap::Less | Overlap::Greater => {
-                let pg = try!(parent.child_pgitem(i));
-                try!(chain.add_child(pw, pg, parent.depth() - 1));
-                nodes_recycled += 1;
-            },
-            Overlap::Yes => {
-                nodes_rewritten.push(parent.child_pagenum(i));
-                let sub = try!(parent.fetch_item_parent(i));
-                let sub_nodes_recycled = try!(survivors_rewrite_node(pw, skip_pagenum, skip_depth, skip_range, &sub, chain, nodes_rewritten));
-                nodes_recycled += sub_nodes_recycled;
-            },
+        let this_pagenum = parent.child_pagenum(i);
+        if this_pagenum == this_skip {
+            nodes_rewritten.push(this_pagenum);
+            let sub = try!(parent.fetch_item_parent(i));
+            let sub_nodes_recycled = try!(survivors_rewrite_node(pw, skip, skip_depth, &sub, chain, nodes_rewritten));
+            nodes_recycled += sub_nodes_recycled;
+        } else {
+            let pg = try!(parent.child_pgitem(i));
+            try!(chain.add_child(pw, pg, parent.depth() - 1));
+            nodes_recycled += 1;
         }
     }
 
@@ -3974,17 +3880,16 @@ fn survivors_rewrite_ancestor(
 
 fn survivors_rewrite_node(
                     pw: &mut PageWriter,
-                    skip_pagenum: PageNum,
+                    skip: &HashMap<u8, PageNum>,
                     skip_depth: u8,
-                    skip_range: &KeyRange,
                     parent: &ParentPage,
                     chain: &mut ParentNodeWriter,
                     nodes_rewritten: &mut Vec<PageNum>,
                     ) -> Result<usize> {
     if parent.depth() - 1 == skip_depth {
-        survivors_rewrite_immediate_parent_of_skip(pw, skip_pagenum, skip_depth, parent, chain)
+        survivors_rewrite_immediate_parent_of_skip(pw, skip[&skip_depth], skip_depth, parent, chain)
     } else if parent.depth() - 1 > skip_depth {
-        survivors_rewrite_ancestor(pw, skip_pagenum, skip_depth, skip_range, parent, chain, nodes_rewritten, )
+        survivors_rewrite_ancestor(pw, skip, skip_depth, parent, chain, nodes_rewritten, )
     } else {
         panic!();
     }
@@ -3992,7 +3897,7 @@ fn survivors_rewrite_node(
 
 fn write_survivors(
                 pw: &mut PageWriter,
-                skip_pagenum: PageNum,
+                skip: &HashMap<u8, PageNum>,
                 parent: &ParentPage,
                 path: &str,
                 f: std::rc::Rc<std::cell::RefCell<File>>,
@@ -4001,31 +3906,11 @@ fn write_survivors(
 
     let t1 = time::PreciseTime::now();
 
-// TODO depth and range should probably have been figured out by the caller
-    let (skip_depth, skip_range) = {
-        let buf = try!(read_and_alloc_page(&f, skip_pagenum, pw.page_size()));
-        let done_page = move |_| -> () {
-        };
-        let buf = Lend::new(buf, box done_page);
-
-        let pt = try!(PageType::from_u8(buf[0]));
-            match pt {
-                PageType::LEAF_NODE => {
-                    let page = try!(LeafPage::new_already_read_page(path, f.clone(), skip_pagenum, buf));
-                    (0, try!(page.range()).into_keyrange())
-                },
-                PageType::PARENT_NODE => {
-                    let depth = buf[2];
-                    let page = try!(ParentPage::new_already_read_page(path, f.clone(), skip_pagenum, buf));
-                    (depth, try!(page.range()).into_keyrange())
-                },
-            }
-    };
-
     let mut chain = ParentNodeWriter::new(pw.page_size(), 1);
     let mut nodes_rewritten = vec![];
 
-    let nodes_recycled = try!(survivors_rewrite_node(pw, skip_pagenum, skip_depth, &skip_range, parent, &mut chain, &mut nodes_rewritten, ));
+    let skip_depth = skip.keys().map(|k| *k).min().unwrap();
+    let nodes_recycled = try!(survivors_rewrite_node(pw, skip, skip_depth, parent, &mut chain, &mut nodes_rewritten, ));
     nodes_rewritten.push(parent.pagenum);
 
     let (count_parent_nodes, seg) = try!(chain.done(pw));
@@ -4142,22 +4027,12 @@ impl ParentNodeWriter {
             },
         }
 
-        self.pb.PutVarint(item.first_key.len_with_overflow_flag());
-        self.put_key(&item.first_key, prefix_len);
-
-        match item.last_key {
-            Some(ref last_key) => {
-                self.pb.PutVarint(last_key.len_with_overflow_flag());
-                self.put_key(&last_key, prefix_len);
-            },
-            None => {
-                self.pb.PutVarint(0);
-            },
-        }
+        self.pb.PutVarint(item.last_key.len_with_overflow_flag());
+        self.put_key(&item.last_key, prefix_len);
     }
 
     fn build_parent_page(&mut self,
-                      ) -> (KeyWithLocation, Option<KeyWithLocation>, PageCount, usize, usize) {
+                      ) -> (KeyWithLocation, PageCount, usize, usize) {
         // TODO? assert!(st.items.len() > 1);
         //println!("build_parent_page, prefixLen: {:?}", st.prefixLen);
         //println!("build_parent_page, items: {:?}", st.items);
@@ -4167,7 +4042,7 @@ impl ParentNodeWriter {
         self.pb.PutByte(self.my_depth);
         self.pb.PutVarint(self.st.prefixLen as u64);
         if self.st.prefixLen > 0 {
-            self.pb.PutArray(&self.st.items[0].first_key.key[0 .. self.st.prefixLen]);
+            self.pb.PutArray(&self.st.items[0].last_key.key[0 .. self.st.prefixLen]);
         }
         let count_items = self.st.items.len();
         self.pb.PutInt16(count_items as u16);
@@ -4175,51 +4050,33 @@ impl ParentNodeWriter {
 
         let mut count_pages = 0;
 
-        // deal with the first item separately
-        let (first_key, last_key_from_first_item) = {
+        // deal with all the items except the last one
+        let tmp_count = self.st.items.len() - 1;
+        let tmp_vec = self.st.items.drain(0 .. tmp_count).collect::<Vec<_>>();
+        let prefix_len = self.st.prefixLen;
+        for item in tmp_vec {
+            self.put_item(&mut count_pages, &item, prefix_len);
+        }
+
+        assert!(self.st.items.len() == 1);
+
+        // now the last item
+        let last_key = {
             let item = self.st.items.remove(0); 
             let prefix_len = self.st.prefixLen;
             self.put_item(&mut count_pages, &item, prefix_len);
-            (item.first_key, item.last_key)
+            item.last_key
         };
+        assert!(self.st.items.is_empty());
 
-        if self.st.items.len() == 0 {
-            // there was only one item in this page
-            assert!(count_items == 1);
-            (first_key, last_key_from_first_item, count_pages, count_items, self.pb.sofar())
-        } else {
-            if self.st.items.len() > 1 {
-                // deal with all the remaining items except the last one
-                let tmp_count = self.st.items.len() - 1;
-                let tmp_vec = self.st.items.drain(0 .. tmp_count).collect::<Vec<_>>();
-                let prefix_len = self.st.prefixLen;
-                for item in tmp_vec {
-                    self.put_item(&mut count_pages, &item, prefix_len);
-                }
-            }
-            assert!(self.st.items.len() == 1);
-
-            // now the last item
-            let last_key = {
-                let item = self.st.items.remove(0); 
-                let prefix_len = self.st.prefixLen;
-                self.put_item(&mut count_pages, &item, prefix_len);
-                match item.last_key {
-                    Some(last_key) => last_key,
-                    None => item.first_key,
-                }
-            };
-            assert!(self.st.items.is_empty());
-
-            (first_key, Some(last_key), count_pages, count_items, self.pb.sofar())
-        }
+        (last_key, count_pages, count_items, self.pb.sofar())
     }
 
     fn write_parent_page(&mut self,
                           pw: &mut PageWriter,
                          ) -> Result<(usize, pgitem)> {
         // assert st.sofar > 0
-        let (first_key, last_key, count_pages, count_items, count_bytes) = self.build_parent_page();
+        let (last_key, count_pages, count_items, count_bytes) = self.build_parent_page();
         assert!(self.st.items.is_empty());
         //println!("parent blocklist: {:?}", blocks);
         //println!("parent blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
@@ -4232,7 +4089,6 @@ impl ParentNodeWriter {
                 //count_items: count_items, 
                 //count_bytes: count_bytes,
             },
-            first_key: first_key,
             last_key: last_key,
         };
         self.st.sofar = 0;
@@ -4242,44 +4098,20 @@ impl ParentNodeWriter {
 
     fn calc_prefix_len(&self, item: &pgitem) -> usize {
         if self.st.items.is_empty() {
-            match item.last_key {
-                Some(ref last_key) => {
-                    bcmp::PrefixMatch(&*item.first_key.key, &last_key.key, last_key.key.len())
-                },
-                None => {
-                    item.first_key.key.len()
-                },
-            }
+            item.last_key.key.len()
         } else {
             if self.st.prefixLen > 0 {
                 let a =
-                    match &item.first_key.location {
+                    match &item.last_key.location {
                         &KeyLocation::Inline => {
-                            bcmp::PrefixMatch(&*self.st.items[0].first_key.key, &item.first_key.key, self.st.prefixLen)
+                            bcmp::PrefixMatch(&*self.st.items[0].last_key.key, &item.last_key.key, self.st.prefixLen)
                         },
                         &KeyLocation::Overflowed(_) => {
                             // an overflowed key does not change the prefix
                             self.st.prefixLen
                         },
                     };
-                let b = 
-                    match item.last_key {
-                        Some(ref last_key) => {
-                            match &last_key.location {
-                                &KeyLocation::Inline => {
-                                    bcmp::PrefixMatch(&*self.st.items[0].first_key.key, &last_key.key, a)
-                                },
-                                &KeyLocation::Overflowed(_) => {
-                                    // an overflowed key does not change the prefix
-                                    a
-                                },
-                            }
-                        },
-                        None => {
-                            a
-                        },
-                    };
-                b
+                a
             } else {
                 0
             }
@@ -4297,24 +4129,11 @@ impl ParentNodeWriter {
                 None => {
                 },
                 Some(ref prev_child) => {
-                    let c = child.first_key.key.cmp(&prev_child.first_key.key);
+                    let c = child.last_key.key.cmp(&prev_child.last_key.key);
                     if c != Ordering::Greater {
-                        println!("prev_child first_key: {:?}", prev_child.first_key);
-                        println!("cur child first_key: {:?}", child.first_key);
+                        println!("prev_child last_key: {:?}", prev_child.last_key);
+                        println!("cur child last_key: {:?}", child.last_key);
                         panic!("unsorted child pages");
-                    }
-                    match &prev_child.last_key {
-                        &Some(ref last_key) => {
-                            let c = child.first_key.key.cmp(&last_key.key);
-                            if c != Ordering::Greater {
-                                println!("prev_child first_key: {:?}", prev_child.first_key);
-                                println!("prev_child last_key: {:?}", last_key);
-                                println!("cur child first_key: {:?}", child.first_key);
-                                panic!("overlapping child pages");
-                            }
-                        },
-                        &None => {
-                        },
                     }
                 },
             }
@@ -4562,7 +4381,7 @@ fn create_segment<I>(mut pw: PageWriter,
     Ok(seg)
 }
 
-struct OverflowReader {
+pub struct OverflowReader {
     fs: File,
     len: u64,
     firstPage: PageNum, // TODO this will be needed later for Seek trait
@@ -4575,7 +4394,7 @@ struct OverflowReader {
 }
     
 impl OverflowReader {
-    fn new(path: &str, pgsz: usize, firstPage: PageNum, len: u64) -> Result<OverflowReader> {
+    pub fn new(path: &str, pgsz: usize, firstPage: PageNum, len: u64) -> Result<OverflowReader> {
         // TODO I wonder if maybe we should defer the opening of the file until
         // somebody actually tries to read from it?  so that constructing a
         // ValueRef object (which contains one of these) would be a lighter-weight
@@ -4774,56 +4593,6 @@ impl LeafPage {
         BlockList::new()
     }
 
-    fn overlaps(&self, range: &KeyRange) -> Result<Overlap> {
-        // TODO get a KeyRangeRef first?
-        match try!(self.key(0)).compare_with(&range.max) {
-            Ordering::Greater => {
-                Ok(Overlap::Greater)
-            },
-            Ordering::Less | Ordering::Equal => {
-                let last_pair = self.pairs.len() - 1;
-                match try!(self.key(last_pair)).compare_with(&range.min) {
-                    Ordering::Less => {
-                        Ok(Overlap::Less)
-                    },
-                    Ordering::Greater | Ordering::Equal => {
-                        Ok(Overlap::Yes)
-                    },
-                }
-            },
-        }
-    }
-
-    fn first_key_with_location(&self) -> Result<KeyWithLocation> {
-        self.key_with_location(0)
-    }
-
-    fn last_key_with_location(&self) -> Result<Option<KeyWithLocation>> {
-        if self.pairs.len() == 1 {
-            Ok(None)
-        } else {
-            let i = self.pairs.len() - 1;
-            let kw = try!(self.key_with_location(i));
-            Ok(Some(kw))
-        }
-    }
-
-    fn pgitem(&self) -> Result<pgitem> {
-        let mut blocks = self.blocklist_unsorted();
-        blocks.sort_and_consolidate();
-        assert!(!blocks.contains_page(self.pagenum));
-        let first_key = try!(self.first_key_with_location());
-        let last_key = try!(self.last_key_with_location());
-        // TODO pgitem::new
-        let pg = pgitem {
-            page: self.pagenum,
-            info: ChildInfo::Leaf(blocks),
-            first_key: first_key,
-            last_key: last_key,
-        };
-        Ok(pg)
-    }
-
     fn parse_page(pgnum: PageNum, pr: &[u8], pairs: &mut Vec<PairInLeaf>) -> Result<(Option<Box<[u8]>>, usize)> {
         let mut prefix = None;
 
@@ -4909,41 +4678,6 @@ impl LeafPage {
             };
         let k = try!(self.pairs[n].key.keyref(&self.pr, prefix, &self.path));
         Ok(k)
-    }
-
-    fn key_with_location(&self, n: usize) -> Result<KeyWithLocation> { 
-        let prefix: Option<&[u8]> = 
-            match self.prefix {
-                Some(ref b) => Some(b),
-                None => None,
-            };
-        let k = try!(self.pairs[n].key.key_with_location(&self.pr, prefix, &self.path));
-        Ok(k)
-    }
-
-    fn range(&self) -> Result<KeyRangeRef> {
-        let min = try!(self.key(0));
-        let max = {
-            let i = self.pairs.len() - 1;
-            try!(self.key(i))
-        };
-        let range = KeyRangeRef {
-            min: min,
-            max: max,
-        };
-        Ok(range)
-    }
-
-    fn grow_range(&self, cur: Option<KeyRange>) -> Result<KeyRange> {
-        let range = try!(self.range());
-        match cur {
-            None => {
-                Ok(range.into_keyrange())
-            },
-            Some(cur) => {
-                Ok(range.grow(cur))
-            },
-        }
     }
 
     fn kvp_for_merge(&self, n: usize) -> Result<kvp> {
@@ -5035,14 +4769,18 @@ impl LeafCursor {
     }
 
     fn seek(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
+        //println!("leaf cursor page: {}  search: kq = {:?},  sop = {:?}", self.page.pagenum, k, sop);
         let tmp_countLeafKeys = self.page.count_keys();
         let (newCur, equal) = try!(self.page.search(k, 0, (tmp_countLeafKeys - 1), sop, None, None));
         self.cur = newCur;
         if self.cur.is_none() {
+            //println!("    Invalid");
             Ok(SeekResult::Invalid)
         } else if equal {
+            //println!("    Equal");
             Ok(SeekResult::Equal)
         } else {
+            //println!("    Unequal");
             Ok(SeekResult::Unequal)
         }
     }
@@ -5181,10 +4919,6 @@ impl PageCursor {
                 },
                 PageType::PARENT_NODE => {
                     let page = try!(ParentPage::new_already_read_page(path, f, pagenum, buf));
-                    if cfg!(expensive_check) 
-                    {
-                        try!(page.verify_child_keys());
-                    }
                     let sub = try!(ParentCursor::new(page));
                     PageCursor::Parent(sub)
                 },
@@ -5344,18 +5078,9 @@ pub enum KeyInPage {
 impl KeyInPage {
     #[inline]
     fn read(pr: &[u8], cur: &mut usize, prefix_len: usize) -> Result<Self> {
-        let k = try!(Self::read_optional(pr, cur, prefix_len));
-        match k {
-            Some(k) => Ok(k),
-            None => Err(Error::CorruptFile("key cannot be zero length")),
-        }
-    }
-
-    #[inline]
-    fn read_optional(pr: &[u8], cur: &mut usize, prefix_len: usize) -> Result<Option<Self>> {
         let klen = varint::read(pr, cur) as usize;
         if klen == 0 {
-            return Ok(None);
+            return Err(Error::CorruptFile("key cannot be zero length"));
         }
         let inline = 0 == klen % 2;
         let klen = klen / 2;
@@ -5369,7 +5094,7 @@ impl KeyInPage {
                 let k = KeyInPage::Overflowed(klen, blocks);
                 k
             };
-        Ok(Some(k))
+        Ok(k)
     }
 
     #[inline]
@@ -5483,21 +5208,11 @@ struct PairInLeaf {
 pub struct ParentPageItem {
     page: PageNum,
 
-    blocks: ChildInfo,
+    blocks: ChildInfo, // TODO misnamed
 
     // blocks does NOT contain page
 
-    first_key: KeyInPage,
-    last_key: Option<KeyInPage>,
-}
-
-#[derive(Debug)]
-enum KeyInRange {
-    Less,
-    Greater,
-    EqualFirst,
-    EqualLast,
-    Within,
+    last_key: KeyInPage,
 }
 
 impl ParentPageItem {
@@ -5505,71 +5220,10 @@ impl ParentPageItem {
         self.page
     }
 
-    pub fn first_key(&self) -> &KeyInPage {
-        &self.first_key
-    }
-
-    pub fn last_key(&self) -> &Option<KeyInPage> {
+    pub fn last_key(&self) -> &KeyInPage {
         &self.last_key
     }
 
-}
-
-struct DepthIterator {
-    stack: Vec<(ParentPage, usize)>,
-    depth: u8,
-}
-
-impl DepthIterator {
-    fn new(top: ParentPage, depth: u8) -> Self {
-        assert!(top.depth() > depth);
-        DepthIterator {
-            stack: vec![(top, 0)],
-            depth: depth,
-        }
-    }
-
-    fn get_next(&mut self) -> Result<Option<pgitem>> {
-        loop {
-            match self.stack.pop() {
-                None => {
-                    return Ok(None);
-                },
-                Some((parent, cur)) => {
-                    if parent.depth() == self.depth + 1 {
-                        let pg = try!(parent.child_pgitem(cur));
-                        if cur + 1 < parent.count_items() {
-                            self.stack.push((parent, cur + 1));
-                        }
-                        return Ok(Some(pg));
-                    } else {
-                        let child = try!(parent.fetch_item_parent(cur));
-                        if cur + 1 < parent.count_items() {
-                            self.stack.push((parent, cur + 1));
-                        }
-                        self.stack.push((child, 0));
-                    }
-                },
-            }
-        }
-    }
-}
-
-impl Iterator for DepthIterator {
-    type Item = Result<pgitem>;
-    fn next(&mut self) -> Option<Result<pgitem>> {
-        match self.get_next() {
-            Ok(None) => {
-                None
-            },
-            Ok(Some(pg)) => {
-                Some(Ok(pg))
-            },
-            Err(e) => {
-                Some(Err(e))
-            },
-        }
-    }
 }
 
 pub struct Node {
@@ -5688,11 +5342,6 @@ impl ParentPage {
             bytes_used_on_page: bytes_used_on_page,
         };
 
-        if cfg!(expensive_check) 
-        {
-            try!(res.verify_child_keys());
-        }
-
         Ok(res)
     }
 
@@ -5724,23 +5373,6 @@ impl ParentPage {
 
     pub fn len_on_page(&self) -> usize {
         self.bytes_used_on_page
-    }
-
-    #[cfg(remove_me)]
-    fn pgitem(&self) -> Result<pgitem> {
-        let mut blocks = try!(self.blocklist_unsorted());
-        blocks.sort_and_consolidate();
-        let first_key = try!(self.first_key_with_location());
-        let last_key = try!(self.last_key_with_location());
-        // TODO pgitem::new
-        let pg = pgitem {
-            page: self.pagenum,
-            blocks: blocks,
-            first_key: first_key,
-            last_key: last_key,
-        };
-        assert!(!pg.blocks.contains_page(pg.page));
-        Ok(pg)
     }
 
     fn child_blocklist(&self, i: usize) -> Result<BlockList> {
@@ -5783,97 +5415,20 @@ impl ParentPage {
         }
     }
 
-    fn child_count_pages(&self, i: usize) -> PageCount {
-        match self.children[i].blocks {
-            ChildInfo::Leaf(ref blocks) => {
-                blocks.count_pages()
-            },
-            ChildInfo::Parent{count_pages, ..} => {
-                assert!(self.depth() > 1);
-                count_pages
-            },
-        }
+    pub fn child_key<'a>(&'a self, i: usize) -> Result<KeyRef<'a>> {
+        let last_key = try!(self.key(&self.children[i].last_key));
+        Ok(last_key)
     }
 
     fn child_pgitem(&self, i: usize) -> Result<pgitem> {
-        let first_key = try!(self.key_with_location(&self.children[i].first_key));
-        let last_key = {
-            match &self.children[i].last_key {
-                &Some(ref last_key) => {
-                    let kw = try!(self.key_with_location(last_key));
-                    Some(kw)
-                },
-                &None => {
-                    None
-                },
-            }
-        };
+        let last_key = try!(self.key_with_location(&self.children[i].last_key));
         // TODO pgitem::new
         let pg = pgitem {
             page: self.children[i].page,
             info: self.children[i].blocks.clone(),
-            first_key: first_key,
             last_key: last_key,
         };
         Ok(pg)
-    }
-
-// TODO dislike
-    fn first_key<'a>(&'a self) -> Result<KeyRef<'a>> {
-        self.key(&self.children[0].first_key)
-    }
-
-// TODO dislike
-    fn last_key<'a>(&'a self) -> Result<KeyRef<'a>> {
-        let i = self.children.len() - 1;
-        let last_key =
-            match &self.children[i].last_key {
-                &Some(ref last_key) => {
-                    last_key
-                },
-                &None => {
-                    &self.children[i].first_key
-                },
-            };
-        self.key(last_key)
-    }
-
-    fn overlaps(&self, first_key: &[u8], last_key: &[u8]) -> Result<Overlap> {
-        match try!(self.first_key()).compare_with(last_key) {
-            Ordering::Greater => {
-                Ok(Overlap::Greater)
-            },
-            Ordering::Less | Ordering::Equal => {
-                match try!(self.last_key()).compare_with(first_key) {
-                    Ordering::Less => {
-                        Ok(Overlap::Less)
-                    },
-                    Ordering::Greater | Ordering::Equal => {
-                        Ok(Overlap::Yes)
-                    },
-                }
-            },
-        }
-    }
-
-    fn siblings_for(&self, skip: Option<(usize, usize)>) -> Result<Vec<pgitem>> {
-        let mut v = Vec::with_capacity(self.children.len());
-        for i in 0 .. self.children.len() {
-            let include =
-                match skip {
-                    Some((first, last)) => {
-                        i < first || i > last
-                    },
-                    None => {
-                        true
-                    },
-                };
-            if include {
-                let pg = try!(self.child_pgitem(i));
-                v.push(pg);
-            }
-        }
-        Ok(v)
     }
 
     pub fn depth(&self) -> u8 {
@@ -5938,71 +5493,6 @@ impl ParentPage {
         self.children.len()
     }
 
-    pub fn verify_child_keys(&self) -> Result<()> {
-        for i in 0 .. self.children.len() {
-            // for each child, make sure the last key > first key
-            match &self.children[i].last_key {
-                &Some(ref last_key) => {
-                    let first_key = try!(self.key(&self.children[i].first_key));
-                    let last_key = try!(self.key(last_key));
-                    let c = KeyRef::cmp(&last_key, &first_key);
-                    assert!(c == Ordering::Greater);
-                },
-                &None => {
-                },
-            };
-
-            // for each child, make sure it provides the same first and
-            // last key as the ones we've got.
-
-            let buf = try!(read_and_alloc_page(&self.f, self.children[i].page, self.pr.len()));
-            let done_page = move |_| -> () {
-            };
-            let buf = Lend::new(buf, box done_page);
-
-            let mut sub = try!(PageCursor::new_already_read_page(&self.path, self.f.clone(), self.children[i].page, buf));
-            try!(sub.First());
-            assert!(sub.IsValid());
-            {
-                let k = try!(sub.KeyRef());
-                let first_key = try!(self.key(&self.children[i].first_key));
-                let c = KeyRef::cmp(&k, &first_key);
-                if c != Ordering::Equal {
-                    println!("mismatch on first key:");
-                    println!("parent page {}  child page {}", self.pagenum, self.children[i].page);
-                    panic!();
-                }
-                assert!(c == Ordering::Equal);
-            }
-            try!(sub.Last());
-            assert!(sub.IsValid());
-            let last_key =
-                match &self.children[i].last_key {
-                    &Some(ref last_key) => {
-                        last_key
-                    },
-                    &None => {
-                        &self.children[i].first_key
-                    },
-                };
-            {
-                let k = try!(sub.KeyRef());
-                let last_key = try!(self.key(last_key));
-                let c = KeyRef::cmp(&k, &last_key);
-                if c != Ordering::Equal {
-                    println!("mismatch on last key:");
-                    println!("parent page {}  child page {}", self.pagenum, self.children[i].page);
-                    println!("child.Leaf says ({}): {:?}", k.len(), k);
-                    println!("parent says ({}): {:?}", last_key.len(), last_key);
-                    println!("parent also says: {:?}", self.children[i].last_key);
-                    panic!();
-                }
-                assert!(c == Ordering::Equal);
-            }
-        }
-        Ok(())
-    }
-
     #[inline]
     fn key<'a>(&'a self, k: &KeyInPage) -> Result<KeyRef<'a>> { 
         let prefix: Option<&[u8]> = 
@@ -6022,50 +5512,6 @@ impl ParentPage {
             };
         let k = try!(k.key_with_location(&self.pr, prefix, &self.path));
         Ok(k)
-    }
-
-    fn first_key_with_location(&self) -> Result<KeyWithLocation> {
-        self.key_with_location(&self.children[0].first_key)
-    }
-
-    fn last_key_with_location(&self) -> Result<Option<KeyWithLocation>> {
-        let i = self.children.len() - 1;
-        match &self.children[i].last_key {
-            &Some(ref last_key) => {
-                let kw = try!(self.key_with_location(last_key));
-                Ok(Some(kw))
-            },
-            &None => {
-                if i > 0 {
-                    let kw = try!(self.key_with_location(&self.children[i].first_key));
-                    Ok(Some(kw))
-                } else {
-                    Ok(None)
-                }
-            },
-        }
-    }
-
-    pub fn range(&self) -> Result<KeyRangeRef> {
-        let min = try!(self.key(&self.children[0].first_key));
-        let max = {
-            let i = self.children.len() - 1;
-            let key =
-                match &self.children[i].last_key {
-                    &Some(ref last_key) => {
-                        last_key
-                    },
-                    &None => {
-                        &self.children[i].first_key
-                    },
-                };
-            try!(self.key(key))
-        };
-        let range = KeyRangeRef {
-            min: min,
-            max: max,
-        };
-        Ok(range)
     }
 
     fn parse_page(pgnum: PageNum, pr: &[u8]) -> Result<(Option<Box<[u8]>>, Vec<ParentPageItem>, usize)> {
@@ -6114,15 +5560,13 @@ impl ParentPage {
                     }
                 };
 
-            let key_1 = try!(KeyInPage::read(pr, &mut cur, prefix_len));
-            let key_2 = try!(KeyInPage::read_optional(pr, &mut cur, prefix_len));
+            let last_key = try!(KeyInPage::read(pr, &mut cur, prefix_len));
 
             let pg = ParentPageItem {
                 page: page, 
                 //if cfg!(child_block_list) 
                 blocks: blocks,
-                first_key: key_1,
-                last_key: key_2,
+                last_key: last_key,
             };
             children.push(pg);
         }
@@ -6148,14 +5592,13 @@ impl ParentPage {
         Ok(total_count_pages)
     }
 
-    fn any_node_at_depth(&self, depth: u8) -> Result<PageNum> {
+    fn any_node_at_depth(&self, depth: u8, lineage: &mut HashMap<u8, PageNum>) -> Result<()> {
+        lineage.insert(self.depth(), self.pagenum);
+
         // we need to pick a child, and it kinda doesn't matter which
         // one, but we don't need the number to be really random, and we
         // don't want to take a dependency on time or rand just for this,
         // so we use the page number as a lame source of randomness.
-
-        // TODO this should return the key range, rather than forcing
-        // write_survivors to re-read the page to get it.
 
         // TODO later, we probably want to be more clever.  leveldb 
         // remembers the key range of the last compaction and picks up
@@ -6166,7 +5609,8 @@ impl ParentPage {
         let i = ((self.pagenum as u32) % (self.children.len() as u32)) as usize;
         let pagenum = self.child_pagenum(i);
         if self.depth() - 1 == depth {
-            Ok(pagenum)
+            lineage.insert(self.depth() - 1, pagenum);
+            Ok(())
         } else {
             assert!(self.depth() - 1 > depth);
             assert!(self.depth() > 1);
@@ -6177,7 +5621,7 @@ impl ParentPage {
             let buf = Lend::new(buf, box done_page);
 
             let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, buf));
-            page.any_node_at_depth(depth)
+            page.any_node_at_depth(depth, lineage)
         }
     }
 
@@ -6198,112 +5642,9 @@ impl ParentPage {
         Ok(())
     }
 
-    fn key_in_child_range(&self, i: usize, kq: &KeyRef) -> Result<KeyInRange> {
-        match self.children[i].last_key {
-            Some(ref last_key) => {
-                let last_key = try!(self.key(last_key));
-                match KeyRef::cmp(kq, &last_key) {
-                    Ordering::Less => {
-                    },
-                    Ordering::Equal => {
-                        return Ok(KeyInRange::EqualLast);
-                    },
-                    Ordering::Greater => {
-                        return Ok(KeyInRange::Greater);
-                    },
-                }
-            },
-            None => {
-            },
-        }
-        let first_key = try!(self.key(&self.children[i].first_key));
-        match KeyRef::cmp(kq, &first_key) {
-            Ordering::Less => {
-                Ok(KeyInRange::Less)
-            },
-            Ordering::Equal => {
-                Ok(KeyInRange::EqualFirst)
-            },
-            Ordering::Greater => {
-                if self.children[i].last_key.is_some() {
-                    Ok(KeyInRange::Within)
-                } else {
-                    Ok(KeyInRange::Greater)
-                }
-            },
-        }
-    }
-
-    pub fn child_range(&self, i: usize) -> Result<KeyRangeRef> {
-        let min = try!(self.key(&self.children[i].first_key));
-        let max = {
-            let key =
-                match &self.children[i].last_key {
-                    &Some(ref last_key) => {
-                        last_key
-                    },
-                    &None => {
-                        &self.children[i].first_key
-                    },
-                };
-            try!(self.key(key))
-        };
-        let range = KeyRangeRef {
-            min: min,
-            max: max,
-        };
-        Ok(range)
-    }
-
-    fn child_overlaps(&self, i: usize, range: &KeyRange) -> Result<Overlap> {
-        match self.children[i].last_key {
-            Some(ref my_last_key) => {
-                let my_last_key = try!(self.key(my_last_key));
-                match my_last_key.compare_with(&range.min) {
-                    Ordering::Less => {
-                        Ok(Overlap::Less)
-                    },
-                    Ordering::Equal => {
-                        Ok(Overlap::Yes)
-                    },
-                    Ordering::Greater => {
-                        let my_first_key = try!(self.key(&self.children[i].first_key));
-                        match my_first_key.compare_with(&range.max) {
-                            Ordering::Greater => {
-                                Ok(Overlap::Greater)
-                            },
-                            Ordering::Less | Ordering::Equal => {
-                                Ok(Overlap::Yes)
-                            },
-                        }
-                    },
-                }
-            },
-            None => {
-                let my_first_key = try!(self.key(&self.children[i].first_key));
-                match my_first_key.compare_with(&range.max) {
-                    Ordering::Greater => {
-                        Ok(Overlap::Greater)
-                    },
-                    Ordering::Equal => {
-                        Ok(Overlap::Yes)
-                    },
-                    Ordering::Less => {
-                        match my_first_key.compare_with(&range.min) {
-                            Ordering::Greater => {
-                                Ok(Overlap::Yes)
-                            },
-                            Ordering::Equal => {
-                                Ok(Overlap::Yes)
-                            },
-                            Ordering::Less => {
-                                Ok(Overlap::Less)
-                            },
-                        }
-                    },
-                }
-            },
-        }
+    fn cmp_with_child_last_key(&self, i: usize, kq: &KeyRef) -> Result<Ordering> {
+        let child_key = try!(self.key(&self.children[i].last_key));
+        Ok(KeyRef::cmp(kq, &child_key))
     }
 
     fn get_child_cursor(&self, i: usize) -> Result<PageCursor> {
@@ -6393,79 +5734,28 @@ impl ParentCursor {
     }
 
     fn seek(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
-        //println!("parent page: {}  search: kq = {:?},  sop = {:?}", self.pagenum, k, sop);
+        //println!("parent page: {}  search: kq = {:?},  sop = {:?}", self.page.pagenum, k, sop);
 
         for i in 0 .. self.page.count_items() {
-            let look = try!(self.page.key_in_child_range(i, k));
-            //println!("    in page {:?} : {:?}", self.children[i].page, look);
-            match look {
-                KeyInRange::EqualFirst => {
-                    try!(self.set_child(i));
-                    try!(self.sub.First());
-                    // TODO assert something?
-                    return Ok(SeekResult::Equal);
-                },
-                KeyInRange::EqualLast => {
-                    try!(self.set_child(i));
-                    try!(self.sub.Last());
-                    // TODO assert something?
-                    return Ok(SeekResult::Equal);
-                },
-                KeyInRange::Within => {
+            match try!(self.page.cmp_with_child_last_key(i, k)) {
+                Ordering::Less | Ordering::Equal => {
                     try!(self.set_child(i));
                     let sr = try!(self.sub.SeekRef(k, sop));
-                    return Ok(sr)
-                },
-                KeyInRange::Less => {
-                    // there should be no case here where the loop continues.
-                    // the children are sorted ascending.  if the key is
-                    // less than this one, it will be less than all the others
-                    // as well.
-                    if i == 0 {
-                        // k is less than the first one
-                        match sop {
-                            SeekOp::SEEK_LE => {
-                                self.cur = None;
-                                return Ok(SeekResult::Invalid);
-                            },
-                            SeekOp::SEEK_GE => {
-                                try!(self.set_child(0));
-                                try!(self.sub.First());
-                                return Ok(SeekResult::Unequal);
-                            },
-                            SeekOp::SEEK_EQ => {
-                                self.cur = None;
-                                return Ok(SeekResult::Invalid);
-                            },
-                        }
+                    if i > 0 && sop == SeekOp::SEEK_LE && sr == SeekResult::Invalid {
+                        try!(self.set_child(i - 1));
+                        try!(self.sub.Last());
+                        return Ok(SeekResult::Unequal);
                     } else {
-                        // had to be greater than the last one
-                        // in between
-                        match sop {
-                            SeekOp::SEEK_LE => {
-                                try!(self.set_child(i - 1));
-                                try!(self.sub.Last());
-                                return Ok(SeekResult::Unequal);
-                            },
-                            SeekOp::SEEK_GE => {
-                                try!(self.set_child(i));
-                                try!(self.sub.First());
-                                return Ok(SeekResult::Unequal);
-                            },
-                            SeekOp::SEEK_EQ => {
-                                self.cur = None;
-                                return Ok(SeekResult::Invalid);
-                            },
-                        }
+                        return Ok(sr)
                     }
                 },
-                KeyInRange::Greater => {
+                Ordering::Greater => {
                     // keep looking
                 },
             }
         }
-        //println!("after loop");
-        // the only way to exit the loop is for the key to be
+        //println!("parent page seek after loop");
+        // the only way to exit the loop to here is for the key to be
         // greater than the last item.
         match sop {
             SeekOp::SEEK_LE => {
@@ -7699,6 +6989,12 @@ impl DatabaseFile {
         InnerPart::write_segment(&self.inner, pairs)
     }
 
+    // tests use this
+    pub fn write_segment_from_sorted_sequence<I>(&self, source: I) -> Result<Option<SegmentHeaderInfo>>
+        where I: Iterator<Item=Result<kvp>>  {
+        InnerPart::write_segment_from_sorted_sequence(&self.inner, source)
+    }
+
     pub fn list_segments(&self) -> Result<(Vec<(PageNum, PageCount)>, Vec<(PageNum, PageCount)>, Vec<(PageNum, PageCount)>)> {
         InnerPart::list_segments(&self.inner)
     }
@@ -8036,6 +7332,15 @@ impl InnerPart {
         Ok(seg)
     }
 
+    // tests use this
+    fn write_segment_from_sorted_sequence<I>(inner: &std::sync::Arc<InnerPart>, source: I) -> Result<Option<SegmentHeaderInfo>> 
+        where I: Iterator<Item=Result<kvp>>  {
+        let pw = try!(PageWriter::new(inner.clone()));
+        let f = try!(inner.open_file_for_cursor());
+        let seg = try!(create_segment(pw, source, f));
+        Ok(seg)
+    }
+
     fn notify_work(&self, from_level: FromLevel) -> Result<()> {
         let senders = try!(self.senders.lock());
         match from_level {
@@ -8132,9 +7437,9 @@ impl InnerPart {
             Other{
                 level: usize,  // TODO why is this here?
                 old_segment: ParentPage, 
-                chosen_page: PageNum, 
+                chosen_page: PageNum,
+                lineage: HashMap<u8, PageNum>, 
                 chosen_node_pages: BlockList, 
-                // TODO depth and key range for chosen page
             },
         }
 
@@ -8253,16 +7558,18 @@ impl InnerPart {
                         let buf = Lend::new(old_from_segment.buf.clone(), box done_page);
                         let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), old_from_segment.root_page, buf));
 
-                        let chosen_page = try!(parent.any_node_at_depth(depth_promote));
-                        //println!("chosen_page: {}", chosen_page);
+                        let mut lineage = HashMap::new();
+                        try!(parent.any_node_at_depth(depth_promote, &mut lineage));
+                        //println!("lineage: {}", lineage);
+                        let chosen_pagenum = lineage[&depth_promote];
 
                         let cursor = {
-                            let buf = try!(read_and_alloc_page(&f, chosen_page, inner.pgsz));
+                            let buf = try!(read_and_alloc_page(&f, chosen_pagenum, inner.pgsz));
                             // TODO it's a little silly here to construct a Lend<>
                             let done_page = move |_| -> () {
                             };
                             let buf = Lend::new(buf, box done_page);
-                            let cursor = try!(PageCursor::new_already_read_page(&inner.path, f.clone(), chosen_page, buf));
+                            let cursor = try!(PageCursor::new_already_read_page(&inner.path, f.clone(), chosen_pagenum, buf));
                             cursor
                         };
 
@@ -8271,8 +7578,8 @@ impl InnerPart {
                         let from = MergingFrom::Other{
                             level: level, 
                             old_segment: parent, 
-                            chosen_page: chosen_page, 
-                            // TODO include the depth of the chosen page and its key range here
+                            lineage: lineage, 
+                            chosen_page: chosen_pagenum, 
                             chosen_node_pages: chosen_node_pages, 
                         };
                         (vec![cursor], from)
@@ -8420,7 +7727,58 @@ impl InnerPart {
                 let mut source = CursorIterator::new(cursor);
                 let mut behind = behind;
                 let wrote = try!(write_merge(&mut pw, &mut source, &into, &mut behind, &inner.path, f.clone(), from_level.get_dest_level()));
-                let overflows_eaten = source.eaten();
+
+                if cfg!(expensive_check) 
+                {
+                    let count_dest_keys_before =
+                        match &into {
+                            &MergingInto::None => {
+                                0
+                            },
+                            &MergingInto::Leaf(ref leaf) => {
+                                leaf.count_keys()
+                            },
+                            &MergingInto::Parent(ref parent) => {
+                                let mut mine = parent.make_parent_page();
+                                try!(mine.read_page(parent.pagenum));
+                                let mut cursor = try!(ParentCursor::new(mine));
+                                let mut count = 0;
+                                try!(cursor.First());
+                                while cursor.IsValid() {
+                                    count += 1;
+                                    try!(cursor.Next());
+                                }
+                                count
+                            },
+                        };
+
+                    let count_dest_keys_after =
+                        match wrote.segment {
+                            Some(ref seg) => {
+                                try!(seg.count_keys(&inner.path, f.clone()))
+                            },
+                            None => {
+                                0
+                            },
+                        };
+
+                    let count_keys_shadowed_in_merge_cursor = source.count_keys_shadowed();
+                    let count_keys_yielded_by_merge_cursor = source.count_keys_yielded();
+
+                    println!("count_dest_keys_before: {}", count_dest_keys_before);
+                    println!("count_dest_keys_after: {}", count_dest_keys_after);
+                    println!("count_keys_yielded_by_merge_cursor: {}", count_keys_yielded_by_merge_cursor);
+                    println!("count_keys_shadowed_in_merge_cursor: {}", count_keys_shadowed_in_merge_cursor);
+                    println!("keys promoted in merge: {}", wrote.keys_promoted);
+                    println!("keys rewritten in merge: {}", wrote.keys_rewritten);
+                    println!("keys shadowed in merge: {}", wrote.keys_shadowed);
+                    println!("tombstones removed in merge: {}", wrote.tombstones_removed);
+
+                    assert!(count_dest_keys_after == count_dest_keys_before + count_keys_yielded_by_merge_cursor - wrote.keys_shadowed - wrote.tombstones_removed);
+                }
+
+                let overflows_eaten = source.overflows_eaten();
+
                 (wrote.segment, wrote.nodes_rewritten, wrote.overflows_freed, overflows_eaten)
             } else {
 // TODO returning None and 3 empty vecs is silly
@@ -8526,8 +7884,10 @@ impl InnerPart {
                         segments: segments,
                     }
                 },
-                MergingFrom::Other{level, old_segment, chosen_page, chosen_node_pages, ..} => {
-                    let wrote = try!(write_survivors(&mut pw, chosen_page, &old_segment, &inner.path, f.clone(), from_level.get_dest_level()));
+                MergingFrom::Other{level, old_segment, chosen_page, lineage, chosen_node_pages, ..} => {
+                    //println!("lineage: {:?}", lineage);
+                    //println!("chosen_node_pages: {:?}", chosen_node_pages);
+                    let wrote = try!(write_survivors(&mut pw, &lineage, &old_segment, &inner.path, f.clone(), from_level.get_dest_level()));
                     let from = 
                         MergeFrom::Other {
                             level: level,
@@ -8536,12 +7896,11 @@ impl InnerPart {
                         };
                     let mut blocks = chosen_node_pages;
                     blocks.add_page_no_reorder(chosen_page);
-                    //println!("write_survivors chosen_page: {:?}", chosen_page);
-                    //println!("write_survivors promoting: {:?}", blocks);
-                    //println!("write_survivors rewritten: {:?}", wrote.nodes_rewritten);
+                    // TODO isn't lineage the same as nodes rewritten, basically?
                     for pgnum in wrote.nodes_rewritten {
                         blocks.add_page_no_reorder(pgnum);
                     }
+                    //println!("blocks becoming inactive on survivors: {:?}", blocks);
                     assert!(!now_inactive.contains_key(&old_segment.pagenum));
                     now_inactive.insert(old_segment.pagenum, blocks);
                     from
@@ -9208,14 +8567,12 @@ impl PageWriter {
 
 // ----------------------------------------------------------------
 
-#[cfg(remove_me)]
 pub struct GenerateNumbers {
     pub cur: usize,
     pub end: usize,
     pub step: usize,
 }
 
-#[cfg(remove_me)]
 impl Iterator for GenerateNumbers {
     type Item = Result<kvp>;
     // TODO allow the number of digits to be customized?
@@ -9226,14 +8583,13 @@ impl Iterator for GenerateNumbers {
         else {
             let k = format!("{:08}", self.cur).into_bytes().into_boxed_slice();
             let v = format!("{}", self.cur * 2).into_bytes().into_boxed_slice();
-            let r = kvp{Key:k, Value:Blob::Array(v)};
+            let r = kvp{Key:k, Value:Blob::Boxed(v)};
             self.cur = self.cur + self.step;
             Some(Ok(r))
         }
     }
 }
 
-#[cfg(remove_me)]
 pub struct GenerateWeirdPairs {
     pub cur: usize,
     pub end: usize,
@@ -9241,7 +8597,6 @@ pub struct GenerateWeirdPairs {
     pub vlen: usize,
 }
 
-#[cfg(remove_me)]
 impl Iterator for GenerateWeirdPairs {
     type Item = Result<kvp>;
     fn next(&mut self) -> Option<Result<kvp>> {
@@ -9271,7 +8626,7 @@ impl Iterator for GenerateWeirdPairs {
             }
             let v = v.into_boxed_slice();
 
-            let r = kvp{Key:k, Value:Blob::Array(v)};
+            let r = kvp{Key:k, Value:Blob::Boxed(v)};
             self.cur = self.cur + 1;
             Some(Ok(r))
         }

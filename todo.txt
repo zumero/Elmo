@@ -1,4 +1,11 @@
 
+so a new leaf can't squeeze between two parents anymore.
+what does this mean for the merge problem where we had
+parent nodes underfull and depth increasing to the right?
+
+saw cases where the page count in the parent page looks 
+wrong.  zero.
+
 status quo (one prefix for the whole page)
 prefix chain
 fsa
@@ -132,6 +139,11 @@ think about memmap for cursors
 unless it needs to pass along an Arc clone, methods should
 be &self not &Arc<InnerPart>
 
+where should I be using AsRef?  From/Into ?
+
+bufadvance and PageBuilder should use trait implementations 
+for Read and Write on slices/vecs
+
 might want to send a Work message as soon as the db is
 loaded.  unless it was opened in a read only mode.
 
@@ -197,21 +209,19 @@ perf problem with storing locations of each page in parent pages?
 look for ways to make elmo index entry encoding more compact
 
 at some point, review all decisions about what actually gets stored
-in the parent page and make sure it's worth it.  two keys?  full
+in the parent page and make sure it's worth it.  full
 block list?  should we store the number of descendant leaves?
 
 how to choose a page from the merge source when merging Other?
 is a parent too big?  a leaf too small?  
 rotate through the key space?
 
-having last_key be an Option<> is so tedious
-
 rm dead MultiPageCursor?  or will we need this later for cases
 where we are merging from Other level N to N+1 and want to select 
 more than a leaf and less then a parent?
 
 header can get really small.  so small that we no longer want to 
-waste 4096 bytes or an entire page on it.  it needs to live on
+waste 4096 bytes or an entire page on it?  it would need to live on
 a portion of the first page, with the rest available as a short
 page for use by segments.  which means the PageWriter stuff needs
 to know that not all pages are the same size (in terms of their
@@ -241,8 +251,6 @@ figure out proper limits for how much should be at each level.
 currently using geometric like leveldb, sometimes with the
 factor as low as 2.  lower multipler means faster writes and
 slower reads.
-
-fix/rewrite all the lsm cargo tests
 
 update rust nightly?
 

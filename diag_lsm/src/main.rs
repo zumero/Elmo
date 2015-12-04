@@ -93,14 +93,14 @@ fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     //println!("blocks ({} blocks, {} pages)", blocks.count_blocks(), blocks.count_pages());
     //println!("key range: {:?}", try!(page.range()));
     let count = page.count_items();
-    if cfg!(expensive_check) 
+    //if cfg!(expensive_check) 
     {
         println!("items ({}):", count);
         for i in 0 .. count {
             let p = page.child_pagenum(i);
             println!("    {}", p);
-            let child_range = try!(page.child_range(i));
-            println!("    {:?}", child_range);
+            let child_key = try!(page.child_key(i));
+            println!("        {:?}", child_key);
         }
         //try!(page.verify_child_keys());
     }

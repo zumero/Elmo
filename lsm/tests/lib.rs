@@ -5,8 +5,10 @@
 extern crate misc;
 extern crate lsm;
 
+use lsm::IForwardCursor;
 use lsm::ICursor;
 use misc::tempfile;
+use std::io::Read;
 
 fn into_utf8(s : String) -> Box<[u8]> {
     s.into_bytes().into_boxed_slice()
@@ -30,11 +32,11 @@ fn key_as_string(csr: &lsm::LivingCursor) -> String {
     from_utf8(key_as_boxed_slice(csr))
 }
 
-fn insert_pair_string_string(d: &mut std::collections::HashMap<Box<[u8]>,Box<[u8]>>, k:&str, v:&str) {
-    d.insert(str_to_utf8(k), str_to_utf8(v));
+fn insert_pair_string_string(d: &mut std::collections::BTreeMap<Box<[u8]>, lsm::Blob>, k: &str, v: &str) {
+    d.insert(str_to_utf8(k), lsm::Blob::Boxed(str_to_utf8(v)));
 }
 
-fn insert_pair_string_blob(d: &mut std::collections::HashMap<Box<[u8]>,lsm::Blob>, k:&str, v:lsm::Blob) {
+fn insert_pair_string_blob(d: &mut std::collections::BTreeMap<Box<[u8]>, lsm::Blob>, k: &str, v: lsm::Blob) {
     d.insert(str_to_utf8(k), v);
 }
 
@@ -60,12 +62,13 @@ fn count_keys_backward(csr: &mut lsm::LivingCursor) -> lsm::Result<usize> {
 
 fn read_value(b: lsm::ValueRef) -> lsm::Result<Box<[u8]>> {
     match b {
-        lsm::ValueRef::Overflowed(len, mut strm) => {
-            let mut a = Vec::with_capacity(len);
+        lsm::ValueRef::Overflowed(path, pgsz, len, blocks) => {
+            let mut a = Vec::with_capacity(len as usize);
+            let mut strm = try!(lsm::OverflowReader::new(&path, pgsz, blocks.blocks[0].firstPage, len));
             try!(strm.read_to_end(&mut a));
             Ok(a.into_boxed_slice())
         },
-        lsm::ValueRef::Array(a) => {
+        lsm::ValueRef::Slice(a) => {
             let mut k = Vec::with_capacity(a.len());
             k.push_all(a);
             Ok(k.into_boxed_slice())
@@ -77,8 +80,8 @@ fn read_value(b: lsm::ValueRef) -> lsm::Result<Box<[u8]>> {
 #[test]
 fn empty_cursor() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("empty_cursor"), lsm::DEFAULT_SETTINGS));
-        let mut csr = try!(db.OpenCursor());
+        let db = try!(lsm::DatabaseFile::new(tempfile("empty_cursor"), lsm::DEFAULT_SETTINGS));
+        let mut csr = try!(db.open_cursor());
         try!(csr.First());
         assert!(!csr.IsValid());
         try!(csr.Last());
@@ -91,13 +94,13 @@ fn empty_cursor() {
 #[test]
 fn first_prev() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("first_prev"), lsm::DEFAULT_SETTINGS));
-        let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}, 100));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g]));
+        let db = try!(lsm::DatabaseFile::new(tempfile("first_prev"), lsm::DEFAULT_SETTINGS));
+        let g = try!(db.write_segment_from_sorted_sequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         try!(csr.First());
         assert!(csr.IsValid());
         try!(csr.Prev());
@@ -110,13 +113,13 @@ fn first_prev() {
 #[test]
 fn last_next() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("first_prev"), lsm::DEFAULT_SETTINGS));
-        let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}, 100));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g]));
+        let db = try!(lsm::DatabaseFile::new(tempfile("first_prev"), lsm::DEFAULT_SETTINGS));
+        let g = try!(db.write_segment_from_sorted_sequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         try!(csr.Last());
         assert!(csr.IsValid());
         try!(csr.Next());
@@ -129,13 +132,13 @@ fn last_next() {
 #[test]
 fn seek() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("seek"), lsm::DEFAULT_SETTINGS));
-        let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}, 100));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g]));
+        let db = try!(lsm::DatabaseFile::new(tempfile("seek"), lsm::DEFAULT_SETTINGS));
+        let g = try!(db.write_segment_from_sorted_sequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         try!(csr.First());
         assert!(csr.IsValid());
         // TODO constructing the utf8 byte array seems convoluted
@@ -165,17 +168,17 @@ fn seek() {
 #[test]
 fn lexographic() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("lexicographic"), lsm::DEFAULT_SETTINGS));
-        let mut d = std::collections::HashMap::new();
+        let db = try!(lsm::DatabaseFile::new(tempfile("lexicographic"), lsm::DEFAULT_SETTINGS));
+        let mut d = std::collections::BTreeMap::new();
         insert_pair_string_string(&mut d, "8", "");
         insert_pair_string_string(&mut d, "10", "");
         insert_pair_string_string(&mut d, "20", "");
-        let g = try!(db.WriteSegment(d));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g]));
+        let g = try!(db.write_segment(d));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         try!(csr.First());
         assert!(csr.IsValid());
         assert_eq!(key_as_string(&csr), "10");
@@ -215,27 +218,27 @@ fn lexographic() {
 #[test]
 fn seek_cur() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("seek_cur"), lsm::DEFAULT_SETTINGS));
-        let mut t1 = std::collections::HashMap::new();
+        let db = try!(lsm::DatabaseFile::new(tempfile("seek_cur"), lsm::DEFAULT_SETTINGS));
+        let mut t1 = std::collections::BTreeMap::new();
         for i in 0 .. 100 {
             let sk = format!("{:03}", i);
             let sv = format!("{}", i);
             insert_pair_string_string(&mut t1, &sk, &sv);
         }
-        let mut t2 = std::collections::HashMap::new();
+        let mut t2 = std::collections::BTreeMap::new();
         for i in 0 .. 1000 {
             let sk = format!("{:05}", i);
             let sv = format!("{}", i);
             insert_pair_string_string(&mut t2, &sk, &sv);
         }
-        let g1 = try!(db.WriteSegment(t1));
-        let g2 = try!(db.WriteSegment(t2));
+        let g1 = try!(db.write_segment(t1));
+        let g2 = try!(db.write_segment(t2));
         {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g1]));
-            try!(lck.commitSegments(vec![g2]));
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g1.unwrap()));
+            try!(lck.commit_segment(g2.unwrap()));
         }
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("00001")), lsm::SeekOp::SEEK_EQ));
         assert!(csr.IsValid());
         Ok(())
@@ -246,27 +249,27 @@ fn seek_cur() {
 #[test]
 fn weird() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("weird"), lsm::DEFAULT_SETTINGS));
-        let mut t1 = std::collections::HashMap::new();
+        let db = try!(lsm::DatabaseFile::new(tempfile("weird"), lsm::DEFAULT_SETTINGS));
+        let mut t1 = std::collections::BTreeMap::new();
         for i in 0 .. 100 {
             let sk = format!("{:03}", i);
             let sv = format!("{}", i);
             insert_pair_string_string(&mut t1, &sk, &sv);
         }
-        let mut t2 = std::collections::HashMap::new();
+        let mut t2 = std::collections::BTreeMap::new();
         for i in 0 .. 1000 {
             let sk = format!("{:05}", i);
             let sv = format!("{}", i);
             insert_pair_string_string(&mut t2, &sk, &sv);
         }
-        let g1 = try!(db.WriteSegment(t1));
-        let g2 = try!(db.WriteSegment(t2));
+        let g1 = try!(db.write_segment(t1));
+        let g2 = try!(db.write_segment(t2));
         {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g1]));
-            try!(lck.commitSegments(vec![g2]));
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g1.unwrap()));
+            try!(lck.commit_segment(g2.unwrap()));
         }
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         try!(csr.First());
         for _ in 0 .. 100 {
             try!(csr.Next());
@@ -324,26 +327,26 @@ fn weird() {
 #[test]
 fn no_le_ge_multicursor() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("no_le_ge_multicursor"), lsm::DEFAULT_SETTINGS));
+        let db = try!(lsm::DatabaseFile::new(tempfile("no_le_ge_multicursor"), lsm::DEFAULT_SETTINGS));
 
-        let mut t1 = std::collections::HashMap::new();
+        let mut t1 = std::collections::BTreeMap::new();
         insert_pair_string_string(&mut t1, "c", "3");
         insert_pair_string_string(&mut t1, "g", "7");
-        let g1 = try!(db.WriteSegment(t1));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g1]));
+        let g = try!(db.write_segment(t1));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
 
-        let mut t2 = std::collections::HashMap::new();
+        let mut t2 = std::collections::BTreeMap::new();
         insert_pair_string_string(&mut t2, "e", "5");
-        let g2 = try!(db.WriteSegment(t2));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g2]));
+        let g = try!(db.write_segment(t2));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
 
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
 
         try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("a")), lsm::SeekOp::SEEK_LE));
         assert!(!csr.IsValid());
@@ -365,16 +368,16 @@ fn no_le_ge_multicursor() {
 #[test]
 fn empty_val() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("empty_val"), lsm::DEFAULT_SETTINGS));
+        let db = try!(lsm::DatabaseFile::new(tempfile("empty_val"), lsm::DEFAULT_SETTINGS));
 
-        let mut t1 = std::collections::HashMap::new();
+        let mut t1 = std::collections::BTreeMap::new();
         insert_pair_string_string(&mut t1, "_", "");
-        let g1 = try!(db.WriteSegment(t1));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g1]));
+        let g = try!(db.write_segment(t1));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("_")), lsm::SeekOp::SEEK_EQ));
         assert!(csr.IsValid());
         assert_eq!(0, csr.ValueLength().unwrap().unwrap());
@@ -387,28 +390,28 @@ fn empty_val() {
 #[test]
 fn delete_not_there() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("delete_not_there"), lsm::DEFAULT_SETTINGS));
+        let db = try!(lsm::DatabaseFile::new(tempfile("delete_not_there"), lsm::DEFAULT_SETTINGS));
 
-        let mut t1 = std::collections::HashMap::new();
+        let mut t1 = std::collections::BTreeMap::new();
         insert_pair_string_string(&mut t1, "a", "1");
         insert_pair_string_string(&mut t1, "b", "2");
         insert_pair_string_string(&mut t1, "c", "3");
         insert_pair_string_string(&mut t1, "d", "4");
-        let g1 = try!(db.WriteSegment(t1));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g1]));
+        let g = try!(db.write_segment(t1));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
 
-        let mut t2 = std::collections::HashMap::new();
+        let mut t2 = std::collections::BTreeMap::new();
         insert_pair_string_blob(&mut t2, "e", lsm::Blob::Tombstone);
-        let g2 = try!(db.WriteSegment2(t2));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g2]));
+        let g = try!(db.write_segment(t2));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
 
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         assert_eq!(4, try!(count_keys_forward(&mut csr)));
         assert_eq!(4, try!(count_keys_backward(&mut csr)));
 
@@ -420,17 +423,17 @@ fn delete_not_there() {
 #[test]
 fn delete_nothing_there() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("delete_nothing_there"), lsm::DEFAULT_SETTINGS));
+        let db = try!(lsm::DatabaseFile::new(tempfile("delete_nothing_there"), lsm::DEFAULT_SETTINGS));
 
-        let mut t2 = std::collections::HashMap::new();
+        let mut t2 = std::collections::BTreeMap::new();
         insert_pair_string_blob(&mut t2, "e", lsm::Blob::Tombstone);
-        let g2 = try!(db.WriteSegment2(t2));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g2]));
+        let g = try!(db.write_segment(t2));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
 
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         assert_eq!(0, try!(count_keys_forward(&mut csr)));
         assert_eq!(0, try!(count_keys_backward(&mut csr)));
 
@@ -442,28 +445,28 @@ fn delete_nothing_there() {
 #[test]
 fn simple_tombstone() {
     fn f(del: &str) -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("simple_tombstone"), lsm::DEFAULT_SETTINGS));
+        let db = try!(lsm::DatabaseFile::new(tempfile("simple_tombstone"), lsm::DEFAULT_SETTINGS));
 
-        let mut t1 = std::collections::HashMap::new();
+        let mut t1 = std::collections::BTreeMap::new();
         insert_pair_string_string(&mut t1, "a", "1");
         insert_pair_string_string(&mut t1, "b", "2");
         insert_pair_string_string(&mut t1, "c", "3");
         insert_pair_string_string(&mut t1, "d", "4");
-        let g1 = try!(db.WriteSegment(t1));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g1]));
+        let g = try!(db.write_segment(t1));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
 
-        let mut t2 = std::collections::HashMap::new();
+        let mut t2 = std::collections::BTreeMap::new();
         insert_pair_string_blob(&mut t2, del, lsm::Blob::Tombstone);
-        let g2 = try!(db.WriteSegment2(t2));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g2]));
+        let g = try!(db.write_segment(t2));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
 
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         assert_eq!(3, try!(count_keys_forward(&mut csr)));
         assert_eq!(3, try!(count_keys_backward(&mut csr)));
 
@@ -478,19 +481,17 @@ fn simple_tombstone() {
 #[test]
 fn many_segments() {
     fn f() -> lsm::Result<bool> {
-        let db = try!(lsm::db::new(tempfile("many_segments"), lsm::DEFAULT_SETTINGS));
+        let db = try!(lsm::DatabaseFile::new(tempfile("many_segments"), lsm::DEFAULT_SETTINGS));
 
         const NUM : usize = 5000;
         const EACH : usize = 10;
 
-        let mut a = Vec::new();
         for i in 0 .. NUM {
-            let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: i * EACH, end: (i+1) * EACH, step: 1}, EACH));
-            a.push(g);
-        }
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(a.clone()));
+            let g = try!(db.write_segment_from_sorted_sequence(lsm::GenerateNumbers {cur: i * EACH, end: (i+1) * EACH, step: 1})).unwrap();
+            {
+                let lck = try!(db.get_write_lock());
+                try!(lck.commit_segment(g));
+            }
         }
 
         let res : lsm::Result<bool> = Ok(true);
@@ -502,38 +503,39 @@ fn many_segments() {
 #[test]
 fn one_blob() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("one_blob"), lsm::DEFAULT_SETTINGS));
+        let db = try!(lsm::DatabaseFile::new(tempfile("one_blob"), lsm::DEFAULT_SETTINGS));
 
-        const LEN : usize = 100000;
+        const LEN: usize = 100000;
 
         let mut v = Vec::new();
         for i in 0 .. LEN {
             v.push(i as u8);
         }
         assert_eq!(LEN, v.len());
-        let mut t2 = std::collections::HashMap::new();
-        insert_pair_string_blob(&mut t2, "e", lsm::Blob::Array(v.into_boxed_slice()));
-        let g2 = try!(db.WriteSegment2(t2));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g2]));
+        let mut t2 = std::collections::BTreeMap::new();
+        insert_pair_string_blob(&mut t2, "e", lsm::Blob::Boxed(v.into_boxed_slice()));
+        let g = try!(db.write_segment(t2));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
 
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         assert_eq!(1, try!(count_keys_forward(&mut csr)));
         assert_eq!(1, try!(count_keys_backward(&mut csr)));
 
         try!(csr.First());
         assert!(csr.IsValid());
-        assert_eq!(LEN, csr.ValueLength().unwrap().unwrap());
+        assert_eq!(LEN as u64, csr.ValueLength().unwrap().unwrap());
         let mut q = csr.ValueRef().unwrap();
 
         match q {
             lsm::ValueRef::Tombstone => assert!(false),
-            lsm::ValueRef::Array(ref a) => assert_eq!(LEN, a.len()),
-            lsm::ValueRef::Overflowed(len, ref mut r) => {
-                let mut a = Vec::with_capacity(len);
-                try!(r.read_to_end(&mut a));
+            lsm::ValueRef::Slice(ref a) => assert_eq!(LEN, a.len()),
+            lsm::ValueRef::Overflowed(path, pgsz, len, blocks) => {
+                let mut a = Vec::with_capacity(len as usize);
+                let mut strm = try!(lsm::OverflowReader::new(&path, pgsz, blocks.blocks[0].firstPage, len));
+                try!(strm.read_to_end(&mut a));
                 assert_eq!(LEN, a.len());
             },
         }
@@ -546,17 +548,17 @@ fn one_blob() {
 #[test]
 fn no_le_ge() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("no_le_ge"), lsm::DEFAULT_SETTINGS));
-        let mut t1 = std::collections::HashMap::new();
+        let db = try!(lsm::DatabaseFile::new(tempfile("no_le_ge"), lsm::DEFAULT_SETTINGS));
+        let mut t1 = std::collections::BTreeMap::new();
         insert_pair_string_string(&mut t1, "c", "3");
         insert_pair_string_string(&mut t1, "g", "7");
         insert_pair_string_string(&mut t1, "e", "5");
-        let g1 = try!(db.WriteSegment(t1));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g1]));
+        let g = try!(db.write_segment(t1));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("a")), lsm::SeekOp::SEEK_LE));
         assert!(!csr.IsValid());
 
@@ -577,19 +579,19 @@ fn no_le_ge() {
 #[test]
 fn seek_ge_le_bigger() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("seek_ge_le_bigger"), lsm::DEFAULT_SETTINGS));
-        let mut t1 = std::collections::HashMap::new();
+        let db = try!(lsm::DatabaseFile::new(tempfile("seek_ge_le_bigger"), lsm::DEFAULT_SETTINGS));
+        let mut t1 = std::collections::BTreeMap::new();
         for i in 0 .. 10000 {
             let sk = format!("{}", i*2);
             let sv = format!("{}", i);
             insert_pair_string_string(&mut t1, &sk, &sv);
         }
-        let g = try!(db.WriteSegment(t1));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g]));
+        let g = try!(db.write_segment(t1));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("8088")), lsm::SeekOp::SEEK_EQ));
         assert!(csr.IsValid());
 
@@ -612,8 +614,8 @@ fn seek_ge_le_bigger() {
 #[test]
 fn seek_ge_le() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("seek_ge_le"), lsm::DEFAULT_SETTINGS));
-        let mut t1 = std::collections::HashMap::new();
+        let db = try!(lsm::DatabaseFile::new(tempfile("seek_ge_le"), lsm::DEFAULT_SETTINGS));
+        let mut t1 = std::collections::BTreeMap::new();
         insert_pair_string_string(&mut t1, "a", "1");
         insert_pair_string_string(&mut t1, "c", "3");
         insert_pair_string_string(&mut t1, "e", "5");
@@ -627,12 +629,12 @@ fn seek_ge_le() {
         insert_pair_string_string(&mut t1, "u", "21");
         insert_pair_string_string(&mut t1, "w", "23");
         insert_pair_string_string(&mut t1, "y", "25");
-        let g = try!(db.WriteSegment(t1));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g]));
+        let g = try!(db.write_segment(t1));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         assert_eq!(13, try!(count_keys_forward(&mut csr)));
         assert_eq!(13, try!(count_keys_backward(&mut csr)));
 
@@ -655,26 +657,26 @@ fn seek_ge_le() {
 #[test]
 fn tombstone() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("tombstone"), lsm::DEFAULT_SETTINGS));
-        let mut t1 = std::collections::HashMap::new();
+        let db = try!(lsm::DatabaseFile::new(tempfile("tombstone"), lsm::DEFAULT_SETTINGS));
+        let mut t1 = std::collections::BTreeMap::new();
         insert_pair_string_string(&mut t1, "a", "1");
         insert_pair_string_string(&mut t1, "b", "2");
         insert_pair_string_string(&mut t1, "c", "3");
         insert_pair_string_string(&mut t1, "d", "4");
-        let g1 = try!(db.WriteSegment(t1));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g1]));
+        let g = try!(db.write_segment(t1));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
-        let mut t2 = std::collections::HashMap::new();
+        let mut t2 = std::collections::BTreeMap::new();
         insert_pair_string_blob(&mut t2, "b", lsm::Blob::Tombstone);
-        let g2 = try!(db.WriteSegment2(t2));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g2]));
+        let g = try!(db.write_segment(t2));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
         // TODO it would be nice to check the multicursor without the living wrapper
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         try!(csr.First());
         assert!(csr.IsValid());
         assert_eq!("a", key_as_string(&csr));
@@ -720,29 +722,29 @@ fn tombstone() {
 #[test]
 fn overwrite() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("overwrite"), lsm::DEFAULT_SETTINGS));
-        let mut t1 = std::collections::HashMap::new();
+        let db = try!(lsm::DatabaseFile::new(tempfile("overwrite"), lsm::DEFAULT_SETTINGS));
+        let mut t1 = std::collections::BTreeMap::new();
         insert_pair_string_string(&mut t1, "a", "1");
         insert_pair_string_string(&mut t1, "b", "2");
         insert_pair_string_string(&mut t1, "c", "3");
         insert_pair_string_string(&mut t1, "d", "4");
-        let g1 = try!(db.WriteSegment(t1));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g1]));
+        let g = try!(db.write_segment(t1));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
-        fn getb(db: &lsm::db) -> lsm::Result<String> {
-            let mut csr = try!(db.OpenCursor());
+        fn getb(db: &lsm::DatabaseFile) -> lsm::Result<String> {
+            let mut csr = try!(db.open_cursor());
             try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("b")), lsm::SeekOp::SEEK_EQ));
             Ok(from_utf8(read_value(csr.ValueRef().unwrap()).unwrap()))
         }
         assert_eq!("2", getb(&db).unwrap());
-        let mut t2 = std::collections::HashMap::new();
+        let mut t2 = std::collections::BTreeMap::new();
         insert_pair_string_string(&mut t2, "b", "5");
-        let g2 = try!(db.WriteSegment(t2));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g2]));
+        let g = try!(db.write_segment(t2));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
         assert_eq!("5", getb(&db).unwrap());
 
@@ -755,15 +757,15 @@ fn overwrite() {
 fn blobs_of_many_sizes() {
     fn f() -> lsm::Result<()> {
         let settings = lsm::DbSettings {
-                DefaultPageSize : 256,
-                PagesPerBlock : 4,
+                default_page_size : 256,
+                pages_per_block : 4,
                 .. lsm::DEFAULT_SETTINGS
             };
-        let db = try!(lsm::db::new(tempfile("blobs_of_many_sizes"), settings));
+        let db = try!(lsm::DatabaseFile::new(tempfile("blobs_of_many_sizes"), settings));
         // TODO why doesn't Box<[u8]> support clone?
         // for now, we have a function to generate the pile we need, and we call it twice
-        fn gen() -> std::collections::HashMap<Box<[u8]>,Box<[u8]>> {
-            let mut t1 = std::collections::HashMap::new();
+        fn gen() -> std::collections::BTreeMap<Box<[u8]>, lsm::Blob> {
+            let mut t1 = std::collections::BTreeMap::new();
             for i in 200 .. 1500 {
                 let k = format!("{}", i);
                 let mut v = String::new();
@@ -775,18 +777,22 @@ fn blobs_of_many_sizes() {
             }
             t1
         }
-        let g1 = try!(db.WriteSegment(gen()));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g1]));
+        let g = try!(db.write_segment(gen()));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         let t1 = gen(); // generate another copy
-        for (k,v) in t1 {
-            try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(k), lsm::SeekOp::SEEK_EQ));
-            assert!(csr.IsValid());
-            assert_eq!(v.len(), csr.ValueLength().unwrap().unwrap());
-            assert_eq!(v, read_value(csr.ValueRef().unwrap()).unwrap());
+        for (k, v) in t1 {
+            if let lsm::Blob::Boxed(v) = v {
+                try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(k), lsm::SeekOp::SEEK_EQ));
+                assert!(csr.IsValid());
+                assert_eq!(v.len() as u64, csr.ValueLength().unwrap().unwrap());
+                assert_eq!(v, read_value(csr.ValueRef().unwrap()).unwrap());
+            } else {
+                unreachable!();
+            }
         }
         Ok(())
     }
@@ -797,30 +803,30 @@ fn blobs_of_many_sizes() {
 fn write_then_read() {
     fn f() -> lsm::Result<()> {
         fn write(name: &str) -> lsm::Result<()> {
-            let db = try!(lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS));
-            let mut d = std::collections::HashMap::new();
+            let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+            let mut d = std::collections::BTreeMap::new();
             for i in 1 .. 100 {
                 let s = format!("{}", i);
                 insert_pair_string_string(&mut d, &s, &s);
             }
-            let g = try!(db.WriteSegment(d));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g]));
+            let g = try!(db.write_segment(d));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
-            let mut d = std::collections::HashMap::new();
+            let mut d = std::collections::BTreeMap::new();
             insert_pair_string_blob(&mut d, "73", lsm::Blob::Tombstone);
-            let g = try!(db.WriteSegment2(d));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g]));
+            let g = try!(db.write_segment(d));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
             Ok(())
         }
 
         fn read(name: &str) -> lsm::Result<()> {
-            let db = try!(lsm::db::new(String::from(name), lsm::DEFAULT_SETTINGS));
-            let mut csr = try!(db.OpenCursor());
+            let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+            let mut csr = try!(db.open_cursor());
             try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(into_utf8(format!("{}", 42))), lsm::SeekOp::SEEK_EQ));
             assert!(csr.IsValid());
             try!(csr.Next());
@@ -847,18 +853,18 @@ fn write_then_read() {
 #[test]
 fn prefix_compression() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("prefix_compression"), lsm::DEFAULT_SETTINGS));
-        let mut d = std::collections::HashMap::new();
+        let db = try!(lsm::DatabaseFile::new(tempfile("prefix_compression"), lsm::DEFAULT_SETTINGS));
+        let mut d = std::collections::BTreeMap::new();
         for i in 1 .. 10000 {
             let s = format!("{}", i);
             insert_pair_string_string(&mut d, &("prefix_compression".to_string() + &s), &s);
         }
-        let g = try!(db.WriteSegment(d));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g]));
+        let g = try!(db.write_segment(d));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         try!(csr.First());
         assert!(csr.IsValid());
         Ok(())
@@ -873,17 +879,17 @@ fn threads() {
         use std::thread;
 
         let settings = lsm::DbSettings {
-                DefaultPageSize : 256,
-                PagesPerBlock : 4,
+                default_page_size : 256,
+                pages_per_block : 4,
                 .. lsm::DEFAULT_SETTINGS
             };
-        let db = try!(lsm::db::new(tempfile("threads"), settings));
+        let db = try!(lsm::DatabaseFile::new(tempfile("threads"), settings));
         let data = Arc::new(db);
 
         let h1 = {
             let data = data.clone();
             let h = thread::spawn(move || -> lsm::Result<()> {
-                let _g = try!(data.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 10000, step: 1}, 10000));
+                let _g = try!(data.write_segment_from_sorted_sequence(lsm::GenerateNumbers {cur: 0, end: 10000, step: 1}));
                 Ok(())
             });
             h
@@ -892,7 +898,7 @@ fn threads() {
         let h2 = {
             let data = data.clone();
             let h = thread::spawn(move || -> lsm::Result<()> {
-                let _g = try!(data.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 20000, end: 30000, step: 1}, 10000));
+                let _g = try!(data.write_segment_from_sorted_sequence(lsm::GenerateNumbers {cur: 20000, end: 30000, step: 1}));
                 Ok(())
             });
             h
@@ -912,13 +918,13 @@ fn threads() {
 #[test]
 fn key_ref() {
     fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("key_ref"), lsm::DEFAULT_SETTINGS));
-        let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}, 100));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g]));
+        let db = try!(lsm::DatabaseFile::new(tempfile("key_ref"), lsm::DEFAULT_SETTINGS));
+        let g = try!(db.write_segment_from_sorted_sequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}));
+        if let Some(g) = g {
+            let lck = try!(db.get_write_lock());
+            try!(lck.commit_segment(g));
         }
-        let mut csr = try!(db.OpenCursor());
+        let mut csr = try!(db.open_cursor());
         try!(csr.First());
         assert!(csr.IsValid());
 
@@ -945,11 +951,11 @@ fn threads_with_weird_pairs() {
         use std::thread;
 
         let settings = lsm::DbSettings {
-                DefaultPageSize : 256,
-                PagesPerBlock : 2,
+                default_page_size : 256,
+                pages_per_block : 2,
                 .. lsm::DEFAULT_SETTINGS
             };
-        let db = try!(lsm::db::new(tempfile("threads_with_overflows"), settings));
+        let db = try!(lsm::DatabaseFile::new(tempfile("threads_with_overflows"), settings));
         let data = Arc::new(db);
 
         let mut handles = Vec::new();
@@ -958,7 +964,7 @@ fn threads_with_weird_pairs() {
             let h = {
                 let data = data.clone();
                 let h = thread::spawn(move || -> lsm::Result<()> {
-                    let _g = try!(data.WriteSegmentFromSortedSequence(lsm::GenerateWeirdPairs {cur: i*10, end: i*10+pairs, klen: klen, vlen: vlen}, pairs));
+                    let _g = try!(data.write_segment_from_sorted_sequence(lsm::GenerateWeirdPairs {cur: i*10, end: i*10+pairs, klen: klen, vlen: vlen}));
                     Ok(())
                 });
                 h
@@ -986,112 +992,5 @@ fn threads_with_weird_pairs() {
     let r = f(1000, 1000, 10, 10); 
     assert!(r.is_ok());
 
-}
-
-#[test]
-fn no_merge_needed() {
-    fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("no_merge_needed"), lsm::DEFAULT_SETTINGS));
-        let g = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}, 100));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g]));
-        }
-
-        let r = try!(db.merge(0, 0, 2, 32));
-        assert!(r.is_none());
-
-        let r = try!(db.merge(1, 1, 2, 32));
-        assert!(r.is_none());
-
-        Ok(())
-    }
-    assert!(f().is_ok());
-}
-
-#[test]
-fn simple_merge() {
-    fn f() -> lsm::Result<()> {
-        let db = try!(lsm::db::new(tempfile("simple_merge"), lsm::DEFAULT_SETTINGS));
-
-        // no merges needed yet at levels 0, 1, 2
-        let r = try!(db.merge(0, 0, 2, 32));
-        assert!(r.is_none());
-
-        let r = try!(db.merge(1, 1, 2, 32));
-        assert!(r.is_none());
-
-        let r = try!(db.merge(2, 2, 2, 32));
-        assert!(r.is_none());
-
-        // write two level 0 segments
-        let g1 = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 0, end: 100, step: 1}, 100));
-        let g2 = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 100, end: 200, step: 2}, 50));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g1, g2]));
-        }
-
-        // level 1 still needs no merge
-        let r = try!(db.merge(1, 1, 2, 32));
-        assert!(r.is_none());
-
-        // but level 0 does
-        let r = try!(db.merge(0, 0, 2, 32));
-        assert!(r.is_some());
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitMerge(r.unwrap()));
-        }
-
-        // but now it doesn't because we just did it
-        let r = try!(db.merge(0, 0, 2, 32));
-        assert!(r.is_none());
-
-        // level 1 still needs no merge
-        let r = try!(db.merge(1, 1, 2, 32));
-        assert!(r.is_none());
-
-        // write two more level 0 segments
-        let g1 = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 300, end: 400, step: 1}, 100));
-        let g2 = try!(db.WriteSegmentFromSortedSequence(lsm::GenerateNumbers {cur: 400, end: 500, step: 2}, 50));
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitSegments(vec![g1, g2]));
-        }
-
-        // level 1 still needs no merge
-        let r = try!(db.merge(1, 1, 2, 32));
-        assert!(r.is_none());
-
-        // but level 0 does
-        let r = try!(db.merge(0, 0, 2, 32));
-        assert!(r.is_some());
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitMerge(r.unwrap()));
-        }
-
-
-        // and now level 1 does
-        let r = try!(db.merge(1, 1, 2, 32));
-        assert!(r.is_some());
-        {
-            let lck = try!(db.GetWriteLock());
-            try!(lck.commitMerge(r.unwrap()));
-        }
-
-
-        // but not anymore, since we just did it
-        let r = try!(db.merge(1, 1, 2, 32));
-        assert!(r.is_none());
-
-        // and level 2 does not need a merge
-        let r = try!(db.merge(2, 2, 2, 32));
-        assert!(r.is_none());
-
-        Ok(())
-    }
-    assert!(f().is_ok());
 }
 

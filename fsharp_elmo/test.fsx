@@ -133,6 +133,7 @@ let all_tests = [
     "jstests/aggregation/bugs/server6361.js"; // exclusions not allowed
     "jstests/aggregation/bugs/server11118.js"; // date formatting
     "jstests/aggregation/bugs/match.js"; // invalid matcher syntax mod:[0,0]
+
     "jstests/aggregation/bugs/server8581.js"; // $redact, matcher problem with $lte undefined vs number
     "jstests/aggregation/bugs/server6335.js"; // no $where in match
     "jstests/core/sort2.js"; // NaN/Infinity issue ?
@@ -588,6 +589,7 @@ let results =
         let elapsed = (t2 - t1).TotalMilliseconds
         let status = p.ExitCode
         if status <> 0 then printfn "    failed: %s" t else printfn "    passed: %s" t
+        //if status <> 0 then failwith "fail"
         //lsof()
         {
             name = t
