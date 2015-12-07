@@ -206,6 +206,23 @@ fn list_free_blocks(name: &str) -> Result<(),lsm::Error> {
     Ok(())
 }
 
+fn list_page_keys(name: &str, pgnum: lsm::PageNum) -> Result<(),lsm::Error> {
+    let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
+    let mut cursor = try!(db.open_cursor_on_page(pgnum));
+    try!(cursor.First());
+    while cursor.IsValid() {
+        {
+            let k = try!(cursor.KeyRef());
+            println!("k: {:?}", k);
+            let v = try!(cursor.ValueRef());
+            println!("    v: {:?}", v);
+            //let q = try!(v.into_boxed_slice());
+        }
+        try!(cursor.Next());
+    }
+    Ok(())
+}
+
 fn list_keys(name: &str) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let mut cursor = try!(db.open_cursor());
@@ -523,6 +540,14 @@ fn result_main() -> Result<(),lsm::Error> {
             }
             let pgnum = args[3].parse::<u32>().unwrap();
             show_leaf_page(name, pgnum)
+        },
+        "list_page_keys" => {
+            println!("usage: list_page_keys pagenum");
+            if args.len() < 4 {
+                return Err(lsm::Error::Misc(String::from("too few args")));
+            }
+            let pgnum = args[3].parse::<u32>().unwrap();
+            list_page_keys(name, pgnum)
         },
         "show_parent_page" => {
             println!("usage: show_parent_page pagenum");

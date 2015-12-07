@@ -748,6 +748,7 @@ impl MyConn {
 
             try!(cursor.Next().map_err(elmo::wrap_err));
         }
+        //println!("base_list_indexes,{:?},{}", collection_id, a.len());
         Ok(a)
     }
 

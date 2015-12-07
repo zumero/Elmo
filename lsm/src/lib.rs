@@ -60,9 +60,6 @@ pub type PageNum = u32;
 pub type PageCount = u32;
 // type PageSize = u32;
 
-// TODO also perhaps the type representing size of a value, u32
-// size of a value should NOT be usize, right?
-
 // TODO there is code which assumes that PageNum is u32.
 // but that's the nature of the file format.  the type alias
 // isn't so much so that we can change it, but rather, to make
@@ -322,6 +319,8 @@ impl BlockList {
         // don't need to clone self, it could be done in place.
         // we could require/assert/assume that the other blocklist
         // is already sorted
+        // however, note that this function is only used for diag
+        // purposes.
 
         let mut sorted_self = self.clone();
         sorted_self.sort_and_consolidate();
@@ -541,7 +540,7 @@ fn get_level_size(i: usize) -> u64 {
     for _ in 0 .. i + 1 {
         // TODO tune this factor.
         // for leveldb, it is 10.
-        n *= 2;
+        n *= 10;
     }
     n * 1024 * 1024
 }
@@ -1303,14 +1302,14 @@ pub const DEFAULT_SETTINGS: DbSettings =
         pages_per_block: 256,
         min_segments_promote_fresh: 4,
         max_segments_promote_fresh: 8,
-        min_segments_promote_young: 4,
-        max_segments_promote_young: 8,
+        min_segments_promote_young: 1,
+        max_segments_promote_young: 2,
         sleep_desperate_fresh: 20,
         sleep_desperate_young: 20,
         sleep_desperate_level: 50,
-        desperate_fresh: 256,
-        desperate_young: 32,
-        desperate_level_factor: 4,
+        desperate_fresh: 8,
+        desperate_young: 8,
+        desperate_level_factor: 2,
     };
 
 #[derive(Debug, Clone)]
@@ -1629,7 +1628,8 @@ impl MultiCursor {
         let mut ka = Vec::with_capacity(self.subcursors.len());
         for c in self.subcursors.iter() {
             if c.IsValid() {
-                ka.push(Some(try!(c.KeyRef())));
+                let k = try!(c.KeyRef());
+                ka.push(Some(k));
             } else {
                 ka.push(None);
             }
@@ -2379,6 +2379,16 @@ impl IForwardCursor for MergeCursor {
 
 pub struct LivingCursor { 
     chain: Lend<MultiCursor>,
+
+    // TODO skipped is only for diag purposes
+    skipped: usize,
+}
+
+impl Drop for LivingCursor {
+    fn drop(&mut self) {
+        // TODO skipped is only for diag purposes
+        println!("tombstones_skipped,{}", self.skipped);
+    }
 }
 
 impl LivingCursor {
@@ -2390,29 +2400,34 @@ impl LivingCursor {
         }
     }
 
-    fn skipTombstonesForward(&mut self) -> Result<()> {
+    fn skip_tombstones_forward(&mut self) -> Result<()> {
         while self.chain.IsValid() && try!(self.chain.ValueLength()).is_none() {
+            self.skipped += 1;
             try!(self.chain.Next());
         }
         Ok(())
     }
 
-    fn skipTombstonesBackward(&mut self) -> Result<()> {
+    fn skip_tombstones_backward(&mut self) -> Result<()> {
         while self.chain.IsValid() && try!(self.chain.ValueLength()).is_none() {
+            self.skipped += 1;
             try!(self.chain.Prev());
         }
         Ok(())
     }
 
     fn new(ch: Lend<MultiCursor>) -> LivingCursor {
-        LivingCursor { chain: ch }
+        LivingCursor { 
+            chain: ch,
+            skipped: 0,
+        }
     }
 }
 
 impl IForwardCursor for LivingCursor {
     fn First(&mut self) -> Result<()> {
         try!(self.chain.First());
-        try!(self.skipTombstonesForward());
+        try!(self.skip_tombstones_forward());
         Ok(())
     }
 
@@ -2443,7 +2458,7 @@ impl IForwardCursor for LivingCursor {
     fn Next(&mut self) -> Result<()> {
         //println!("LC Next");
         try!(self.chain.Next());
-        try!(self.skipTombstonesForward());
+        try!(self.skip_tombstones_forward());
         Ok(())
     }
 
@@ -2452,13 +2467,13 @@ impl IForwardCursor for LivingCursor {
 impl ICursor for LivingCursor {
     fn Last(&mut self) -> Result<()> {
         try!(self.chain.Last());
-        try!(self.skipTombstonesBackward());
+        try!(self.skip_tombstones_backward());
         Ok(())
     }
 
     fn Prev(&mut self) -> Result<()> {
         try!(self.chain.Prev());
-        try!(self.skipTombstonesBackward());
+        try!(self.skip_tombstones_backward());
         Ok(())
     }
 
@@ -2472,7 +2487,7 @@ impl ICursor for LivingCursor {
         match sop {
             SeekOp::SEEK_GE => {
                 if sr.is_valid() && self.chain.ValueLength().unwrap().is_none() {
-                    try!(self.skipTombstonesForward());
+                    try!(self.skip_tombstones_forward());
                     SeekResult::from_cursor(&*self.chain, k)
                 } else {
                     Ok(sr)
@@ -2480,7 +2495,7 @@ impl ICursor for LivingCursor {
             },
             SeekOp::SEEK_LE => {
                 if sr.is_valid() && self.chain.ValueLength().unwrap().is_none() {
-                    try!(self.skipTombstonesBackward());
+                    try!(self.skip_tombstones_backward());
                     SeekResult::from_cursor(&*self.chain, k)
                 } else {
                     Ok(sr)
@@ -3428,24 +3443,17 @@ fn merge_process_pair(
     }
 
     let keep =
-        match dest_level {
-            DestLevel::Young | DestLevel::Other(0) => {
-                if pair.Value.is_tombstone() {
-                    if try!(necessary_tombstone(&pair.Key, behind)) {
-                        true
-                    } else {
-                        //println!("dest,{:?},skip_tombstone_promoted", dest_level, );
-                        false
-                    }
-                } else {
-                    true
-                }
-            },
-            _ => {
-                assert!(behind.is_empty());
+        if pair.Value.is_tombstone() {
+            if try!(necessary_tombstone(&pair.Key, behind)) {
                 true
-            },
+            } else {
+                //println!("dest,{:?},skip_tombstone_promoted", dest_level, );
+                false
+            }
+        } else {
+            true
         };
+
     if keep {
         if let Some(pg) = try!(process_pair_into_leaf(st, pb, pw, vbuf, pair)) {
             try!(chain.add_child(pw, pg, 0));
@@ -7226,6 +7234,7 @@ impl InnerPart {
     fn open_cursor(inner: &std::sync::Arc<InnerPart>) -> Result<LivingCursor> {
         let headerstuff = try!(inner.header.read());
         let header = &headerstuff.data;
+        //println!("open_cursor,fresh,{},young,{},levels,{}", header.fresh.len(), header.young.len(), header.levels.len());
         let f = try!(inner.open_file_for_cursor());
 
         let cursors = 
@@ -7661,83 +7670,76 @@ impl InnerPart {
 
             let (behind, behind_rlock) = {
 
-                match from_level {
-                    FromLevel::Fresh | FromLevel::Young => {
-                        // during merge, a tombstone can be removed iff there is nothing
-                        // for that key left in the segments behind the dest segment.
-                        // so we need cursors on all those segments so that write_merge()
-                        // can check.
+                // during merge, a tombstone can be removed iff there is nothing
+                // for that key left in the segments behind the dest segment.
+                // so we need cursors on all those segments so that write_merge()
+                // can check.
 
-                        let (behind_cursors, behind_segments) = {
-                            fn get_cursor(
-                                path: &str, 
-                                f: std::rc::Rc<std::cell::RefCell<File>>,
-                                seg: &SegmentHeaderInfo,
-                                ) -> Result<PageCursor> {
+                let (behind_cursors, behind_segments) = {
+                    fn get_cursor(
+                        path: &str, 
+                        f: std::rc::Rc<std::cell::RefCell<File>>,
+                        seg: &SegmentHeaderInfo,
+                        ) -> Result<PageCursor> {
 
-                                let done_page = move |_| -> () {
-                                };
-                                // TODO and the clone below is silly too
-                                let buf = Lend::new(seg.buf.clone(), box done_page);
-
-                                let cursor = try!(PageCursor::new_already_read_page(path, f, seg.root_page, buf));
-                                Ok(cursor)
-                            }
-
-                            let mut behind_cursors = vec![];
-                            let mut behind_segments = HashSet::new();
-                            match from_level.get_dest_level() {
-                                DestLevel::Young => {
-                                    for i in 0 .. header.young.len() {
-                                        let seg = &header.young[i];
-
-                                        behind_segments.insert(seg.root_page);
-
-                                        let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
-                                        behind_cursors.push(cursor);
-                                    }
-                                    for i in 0 .. header.levels.len() {
-                                        let seg = &header.levels[i];
-
-                                        behind_segments.insert(seg.root_page);
-
-                                        let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
-                                        behind_cursors.push(cursor);
-                                    }
-                                },
-                                DestLevel::Other(dest_level) => {
-                                    for i in dest_level + 1 .. header.levels.len() {
-                                        let seg = &header.levels[i];
-
-                                        behind_segments.insert(seg.root_page);
-
-                                        let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
-                                        behind_cursors.push(cursor);
-                                    }
-                                },
-                            }
-                            (behind_cursors, behind_segments)
+                        let done_page = move |_| -> () {
                         };
+                        // TODO and the clone below is silly too
+                        let buf = Lend::new(seg.buf.clone(), box done_page);
 
-                        let behind_rlock =
-                            if behind_segments.is_empty() {
-                                None
-                            } else {
-                                // we do need read locks for all these cursors to protect them from going
-                                // away while we are writing the merge.
-                                let rlock = {
-                                    let mut space = try!(inner.space.lock());
-                                    let rlock = space.add_rlock(behind_segments);
-                                    rlock
-                                };
-                                Some(rlock)
-                            };
-                        (behind_cursors, behind_rlock)
-                    },
-                    _ => {
-                        (vec![], None)
-                    },
-                }
+                        let cursor = try!(PageCursor::new_already_read_page(path, f, seg.root_page, buf));
+                        Ok(cursor)
+                    }
+
+                    let mut behind_cursors = vec![];
+                    let mut behind_segments = HashSet::new();
+                    match from_level.get_dest_level() {
+                        DestLevel::Young => {
+                            for i in 0 .. header.young.len() {
+                                let seg = &header.young[i];
+
+                                behind_segments.insert(seg.root_page);
+
+                                let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
+                                behind_cursors.push(cursor);
+                            }
+                            for i in 0 .. header.levels.len() {
+                                let seg = &header.levels[i];
+
+                                behind_segments.insert(seg.root_page);
+
+                                let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
+                                behind_cursors.push(cursor);
+                            }
+                        },
+                        DestLevel::Other(dest_level) => {
+                            for i in dest_level + 1 .. header.levels.len() {
+                                let seg = &header.levels[i];
+
+                                behind_segments.insert(seg.root_page);
+
+                                let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
+                                behind_cursors.push(cursor);
+                            }
+                        },
+                    }
+                    (behind_cursors, behind_segments)
+                };
+
+                let behind_rlock =
+                    if behind_segments.is_empty() {
+                        None
+                    } else {
+                        // we do need read locks for all these cursors to protect them from going
+                        // away while we are writing the merge.
+                        let rlock = {
+                            let mut space = try!(inner.space.lock());
+                            let rlock = space.add_rlock(behind_segments);
+                            rlock
+                        };
+                        Some(rlock)
+                    };
+                (behind_cursors, behind_rlock)
 
             };
 
@@ -7915,6 +7917,7 @@ impl InnerPart {
                     //println!("lineage: {:?}", lineage);
                     //println!("chosen_node_pages: {:?}", chosen_node_pages);
                     let wrote = try!(write_survivors(&mut pw, &lineage, &old_segment, &inner.path, f.clone(), from_level.get_dest_level()));
+                    assert!(wrote.segment.is_some());
                     let from = 
                         MergeFrom::Other {
                             level: level,
@@ -7936,7 +7939,7 @@ impl InnerPart {
 
         try!(pw.end());
 
-        if cfg!(expensive_check) 
+        //if cfg!(expensive_check) 
         {
             // TODO function is inherently inefficient when called on a segment that
             // is in the header, because it loads and allocs the root page, a copy
@@ -8047,7 +8050,7 @@ impl InnerPart {
                     old_blocks.sort_and_consolidate();
                     new_blocks.sort_and_consolidate();
 
-                    if cfg!(expensive_check) 
+                    //if cfg!(expensive_check) 
                     {
                         match new_dest_segment {
                             Some(ref new_dest_segment) => {
@@ -8069,7 +8072,7 @@ impl InnerPart {
                         }
                     }
 
-                    if cfg!(expensive_check) 
+                    //if cfg!(expensive_check) 
                     {
                         match from {
                             MergeFrom::Other{ref new_segment, ..} => {

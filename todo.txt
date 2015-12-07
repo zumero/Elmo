@@ -1,4 +1,59 @@
 
+weird:  the second run of the test suite currently is a lot
+faster with the prepare_merge() expensive_check turned on.
+
+needs_merge() probably needs some way to account for whether
+reads are happening or not.  if it is purely writes, we have
+less incentive to do merges.  if reads are happening, we should
+get desperate faster.
+
+too many tombstones getting left?  need a diag to find tombstones
+that could have been dropped but were not?
+
+what happened below?  is the startup list_all_blocks() code okay?
+
+thread '<unnamed>' panicked at 'explicit panic', /Users/eric/dev/Elmo/lsm/src/lib.rs:4631
+stack backtrace:
+   1:        0x10bb14c30 - sys::backtrace::tracing::imp::write::hdcea88a6044f25a0c7s
+   2:        0x10bb0ab82 - sys_common::unwind::begin_unwind_inner::ha0580f58a156b13e28r
+   3:        0x10ba98744 - sys_common::unwind::begin_unwind::h1618399666050044516
+   4:        0x10babb45c - LeafPage::parse_page::h844989bca426533aF6f
+   5:        0x10bab366e - LeafPage::read_page::h8c43b2d678091577Ubg
+   6:        0x10babd480 - PageCursor::read_page::h66798c706c1c7ac2evg
+   7:        0x10babd3ef - PageCursor::read_page::h66798c706c1c7ac2evg
+   8:        0x10baa02de - ParentCursor.IForwardCursor::Next::hb98be6463298992cnAh
+   9:        0x10baa2e39 - MultiCursor.IForwardCursor::Next::hba116173610801f3TAc
+  10:        0x10baa6c1f - LivingCursor::skipTombstonesForward::hca08ce25eb751ab1qdd
+  11:        0x10baa80f5 - RangeCursor::Next::h1031ce63f5601f33nzd
+  12:        0x10b94e2d8 - RangeCursorBsonValueIterator.Iterator::next::h0b899b538087344fkea
+  13:        0x10b987815 - MyCollectionReader.Iterator::next::h7251dfba7c3adff1zfc
+  14:        0x10ba406ce - iter::FilterMap<I, F>.Iterator::next::h11490810477968315499
+  15:        0x10b9124b2 - iter::Iterator::count::h6329506342169373999
+  16:        0x10b932a5b - Server<'b>::reply_cmd::h533c1789c23e1413idc
+
+running the elmo test multiple times shows it getting
+slower, and elmo list_indexes is a lot of the time,
+and the worst culprit is MultiCursor::sort.  is the
+segment list just getting too long?  lower the
+Desperate threshold?
+
+shouldn't MC::sort try to remember the orderings?
+or can it?
+
+part of the problem is in the elmo layer and in the
+mongo tests.  a lot of indexes get left around after
+each test run.  the elmo layer, when asked for a
+collection writer, gets a list of all the indexes,
+so this query gets slower the more indexes there are.
+it should not need the list to update the primary index.
+and if it is not constraining the index list by range,
+it should be.
+
+second run of test suite into same db is really slow.
+probably fragmentation and blocklist stuff?  no.  second
+run has LiveCursor skipping a thousand times as many
+tombstones.
+
 should the default page size be 4K or 8K ?
 
 parent node writer gets in trouble, overflows its stack,
@@ -172,9 +227,6 @@ chose not to recycle the parent of that node.
 
 every time we recycle a node, we flush the current page
 in progress, at every level, down to that node's depth.
-
-second run of test suite into same db is really slow.
-probably fragmentation and blocklist stuff?
 
 do we have no test cases involving an overflowed key?
 
