@@ -1,6 +1,27 @@
 
+hmmm.  maybe we had the necessary_tombstone() code backwards.
+consider NOT doing this check on merge from Fresh.  to make
+it faster.  merge from fresh is imply to reduce the segment
+count as quickly as possible by combining them together into
+bigger segments in Young.
+
+I wonder if we have problems where a fresh segment contains a
+ton of tombstones that should be deleted but can't be because
+it's the only fresh segment so needs_merge return false.
+tried addressing this with a change to the settings, as an
+experiment.
+
+treating all fresh/young segments as the same size has gotta
+be a problem.
+
 weird:  the second run of the test suite currently is a lot
 faster with the prepare_merge() expensive_check turned on.
+
+weirder:  running 8 test runs in a row from a bash script
+without a server restart:  with expensive_check off, several
+failures, and quite slow.  with expensive_check on, no
+failures, and faster.  (this was done with the promote N->N+1
+code set to always choose one leaf).
 
 needs_merge() probably needs some way to account for whether
 reads are happening or not.  if it is purely writes, we have
@@ -11,6 +32,9 @@ too many tombstones getting left?  need a diag to find tombstones
 that could have been dropped but were not?
 
 what happened below?  is the startup list_all_blocks() code okay?
+actually, this can happen without stopping/starting the server,
+so list_all_blocks() is not in play.  it can also happen with
+either a leaf or a parent page.
 
 thread '<unnamed>' panicked at 'explicit panic', /Users/eric/dev/Elmo/lsm/src/lib.rs:4631
 stack backtrace:
