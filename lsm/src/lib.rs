@@ -3864,7 +3864,7 @@ fn write_merge(
 
 fn survivors_rewrite_immediate_parent_of_skip(
                     pw: &mut PageWriter,
-                    skip_pagenum: PageNum,
+                    skip_pages: &Vec<PageNum>,
                     skip_depth: u8,
                     parent: &ParentPage,
                     chain: &mut ParentNodeWriter,
@@ -3874,9 +3874,25 @@ fn survivors_rewrite_immediate_parent_of_skip(
 
     let mut nodes_recycled = 0;
 
-    let len = parent.count_items();
-    for i in 0 .. len {
-        if parent.child_pagenum(i) == skip_pagenum {
+// TODO it would be better to do this with only one loop
+
+    fn find_page(parent: &ParentPage, page: PageNum) -> usize {
+        for i in 0 .. parent.count_items() {
+            if parent.child_pagenum(i) == page {
+                return i;
+            }
+        }
+        unreachable!();
+    }
+
+    let first_skip = find_page(parent, skip_pages[0]);
+    for i in 0 .. skip_pages.len() {
+        assert!(parent.child_pagenum(first_skip + i) == skip_pages[i]);
+    }
+    let last_skip = first_skip + skip_pages.len() - 1;
+
+    for i in 0 .. parent.count_items() {
+        if i >= first_skip && i <= last_skip {
             // skip
         } else {
             let pg = try!(parent.child_pgitem(i));
@@ -3885,15 +3901,16 @@ fn survivors_rewrite_immediate_parent_of_skip(
         }
     }
 
-    assert!(nodes_recycled == len - 1);
+    assert!(nodes_recycled == parent.count_items() - skip_pages.len());
 
     Ok(nodes_recycled)
 }
 
 fn survivors_rewrite_ancestor(
                     pw: &mut PageWriter,
-                    skip: &HashMap<u8, PageNum>,
+                    skip_pages: &Vec<PageNum>,
                     skip_depth: u8,
+                    skip_lineage: &Vec<PageNum>,
                     parent: &ParentPage,
                     chain: &mut ParentNodeWriter,
                     nodes_rewritten: &mut Box<[Vec<PageNum>]>,
@@ -3903,13 +3920,14 @@ fn survivors_rewrite_ancestor(
     assert!(parent.depth() > skip_depth + 1);
 
     let len = parent.count_items();
-    let this_skip = skip[&(parent.depth() - 1)];
+    let this_skip = skip_lineage[parent.depth() as usize - 1];
+    assert!(this_skip != 0);
     for i in 0 .. len {
         let this_pagenum = parent.child_pagenum(i);
         if this_pagenum == this_skip {
             nodes_rewritten[parent.depth() as usize - 1].push(this_pagenum);
             let sub = try!(parent.fetch_item_parent(i));
-            try!(survivors_rewrite_node(pw, skip, skip_depth, &sub, chain, nodes_rewritten, nodes_recycled,));
+            try!(survivors_rewrite_node(pw, skip_pages, skip_depth, skip_lineage, &sub, chain, nodes_rewritten, nodes_recycled,));
         } else {
             let pg = try!(parent.child_pgitem(i));
             try!(chain.add_child(pw, pg, parent.depth() - 1));
@@ -3922,28 +3940,33 @@ fn survivors_rewrite_ancestor(
 
 fn survivors_rewrite_node(
                     pw: &mut PageWriter,
-                    skip: &HashMap<u8, PageNum>,
+                    skip_pages: &Vec<PageNum>,
                     skip_depth: u8,
+                    skip_lineage: &Vec<PageNum>,
                     parent: &ParentPage,
                     chain: &mut ParentNodeWriter,
                     nodes_rewritten: &mut Box<[Vec<PageNum>]>,
                     nodes_recycled: &mut Box<[usize]>,
                     ) -> Result<()> {
     if parent.depth() - 1 == skip_depth {
-        let num_recycled = try!(survivors_rewrite_immediate_parent_of_skip(pw, skip[&skip_depth], skip_depth, parent, chain));
+        let num_recycled = try!(survivors_rewrite_immediate_parent_of_skip(pw, skip_pages, skip_depth, parent, chain));
         nodes_recycled[skip_depth as usize] += num_recycled;
     } else if parent.depth() - 1 > skip_depth {
-        try!(survivors_rewrite_ancestor(pw, skip, skip_depth, parent, chain, nodes_rewritten, nodes_recycled, ));
+        try!(survivors_rewrite_ancestor(pw, skip_pages, skip_depth, skip_lineage, parent, chain, nodes_rewritten, nodes_recycled, ));
     } else {
         panic!();
     }
     Ok(())
 }
 
-// TODO silly for skip to be a hashmap. just use an array indexed by depth
+// TODO if this is going to be used by merge from Young,
+// it needs to be able to handle the case where there are
+// no survivors.  or do we just catch that in the caller?
 fn write_survivors(
                 pw: &mut PageWriter,
-                skip: &HashMap<u8, PageNum>,
+                skip_pages: &Vec<PageNum>,
+                skip_depth: u8,
+                skip_lineage: &Vec<PageNum>,
                 parent: &ParentPage,
                 path: &str,
                 f: std::rc::Rc<std::cell::RefCell<File>>,
@@ -3952,12 +3975,14 @@ fn write_survivors(
 
     let t1 = time::PreciseTime::now();
 
+    assert!(!skip_pages.is_empty());
+    assert!(skip_lineage[skip_depth as usize] == 0);
+
     let mut chain = ParentNodeWriter::new(pw.page_size(), 1);
     let mut nodes_rewritten = vec![vec![]; parent.depth() as usize + 1].into_boxed_slice();
     let mut nodes_recycled = vec![0; parent.depth() as usize + 1].into_boxed_slice();
 
-    let skip_depth = skip.keys().map(|k| *k).min().unwrap();
-    try!(survivors_rewrite_node(pw, skip, skip_depth, parent, &mut chain, &mut nodes_rewritten, &mut nodes_recycled, ));
+    try!(survivors_rewrite_node(pw, skip_pages, skip_depth, skip_lineage, parent, &mut chain, &mut nodes_rewritten, &mut nodes_recycled, ));
     nodes_rewritten[parent.depth() as usize].push(parent.pagenum);
 
     let (count_parent_nodes, seg) = try!(chain.done(pw));
@@ -5638,8 +5663,8 @@ impl ParentPage {
         Ok(total_count_pages)
     }
 
-    fn any_node_at_depth(&self, depth: u8, lineage: &mut HashMap<u8, PageNum>) -> Result<()> {
-        lineage.insert(self.depth(), self.pagenum);
+    fn any_node_at_depth(&self, depth: u8, lineage: &mut Vec<PageNum>) -> Result<PageNum> {
+        lineage[self.depth() as usize] = self.pagenum;
 
         // we need to pick a child, and it kinda doesn't matter which
         // one, but we don't need the number to be really random, and we
@@ -5655,8 +5680,7 @@ impl ParentPage {
         let i = ((self.pagenum as u32) % (self.children.len() as u32)) as usize;
         let pagenum = self.child_pagenum(i);
         if self.depth() - 1 == depth {
-            lineage.insert(self.depth() - 1, pagenum);
-            Ok(())
+            Ok(pagenum)
         } else {
             assert!(self.depth() - 1 > depth);
             assert!(self.depth() > 1);
@@ -7492,9 +7516,10 @@ impl InnerPart {
             Other{
                 level: usize,  // TODO why is this here?
                 old_segment: ParentPage, 
-                chosen_page: PageNum,
-                lineage: HashMap<u8, PageNum>, 
-                chosen_node_pages: BlockList, 
+                promote_pages: Vec<PageNum>, // must be contig within same parent
+                promote_depth: u8,
+                promote_blocks: BlockList, 
+                promote_lineage: Vec<PageNum>, 
             },
         }
 
@@ -7598,7 +7623,7 @@ impl InnerPart {
                         let depth_root = old_from_segment.buf[2];
                         //println!("old_from_segment: {}, depth: {}", old_from_segment.root_page, depth_root);
                         assert!(depth_root >= 1);
-                        let depth_promote =
+                        let promote_depth =
                             if depth_root == 1 {
                                 0
                             } else {
@@ -7606,7 +7631,7 @@ impl InnerPart {
                                 // TODO should this depend on the size of the dest segment?
                                 0
                             };
-                        //println!("depth_promote: {}", depth_promote);
+                        //println!("promote_depth: {}", promote_depth);
 
                         // TODO it's a little silly here to construct a Lend<>
                         let done_page = move |_| -> () {
@@ -7617,13 +7642,9 @@ impl InnerPart {
                         // TODO might need to allow this to choose more than one leaf.
                         // always promoting a single leaf seems too small.
 
-                        // TODO the lineage could just be a vec/array where the depth is
-                        // the index, instead of a hashmap.
-
-                        let mut lineage = HashMap::new();
-                        try!(parent.any_node_at_depth(depth_promote, &mut lineage));
+                        let mut lineage = vec![0; parent.depth() as usize + 1];
+                        let chosen_pagenum = try!(parent.any_node_at_depth(promote_depth, &mut lineage));
                         //println!("lineage: {}", lineage);
-                        let chosen_pagenum = lineage[&depth_promote];
 
                         let cursor = {
                             let buf = try!(read_and_alloc_page(&f, chosen_pagenum, inner.pgsz));
@@ -7636,13 +7657,14 @@ impl InnerPart {
                         };
 
                         // TODO use node iterator
-                        let chosen_node_pages = try!(cursor.blocklist_unsorted_no_overflows());
+                        let promote_blocks = try!(cursor.blocklist_unsorted_no_overflows());
                         let from = MergingFrom::Other{
                             level: level, 
                             old_segment: parent, 
-                            lineage: lineage, 
-                            chosen_page: chosen_pagenum, 
-                            chosen_node_pages: chosen_node_pages, 
+                            promote_lineage: lineage, 
+                            promote_pages: vec![chosen_pagenum], 
+                            promote_depth: promote_depth,
+                            promote_blocks: promote_blocks, 
                         };
                         (vec![cursor], from)
 
@@ -7951,10 +7973,10 @@ impl InnerPart {
                         segments: segments,
                     }
                 },
-                MergingFrom::Other{level, old_segment, chosen_page, lineage, chosen_node_pages, ..} => {
-                    //println!("lineage: {:?}", lineage);
-                    //println!("chosen_node_pages: {:?}", chosen_node_pages);
-                    let wrote = try!(write_survivors(&mut pw, &lineage, &old_segment, &inner.path, f.clone(), from_level.get_dest_level()));
+                MergingFrom::Other{level, old_segment, promote_pages, promote_depth, promote_lineage, promote_blocks, ..} => {
+                    //println!("promote_lineage: {:?}", promote_lineage);
+                    //println!("promote_blocks: {:?}", promote_blocks);
+                    let wrote = try!(write_survivors(&mut pw, &promote_pages, promote_depth, &promote_lineage, &old_segment, &inner.path, f.clone(), from_level.get_dest_level()));
                     assert!(wrote.segment.is_some());
 
                     println!("survivors,from,{:?}, leaves_rewritten,{}, leaves_recycled,{}, parent1_rewritten,{}, parent1_recycled,{}, ms,{}", 
@@ -7972,9 +7994,11 @@ impl InnerPart {
                             old_segment: old_segment.pagenum,
                             new_segment: wrote.segment.unwrap(),
                         };
-                    let mut blocks = chosen_node_pages;
-                    blocks.add_page_no_reorder(chosen_page);
-                    // TODO isn't lineage the same as nodes rewritten, basically?
+                    let mut blocks = promote_blocks;
+                    for page in promote_pages {
+                        blocks.add_page_no_reorder(page);
+                    }
+                    // TODO isn't promote_lineage the same as nodes rewritten, basically?
                     for depth in 0 .. wrote.nodes_rewritten.len() {
                         for pgnum in wrote.nodes_rewritten[depth].iter() {
                             blocks.add_page_no_reorder(*pgnum);
