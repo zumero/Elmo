@@ -1,4 +1,54 @@
 
+don't build behind if there are no tombstones or if
+we are not going to use it.
+
+still getting bad page type errors, very intermittent
+
+revisit how much stuff should we promote.  try doing
+more now?
+
+looping over all the children in a parent node to get
+max tombstones, but when there are no tombstones, this
+is sad.
+
+5M url test spends all its time desperate, which is
+unsurprising.
+
+distinction between needs_merge() and prepare_merge()
+is getting lamer.
+
+when choosing what to promote, if there are no tombstones,
+should we do random?  or should there be another thing
+to prioritize?  like the one with the most items?  or
+the least?
+
+merge from Young is now the most expensive.  why?
+
+should Other levels *ever* be desperate?
+
+retry the 5M url test with lower level mulitplier
+
+replace parent's count_pages with count_leaves?
+for a depth 1 parent, it's silly, as all the entries
+should be 1.  for a depth 2 parent, each entry is the
+number of children.  for a depth 3 parent, it gets
+more informative.
+
+but what do we gain by considering overflow pages
+in a decision about whether to promote or not?  they
+just get reused anyway.
+
+have parent keep count_pairs and count_tombstones?
+would be useful for choosing what to promote, in the
+case where we want to promote tombstones even if the
+level is not otherwise in need of a merge.  depth 1
+parents would need these too.
+
+so yeah, it would seem that the blocklist stored for
+the leaf children of a depth 1 parent is only used at
+startup to identify all the pages in use.  is that
+right?
+
 idea:  what about cases where we have lots of tombstones
 but are not in a needs_merge state?  we want to get rid
 of them anyway...
@@ -14,7 +64,7 @@ waiting because merge need is desperate?
 
 hmmm.  maybe we had the necessary_tombstone() code backwards.
 consider NOT doing this check on merge from Fresh.  to make
-it faster.  merge from fresh is imply to reduce the segment
+it faster.  merge from fresh is simply to reduce the segment
 count as quickly as possible by combining them together into
 bigger segments in Young.
 
