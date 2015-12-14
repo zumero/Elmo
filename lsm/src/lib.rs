@@ -1304,10 +1304,16 @@ pub const DEFAULT_SETTINGS: DbSettings =
         desperate_level_factor: 2,
     };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SegmentHeaderInfo {
     pub root_page: PageNum,
     buf: Box<[u8]>,
+}
+
+impl std::fmt::Debug for SegmentHeaderInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "SegmentHeaderInfo {{ root_page: {} }}", self.root_page)
+    }
 }
 
 impl SegmentHeaderInfo {
@@ -5754,7 +5760,7 @@ impl ParentPage {
             let avail = self.children.len() - i;
             // TODO config constant
             let take = std::cmp::min(avail, 8);
-            println!("any_node,{},{},{}", self.children.len(), i, take);
+            //println!("any_node,{},{},{}", self.children.len(), i, take);
             let v = 
                 self.children[i .. i + take]
                 .iter()
@@ -6354,10 +6360,12 @@ impl Space {
     }
 
     fn maybe_release_segment(&mut self, seg: PageNum) {
+        //println!("maybe_release_segment: {}", seg);
         if self.dependencies.contains_key(&seg) || self.has_rlock(seg) {
             // anything that still has an rlock (directly or
             // indirectly through a dependency) has gotta be
             // left alone.
+            //println!("seg {} has deps, so no release", seg);
             return;
         }
 
@@ -6374,6 +6382,7 @@ impl Space {
 
         match self.zombies.remove(&seg) {
             Some(blocks) => {
+                //println!("release zombies, so add_free_blocks: {:?}", blocks);
                 self.add_free_blocks(blocks);
             },
             None => {
@@ -6419,6 +6428,8 @@ impl Space {
     fn add_inactive(&mut self, mut blocks: HashMap<PageNum, BlockList>) {
         // everything in blocks should go in either free or zombie
 
+        //println!("add_inactive: {:?}", blocks);
+        //println!("dependencies: {:?}", self.dependencies);
         if !blocks.is_empty() {
             let segments = blocks.keys().map(|p| *p).collect::<HashSet<PageNum>>();
             let new_zombie_segments = 
@@ -6433,7 +6444,7 @@ impl Space {
             }
             if !blocks.is_empty() {
                 for (pg, b) in blocks {
-                    //println!("no rlock on {}, so free: {:?}", pg, b);
+                    //println!("no rlock on {}, so add_free_blocks: {:?}", pg, b);
                     self.add_free_blocks(b);
                 }
             }
@@ -6441,10 +6452,11 @@ impl Space {
     }
 
     fn add_dependencies(&mut self, seg: PageNum, depends_on: Vec<PageNum>) {
+        //println!("add_dependencies: {} depends on {:?}", seg, depends_on);
         let depends_on = 
             depends_on
             .into_iter()
-            .filter(|seg| self.has_rlock(*seg))
+            .filter(|seg| self.dependencies.contains_key(seg) || self.has_rlock(*seg))
             .collect::<HashSet<_>>();
         if depends_on.is_empty() {
             return;
@@ -7204,7 +7216,7 @@ impl HeaderStuff {
             pb
         }
 
-        println!("header, fresh,{}, young,{}, levels,{}", hdr.fresh.len(), hdr.young.len(), hdr.levels.len());
+        //println!("header, fresh,{}, young,{}, levels,{}", hdr.fresh.len(), hdr.young.len(), hdr.levels.len());
 
         let mut pb = PageBuilder::new(HEADER_SIZE_IN_BYTES);
         // TODO format version number
@@ -7411,6 +7423,17 @@ impl InnerPart {
 
         println!("open_cursor,{}, fresh,{}, young,{}, levels,{}", rlock, header.fresh.len(), header.young.len(), header.levels.len());
 
+        if cfg!(expensive_check) 
+        {
+            let segnums = 
+                header.fresh.iter()
+                .chain(header.young.iter())
+                .chain(header.levels.iter())
+                .map(|seg| seg.root_page)
+                .collect::<Vec<_>>();
+            println!("open_cursor,{},{:?}", rlock, segnums);
+        }
+
         let foo = inner.clone();
         let done = move |_| -> () {
             // TODO this wants to propagate errors
@@ -7503,6 +7526,20 @@ impl InnerPart {
         let pw = try!(PageWriter::new(inner.clone()));
         let f = try!(inner.open_file_for_cursor());
         let seg = try!(create_segment(pw, source, f));
+        /*
+        if cfg!(expensive_check) 
+        {
+            match seg {
+                Some(ref seg) => {
+                    let mut blocks = try!(seg.blocklist_unsorted(&inner.path, f.clone()));
+                    blocks.sort_and_consolidate();
+                    println!("write_segment,{:?}", blocks);
+                },
+                None => {
+                },
+            }
+        }
+        */
         Ok(seg)
     }
 
@@ -7751,10 +7788,7 @@ impl InnerPart {
                                     };
                                 let t2 = time::PreciseTime::now();
                                 let elapsed = t1.to(t2);
-                                println!("prepare,from,{:?}, ms,{}", 
-                                    from_level,
-                                    elapsed.num_milliseconds()
-                                    );
+                                //println!("prepare,from,{:?}, ms,{}", from_level, elapsed.num_milliseconds());
                                 return Ok(pm);
                             },
                         }
@@ -7791,7 +7825,7 @@ impl InnerPart {
 
                             let mut lineage = vec![0; parent.depth() as usize + 1];
                             let chosen_pages = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage));
-                            println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
+                            //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
                             //println!("lineage: {}", lineage);
 
                             let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, chosen_pages.clone()));
@@ -8006,7 +8040,7 @@ impl InnerPart {
                 let wrote = try!(write_merge(&mut pw, &mut source, &into, behind, &inner.path, f.clone(), from_level.get_dest_level()));
 
                 let count_keys_yielded_by_merge_cursor = source.count_keys_yielded();
-                println!("count_keys_yielded_by_merge_cursor: {}", count_keys_yielded_by_merge_cursor);
+                //println!("count_keys_yielded_by_merge_cursor: {}", count_keys_yielded_by_merge_cursor);
 
                 println!("merge,from,{:?}, leaves_rewritten,{}, leaves_recycled,{}, parent1_rewritten,{}, parent1_recycled,{}, keys_promoted,{}, keys_rewritten,{}, keys_shadowed,{}, tombstones_removed,{}, ms,{}", 
                          from_level, 
@@ -8495,10 +8529,7 @@ impl InnerPart {
 
         let t2 = time::PreciseTime::now();
         let elapsed = t1.to(t2);
-        println!("prepare,from,{:?}, ms,{}", 
-            from_level,
-            elapsed.num_milliseconds()
-            );
+        //println!("prepare,from,{:?}, ms,{}", from_level, elapsed.num_milliseconds());
 
         Ok(pm)
     }
@@ -8567,45 +8598,67 @@ impl InnerPart {
                 ndx
             }
 
-            let deps = 
-                // TODO this code assumes that the new dest segment might have
-                // recycled something from ANY of the promoted segments OR from
-                // the old dest segment.  this is a little bit pessimistic.
-                // a node page can only be recycled from the old dest, but overflows
-                // could have been recycled from anywhere.  the write merge segment code
-                // could keep track of things more closely, but that would probably
-                // be a low bang for the buck.
-                match pm.new_dest_segment {
-                    None => {
-                        None
-                    },
-                    Some(ref new_seg) => {
-                        let mut deps = vec![];
-                        match pm.from {
-                            MergeFrom::Fresh{ref segments} => {
-                                for seg in segments {
-                                    deps.push(*seg);
-                                }
-                            },
-                            MergeFrom::FreshNoRewrite{..} => {
-                            },
-                            MergeFrom::Young{old_segment, ..} => {
-                                deps.push(old_segment);
-                            },
-                            MergeFrom::Other{old_segment, ..} => {
-                                deps.push(old_segment);
-                            },
-                        }
-                        match pm.old_dest_segment {
-                            Some(seg) => {
-                                deps.push(seg);
-                            },
-                            None => {
-                            },
-                        }
-                        Some((new_seg.root_page, deps))
-                    },
-                };
+            let mut deps = HashMap::new();
+
+            // TODO this code assumes that the new dest segment might have
+            // recycled something from ANY of the promoted segments OR from
+            // the old dest segment.  this is a little bit pessimistic.
+            // a node page can only be recycled from the old dest, but overflows
+            // could have been recycled from anywhere.  the write merge segment code
+            // could keep track of things more closely, but that would probably
+            // be low bang for the buck.
+            match pm.new_dest_segment {
+                None => {
+                },
+                Some(ref new_seg) => {
+                    let mut deps_dest = vec![];
+                    match pm.from {
+                        MergeFrom::Fresh{ref segments} => {
+                            for seg in segments {
+                                deps_dest.push(*seg);
+                            }
+                        },
+                        MergeFrom::FreshNoRewrite{..} => {
+                            assert!(pm.now_inactive.is_empty());
+                        },
+                        MergeFrom::Young{old_segment, ..} => {
+                            deps_dest.push(old_segment);
+                        },
+                        MergeFrom::Other{old_segment, ..} => {
+                            deps_dest.push(old_segment);
+                        },
+                    }
+                    match pm.old_dest_segment {
+                        Some(seg) => {
+                            deps_dest.push(seg);
+                        },
+                        None => {
+                        },
+                    }
+                    deps.insert(new_seg.root_page, deps_dest);
+                },
+            }
+
+            // also, the survivors must depend on the old segment
+
+            match pm.from {
+                MergeFrom::Fresh{..} => {
+                },
+                MergeFrom::FreshNoRewrite{..} => {
+                },
+                MergeFrom::Young{old_segment, ref new_segment} => {
+                    match new_segment {
+                        &Some(ref new_segment) => {
+                            deps.insert(new_segment.root_page, vec![old_segment]);
+                        },
+                        &None => {
+                        },
+                    }
+                },
+                MergeFrom::Other{level, old_segment, ref new_segment} => {
+                    deps.insert(new_segment.root_page, vec![old_segment]);
+                },
+            }
 
             match pm.from {
                 MergeFrom::Fresh{ref segments} => {
@@ -8667,10 +8720,10 @@ impl InnerPart {
             //println!("merge committed");
 
             let mut space = try!(self.space.lock());
-            space.add_inactive(pm.now_inactive);
-            if let Some(deps) = deps {
-                space.add_dependencies(deps.0, deps.1);
+            for (seg, depends_on) in deps {
+                space.add_dependencies(seg, depends_on);
             }
+            space.add_inactive(pm.now_inactive);
         }
 
         // note that we intentionally do not release the writeLock here.

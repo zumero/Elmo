@@ -777,17 +777,25 @@ fn blobs_of_many_sizes() {
             }
             t1
         }
+        println!("writing segment");
         let g = try!(db.write_segment(gen()));
+        println!("wrote segment: {:?}", g);
         if let Some(g) = g {
             let lck = try!(db.get_write_lock());
+            println!("got write lock");
             try!(lck.commit_segment(g));
+            println!("committed segment");
         }
+        println!("opening cursor");
         let mut csr = try!(db.open_cursor());
+        println!("got cursor");
         let t1 = gen(); // generate another copy
         for (k, v) in t1 {
             if let lsm::Blob::Boxed(v) = v {
+                println!("k: {:?}", k);
                 try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(k), lsm::SeekOp::SEEK_EQ));
                 assert!(csr.IsValid());
+                println!("    valid");
                 assert_eq!(v.len() as u64, csr.ValueLength().unwrap().unwrap());
                 assert_eq!(v, read_value(csr.ValueRef().unwrap()).unwrap());
             } else {
