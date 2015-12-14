@@ -1,4 +1,17 @@
 
+idea:  what about cases where we have lots of tombstones
+but are not in a needs_merge state?  we want to get rid
+of them anyway...
+
+why do we have so many cases where any_node shows only
+1 (or just a few) children to choose from when promoting?
+
+why is the number of keys promoted always so small, even
+when we are promoting 8 leaves?
+
+do we need to dump timings of when the main thread is
+waiting because merge need is desperate?
+
 hmmm.  maybe we had the necessary_tombstone() code backwards.
 consider NOT doing this check on merge from Fresh.  to make
 it faster.  merge from fresh is imply to reduce the segment

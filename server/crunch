@@ -10,12 +10,21 @@ egrep merge $1 | egrep 'Other\(0\)' | awk "$CRUNCH_MERGE"
 #egrep merge $1 | egrep 'Other\(1\)' | awk "$CRUNCH_MERGE"
 /bin/echo -n "open_cursor,"
 egrep open_cursor $1 | awk 'BEGIN{FS=","} { fresh+=$4; young+=$6; levels+=$8; } END {printf "%d, fresh,%.2f, young,%.2f, levels,%.2f\n", NR, fresh/NR, young/NR, levels/NR}'
-egrep tombstones_skipped $1 | awk 'BEGIN{FS=","} { tombstones_skipped+=$3; if(max=""){max=$3}; if($3>max){max=$3}; } END {printf "tombstones_skipped,%.2f (%d max)\n", tombstones_skipped/NR, max}'
-CRUNCH_PREPARE='BEGIN{FS=","} { ms+=$5; } END {printf "%.2f\n", ms/NR}'
+egrep tombstones_skipped $1 | awk 'BEGIN{FS=","} { tombstones_skipped+=$3; if(max==""){max=$3}; if($3>max){max=$3}; } END {printf "tombstones_skipped,%.2f (%d max)\n", tombstones_skipped/NR, max}'
+CRUNCH_PREPARE='BEGIN{FS=","} { ms+=$5; if(max==""){max=$5}; if($5>max){max=$5}; } END {printf "%.2f (%d max)\n", ms/NR, max}'
 /bin/echo -n "prepare,from,Fresh,"
 egrep prepare $1 | egrep Fresh | awk "$CRUNCH_PREPARE"
 /bin/echo -n "prepare,from,Young,"
 egrep prepare $1 | egrep Young | awk "$CRUNCH_PREPARE"
 /bin/echo -n "prepare,from,Other(0),"
 egrep prepare $1 | egrep 'Other\(0\)' | awk "$CRUNCH_PREPARE"
+CRUNCH_DESPERATE='BEGIN{FS=","} { ms+=$4; } END {printf "%d,%d\n", NR, ms}'
+/bin/echo -n "desperate,main,"
+egrep desperate $1 | egrep main | awk "$CRUNCH_DESPERATE"
+/bin/echo -n "desperate,Fresh,"
+egrep desperate $1 | egrep Fresh | awk "$CRUNCH_DESPERATE"
+/bin/echo -n "desperate,Young,"
+egrep desperate $1 | egrep Young | awk "$CRUNCH_DESPERATE"
+/bin/echo -n "desperate,Other,"
+egrep desperate $1 | egrep Other | awk "$CRUNCH_DESPERATE"
 
