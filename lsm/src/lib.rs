@@ -5749,7 +5749,7 @@ impl ParentPage {
         }
     }
 
-    fn choose_nodes_to_promote(&self, depth: u8, lineage: &mut Vec<PageNum>) -> Result<Vec<PageNum>> {
+    fn choose_nodes_to_promote(&self, depth: u8, lineage: &mut Vec<PageNum>) -> Result<(Vec<PageNum>, u64)> {
         lineage[self.depth() as usize] = self.pagenum;
 
         let i = self.max_tombstones_or_quasi_random();
@@ -5766,7 +5766,12 @@ impl ParentPage {
                 .iter()
                 .map(|x| x.page)
                 .collect::<Vec<_>>();
-            Ok(v)
+            let count_tombstones = 
+                self.children[i .. i + take]
+                .iter()
+                .map(|x| x.count_tombstones())
+                .sum();
+            Ok((v, count_tombstones))
         } else {
             assert!(self.depth() - 1 > depth);
             assert!(self.depth() > 1);
@@ -7669,6 +7674,7 @@ impl InnerPart {
             },
             YoungWhole{
                 segment: FromWholeSegment,
+                // TODO count_tombstones: u64,
             },
             YoungPartial{
                 old_segment: ParentPage,
@@ -7676,6 +7682,7 @@ impl InnerPart {
                 promote_depth: u8,
                 promote_blocks: BlockList, 
                 promote_lineage: Vec<PageNum>, 
+                count_tombstones: u64,
             },
             Other{
                 level: usize,  // TODO why is this here?
@@ -7684,12 +7691,13 @@ impl InnerPart {
                 promote_depth: u8,
                 promote_blocks: BlockList, 
                 promote_lineage: Vec<PageNum>, 
+                count_tombstones: u64,
             },
         }
 
         let f = try!(inner.open_file_for_cursor());
 
-        let (cursor, from, into, behind, behind_rlock) = {
+        let (cursor, from, into, behind_cursors, behind_rlock) = {
             let headerstuff = try!(inner.header.read());
             let header = &headerstuff.data;
 
@@ -7813,6 +7821,7 @@ impl InnerPart {
                                 node_pages: node_pages,
                             };
 
+                            // TODO could count tombstones here as well
                             (cursors, MergingFrom::YoungWhole{segment: seg})
                         } else {
                             let promote_depth = 0;
@@ -7824,7 +7833,7 @@ impl InnerPart {
                             let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), segment.root_page, buf));
 
                             let mut lineage = vec![0; parent.depth() as usize + 1];
-                            let chosen_pages = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage));
+                            let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage));
                             //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
                             //println!("lineage: {}", lineage);
 
@@ -7836,6 +7845,7 @@ impl InnerPart {
                                 promote_pages: chosen_pages, 
                                 promote_depth: promote_depth,
                                 promote_blocks: BlockList::new(), 
+                                count_tombstones: count_tombstones,
                             };
                             (vec![cursor], from)
                         }
@@ -7865,7 +7875,7 @@ impl InnerPart {
                         let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), old_from_segment.root_page, buf));
 
                         let mut lineage = vec![0; parent.depth() as usize + 1];
-                        let chosen_pages = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage));
+                        let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage));
                         println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
                         let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, chosen_pages.clone()));
                         //println!("lineage: {}", lineage);
@@ -7887,6 +7897,7 @@ impl InnerPart {
                             promote_pages: chosen_pages, 
                             promote_depth: promote_depth,
                             promote_blocks: promote_blocks, 
+                            count_tombstones: count_tombstones,
                         };
                         (vec![cursor], from)
                     },
@@ -7934,88 +7945,115 @@ impl InnerPart {
                     },
                 };
 
-            let (behind, behind_rlock) = {
-
-                // TODO in cases where we are not going to bother trying to remove
-                // tombstones, don't bother getting these cursors and rlock
-
-                // TODO we can now check the stuff we are promoting to see if there are
-                // any tombstones.  if not, don't bother with behind.
+            let (behind_cursors, behind_rlock) = {
 
                 // during merge, a tombstone can be removed iff there is nothing
                 // for that key left in the segments behind the dest segment.
                 // so we need cursors on all those segments so that we can check
                 // while writing the merge segment.
 
-                let (behind_cursors, behind_segments) = {
-                    fn get_cursor(
-                        path: &str, 
-                        f: std::rc::Rc<std::cell::RefCell<File>>,
-                        seg: &SegmentHeaderInfo,
-                        ) -> Result<PageCursor> {
+                // TODO is it really true that we can skip tombstone checks if
+                // there are no tombstones being promoted?  what about tombstones
+                // in the overlapping stuff that needs to get rewritten?  is that
+                // possible?
 
-                        let done_page = move |_| -> () {
-                        };
-                        // TODO and the clone below is silly too
-                        let buf = Lend::new(seg.buf.clone(), box done_page);
-
-                        let cursor = try!(PageCursor::new_already_read_page(path, f, seg.root_page, buf));
-                        Ok(cursor)
-                    }
-
-                    let mut behind_cursors = vec![];
-                    let mut behind_segments = HashSet::new();
-                    match from_level.get_dest_level() {
-                        DestLevel::Young => {
-                            for i in 0 .. header.young.len() {
-                                let seg = &header.young[i];
-
-                                behind_segments.insert(seg.root_page);
-
-                                let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
-                                behind_cursors.push(cursor);
-                            }
-                            for i in 0 .. header.levels.len() {
-                                let seg = &header.levels[i];
-
-                                behind_segments.insert(seg.root_page);
-
-                                let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
-                                behind_cursors.push(cursor);
-                            }
+                let behind_segments = {
+                    match from {
+                        MergingFrom::Fresh{..} => {
+                            None
                         },
-                        DestLevel::Other(dest_level) => {
+                        MergingFrom::YoungWhole{..} => {
+                            // TODO skip if no tombstones
+                            let dest_level = 0;
+                            let mut behind_segments = Vec::with_capacity(header.levels.len());
                             for i in dest_level + 1 .. header.levels.len() {
                                 let seg = &header.levels[i];
 
-                                behind_segments.insert(seg.root_page);
+                                behind_segments.push(seg);
+                            }
+                            Some(behind_segments)
+                        },
+                        MergingFrom::YoungPartial{count_tombstones, ..} => {
+                            if count_tombstones == 0 {
+                                None
+                            } else {
+                                let dest_level = 0;
+                                let mut behind_segments = Vec::with_capacity(header.levels.len());
+                                for i in dest_level + 1 .. header.levels.len() {
+                                    let seg = &header.levels[i];
 
-                                let cursor = try!(get_cursor(&inner.path, f.clone(), seg));
-                                behind_cursors.push(cursor);
+                                    behind_segments.push(seg);
+                                }
+                                Some(behind_segments)
+                            }
+                        },
+                        MergingFrom::Other{level, count_tombstones, ..} => {
+                            if count_tombstones == 0 {
+                                None
+                            } else {
+                                let dest_level = level + 1;
+                                let mut behind_segments = Vec::with_capacity(header.levels.len());
+                                for i in dest_level + 1 .. header.levels.len() {
+                                    let seg = &header.levels[i];
+
+                                    behind_segments.push(seg);
+                                }
+                                Some(behind_segments)
                             }
                         },
                     }
-                    (behind_cursors, behind_segments)
                 };
 
-                let behind_rlock =
-                    if behind_segments.is_empty() {
-                        None
-                    } else {
-                        // we do need read locks for all these cursors to protect them from going
-                        // away while we are writing the merge.
-                        let rlock = {
-                            let mut space = try!(inner.space.lock());
-                            let rlock = space.add_rlock(behind_segments);
-                            rlock
-                        };
-                        Some(rlock)
-                    };
-                (behind_cursors, behind_rlock)
+                match behind_segments {
+                    Some(behind_segments) => {
+                        let behind_cursors = {
+                            fn get_cursor(
+                                path: &str, 
+                                f: std::rc::Rc<std::cell::RefCell<File>>,
+                                seg: &SegmentHeaderInfo,
+                                ) -> Result<PageCursor> {
 
+                                let done_page = move |_| -> () {
+                                };
+                                // TODO and the clone below is silly too
+                                let buf = Lend::new(seg.buf.clone(), box done_page);
+
+                                let cursor = try!(PageCursor::new_already_read_page(path, f, seg.root_page, buf));
+                                Ok(cursor)
+                            }
+
+                            let behind_cursors = 
+                                behind_segments
+                                .iter()
+                                .map(|seg| get_cursor(&inner.path, f.clone(), seg))
+                                .collect::<Result<Vec<_>>>();
+                            let behind_cursors = try!(behind_cursors);
+                            Some(behind_cursors)
+                        };
+                        let behind_segments =
+                            behind_segments
+                            .iter()
+                            .map(|seg| seg.root_page)
+                            .collect::<HashSet<_>>();
+                        let behind_rlock = {
+                                // we do need read locks for all these cursors to protect them from going
+                                // away while we are writing the merge.
+                                let rlock = {
+                                    let mut space = try!(inner.space.lock());
+                                    let rlock = space.add_rlock(behind_segments);
+                                    rlock
+                                };
+                                Some(rlock)
+                            };
+                        (behind_cursors, behind_rlock)
+                    },
+                    None => {
+                        (None, None)
+                    },
+                }
             };
 
-            (cursor, from, into, behind, behind_rlock)
+            (cursor, from, into, behind_cursors, behind_rlock)
         };
 
         let mut pw = try!(PageWriter::new(inner.clone()));
@@ -8026,18 +8064,7 @@ impl InnerPart {
             try!(cursor.First());
             if cursor.IsValid() {
                 let mut source = CursorIterator::new(cursor);
-                //let mut behind = behind;
-                let behind =
-                    match from_level {
-                        FromLevel::Fresh => {
-                            // TODO don't get the cursors at all
-                            None
-                        },
-                        _ => {
-                            Some(behind)
-                        },
-                    };
-                let wrote = try!(write_merge(&mut pw, &mut source, &into, behind, &inner.path, f.clone(), from_level.get_dest_level()));
+                let wrote = try!(write_merge(&mut pw, &mut source, &into, behind_cursors, &inner.path, f.clone(), from_level.get_dest_level()));
 
                 let count_keys_yielded_by_merge_cursor = source.count_keys_yielded();
                 //println!("count_keys_yielded_by_merge_cursor: {}", count_keys_yielded_by_merge_cursor);

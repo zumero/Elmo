@@ -1,4 +1,25 @@
 
+when using Instruments with Separate by Thread, one of the
+merge threads is using a LOT more time than the others.
+Probably Young->Other(0), but not certain.
+
+how did the following happen (185 len per node in depth 1)?
+
+Depth 0:
+    953 nodes
+    61 items per node
+    2830 len per node
+Depth 1:
+    73 nodes
+    13 items per node
+    185 len per node
+Depth 2:
+    1 nodes
+    73 items per node
+    2153 len per node
+
+dependencies can chain.
+
 don't build behind if there are no tombstones or if
 we are not going to use it.
 
