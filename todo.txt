@@ -2,8 +2,6 @@
 don't build behind if there are no tombstones or if
 we are not going to use it.
 
-still getting bad page type errors, very intermittent
-
 revisit how much stuff should we promote.  try doing
 more now?
 
@@ -38,20 +36,10 @@ but what do we gain by considering overflow pages
 in a decision about whether to promote or not?  they
 just get reused anyway.
 
-have parent keep count_pairs and count_tombstones?
-would be useful for choosing what to promote, in the
-case where we want to promote tombstones even if the
-level is not otherwise in need of a merge.  depth 1
-parents would need these too.
-
 so yeah, it would seem that the blocklist stored for
 the leaf children of a depth 1 parent is only used at
 startup to identify all the pages in use.  is that
 right?
-
-idea:  what about cases where we have lots of tombstones
-but are not in a needs_merge state?  we want to get rid
-of them anyway...
 
 why do we have so many cases where any_node shows only
 1 (or just a few) children to choose from when promoting?
@@ -59,87 +47,13 @@ why do we have so many cases where any_node shows only
 why is the number of keys promoted always so small, even
 when we are promoting 8 leaves?
 
-do we need to dump timings of when the main thread is
-waiting because merge need is desperate?
-
-hmmm.  maybe we had the necessary_tombstone() code backwards.
-consider NOT doing this check on merge from Fresh.  to make
-it faster.  merge from fresh is simply to reduce the segment
-count as quickly as possible by combining them together into
-bigger segments in Young.
-
-I wonder if we have problems where a fresh segment contains a
-ton of tombstones that should be deleted but can't be because
-it's the only fresh segment so needs_merge return false.
-tried addressing this with a change to the settings, as an
-experiment.
-
-treating all fresh/young segments as the same size has gotta
-be a problem.
-
-weird:  the second run of the test suite currently is a lot
-faster with the prepare_merge() expensive_check turned on.
-
-weirder:  running 8 test runs in a row from a bash script
-without a server restart:  with expensive_check off, several
-failures, and quite slow.  with expensive_check on, no
-failures, and faster.  (this was done with the promote N->N+1
-code set to always choose one leaf).
-
 needs_merge() probably needs some way to account for whether
 reads are happening or not.  if it is purely writes, we have
 less incentive to do merges.  if reads are happening, we should
 get desperate faster.
 
-too many tombstones getting left?  need a diag to find tombstones
-that could have been dropped but were not?
-
-what happened below?  is the startup list_all_blocks() code okay?
-actually, this can happen without stopping/starting the server,
-so list_all_blocks() is not in play.  it can also happen with
-either a leaf or a parent page.
-
-thread '<unnamed>' panicked at 'explicit panic', /Users/eric/dev/Elmo/lsm/src/lib.rs:4631
-stack backtrace:
-   1:        0x10bb14c30 - sys::backtrace::tracing::imp::write::hdcea88a6044f25a0c7s
-   2:        0x10bb0ab82 - sys_common::unwind::begin_unwind_inner::ha0580f58a156b13e28r
-   3:        0x10ba98744 - sys_common::unwind::begin_unwind::h1618399666050044516
-   4:        0x10babb45c - LeafPage::parse_page::h844989bca426533aF6f
-   5:        0x10bab366e - LeafPage::read_page::h8c43b2d678091577Ubg
-   6:        0x10babd480 - PageCursor::read_page::h66798c706c1c7ac2evg
-   7:        0x10babd3ef - PageCursor::read_page::h66798c706c1c7ac2evg
-   8:        0x10baa02de - ParentCursor.IForwardCursor::Next::hb98be6463298992cnAh
-   9:        0x10baa2e39 - MultiCursor.IForwardCursor::Next::hba116173610801f3TAc
-  10:        0x10baa6c1f - LivingCursor::skipTombstonesForward::hca08ce25eb751ab1qdd
-  11:        0x10baa80f5 - RangeCursor::Next::h1031ce63f5601f33nzd
-  12:        0x10b94e2d8 - RangeCursorBsonValueIterator.Iterator::next::h0b899b538087344fkea
-  13:        0x10b987815 - MyCollectionReader.Iterator::next::h7251dfba7c3adff1zfc
-  14:        0x10ba406ce - iter::FilterMap<I, F>.Iterator::next::h11490810477968315499
-  15:        0x10b9124b2 - iter::Iterator::count::h6329506342169373999
-  16:        0x10b932a5b - Server<'b>::reply_cmd::h533c1789c23e1413idc
-
-running the elmo test multiple times shows it getting
-slower, and elmo list_indexes is a lot of the time,
-and the worst culprit is MultiCursor::sort.  is the
-segment list just getting too long?  lower the
-Desperate threshold?
-
-shouldn't MC::sort try to remember the orderings?
-or can it?
-
-part of the problem is in the elmo layer and in the
-mongo tests.  a lot of indexes get left around after
-each test run.  the elmo layer, when asked for a
-collection writer, gets a list of all the indexes,
-so this query gets slower the more indexes there are.
-it should not need the list to update the primary index.
-and if it is not constraining the index list by range,
-it should be.
-
-second run of test suite into same db is really slow.
-probably fragmentation and blocklist stuff?  no.  second
-run has LiveCursor skipping a thousand times as many
-tombstones.
+elmo layer still calls list_indexes way too often.  cache
+this.
 
 should the default page size be 4K or 8K ?
 
@@ -153,10 +67,6 @@ them can fit in a parent page.  or maybe a parent page
 needs the ability to overflow a key even if the leaf
 did not, just to ensure that at least two keys fit in
 every parent.
-
-most of the largest merges are from Young to Other(0).  need
-to be more careful about how much we merge from Young at
-one time.
 
 too many open/close of the file for PageWriter as well.
 
@@ -175,7 +85,7 @@ be &self not &Arc<InnerPart>
 where should I be using AsRef?  From/Into ?
 
 bufadvance and PageBuilder should use trait implementations 
-for Read and Write on slices/vecs
+for Read and Write on slices/vecs.  varint::read too.
 
 vec capacities
 
@@ -198,14 +108,6 @@ parent nodes underfull and depth increasing to the right?
 
 need to figure out a place to call truncate_file_if_possible()
 every so often.
-
-how to choose a page from the merge source when merging Other?
-is a parent too big?  a leaf too small?  
-rotate through the key space?
-
-rm dead MultiPageCursor?  or will we need this later for cases
-where we are merging from Other level N to N+1 and want to select 
-more than a leaf and less then a parent?
 
 removing the rewrite_level (which should be rewrite_depth)
 code now shows that the depth increasing to the right
