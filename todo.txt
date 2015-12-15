@@ -1,7 +1,4 @@
 
-wow.  BlockList::encoded_len() is now near the top of
-the profiler.
-
 the multiple consecutive run of the test suite case
 is basically an exercise in managing tombstones.  this
 is probably not a typical workload.
@@ -11,50 +8,17 @@ level.
 
 when using Instruments with Separate by Thread, one of the
 merge threads is using a LOT more time than the others.
-Probably Young->Other(0), but not certain.
-
-merge from Young is now the most expensive.  why?
-
-how did the following happen (185 len per node in depth 1)?
-
-Depth 0:
-    953 nodes
-    61 items per node
-    2830 len per node
-Depth 1:
-    73 nodes
-    13 items per node
-    185 len per node
-Depth 2:
-    1 nodes
-    73 items per node
-    2153 len per node
-
-and this one (44 len per node in depth 0):
-
-Depth 0:
-    531 nodes
-    2 items per node
-    44 len per node
-Depth 1:
-    3 nodes
-    177 items per node
-    2426 len per node
-Depth 2:
-    1 nodes
-    3 items per node
-    61 len per node
+Probably Young->Other(0), but not certain.  this would
+make sense, as merges get less common at higher levels,
+right?
 
 still might need to choose to rewrite a node that could be
 recycled, based on its fullness?
 
-is it possible for the depth of a segment to decrease
-when it is the target of a merge?
+it is possible for the depth of a segment to decrease
+when it is the target of a merge, right?
 
 dependencies can chain.  maybe long chains.
-
-revisit how much stuff should we promote.  try doing
-more now?
 
 looping over all the children in a parent node to get
 max tombstones, but when there are no tombstones, this
@@ -75,16 +39,6 @@ should Other levels *ever* be desperate?
 
 retry the 5M url test with lower level mulitplier
 
-replace parent's count_pages with count_leaves?
-for a depth 1 parent, it's silly, as all the entries
-should be 1.  for a depth 2 parent, each entry is the
-number of children.  for a depth 3 parent, it gets
-more informative.
-
-but what do we gain by considering overflow pages
-in a decision about whether to promote or not?  they
-just get reused anyway.
-
 so yeah, it would seem that the blocklist stored for
 the leaf children of a depth 1 parent is only used at
 startup to identify all the pages in use.  is that
@@ -92,11 +46,7 @@ right?  if so, how feasible would it be to remove these
 and calculate them?  any way to do this in a background
 thread?
 
-why do we have so many cases where any_node shows only
-1 (or just a few) children to choose from when promoting?
-
-why is the number of keys promoted always so small, even
-when we are promoting 8 leaves?
+reuse key overflows.
 
 needs_merge() probably needs some way to account for whether
 reads are happening or not.  if it is purely writes, we have
@@ -252,16 +202,6 @@ the other thing ParentNodeWriter got us was not having to
 keep all the leaves in memory.  it's more like a stream,
 processing things as we go.
 
-commit 5M urls in one transaction.  we will need ways of
-dealing with large segments in fresh and young.  can't
-promote whole segment.  writing segment would need to be
-done in batches, but can't keep page in ram for lots of
-batches.  in this sense, promote from young needs to be
-not much different than promote from N.
-
-and maybe promote from N to N+1 needs the ability to
-leave N empty (edge case).
-
 if we are rewriting a node, that means we could not or
 chose not to recycle the parent of that node.
 
@@ -306,8 +246,6 @@ maybe everywhere we read a page (cursors), instead of a file,
 we should provide an object which abstracts the reading of page.
 allows a cache.  or a non-file.
 
-revisit when to check for tombstones during write_merge
-
 lsm_diag should just have show_page
 
 consider fiddling with the depth at which parent nodes
@@ -331,8 +269,6 @@ usable space).  and callers of PageWriter need to know how big
 the next page is going to be.
 
 do binary search of keys in the parent page like in the leaf?
-
-not sure a parent page with only one item in it makes much sense
 
 code for calc/build/write leaf and parent has gotten awfully similar
 
@@ -408,8 +344,6 @@ vbuf reuse write leaves
 keyInLeafs should share code.
 
 same for Value and ValueRef code
-
-want to write lint to disallow tabs?
 
 perhaps, when reading stuff from a buffer, instead of using a cur variable,
 we should use the Read impl of slice

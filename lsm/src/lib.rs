@@ -1314,7 +1314,7 @@ pub const DEFAULT_SETTINGS: DbSettings =
         sleep_desperate_young: 20,
         sleep_desperate_level: 50,
         desperate_fresh: 128,
-        desperate_young: 64,
+        desperate_young: 128,
         desperate_level_factor: 2,
     };
 

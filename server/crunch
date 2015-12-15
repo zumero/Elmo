@@ -6,8 +6,8 @@ egrep merge $1 | egrep Fresh | awk "$CRUNCH_MERGE"
 egrep merge $1 | egrep Young | awk "$CRUNCH_MERGE"
 /bin/echo -n "merge,from,Other(0),"
 egrep merge $1 | egrep 'Other\(0\)' | awk "$CRUNCH_MERGE"
-#/bin/echo -n "merge,from,Other(1),"
-#egrep merge $1 | egrep 'Other\(1\)' | awk "$CRUNCH_MERGE"
+/bin/echo -n "merge,from,Other(1),"
+egrep merge $1 | egrep 'Other\(1\)' | awk "$CRUNCH_MERGE"
 /bin/echo -n "open_cursor,"
 egrep open_cursor $1 | awk 'BEGIN{FS=","} { fresh+=$4; young+=$6; levels+=$8; } END {printf "%d, fresh,%.2f, young,%.2f, levels,%.2f\n", NR, fresh/NR, young/NR, levels/NR}'
 egrep tombstones_skipped $1 | awk 'BEGIN{FS=","} { tombstones_skipped+=$3; if(max==""){max=$3}; if($3>max){max=$3}; } END {printf "tombstones_skipped,%.2f (%d max)\n", tombstones_skipped/NR, max}'
