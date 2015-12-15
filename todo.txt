@@ -1,7 +1,16 @@
 
+the multiple consecutive run of the test suite case
+is basically an exercise in managing tombstones.  this
+is probably not a typical workload.
+
+it should be okay to deplete Other(N) if it is the last
+level.
+
 when using Instruments with Separate by Thread, one of the
 merge threads is using a LOT more time than the others.
 Probably Young->Other(0), but not certain.
+
+merge from Young is now the most expensive.  why?
 
 how did the following happen (185 len per node in depth 1)?
 
@@ -18,10 +27,28 @@ Depth 2:
     73 items per node
     2153 len per node
 
-dependencies can chain.
+and this one (44 len per node in depth 0):
 
-don't build behind if there are no tombstones or if
-we are not going to use it.
+Depth 0:
+    531 nodes
+    2 items per node
+    44 len per node
+Depth 1:
+    3 nodes
+    177 items per node
+    2426 len per node
+Depth 2:
+    1 nodes
+    3 items per node
+    61 len per node
+
+still might need to choose to rewrite a node that could be
+recycled, based on its fullness?
+
+is it possible for the depth of a segment to decrease
+when it is the target of a merge?
+
+dependencies can chain.  maybe long chains.
 
 revisit how much stuff should we promote.  try doing
 more now?
@@ -41,8 +68,6 @@ should we do random?  or should there be another thing
 to prioritize?  like the one with the most items?  or
 the least?
 
-merge from Young is now the most expensive.  why?
-
 should Other levels *ever* be desperate?
 
 retry the 5M url test with lower level mulitplier
@@ -60,7 +85,9 @@ just get reused anyway.
 so yeah, it would seem that the blocklist stored for
 the leaf children of a depth 1 parent is only used at
 startup to identify all the pages in use.  is that
-right?
+right?  if so, how feasible would it be to remove these
+and calculate them?  any way to do this in a background
+thread?
 
 why do we have so many cases where any_node shows only
 1 (or just a few) children to choose from when promoting?

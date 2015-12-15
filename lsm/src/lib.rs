@@ -3795,7 +3795,7 @@ fn write_merge(
             let rewrite_level = 
                 match parent.depth() {
                     1 => 1,
-                    2 => 2,
+                    2 => 1,
                     3 => 2,
                     4 => 2,
                     5 => 3,
@@ -5752,6 +5752,9 @@ impl ParentPage {
     fn choose_nodes_to_promote(&self, depth: u8, lineage: &mut Vec<PageNum>) -> Result<(Vec<PageNum>, u64)> {
         lineage[self.depth() as usize] = self.pagenum;
 
+        // TODO if this is promoting from Other, we need to be sure
+        // we don't deplete the level.
+
         let i = self.max_tombstones_or_quasi_random();
         if self.depth() - 1 == depth {
             // TODO maybe choose an i which allows us to take as many nodes
@@ -7600,6 +7603,7 @@ impl InnerPart {
                 let pt = try!(PageType::from_u8(header.fresh[i].buf[0]));
                 match pt {
                     PageType::PARENT_NODE => {
+                        // a parent node is promoted from Fresh without a rewrite
                         return Ok(NeedsMerge::Yes);
                     },
                     PageType::LEAF_NODE => {
@@ -7732,11 +7736,14 @@ impl InnerPart {
                 match from_level {
                     FromLevel::Fresh => {
                         let i = header.fresh.len() - 1;
-                        let pt = try!(PageType::from_u8(header.fresh[i].buf[0]));
-                        match pt {
+                        match try!(PageType::from_u8(header.fresh[i].buf[0])) {
                             PageType::LEAF_NODE => {
                                 let mut i = i;
                                 // TODO should there be a limit to how many leaves we will take at one time?
+
+                                // note that must accept just one if that's all we have.
+                                // otherwise, we could get stuck with the last segment being a leaf
+                                // and the second-to-last segment being a parent.
                                 while i > 0 {
                                     if PageType::LEAF_NODE == try!(PageType::from_u8(header.fresh[i - 1].buf[0])) {
                                         i -= 1;
@@ -7805,49 +7812,49 @@ impl InnerPart {
                     FromLevel::Young => {
                         let i = header.young.len() - 1;
                         let segment = &header.young[i];
-                        let pt = try!(PageType::from_u8(segment.buf[0]));
-                        
-                        // TODO match instead of if?
-                        if pt == PageType::LEAF_NODE {
-                            let merge_segments = slice_from_end(&header.young, 1);
+                        match try!(PageType::from_u8(header.young[i].buf[0])) {
+                            PageType::LEAF_NODE => {
+                                let merge_segments = slice_from_end(&header.young, 1);
 
-                            //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
-                            let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
+                                //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
+                                let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
 
-                            // TODO use node iterator
-                            let node_pages = try!(segment.blocklist_unsorted_no_overflows(&inner.path, f.clone()));
-                            let seg = FromWholeSegment {
-                                root_page: segment.root_page,
-                                node_pages: node_pages,
-                            };
+                                // TODO use node iterator
+                                let node_pages = try!(segment.blocklist_unsorted_no_overflows(&inner.path, f.clone()));
+                                let seg = FromWholeSegment {
+                                    root_page: segment.root_page,
+                                    node_pages: node_pages,
+                                };
 
-                            // TODO could count tombstones here as well
-                            (cursors, MergingFrom::YoungWhole{segment: seg})
-                        } else {
-                            let promote_depth = 0;
+                                // TODO could count tombstones here as well
+                                (cursors, MergingFrom::YoungWhole{segment: seg})
+                            },
+                            PageType::PARENT_NODE => {
+                                let promote_depth = 0;
 
-                            // TODO it's a little silly here to construct a Lend<>
-                            let done_page = move |_| -> () {
-                            };
-                            let buf = Lend::new(segment.buf.clone(), box done_page);
-                            let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), segment.root_page, buf));
+                                // TODO it's a little silly here to construct a Lend<>
+                                let done_page = move |_| -> () {
+                                };
+                                let buf = Lend::new(segment.buf.clone(), box done_page);
+                                let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), segment.root_page, buf));
 
-                            let mut lineage = vec![0; parent.depth() as usize + 1];
-                            let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage));
-                            //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
-                            //println!("lineage: {}", lineage);
+                                let mut lineage = vec![0; parent.depth() as usize + 1];
+                                let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage));
+                                //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
+                                //println!("lineage: {}", lineage);
 
-                            let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, chosen_pages.clone()));
+                                let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, chosen_pages.clone()));
 
-                            let from = MergingFrom::YoungPartial{
-                                old_segment: parent, 
-                                promote_lineage: lineage, 
-                                promote_pages: chosen_pages, 
-                                promote_depth: promote_depth,
-                                promote_blocks: BlockList::new(), 
-                                count_tombstones: count_tombstones,
-                            };
-                            (vec![cursor], from)
+                                let from = MergingFrom::YoungPartial{
+                                    old_segment: parent, 
+                                    promote_lineage: lineage, 
+                                    promote_pages: chosen_pages, 
+                                    promote_depth: promote_depth,
+                                    promote_blocks: BlockList::new(), 
+                                    count_tombstones: count_tombstones,
+                                };
+                                (vec![cursor], from)
+                            }
                         }
                     },
                     FromLevel::Other(level) => {
@@ -7875,8 +7882,9 @@ impl InnerPart {
                         let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), old_from_segment.root_page, buf));
 
                         let mut lineage = vec![0; parent.depth() as usize + 1];
+                        // TODO make sure this isn't depleting the whole segment
                         let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage));
-                        println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
+                        //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
                         let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, chosen_pages.clone()));
                         //println!("lineage: {}", lineage);
 
