@@ -461,6 +461,7 @@ impl BlockList {
         // of all blocks after the first one as offsets from th first one.
         // this requires that the list was sorted before this func was called.
 
+        let len_before = pb.len();
         misc::push_varint(pb, self.blocks.len() as u64);
         if self.blocks.len() > 0 {
             let first_page = self.blocks[0].firstPage;
@@ -474,13 +475,26 @@ impl BlockList {
                 }
             }
         }
+        let len_after = pb.len();
+        assert!(len_after - len_before == self.encoded_len());
     }
 
     fn encoded_len(&self) -> usize {
-        // TODO do this without mem alloc
-        let mut v = vec![];
-        self.encode(&mut v);
-        v.len()
+        let mut len = 0;
+        len += varint::space_needed_for(self.blocks.len() as u64);
+        if self.blocks.len() > 0 {
+            let first_page = self.blocks[0].firstPage;
+            len += varint::space_needed_for(self.blocks[0].firstPage as u64);
+            len += varint::space_needed_for((self.blocks[0].lastPage - self.blocks[0].firstPage) as u64);
+            if self.blocks.len() > 1 {
+                for i in 1 .. self.blocks.len() {
+                    assert!(self.blocks[i].firstPage > first_page);
+                    len += varint::space_needed_for((self.blocks[i].firstPage - first_page) as u64);
+                    len += varint::space_needed_for((self.blocks[i].lastPage - self.blocks[i].firstPage) as u64);
+                }
+            }
+        }
+        len
     }
 
     fn read(pr: &[u8], cur: &mut usize) -> Self {
