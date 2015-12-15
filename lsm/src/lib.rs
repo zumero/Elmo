@@ -5735,13 +5735,9 @@ impl ParentPage {
         Ok((total_count_leaves, total_count_tombstones))
     }
 
-    fn max_tombstones_or_quasi_random(&self) -> usize {
+    fn choose_one(&self) -> usize {
 
         // if tombstones are present, prioritize promoting them
-
-        // TODO it would be nice here if we could get the N (want)
-        // items which contain the max tombstones.  like a sliding
-        // window.
 
         let mut result = 0;
         let mut max = self.children[0].count_tombstones();
@@ -5753,6 +5749,8 @@ impl ParentPage {
         }
 
         if max == 0 {
+            // there are no tombstones
+
             // we need to pick a child, and it kinda doesn't matter which
             // one, but we don't need the number to be really random, and we
             // don't want to take a dependency on time or rand just for this,
@@ -5772,14 +5770,63 @@ impl ParentPage {
         }
     }
 
+    fn choose_range(&self, want: usize) -> usize {
+
+        // if tombstones are present, prioritize promoting them
+
+        let mut cur_sum = 0;
+        let mut winning_sum = 0;
+        let mut winning_i = 0;
+        for i in 0 .. self.children.len() {
+            if i >= want {
+                cur_sum -= self.children[i - want].count_tombstones();
+            }
+            cur_sum += self.children[i].count_tombstones();
+            if i + 1 >= want {
+                if cur_sum > winning_sum {
+                    winning_sum = cur_sum;
+                    winning_i = i + 1 - want;
+                }
+            }
+        }
+
+        if winning_sum == 0 {
+            // there are no tombstones
+
+            // we need to pick a child, and it kinda doesn't matter which
+            // one, but we don't need the number to be really random, and we
+            // don't want to take a dependency on time or rand just for this,
+            // so we use the page number as a lame source of randomness.
+
+            // TODO later, we probably want to be more clever.  leveldb 
+            // remembers the key range of the last compaction and picks up
+            // where it left off.  we also will eventually want the ability
+            // to have two merges going on in the same level in different
+            // threads, which should be fine if the key ranges do not overlap
+            // the same stuff, and if we can fix up the parent node at the end.
+
+            let count = self.children.len() - want + 1;
+            let i = ((self.pagenum as u32) % (count as u32)) as usize;
+            assert!(i + want - 1 < self.children.len());
+            i
+        } else {
+            assert!(winning_i + want - 1 < self.children.len());
+            winning_i
+        }
+    }
+
     fn choose_nodes_to_promote(&self, depth: u8, lineage: &mut Vec<PageNum>, want: usize) -> Result<(Vec<PageNum>, u64)> {
         lineage[self.depth() as usize] = self.pagenum;
 
-        let i = self.max_tombstones_or_quasi_random();
         if self.depth() - 1 == depth {
-            // TODO maybe choose an i which allows us to take as many nodes
-            // as we want, instead of choosing i and then taking whatever is
-            // available from there to the end.
+            let i =
+                if self.children.len() <= want {
+                    0
+                } else {
+                    let i = self.choose_range(want);
+                    assert!(i + want - 1 < self.children.len());
+                    i
+                };
             let avail = self.children.len() - i;
             let take = std::cmp::min(avail, want);
             //println!("any_node,{},{},{}", self.children.len(), i, take);
@@ -5798,6 +5845,7 @@ impl ParentPage {
             assert!(self.depth() - 1 > depth);
             assert!(self.depth() > 1);
 
+            let i = self.choose_one();
             let pagenum = self.child_pagenum(i);
             let buf = try!(read_and_alloc_page(&self.f, pagenum, self.pr.len()));
             let done_page = move |_| -> () {
@@ -7860,7 +7908,7 @@ impl InnerPart {
 
                                 let mut lineage = vec![0; parent.depth() as usize + 1];
                                 // TODO config constant
-                                let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, 8));
+                                let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, 32));
                                 //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
                                 //println!("lineage: {}", lineage);
 
@@ -7907,7 +7955,7 @@ impl InnerPart {
                         // make sure this isn't depleting the whole segment
                         let count_leaves = parent.count_leaves();
                         // TODO config constant
-                        let want = std::cmp::min(count_leaves - 1, 8);
+                        let want = std::cmp::min(count_leaves - 1, 32);
                         assert!(want > 0);
                         let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, want as usize));
                         //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
