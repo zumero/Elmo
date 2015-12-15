@@ -3817,7 +3817,7 @@ fn write_merge(
             nodes_rewritten[0].push(leaf.pagenum);
         },
         MergingInto::Parent(ref parent) => {
-// TODO tune this
+            // TODO tune this.  maybe they should mostly be depth - 1 ?
             let rewrite_level = 
                 match parent.depth() {
                     1 => 1,
@@ -7738,6 +7738,9 @@ impl InnerPart {
                     return Ok(NeedsMerge::No);
                 }
                 if size > inner.settings.desperate_level_factor * get_level_size(i) {
+                    // TODO not sure we need this.  but without it,
+                    // Other(0) gets out of control on 5M urls.
+                    // maybe a locking and starvation issue.
                     return Ok(NeedsMerge::Desperate);
                 }
                 return Ok(NeedsMerge::Yes);

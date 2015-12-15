@@ -1,4 +1,51 @@
 
+hmph.  during one of the test runs, commit_merge()
+panicked because the dest segment (Other(N)) was
+obliterated by the promoted stuff (had to be tombstones).
+
+so yeah, it would seem that the blocklist stored for
+the leaf children of a depth 1 parent is only used at
+startup to identify all the pages in use.  is that
+right?  if so, how feasible would it be to remove these
+and calculate them?  any way to do this in a background
+thread?
+
+reuse key overflows.
+
+parent node writer gets in trouble, overflows its stack,
+when it has to deal with lots of pages that only hold one
+key.  problem is that if only one key fits in the leaf,
+then only one key fits in its parent, so the generation
+of parent nodes is the same size, so depth increases
+forever.  maybe we need to overflow keys unless two of
+them can fit in a parent page.  or maybe a parent page
+needs the ability to overflow a key even if the leaf
+did not, just to ensure that at least two keys fit in
+every parent.
+
+too many open/close of the file for PageWriter as well.
+
+need to make merges more parallelizable.  two merges in
+the same level but different key range.
+
+bufadvance and PageBuilder should use trait implementations 
+for Read and Write on slices/vecs.  varint::read too.
+
+vec capacities
+
+can we have the segment page objects reference the buf in the
+header instead of cloning it?  Arc<buf> ?  but then how do we deal
+with ParentPage that wants to walk through all of its children without
+realloc on each one?  separate implementations?  one form of the
+page object borrows its buf (from the one in the SegmentHeaderInfo).
+the other one owns its buf (so it can read a different page into it).
+
+lots of bufadvance and varint read calls should probably return Result
+so they can properly error on invalid pages read from the file.
+or, when parsing a page, check before calling them.
+
+do we have no test cases involving an overflowed key?
+
 the multiple consecutive run of the test suite case
 is basically an exercise in managing tombstones.  this
 is probably not a typical workload.
@@ -35,18 +82,13 @@ should we do random?  or should there be another thing
 to prioritize?  like the one with the most items?  or
 the least?
 
-should Other levels *ever* be desperate?
+should Other levels *ever* be desperate?  why not just
+let them fill up and merge later?  they don't add to
+the cursor count.  TODO but if we turn this off,
+on the 5M URL test, Other(0) gets huge.  maybe lock
+starvation?
 
 retry the 5M url test with lower level mulitplier
-
-so yeah, it would seem that the blocklist stored for
-the leaf children of a depth 1 parent is only used at
-startup to identify all the pages in use.  is that
-right?  if so, how feasible would it be to remove these
-and calculate them?  any way to do this in a background
-thread?
-
-reuse key overflows.
 
 needs_merge() probably needs some way to account for whether
 reads are happening or not.  if it is purely writes, we have
@@ -57,22 +99,6 @@ elmo layer still calls list_indexes way too often.  cache
 this.
 
 should the default page size be 4K or 8K ?
-
-parent node writer gets in trouble, overflows its stack,
-when it has to deal with lots of pages that only hold one
-key.  problem is that if only one key fits in the leaf,
-then only one key fits in its parent, so the generation
-of parent nodes is the same size, so depth increases
-forever.  maybe we need to overflow keys unless two of
-them can fit in a parent page.  or maybe a parent page
-needs the ability to overflow a key even if the leaf
-did not, just to ensure that at least two keys fit in
-every parent.
-
-too many open/close of the file for PageWriter as well.
-
-need to make merges more parallelizable.  two merges in
-the same level but different key range.
 
 maybe the level factor should be less than 10x so that the segments
 stay smaller and so the blocklists stay smaller.  but then reads get
@@ -85,23 +111,7 @@ be &self not &Arc<InnerPart>
 
 where should I be using AsRef?  From/Into ?
 
-bufadvance and PageBuilder should use trait implementations 
-for Read and Write on slices/vecs.  varint::read too.
-
-vec capacities
-
-can we have the segment page objects reference the buf in the
-header instead of cloning it?  Arc<buf> ?  but then how do we deal
-with ParentPage that wants to walk through all of its children without
-realloc on each one?  separate implementations?  one form of the
-page object borrows its buf (from the one in the SegmentHeaderInfo).
-the other one owns its buf (so it can read a different page into it).
-
 get rid of pagepool?
-
-lots of bufadvance and varint read calls should probably return Result
-so they can properly error on invalid pages read from the file.
-or, when parsing a page, check before calling them.
 
 so a new leaf can't squeeze between two parents anymore.
 what does this mean for the merge problem where we had
@@ -207,8 +217,6 @@ chose not to recycle the parent of that node.
 
 every time we recycle a node, we flush the current page
 in progress, at every level, down to that node's depth.
-
-do we have no test cases involving an overflowed key?
 
 can we somehow get the blocklist to be smaller?  reduce fragmentation?
 or is that simply a tradeoff with recycling?  in other words, if the
