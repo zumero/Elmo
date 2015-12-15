@@ -1324,18 +1324,15 @@ impl SegmentHeaderInfo {
         }
     }
 
-    // note that the resulting count here does not include the root page
-    fn count_pages_for_list_segments(&self) -> Result<PageCount> {
+    fn count_leaves_for_list_segments(&self) -> Result<PageCount> {
         let pt = try!(PageType::from_u8(self.buf[0]));
         match pt {
             PageType::LEAF_NODE => {
-                //println!("SegmentHeaderInfo, count_pages, leaf: {}", self.root_page);
-                // TODO
-                Ok(0)
+                Ok(1)
             },
             PageType::PARENT_NODE => {
-                let (count_pages, count_tombstones) = try!(ParentPage::count_stuff_for_needs_merge(self.root_page, &self.buf));
-                Ok(count_pages)
+                let (count_leaves, count_tombstones) = try!(ParentPage::count_stuff_for_needs_merge(self.root_page, &self.buf));
+                Ok(count_leaves)
             },
         }
     }
@@ -2746,8 +2743,7 @@ enum ChildInfo {
         count_tombstones: u64,
     },
     Parent{
-        // this count does not include the child page itself
-        count_pages: PageCount, 
+        count_leaves: PageCount, 
         count_tombstones: u64,
     },
 }
@@ -2763,11 +2759,27 @@ impl ChildInfo {
                 + varint::space_needed_for(count_tombstones as u64)
             },
             &ChildInfo::Parent{
-                count_pages, 
+                count_leaves, 
                 count_tombstones,
             } => {
-                varint::space_needed_for(count_pages as u64)
+                varint::space_needed_for(count_leaves as u64)
                 + varint::space_needed_for(count_tombstones as u64)
+            },
+        }
+    }
+
+    fn count_leaves(&self) -> PageCount {
+        match self {
+            &ChildInfo::Leaf{
+                ..
+            } => {
+                1
+            },
+            &ChildInfo::Parent{
+                count_leaves,
+                ..
+            } => {
+                count_leaves
             },
         }
     }
@@ -4105,9 +4117,8 @@ impl ParentNodeWriter {
         }
     }
 
-    fn put_item(&mut self, total_count_pages: &mut PageCount, total_count_tombstones: &mut u64, item: &pgitem, prefix_len: usize) {
+    fn put_item(&mut self, total_count_leaves: &mut PageCount, total_count_tombstones: &mut u64, item: &pgitem, prefix_len: usize) {
         self.pb.PutVarint(item.page as u64);
-        *total_count_pages += 1;
         match &item.info {
             &ChildInfo::Leaf{
                 ref blocks_overflows,
@@ -4119,21 +4130,21 @@ impl ParentNodeWriter {
                 blocks_overflows.encode(&mut v);
                 self.pb.PutArray(&v);
                 self.pb.PutVarint(count_tombstones as u64);
-                *total_count_pages += blocks_overflows.count_pages();
+                *total_count_leaves += 1;
                 *total_count_tombstones += count_tombstones;
             },
             &ChildInfo::Parent{
-                count_pages, 
+                count_leaves, 
                 count_tombstones,
                 //count_items, 
                 //count_bytes,
             } => {
                 assert!(self.my_depth > 1);
-                self.pb.PutVarint(count_pages as u64);
+                self.pb.PutVarint(count_leaves as u64);
                 self.pb.PutVarint(count_tombstones as u64);
                 //self.pb.PutVarint(count_items as u64);
                 //self.pb.PutVarint(count_bytes as u64);
-                *total_count_pages += count_pages;
+                *total_count_leaves += count_leaves;
                 *total_count_tombstones += count_tombstones;
             },
         }
@@ -4159,7 +4170,7 @@ impl ParentNodeWriter {
         self.pb.PutInt16(count_items as u16);
         //println!("self.st.items.len(): {}", self.st.items.len());
 
-        let mut count_pages = 0;
+        let mut count_leaves = 0;
         let mut count_tombstones = 0;
 
         // deal with all the items except the last one
@@ -4167,7 +4178,7 @@ impl ParentNodeWriter {
         let tmp_vec = self.st.items.drain(0 .. tmp_count).collect::<Vec<_>>();
         let prefix_len = self.st.prefixLen;
         for item in tmp_vec {
-            self.put_item(&mut count_pages, &mut count_tombstones, &item, prefix_len);
+            self.put_item(&mut count_leaves, &mut count_tombstones, &item, prefix_len);
         }
 
         assert!(self.st.items.len() == 1);
@@ -4176,19 +4187,19 @@ impl ParentNodeWriter {
         let last_key = {
             let item = self.st.items.remove(0); 
             let prefix_len = self.st.prefixLen;
-            self.put_item(&mut count_pages, &mut count_tombstones, &item, prefix_len);
+            self.put_item(&mut count_leaves, &mut count_tombstones, &item, prefix_len);
             item.last_key
         };
         assert!(self.st.items.is_empty());
 
-        (last_key, count_pages, count_tombstones, count_items, self.pb.sofar())
+        (last_key, count_leaves, count_tombstones, count_items, self.pb.sofar())
     }
 
     fn write_parent_page(&mut self,
                           pw: &mut PageWriter,
                          ) -> Result<(usize, pgitem)> {
         // assert st.sofar > 0
-        let (last_key, count_pages, count_tombstones, count_items, count_bytes) = self.build_parent_page();
+        let (last_key, count_leaves, count_tombstones, count_items, count_bytes) = self.build_parent_page();
         assert!(self.st.items.is_empty());
         //println!("parent blocklist: {:?}", blocks);
         //println!("parent blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
@@ -4197,7 +4208,7 @@ impl ParentNodeWriter {
         let pg = pgitem {
             page: self.pb.last_page_written, 
             info: ChildInfo::Parent{
-                count_pages: count_pages, 
+                count_leaves: count_leaves, 
                 count_tombstones: count_tombstones,
                 //count_items: count_items, 
                 //count_bytes: count_bytes,
@@ -5579,6 +5590,15 @@ impl ParentPage {
         box NodeIterator::new(self, min_depth)
     }
 
+    fn count_leaves(&self) -> PageCount {
+        // TODO if depth is 1, just return children.len()
+        self
+            .children
+            .iter()
+            .map(|x| x.info.count_leaves())
+            .sum()
+    }
+
     fn blocklist_unsorted(&self) -> Result<BlockList> {
         let mut list = BlockList::new();
         for i in 0 .. self.children.len() {
@@ -5672,10 +5692,10 @@ impl ParentPage {
                         count_tombstones: count_tombstones,
                     }
                 } else {
-                    let count_pages = varint::read(pr, &mut cur) as PageCount;
+                    let count_leaves = varint::read(pr, &mut cur) as PageCount;
                     let count_tombstones = varint::read(pr, &mut cur) as u64;
                     ChildInfo::Parent{
-                        count_pages: count_pages, 
+                        count_leaves: count_leaves, 
                         count_tombstones: count_tombstones,
                     }
                 };
@@ -5698,27 +5718,30 @@ impl ParentPage {
 
     fn count_stuff_for_needs_merge(pgnum: PageNum, buf: &[u8]) -> Result<(PageCount, u64)> {
         let (_, children, _) = try!(Self::parse_page(pgnum, buf));
-        let mut total_count_pages = 0;
+        let mut total_count_leaves = 0;
         let mut total_count_tombstones = 0;
         for item in children {
             match item.info {
                 ChildInfo::Leaf{blocks_overflows, count_tombstones, ..} => {
-                    total_count_pages += blocks_overflows.count_pages();
+                    total_count_leaves += 1;
                     total_count_tombstones += count_tombstones;
                 },
-                ChildInfo::Parent{count_pages, count_tombstones, ..} => {
-                    total_count_pages += count_pages;
+                ChildInfo::Parent{count_leaves, count_tombstones, ..} => {
+                    total_count_leaves += count_leaves;
                     total_count_tombstones += count_tombstones;
                 },
             }
-            total_count_pages += 1;
         }
-        Ok((total_count_pages, total_count_tombstones))
+        Ok((total_count_leaves, total_count_tombstones))
     }
 
     fn max_tombstones_or_quasi_random(&self) -> usize {
 
         // if tombstones are present, prioritize promoting them
+
+        // TODO it would be nice here if we could get the N (want)
+        // items which contain the max tombstones.  like a sliding
+        // window.
 
         let mut result = 0;
         let mut max = self.children[0].count_tombstones();
@@ -5749,11 +5772,8 @@ impl ParentPage {
         }
     }
 
-    fn choose_nodes_to_promote(&self, depth: u8, lineage: &mut Vec<PageNum>) -> Result<(Vec<PageNum>, u64)> {
+    fn choose_nodes_to_promote(&self, depth: u8, lineage: &mut Vec<PageNum>, want: usize) -> Result<(Vec<PageNum>, u64)> {
         lineage[self.depth() as usize] = self.pagenum;
-
-        // TODO if this is promoting from Other, we need to be sure
-        // we don't deplete the level.
 
         let i = self.max_tombstones_or_quasi_random();
         if self.depth() - 1 == depth {
@@ -5761,8 +5781,7 @@ impl ParentPage {
             // as we want, instead of choosing i and then taking whatever is
             // available from there to the end.
             let avail = self.children.len() - i;
-            // TODO config constant
-            let take = std::cmp::min(avail, 8);
+            let take = std::cmp::min(avail, want);
             //println!("any_node,{},{},{}", self.children.len(), i, take);
             let v = 
                 self.children[i .. i + take]
@@ -5786,7 +5805,7 @@ impl ParentPage {
             let buf = Lend::new(buf, box done_page);
 
             let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, buf));
-            page.choose_nodes_to_promote(depth, lineage)
+            page.choose_nodes_to_promote(depth, lineage, want)
         }
     }
 
@@ -7488,7 +7507,7 @@ impl InnerPart {
         fn do_group(segments: &[SegmentHeaderInfo]) -> Result<Vec<(PageNum, PageCount)>> {
             let mut v = vec![];
             for seg in segments.iter() {
-                let count = try!(seg.count_pages_for_list_segments());
+                let count = try!(seg.count_leaves_for_list_segments());
                 v.push((seg.root_page, count));
             }
             Ok(v)
@@ -7639,18 +7658,19 @@ impl InnerPart {
                 }
                 assert!(pt == PageType::PARENT_NODE);
                 let depth = header.levels[i].buf[2];
-                // TODO this is a fairly expensive way to count the pages under a parent.
+                // TODO this is a fairly expensive way to count the leaves under a parent.
                 // it parses the parent page out of the buffer.
                 // store the count in SegmentHeaderInfo ?
 
-                // TODO is page count the right way to decide if a level is big enough
-                // to need a merge?  key count?  leaf count?
-
-                let (count_pages, count_tombstones) = try!(ParentPage::count_stuff_for_needs_merge(header.levels[i].root_page, &header.levels[i].buf));
+                let (count_leaves, count_tombstones) = try!(ParentPage::count_stuff_for_needs_merge(header.levels[i].root_page, &header.levels[i].buf));
+                if count_leaves < 2 {
+                    // we cannot promote from an Other segment unless we can leave at least one leaf in it
+                    return Ok(NeedsMerge::No);
+                }
                 if count_tombstones > 0 {
                     return Ok(NeedsMerge::Yes);
                 }
-                let size = (count_pages as u64) * (inner.pgsz as u64);
+                let size = (count_leaves as u64) * (inner.pgsz as u64);
                 if size < get_level_size(i) {
                     // this level doesn't need a merge because it is doesn't have enough data in it
                     return Ok(NeedsMerge::No);
@@ -7839,7 +7859,8 @@ impl InnerPart {
                                 let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), segment.root_page, buf));
 
                                 let mut lineage = vec![0; parent.depth() as usize + 1];
-                                let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage));
+                                // TODO config constant
+                                let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, 8));
                                 //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
                                 //println!("lineage: {}", lineage);
 
@@ -7865,6 +7886,7 @@ impl InnerPart {
                         let depth_root = old_from_segment.buf[2];
                         //println!("old_from_segment: {}, depth: {}", old_from_segment.root_page, depth_root);
                         assert!(depth_root >= 1);
+                        // TODO do we really ever want to promote from a depth other than leaves?
                         let promote_depth =
                             if depth_root == 1 {
                                 0
@@ -7882,8 +7904,12 @@ impl InnerPart {
                         let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), old_from_segment.root_page, buf));
 
                         let mut lineage = vec![0; parent.depth() as usize + 1];
-                        // TODO make sure this isn't depleting the whole segment
-                        let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage));
+                        // make sure this isn't depleting the whole segment
+                        let count_leaves = parent.count_leaves();
+                        // TODO config constant
+                        let want = std::cmp::min(count_leaves - 1, 8);
+                        assert!(want > 0);
+                        let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, want as usize));
                         //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
                         let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, chosen_pages.clone()));
                         //println!("lineage: {}", lineage);
