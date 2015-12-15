@@ -7908,7 +7908,7 @@ impl InnerPart {
 
                                 let mut lineage = vec![0; parent.depth() as usize + 1];
                                 // TODO config constant
-                                let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, 32));
+                                let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, 16));
                                 //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
                                 //println!("lineage: {}", lineage);
 
@@ -7955,7 +7955,7 @@ impl InnerPart {
                         // make sure this isn't depleting the whole segment
                         let count_leaves = parent.count_leaves();
                         // TODO config constant
-                        let want = std::cmp::min(count_leaves - 1, 32);
+                        let want = std::cmp::min(count_leaves - 1, 16);
                         assert!(want > 0);
                         let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, want as usize));
                         //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);

@@ -1,4 +1,7 @@
 
+wow.  BlockList::encoded_len() is now near the top of
+the profiler.
+
 the multiple consecutive run of the test suite case
 is basically an exercise in managing tombstones.  this
 is probably not a typical workload.
