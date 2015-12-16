@@ -1,7 +1,31 @@
 
+should the level multiplier be stored in the file header?
+
 hmph.  during one of the test runs, commit_merge()
 panicked because the dest segment (Other(N)) was
 obliterated by the promoted stuff (had to be tombstones).
+
+options:
+
+(1)  make sure a segment cannot be depleted.  seems
+hard.
+
+(2)  change header.levels to Option<SegmentHeaderInfo>.
+massive change.
+
+(3)  set the root_page to 0, effectively treating 0
+as None.  still a big change, but without the compiler
+helping to find all the places that need to change.
+
+(4)  remove the segment and move the other levels down.
+this will probably cause the newly moved level(s) to be
+desperate, and a wave of merges back upward will ensue.
+
+(5)  write an empty leaf.  sad.  might this be the
+least bad option?  but this would require a cursor
+that can have First() end up not Valid().  or we
+would need to special case the construction of the
+cursors.
 
 so yeah, it would seem that the blocklist stored for
 the leaf children of a depth 1 parent is only used at
