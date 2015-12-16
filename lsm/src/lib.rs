@@ -54,6 +54,9 @@ const SIZE_16: usize = 2; // like std::mem::size_of::<u16>()
 
 // the fresh and young levels are not included in the following count
 
+// TODO does this need to be a constant?  maybe we should just allow it
+// to grow as needed?  but then we would need to start up new threads
+// and channels.
 const NUM_LEVELS: usize = 8;
 
 pub type PageNum = u32;
@@ -6260,7 +6263,7 @@ impl IForwardCursor for MultiPageCursor {
 struct HeaderData {
     fresh: Vec<SegmentHeaderInfo>,
     young: Vec<SegmentHeaderInfo>,
-    levels: Vec<SegmentHeaderInfo>,
+    levels: Vec<Option<SegmentHeaderInfo>>,
 
     changeCounter: u64,
     mergeCounter: u64,
@@ -6311,6 +6314,22 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
             Ok(v)
         }
 
+        fn fix_main_segment_list(segments: Vec<PageNum>, pgsz: usize, f: std::rc::Rc<std::cell::RefCell<File>>, path: &str) -> Result<Vec<Option<SegmentHeaderInfo>>> {
+            let mut v = Vec::with_capacity(segments.len());
+            for page in segments.iter() {
+                let pagenum = *page;
+
+                if pagenum == 0 {
+                    v.push(None)
+                } else {
+                    let buf = try!(read_and_alloc_page(&f, pagenum, pgsz));
+                    let seg = SegmentHeaderInfo::new(pagenum, buf);
+                    v.push(Some(seg));
+                }
+            }
+            Ok(v)
+        }
+
         let mut cur = 0;
 
         let pgsz = misc::buf_advance::get_u32(&pr, &mut cur) as usize;
@@ -6323,7 +6342,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
 
         let fresh = try!(fix_segment_list(fresh, pgsz, f.clone(), path));
         let young = try!(fix_segment_list(young, pgsz, f.clone(), path));
-        let levels = try!(fix_segment_list(levels, pgsz, f.clone(), path));
+        let levels = try!(fix_main_segment_list(levels, pgsz, f.clone(), path));
 
         let hd = 
             HeaderData {
@@ -6386,8 +6405,8 @@ fn list_all_blocks(
     let headerBlock = PageBlock::new(1, (HEADER_SIZE_IN_BYTES / pgsz) as PageNum);
     blocks.add_block_no_reorder(headerBlock);
 
-    fn do_seglist(path: &str, f: std::rc::Rc<std::cell::RefCell<File>>, segments: &Vec<SegmentHeaderInfo>, blocks: &mut BlockList) -> Result<()> {
-        for seg in segments.iter() {
+    fn do_seglist<'a, I: Iterator<Item=&'a SegmentHeaderInfo>>(path: &str, f: std::rc::Rc<std::cell::RefCell<File>>, segments: I, blocks: &mut BlockList) -> Result<()> {
+        for seg in segments {
             let b = try!(seg.blocklist_unsorted(path, f.clone()));
             blocks.add_blocklist_no_reorder(&b);
             blocks.add_page_no_reorder(seg.root_page);
@@ -6395,9 +6414,9 @@ fn list_all_blocks(
         Ok(())
     }
 
-    try!(do_seglist(path, f.clone(), &h.fresh, &mut blocks));
-    try!(do_seglist(path, f.clone(), &h.young, &mut blocks));
-    try!(do_seglist(path, f.clone(), &h.levels, &mut blocks));
+    try!(do_seglist(path, f.clone(), h.fresh.iter(), &mut blocks));
+    try!(do_seglist(path, f.clone(), h.young.iter(), &mut blocks));
+    try!(do_seglist(path, f.clone(), h.levels.iter().filter_map(|s| s.as_ref()), &mut blocks));
 
     blocks.sort_and_consolidate();
 
@@ -7298,9 +7317,23 @@ impl HeaderStuff {
                 }
             }
 
+            fn add_main_list(pb: &mut Vec<u8>, v: &Vec<Option<SegmentHeaderInfo>>) {
+                misc::push_varint(pb, v.len() as u64);
+                for seg in v.iter() {
+                    match seg {
+                        &Some(ref seg) => {
+                            misc::push_varint(pb, seg.root_page as u64);
+                        },
+                        &None => {
+                            misc::push_varint(pb, 0);
+                        },
+                    }
+                }
+            }
+
             add_list(&mut pb, &h.fresh);
             add_list(&mut pb, &h.young);
-            add_list(&mut pb, &h.levels);
+            add_main_list(&mut pb, &h.levels);
 
             pb
         }
@@ -7482,7 +7515,7 @@ impl InnerPart {
         let cursors = 
             header.fresh.iter()
             .chain(header.young.iter())
-            .chain(header.levels.iter())
+            .chain(header.levels.iter().filter_map(|s| s.as_ref()))
             .map(|seg| {
                 let buf = seg.buf.clone();
 // TODO it would be nice to just let pagecursor have a reference. Arc?
@@ -7498,7 +7531,7 @@ impl InnerPart {
         let segments = 
             header.fresh.iter()
             .chain(header.young.iter())
-            .chain(header.levels.iter())
+            .chain(header.levels.iter().filter_map(|s| s.as_ref()))
             .map(|seg| {
                 seg.root_page
             })
@@ -7517,7 +7550,7 @@ impl InnerPart {
             let segnums = 
                 header.fresh.iter()
                 .chain(header.young.iter())
-                .chain(header.levels.iter())
+                .chain(header.levels.iter().filter_map(|s| s.as_ref()))
                 .map(|seg| seg.root_page)
                 .collect::<Vec<_>>();
             println!("open_cursor,{},{:?}", rlock, segnums);
@@ -7575,9 +7608,26 @@ impl InnerPart {
             Ok(v)
         }
 
+        fn do_main_group(segments: &[Option<SegmentHeaderInfo>]) -> Result<Vec<(PageNum, PageCount)>> {
+            let mut v = vec![];
+            for seg in segments.iter() {
+                match seg {
+                    &Some(ref seg) => {
+                        let count = try!(seg.count_leaves_for_list_segments());
+                        v.push((seg.root_page, count));
+                    },
+                    &None => {
+                        // TODO using 0,0 here is not ideal
+                        v.push((0, 0));
+                    },
+                }
+            }
+            Ok(v)
+        }
+
         let fresh = try!(do_group(&header.fresh));
         let young = try!(do_group(&header.young));
-        let levels = try!(do_group(&header.levels));
+        let levels = try!(do_main_group(&header.levels));
 
         Ok((fresh, young, levels))
     }
@@ -7714,36 +7764,43 @@ impl InnerPart {
                     // this level doesn't need a merge because it doesn't exist
                     return Ok(NeedsMerge::No);
                 }
-                let pt = try!(PageType::from_u8(header.levels[i].buf[0]));
-                if pt == PageType::LEAF_NODE {
-                    return Ok(NeedsMerge::No);
-                }
-                assert!(pt == PageType::PARENT_NODE);
-                let depth = header.levels[i].buf[2];
-                // TODO this is a fairly expensive way to count the leaves under a parent.
-                // it parses the parent page out of the buffer.
-                // store the count in SegmentHeaderInfo ?
+                match &header.levels[i] {
+                    &Some(ref seg) => {
+                        let pt = try!(PageType::from_u8(seg.buf[0]));
+                        if pt == PageType::LEAF_NODE {
+                            return Ok(NeedsMerge::No);
+                        }
+                        assert!(pt == PageType::PARENT_NODE);
+                        let depth = seg.buf[2];
+                        // TODO this is a fairly expensive way to count the leaves under a parent.
+                        // it parses the parent page out of the buffer.
+                        // store the count in SegmentHeaderInfo ?
 
-                let (count_leaves, count_tombstones) = try!(ParentPage::count_stuff_for_needs_merge(header.levels[i].root_page, &header.levels[i].buf));
-                if count_leaves < 2 {
-                    // we cannot promote from an Other segment unless we can leave at least one leaf in it
-                    return Ok(NeedsMerge::No);
+                        let (count_leaves, count_tombstones) = try!(ParentPage::count_stuff_for_needs_merge(seg.root_page, &seg.buf));
+                        if count_leaves < 2 {
+                            // we cannot promote from an Other segment unless we can leave at least one leaf in it
+                            return Ok(NeedsMerge::No);
+                        }
+                        if count_tombstones > 0 {
+                            return Ok(NeedsMerge::Yes);
+                        }
+                        let size = (count_leaves as u64) * (inner.pgsz as u64);
+                        if size < get_level_size(i) {
+                            // this level doesn't need a merge because it is doesn't have enough data in it
+                            return Ok(NeedsMerge::No);
+                        }
+                        if size > inner.settings.desperate_level_factor * get_level_size(i) {
+                            // TODO not sure we need this.  but without it,
+                            // Other(0) gets out of control on 5M urls.
+                            // maybe a locking and starvation issue.
+                            return Ok(NeedsMerge::Desperate);
+                        }
+                        return Ok(NeedsMerge::Yes);
+                    },
+                    &None => {
+                        return Ok(NeedsMerge::No);
+                    },
                 }
-                if count_tombstones > 0 {
-                    return Ok(NeedsMerge::Yes);
-                }
-                let size = (count_leaves as u64) * (inner.pgsz as u64);
-                if size < get_level_size(i) {
-                    // this level doesn't need a merge because it is doesn't have enough data in it
-                    return Ok(NeedsMerge::No);
-                }
-                if size > inner.settings.desperate_level_factor * get_level_size(i) {
-                    // TODO not sure we need this.  but without it,
-                    // Other(0) gets out of control on 5M urls.
-                    // maybe a locking and starvation issue.
-                    return Ok(NeedsMerge::Desperate);
-                }
-                return Ok(NeedsMerge::Yes);
             },
         }
     }
@@ -7945,7 +8002,8 @@ impl InnerPart {
                     },
                     FromLevel::Other(level) => {
                         assert!(header.levels.len() > level);
-                        let old_from_segment = &header.levels[level];
+                        // TODO unwrap here is ugly.  but needs_merge happpened first
+                        let old_from_segment = header.levels[level].as_ref().unwrap();
                         let pt = try!(PageType::from_u8(old_from_segment.buf[0]));
                         assert!(pt == PageType::PARENT_NODE);
                         let depth_root = old_from_segment.buf[2];
@@ -8016,27 +8074,33 @@ impl InnerPart {
                     },
                     DestLevel::Other(dest_level) => {
                         if header.levels.len() > dest_level {
-                            let dest_segment = &header.levels[dest_level];
-                            let pt = try!(PageType::from_u8(dest_segment.buf[0]));
+                            match &header.levels[dest_level] {
+                                &Some(ref dest_segment) => {
+                                    let pt = try!(PageType::from_u8(dest_segment.buf[0]));
 
-                            // TODO it's a little silly here to construct a Lend<>
-                            let done_page = move |_| -> () {
-                            };
-                            // TODO and the clone below is silly too
-                            let buf = Lend::new(dest_segment.buf.clone(), box done_page);
+                                    // TODO it's a little silly here to construct a Lend<>
+                                    let done_page = move |_| -> () {
+                                    };
+                                    // TODO and the clone below is silly too
+                                    let buf = Lend::new(dest_segment.buf.clone(), box done_page);
 
-                            match pt {
-                                PageType::LEAF_NODE => {
-                                    //println!("root of the dest segment is a leaf");
-                                    let leaf = try!(LeafPage::new_already_read_page(&inner.path, f.clone(), dest_segment.root_page, buf));
-                                    MergingInto::Leaf(leaf)
+                                    match pt {
+                                        PageType::LEAF_NODE => {
+                                            //println!("root of the dest segment is a leaf");
+                                            let leaf = try!(LeafPage::new_already_read_page(&inner.path, f.clone(), dest_segment.root_page, buf));
+                                            MergingInto::Leaf(leaf)
+                                        },
+                                        PageType::PARENT_NODE => {
+                                            let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), dest_segment.root_page, buf));
+                                            MergingInto::Parent(parent)
+                                        },
+                                    }
                                 },
-                                PageType::PARENT_NODE => {
-                                    let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), dest_segment.root_page, buf));
-                                    MergingInto::Parent(parent)
+                                &None => {
+                                    // the dest segment currently does not exist
+                                    MergingInto::None
                                 },
                             }
-
                         } else {
                             // the dest segment does not exist yet.
                             MergingInto::None
@@ -8105,6 +8169,12 @@ impl InnerPart {
 
                 match behind_segments {
                     Some(behind_segments) => {
+                        let behind_segments =
+                            behind_segments
+                            .iter()
+                            .filter_map(|s| s.as_ref())
+                            .collect::<Vec<_>>();
+
                         let behind_cursors = {
                             fn get_cursor(
                                 path: &str, 
@@ -8666,7 +8736,7 @@ impl InnerPart {
         {
             let mut headerstuff = try!(self.header.write());
 
-            // TODO assert new seg shares no pages with any seg in current state
+            // TODO assert new seg shares no pages with any seg in current state?
 
             let mut newHeader = headerstuff.data.clone();
 
@@ -8674,28 +8744,42 @@ impl InnerPart {
                 match (old_dest_segment, new_dest_segment) {
                     (None, None) => {
                         // a merge resulted in what would have been an empty segment.
-                        // multiple segments from the young level cancelled each other out.
-                        // there wasn't anything in this level anyway.
-                        assert!(newHeader.levels.len() == dest_level);
+                        // multiple promoted segments cancelled each other out.
+                        // but there wasn't anything in this level anyway, either
+                        // because it didn't exist or had been depleted.
+                        if newHeader.levels.len() == dest_level {
+                            // fine
+                        } else {
+                            assert!(newHeader.levels[dest_level].is_none());
+                        }
                     },
                     (None, Some(new_seg)) => {
-                        // first merge into this new level
-                        assert!(newHeader.levels.len() == dest_level);
-                        newHeader.levels.push(new_seg);
+                        if newHeader.levels.len() == dest_level {
+                            // first merge into this new level
+                            newHeader.levels.push(Some(new_seg));
+                        } else {
+                            // merge into a previously depleted level
+                            assert!(dest_level < newHeader.levels.len());
+                            assert!(newHeader.levels[dest_level].is_none());
+                            newHeader.levels[dest_level] = Some(new_seg);
+                            println!("level {} resurrected", dest_level);
+                        }
                     },
-                    (Some(_), None) => {
+                    (Some(old), None) => {
                         // a merge resulted in what would have been an empty segment.
-                        // segments from young cancelled out everything that was in
+                        // promoted segments cancelled out everything that was in
                         // the dest level.
                         assert!(dest_level < newHeader.levels.len());
-                        // TODO what do we do about this?
-                        panic!();
+                        assert!(newHeader.levels[dest_level].as_ref().unwrap().root_page == old);
+                        // TODO if this is the last level, just remove it?
+                        newHeader.levels[dest_level] = None;
+                        println!("level {} depleted", dest_level);
                     },
                     (Some(old), Some(new_seg)) => {
                         // level already exists
                         assert!(dest_level < newHeader.levels.len());
-                        assert!(newHeader.levels[dest_level].root_page == old);
-                        newHeader.levels[dest_level] = new_seg;
+                        assert!(newHeader.levels[dest_level].as_ref().unwrap().root_page == old);
+                        newHeader.levels[dest_level] = Some(new_seg);
                     },
                 }
             }
@@ -8832,8 +8916,8 @@ impl InnerPart {
                     update_header(&mut newHeader, pm.old_dest_segment, pm.new_dest_segment, dest_level);
                 },
                 MergeFrom::Other{level, old_segment, new_segment} => {
-                    assert!(old_segment == newHeader.levels[level].root_page);
-                    newHeader.levels[level] = new_segment;
+                    assert!(old_segment == newHeader.levels[level].as_ref().unwrap().root_page);
+                    newHeader.levels[level] = Some(new_segment);
 
                     let dest_level = level + 1;
                     update_header(&mut newHeader, pm.old_dest_segment, pm.new_dest_segment, dest_level);

@@ -1,4 +1,7 @@
 
+allow survivor segment to become empty now that the
+code can handle it
+
 should the level multiplier be stored in the file header?
 
 hmph.  during one of the test runs, commit_merge()
