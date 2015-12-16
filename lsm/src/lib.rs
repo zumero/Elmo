@@ -4794,6 +4794,18 @@ impl LeafPage {
         Ok((prefix, cur))
     }
 
+    fn count_tombstones(pagenum: PageNum, buf: &[u8]) -> Result<u64> {
+        let mut pairs = vec![];
+        let (prefix, bytes_used_on_page) = try!(Self::parse_page(pagenum, &buf, &mut pairs));
+        let mut total_count_tombstones = 0;
+        for p in pairs {
+            if p.value.is_tombstone() {
+                total_count_tombstones += 1;
+            }
+        }
+        Ok(total_count_tombstones)
+    }
+
     pub fn len_on_page(&self) -> usize {
         self.bytes_used_on_page
     }
@@ -5342,6 +5354,15 @@ impl ValueInLeaf {
             };
         Ok(v)
     }
+
+    fn is_tombstone(&self) -> bool {
+        match self {
+            &ValueInLeaf::Tombstone => true,
+            &ValueInLeaf::Inline(_,_) => false,
+            &ValueInLeaf::Overflowed(_,_) => false,
+        }
+    }
+
 }
 
 #[derive(Debug)]
@@ -6766,7 +6787,7 @@ enum MergeFrom {
     Fresh{segments: Vec<PageNum>},
     FreshNoRewrite{segments: Vec<PageNum>},
     Young{old_segment: PageNum, new_segment: Option<SegmentHeaderInfo>},
-    Other{level: usize, old_segment: PageNum, new_segment: SegmentHeaderInfo},
+    Other{level: usize, old_segment: PageNum, new_segment: Option<SegmentHeaderInfo>},
 }
 
 impl MergeFrom {
@@ -6804,7 +6825,6 @@ struct SafePagePool {
 struct Senders {
     notify_fresh: mpsc::Sender<MergeMessage>,
     notify_young: mpsc::Sender<MergeMessage>,
-    // TODO vec, or boxed slice?
     notify_levels: Vec<mpsc::Sender<MergeMessage>>,
 }
 
@@ -7242,7 +7262,7 @@ impl DatabaseFile {
 
     pub fn get_write_lock(&self) -> Result<std::sync::MutexGuard<WriteLock>> {
         while NeedsMerge::Desperate == try!(InnerPart::needs_merge(&self.inner, FromLevel::Fresh)) {
-            // TODO if we need to sleep more than once, do we need to notify_work
+            // TODO if we need to sleep more than once, do we really need to notify_work
             // every time?
             try!(self.inner.notify_work(FromLevel::Fresh));
             println!("desperate,main,sleeping,{}", self.inner.settings.sleep_desperate_fresh);
@@ -7766,36 +7786,40 @@ impl InnerPart {
                 }
                 match &header.levels[i] {
                     &Some(ref seg) => {
-                        let pt = try!(PageType::from_u8(seg.buf[0]));
-                        if pt == PageType::LEAF_NODE {
-                            return Ok(NeedsMerge::No);
-                        }
-                        assert!(pt == PageType::PARENT_NODE);
-                        let depth = seg.buf[2];
-                        // TODO this is a fairly expensive way to count the leaves under a parent.
-                        // it parses the parent page out of the buffer.
-                        // store the count in SegmentHeaderInfo ?
+                        match try!(PageType::from_u8(seg.buf[0])) {
+                            PageType::LEAF_NODE => {
+                                // TODO this is a fairly expensive way to count the stuff.
+                                // it parses the page out of the buffer.
+                                let count_tombstones = try!(LeafPage::count_tombstones(seg.root_page, &seg.buf));
+                                if count_tombstones > 0 {
+                                    return Ok(NeedsMerge::Yes);
+                                }
+                                return Ok(NeedsMerge::No);
+                            },
+                            PageType::PARENT_NODE => {
+                                let depth = seg.buf[2];
+                                // TODO this is a fairly expensive way to count the stuff.
+                                // it parses the page out of the buffer.
+                                // store the count in SegmentHeaderInfo ?
 
-                        let (count_leaves, count_tombstones) = try!(ParentPage::count_stuff_for_needs_merge(seg.root_page, &seg.buf));
-                        if count_leaves < 2 {
-                            // we cannot promote from an Other segment unless we can leave at least one leaf in it
-                            return Ok(NeedsMerge::No);
+                                let (count_leaves, count_tombstones) = try!(ParentPage::count_stuff_for_needs_merge(seg.root_page, &seg.buf));
+                                if count_tombstones > 0 {
+                                    return Ok(NeedsMerge::Yes);
+                                }
+                                let size = (count_leaves as u64) * (inner.pgsz as u64);
+                                if size < get_level_size(i) {
+                                    // this level doesn't need a merge because it is doesn't have enough data in it
+                                    return Ok(NeedsMerge::No);
+                                }
+                                if size > inner.settings.desperate_level_factor * get_level_size(i) {
+                                    // TODO not sure we need this.  but without it,
+                                    // Other(0) gets out of control on 5M urls.
+                                    // maybe a locking and starvation issue.
+                                    return Ok(NeedsMerge::Desperate);
+                                }
+                                return Ok(NeedsMerge::Yes);
+                            },
                         }
-                        if count_tombstones > 0 {
-                            return Ok(NeedsMerge::Yes);
-                        }
-                        let size = (count_leaves as u64) * (inner.pgsz as u64);
-                        if size < get_level_size(i) {
-                            // this level doesn't need a merge because it is doesn't have enough data in it
-                            return Ok(NeedsMerge::No);
-                        }
-                        if size > inner.settings.desperate_level_factor * get_level_size(i) {
-                            // TODO not sure we need this.  but without it,
-                            // Other(0) gets out of control on 5M urls.
-                            // maybe a locking and starvation issue.
-                            return Ok(NeedsMerge::Desperate);
-                        }
-                        return Ok(NeedsMerge::Yes);
                     },
                     &None => {
                         return Ok(NeedsMerge::No);
@@ -7819,8 +7843,9 @@ impl InnerPart {
                 segments: Vec<FromWholeSegment>,
             },
             YoungWhole{
+                // TODO is this always used only for a leaf?
                 segment: FromWholeSegment,
-                // TODO count_tombstones: u64,
+                count_tombstones: u64,
             },
             YoungPartial{
                 old_segment: ParentPage,
@@ -7830,7 +7855,14 @@ impl InnerPart {
                 promote_lineage: Vec<PageNum>, 
                 count_tombstones: u64,
             },
+            OtherWhole{
+                // TODO is this always used only for a leaf?
+                level: usize,  // TODO why is this here?
+                segment: FromWholeSegment,
+                count_tombstones: u64,
+            },
             Other{
+                // TODO OtherPartial
                 level: usize,  // TODO why is this here?
                 old_segment: ParentPage, 
                 promote_pages: Vec<PageNum>, // must be contig within same parent
@@ -7958,18 +7990,26 @@ impl InnerPart {
                             PageType::LEAF_NODE => {
                                 let merge_segments = slice_from_end(&header.young, 1);
 
+                                let seg = &merge_segments[0];
+                                let count_tombstones = try!(LeafPage::count_tombstones(seg.root_page, &seg.buf));
+
                                 //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
                                 let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
 
                                 // TODO use node iterator
+                                // TODO er, blocklist_unsorted_no_overflows on a leaf is always empty
                                 let node_pages = try!(segment.blocklist_unsorted_no_overflows(&inner.path, f.clone()));
                                 let seg = FromWholeSegment {
                                     root_page: segment.root_page,
                                     node_pages: node_pages,
                                 };
 
-                                // TODO could count tombstones here as well
-                                (cursors, MergingFrom::YoungWhole{segment: seg})
+                                let from = MergingFrom::YoungWhole{
+                                    segment: seg,
+                                    count_tombstones: count_tombstones,
+                                };
+
+                                (cursors, from)
                             },
                             PageType::PARENT_NODE => {
                                 let promote_depth = 0;
@@ -8004,59 +8044,81 @@ impl InnerPart {
                         assert!(header.levels.len() > level);
                         // TODO unwrap here is ugly.  but needs_merge happpened first
                         let old_from_segment = header.levels[level].as_ref().unwrap();
-                        let pt = try!(PageType::from_u8(old_from_segment.buf[0]));
-                        assert!(pt == PageType::PARENT_NODE);
-                        let depth_root = old_from_segment.buf[2];
-                        //println!("old_from_segment: {}, depth: {}", old_from_segment.root_page, depth_root);
-                        assert!(depth_root >= 1);
-                        // TODO do we really ever want to promote from a depth other than leaves?
-                        let promote_depth =
-                            if depth_root == 1 {
-                                0
-                            } else {
-                                // TODO config setting?
-                                // TODO should this depend on the size of the dest segment?
-                                0
-                            };
-                        //println!("promote_depth: {}", promote_depth);
+                        match try!(PageType::from_u8(old_from_segment.buf[0])) {
+                            PageType::LEAF_NODE => {
+                                let count_tombstones = try!(LeafPage::count_tombstones(old_from_segment.root_page, &old_from_segment.buf));
 
-                        // TODO it's a little silly here to construct a Lend<>
-                        let done_page = move |_| -> () {
-                        };
-                        let buf = Lend::new(old_from_segment.buf.clone(), box done_page);
-                        let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), old_from_segment.root_page, buf));
+                                // TODO sad that this will re-read the leaf page
+                                let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, vec![old_from_segment.root_page]));
 
-                        let mut lineage = vec![0; parent.depth() as usize + 1];
-                        // make sure this isn't depleting the whole segment
-                        let count_leaves = parent.count_leaves();
-                        // TODO config constant
-                        let want = std::cmp::min(count_leaves - 1, 16);
-                        assert!(want > 0);
-                        let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, want as usize));
-                        //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
-                        let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, chosen_pages.clone()));
-                        //println!("lineage: {}", lineage);
+                                // TODO use node iterator
+                                // TODO er, blocklist_unsorted_no_overflows on a leaf is always empty
+                                let node_pages = try!(old_from_segment.blocklist_unsorted_no_overflows(&inner.path, f.clone()));
+                                let seg = FromWholeSegment {
+                                    root_page: old_from_segment.root_page,
+                                    node_pages: node_pages,
+                                };
 
-                        // TODO use node iterator
-                        //let promote_blocks = try!(cursor.blocklist_unsorted_no_overflows());
-                        let promote_blocks =
-                            if promote_depth == 0 {
-                                BlockList::new()
-                            } else {
-                                // TODO
-                                unreachable!();
-                            };
+                                let from = MergingFrom::OtherWhole{
+                                    level: level,
+                                    segment: seg,
+                                    count_tombstones: count_tombstones,
+                                };
 
-                        let from = MergingFrom::Other{
-                            level: level, 
-                            old_segment: parent, 
-                            promote_lineage: lineage, 
-                            promote_pages: chosen_pages, 
-                            promote_depth: promote_depth,
-                            promote_blocks: promote_blocks, 
-                            count_tombstones: count_tombstones,
-                        };
-                        (vec![cursor], from)
+                                (vec![cursor], from)
+                            },
+                            PageType::PARENT_NODE => {
+                                let depth_root = old_from_segment.buf[2];
+                                //println!("old_from_segment: {}, depth: {}", old_from_segment.root_page, depth_root);
+                                assert!(depth_root >= 1);
+                                // TODO do we really ever want to promote from a depth other than leaves?
+                                let promote_depth =
+                                    if depth_root == 1 {
+                                        0
+                                    } else {
+                                        // TODO config setting?
+                                        // TODO should this depend on the size of the dest segment?
+                                        0
+                                    };
+                                //println!("promote_depth: {}", promote_depth);
+
+                                // TODO it's a little silly here to construct a Lend<>
+                                let done_page = move |_| -> () {
+                                };
+                                let buf = Lend::new(old_from_segment.buf.clone(), box done_page);
+                                let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), old_from_segment.root_page, buf));
+
+                                let mut lineage = vec![0; parent.depth() as usize + 1];
+                                // make sure this isn't depleting the whole segment
+                                let count_leaves = parent.count_leaves();
+                                // TODO config constant
+                                let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, 16));
+                                //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
+                                let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, chosen_pages.clone()));
+                                //println!("lineage: {}", lineage);
+
+                                // TODO use node iterator
+                                //let promote_blocks = try!(cursor.blocklist_unsorted_no_overflows());
+                                let promote_blocks =
+                                    if promote_depth == 0 {
+                                        BlockList::new()
+                                    } else {
+                                        // TODO
+                                        unreachable!();
+                                    };
+
+                                let from = MergingFrom::Other{
+                                    level: level, 
+                                    old_segment: parent, 
+                                    promote_lineage: lineage, 
+                                    promote_pages: chosen_pages, 
+                                    promote_depth: promote_depth,
+                                    promote_blocks: promote_blocks, 
+                                    count_tombstones: count_tombstones,
+                                };
+                                (vec![cursor], from)
+                            },
+                        }
                     },
                 }
             };
@@ -8125,22 +8187,39 @@ impl InnerPart {
                         MergingFrom::Fresh{..} => {
                             None
                         },
-                        MergingFrom::YoungWhole{..} => {
-                            // TODO skip if no tombstones
-                            let dest_level = 0;
-                            let mut behind_segments = Vec::with_capacity(header.levels.len());
-                            for i in dest_level + 1 .. header.levels.len() {
-                                let seg = &header.levels[i];
+                        MergingFrom::YoungWhole{count_tombstones, ..} => {
+                            if count_tombstones == 0 {
+                                None
+                            } else {
+                                let dest_level = 0;
+                                let mut behind_segments = Vec::with_capacity(header.levels.len());
+                                for i in dest_level + 1 .. header.levels.len() {
+                                    let seg = &header.levels[i];
 
-                                behind_segments.push(seg);
+                                    behind_segments.push(seg);
+                                }
+                                Some(behind_segments)
                             }
-                            Some(behind_segments)
                         },
                         MergingFrom::YoungPartial{count_tombstones, ..} => {
                             if count_tombstones == 0 {
                                 None
                             } else {
                                 let dest_level = 0;
+                                let mut behind_segments = Vec::with_capacity(header.levels.len());
+                                for i in dest_level + 1 .. header.levels.len() {
+                                    let seg = &header.levels[i];
+
+                                    behind_segments.push(seg);
+                                }
+                                Some(behind_segments)
+                            }
+                        },
+                        MergingFrom::OtherWhole{level, count_tombstones, ..} => {
+                            if count_tombstones == 0 {
+                                None
+                            } else {
+                                let dest_level = level + 1;
                                 let mut behind_segments = Vec::with_capacity(header.levels.len());
                                 for i in dest_level + 1 .. header.levels.len() {
                                     let seg = &header.levels[i];
@@ -8359,7 +8438,18 @@ impl InnerPart {
                         now_inactive.insert(seg.root_page, blocks);
                     }
                 },
-                MergingFrom::YoungWhole{ref segment} => {
+                MergingFrom::YoungWhole{ref segment, ..} => {
+                    let mut blocks = segment.node_pages.clone();
+                    blocks.add_page_no_reorder(segment.root_page);
+                    // TODO overflows_eaten should be a hashmap
+                    for &(s,ref b) in overflows_eaten.iter() {
+                        if s == segment.root_page {
+                            blocks.add_blocklist_no_reorder(b);
+                        }
+                    }
+                    now_inactive.insert(segment.root_page, blocks);
+                },
+                MergingFrom::OtherWhole{ref segment, ..} => {
                     let mut blocks = segment.node_pages.clone();
                     blocks.add_page_no_reorder(segment.root_page);
                     // TODO overflows_eaten should be a hashmap
@@ -8404,7 +8494,7 @@ impl InnerPart {
                         segments: segments,
                     }
                 },
-                MergingFrom::YoungWhole{segment} => {
+                MergingFrom::YoungWhole{segment, ..} => {
                     MergeFrom::Young{
                         old_segment: segment.root_page,
                         new_segment: None,
@@ -8445,12 +8535,17 @@ impl InnerPart {
                     now_inactive.insert(old_segment.pagenum, blocks);
                     from
                 },
+                MergingFrom::OtherWhole{level, segment, ..} => {
+                    MergeFrom::Other{
+                        level: level,
+                        old_segment: segment.root_page,
+                        new_segment: None,
+                    }
+                },
                 MergingFrom::Other{level, old_segment, promote_pages, promote_depth, promote_lineage, promote_blocks, ..} => {
                     //println!("promote_lineage: {:?}", promote_lineage);
                     //println!("promote_blocks: {:?}", promote_blocks);
                     let wrote = try!(write_survivors(&mut pw, &promote_pages, promote_depth, &promote_lineage, &old_segment, &inner.path, f.clone(), from_level.get_dest_level()));
-                    assert!(wrote.segment.is_some());
-
                     println!("survivors,from,{:?}, leaves_rewritten,{}, leaves_recycled,{}, parent1_rewritten,{}, parent1_recycled,{}, ms,{}", 
                              from_level, 
                              if wrote.nodes_rewritten.len() > 0 { wrote.nodes_rewritten[0].len() } else { 0 },
@@ -8464,7 +8559,7 @@ impl InnerPart {
                         MergeFrom::Other {
                             level: level,
                             old_segment: old_segment.pagenum,
-                            new_segment: wrote.segment.unwrap(),
+                            new_segment: wrote.segment,
                         };
                     let mut blocks = promote_blocks;
                     for page in promote_pages {
@@ -8574,10 +8669,12 @@ impl InnerPart {
                         }
                     },
                     MergeFrom::Other{ref new_segment, ..} => {
-                        let mut blocks = try!(new_segment.blocklist_unsorted(&inner.path, f.clone()));
-                        blocks.add_page_no_reorder(new_segment.root_page);
-                        for (k, b) in old_now_inactive.iter_mut() {
-                            b.remove_anything_in(&blocks);
+                        if let &Some(ref new_segment) = new_segment {
+                            let mut blocks = try!(new_segment.blocklist_unsorted(&inner.path, f.clone()));
+                            blocks.add_page_no_reorder(new_segment.root_page);
+                            for (k, b) in old_now_inactive.iter_mut() {
+                                b.remove_anything_in(&blocks);
+                            }
                         }
                     },
                     _ => {
@@ -8648,15 +8745,17 @@ impl InnerPart {
 
                             },
                             MergeFrom::Other{ref new_segment, ..} => {
-                                let mut blocks = try!(new_segment.blocklist_unsorted(&inner.path, f.clone()));
-                                blocks.add_page_no_reorder(new_segment.root_page);
+                                if let &Some(ref new_segment) = new_segment {
+                                    let mut blocks = try!(new_segment.blocklist_unsorted(&inner.path, f.clone()));
+                                    blocks.add_page_no_reorder(new_segment.root_page);
 
-                                let both = blocks.remove_anything_in(&new_blocks);
-                                if !both.is_empty() {
-                                    println!("{:?}: inactive problem: segment {}", from_level, seg);
-                                    println!("new: {:?}", new_blocks);
-                                    println!("new inactive but in new from ({}): {:?}", new_segment.root_page, both);
-                                    panic!();
+                                    let both = blocks.remove_anything_in(&new_blocks);
+                                    if !both.is_empty() {
+                                        println!("{:?}: inactive problem: segment {}", from_level, seg);
+                                        println!("new: {:?}", new_blocks);
+                                        println!("new inactive but in new from ({}): {:?}", new_segment.root_page, both);
+                                        panic!();
+                                    }
                                 }
 
                             },
@@ -8688,31 +8787,6 @@ impl InnerPart {
         }
 
         //println!("now_inactive: {:?}", now_inactive);
-
-        if cfg!(expensive_check) 
-        {
-            match new_dest_segment {
-                Some(ref new_dest_segment) => {
-                    let mut blocks = try!(new_dest_segment.blocklist_unsorted(&inner.path, f.clone()));
-                    blocks.add_page_no_reorder(new_dest_segment.root_page);
-                    println!("new dest segment: {} -- {:?}", new_dest_segment.root_page, blocks);
-                },
-                None => {
-                    //println!("new_dest_segment: None");
-                },
-            }
-
-            match from {
-                MergeFrom::Other{ref new_segment, ..} => {
-                    let mut blocks = try!(new_segment.blocklist_unsorted(&inner.path, f.clone()));
-                    blocks.add_page_no_reorder(new_segment.root_page);
-                    println!("new from segment: {} -- {:?}", new_segment.root_page, blocks);
-                },
-                _ => {
-                    //println!("new_dest_segment: None");
-                },
-            }
-        }
 
         let pm = 
             PendingMerge {
@@ -8866,7 +8940,13 @@ impl InnerPart {
                     }
                 },
                 MergeFrom::Other{level, old_segment, ref new_segment} => {
-                    deps.insert(new_segment.root_page, vec![old_segment]);
+                    match new_segment {
+                        &Some(ref new_segment) => {
+                            deps.insert(new_segment.root_page, vec![old_segment]);
+                        },
+                        &None => {
+                        },
+                    }
                 },
             }
 
@@ -8917,7 +8997,7 @@ impl InnerPart {
                 },
                 MergeFrom::Other{level, old_segment, new_segment} => {
                     assert!(old_segment == newHeader.levels[level].as_ref().unwrap().root_page);
-                    newHeader.levels[level] = Some(new_segment);
+                    newHeader.levels[level] = new_segment;
 
                     let dest_level = level + 1;
                     update_header(&mut newHeader, pm.old_dest_segment, pm.new_dest_segment, dest_level);

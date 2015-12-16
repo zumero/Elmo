@@ -1,4 +1,29 @@
 
+seems like it should be impossible for a tombstone
+to exist anymore in a main level.  the presence of
+a tombstone there always means need_merge().  but
+if needs_merge() doesn't get called...
+
+hmmm.  for query purposes, it is always best to have
+as few levels as possible.  however, if a level does
+need to exist, it is best for it to be full, so that
+the level below it is not, right?  this allows writes
+to be faster.  so for example, suppose level 1 exists
+but has very little in it.  would it be best to be
+moving stuff from level 0 into it?
+
+in some sense, we are already doing that when tombstones
+are present.  we merge tombstones, but other things get
+promoted along for the ride.  so there is a possibility
+that this design will cause most things to get promoted
+to the last level, leaving middle levels empty or
+nearly empty.  not sure if this is a problem or not.
+
+a main middle level which has just a leaf might as
+well be empty.  it is nice that truly empty leaves
+do not cause any perf problem with open_cursor, but
+a single-leaf segment does have a cost.
+
 allow survivor segment to become empty now that the
 code can handle it
 
