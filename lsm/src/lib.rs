@@ -1303,6 +1303,7 @@ pub struct DbSettings {
     pub desperate_fresh: usize,
     pub desperate_young: usize,
     pub desperate_level_factor: u64,
+    pub num_leaves_promote: usize,
     // TODO min consecutive recycle
     // TODO fresh free
     // TODO level factor
@@ -1319,6 +1320,7 @@ pub const DEFAULT_SETTINGS: DbSettings =
         desperate_fresh: 128,
         desperate_young: 128,
         desperate_level_factor: 2,
+        num_leaves_promote: 16,
     };
 
 #[derive(Clone)]
@@ -8007,8 +8009,7 @@ impl InnerPart {
                                 let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), segment.root_page, buf));
 
                                 let mut lineage = vec![0; parent.depth() as usize + 1];
-                                // TODO config constant
-                                let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, 16));
+                                let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, inner.settings.num_leaves_promote));
                                 //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
                                 //println!("lineage: {}", lineage);
 
@@ -8067,10 +8068,8 @@ impl InnerPart {
                                 let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), old_from_segment.root_page, buf));
 
                                 let mut lineage = vec![0; parent.depth() as usize + 1];
-                                // make sure this isn't depleting the whole segment
                                 let count_leaves = parent.count_leaves();
-                                // TODO config constant
-                                let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, 16));
+                                let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, inner.settings.num_leaves_promote));
                                 //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
                                 let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, chosen_pages.clone()));
                                 //println!("lineage: {}", lineage);
@@ -8078,6 +8077,7 @@ impl InnerPart {
                                 // TODO use node iterator
                                 //let promote_blocks = try!(cursor.blocklist_unsorted_no_overflows());
                                 let promote_blocks =
+                                    // TODO if promote_depth is always 0, this is silly
                                     if promote_depth == 0 {
                                         BlockList::new()
                                     } else {
@@ -9078,6 +9078,7 @@ impl PageWriter {
         // TODO not sure what minimum size we should request.
         // we want overflows to be contiguous, but we also want to
         // avoid putting them at the end of the file.
+        // TODO config constant?
         const MINIMUM_SIZE_FIRST_BLOCK_IN_GROUP: PageCount = 16;
 
         assert!(self.group_blocks.len() <= 2);
