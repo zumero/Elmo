@@ -7842,9 +7842,8 @@ impl InnerPart {
             Fresh{
                 segments: Vec<FromWholeSegment>,
             },
-            YoungWhole{
-                // TODO is this always used only for a leaf?
-                segment: FromWholeSegment,
+            YoungLeaf{
+                segment: PageNum,
                 count_tombstones: u64,
             },
             YoungPartial{
@@ -7855,14 +7854,12 @@ impl InnerPart {
                 promote_lineage: Vec<PageNum>, 
                 count_tombstones: u64,
             },
-            OtherWhole{
-                // TODO is this always used only for a leaf?
+            OtherLeaf{
                 level: usize,  // TODO why is this here?
-                segment: FromWholeSegment,
+                segment: PageNum,
                 count_tombstones: u64,
             },
-            Other{
-                // TODO OtherPartial
+            OtherPartial{
                 level: usize,  // TODO why is this here?
                 old_segment: ParentPage, 
                 promote_pages: Vec<PageNum>, // must be contig within same parent
@@ -7988,28 +7985,17 @@ impl InnerPart {
                         let segment = &header.young[i];
                         match try!(PageType::from_u8(header.young[i].buf[0])) {
                             PageType::LEAF_NODE => {
-                                let merge_segments = slice_from_end(&header.young, 1);
+                                let count_tombstones = try!(LeafPage::count_tombstones(segment.root_page, &segment.buf));
 
-                                let seg = &merge_segments[0];
-                                let count_tombstones = try!(LeafPage::count_tombstones(seg.root_page, &seg.buf));
+                                // TODO sad that this will re-read the leaf page
+                                let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, vec![segment.root_page]));
 
-                                //println!("dest_level: {:?}   segments from: {:?}", from_level.get_dest_level(), merge_segments);
-                                let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
-
-                                // TODO use node iterator
-                                // TODO er, blocklist_unsorted_no_overflows on a leaf is always empty
-                                let node_pages = try!(segment.blocklist_unsorted_no_overflows(&inner.path, f.clone()));
-                                let seg = FromWholeSegment {
-                                    root_page: segment.root_page,
-                                    node_pages: node_pages,
-                                };
-
-                                let from = MergingFrom::YoungWhole{
-                                    segment: seg,
+                                let from = MergingFrom::YoungLeaf{
+                                    segment: segment.root_page,
                                     count_tombstones: count_tombstones,
                                 };
 
-                                (cursors, from)
+                                (vec![cursor], from)
                             },
                             PageType::PARENT_NODE => {
                                 let promote_depth = 0;
@@ -8051,17 +8037,9 @@ impl InnerPart {
                                 // TODO sad that this will re-read the leaf page
                                 let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, vec![old_from_segment.root_page]));
 
-                                // TODO use node iterator
-                                // TODO er, blocklist_unsorted_no_overflows on a leaf is always empty
-                                let node_pages = try!(old_from_segment.blocklist_unsorted_no_overflows(&inner.path, f.clone()));
-                                let seg = FromWholeSegment {
-                                    root_page: old_from_segment.root_page,
-                                    node_pages: node_pages,
-                                };
-
-                                let from = MergingFrom::OtherWhole{
+                                let from = MergingFrom::OtherLeaf{
                                     level: level,
-                                    segment: seg,
+                                    segment: old_from_segment.root_page,
                                     count_tombstones: count_tombstones,
                                 };
 
@@ -8107,7 +8085,7 @@ impl InnerPart {
                                         unreachable!();
                                     };
 
-                                let from = MergingFrom::Other{
+                                let from = MergingFrom::OtherPartial{
                                     level: level, 
                                     old_segment: parent, 
                                     promote_lineage: lineage, 
@@ -8187,7 +8165,7 @@ impl InnerPart {
                         MergingFrom::Fresh{..} => {
                             None
                         },
-                        MergingFrom::YoungWhole{count_tombstones, ..} => {
+                        MergingFrom::YoungLeaf{count_tombstones, ..} => {
                             if count_tombstones == 0 {
                                 None
                             } else {
@@ -8215,7 +8193,7 @@ impl InnerPart {
                                 Some(behind_segments)
                             }
                         },
-                        MergingFrom::OtherWhole{level, count_tombstones, ..} => {
+                        MergingFrom::OtherLeaf{level, count_tombstones, ..} => {
                             if count_tombstones == 0 {
                                 None
                             } else {
@@ -8229,7 +8207,7 @@ impl InnerPart {
                                 Some(behind_segments)
                             }
                         },
-                        MergingFrom::Other{level, count_tombstones, ..} => {
+                        MergingFrom::OtherPartial{level, count_tombstones, ..} => {
                             if count_tombstones == 0 {
                                 None
                             } else {
@@ -8438,32 +8416,22 @@ impl InnerPart {
                         now_inactive.insert(seg.root_page, blocks);
                     }
                 },
-                MergingFrom::YoungWhole{ref segment, ..} => {
-                    let mut blocks = segment.node_pages.clone();
-                    blocks.add_page_no_reorder(segment.root_page);
-                    // TODO overflows_eaten should be a hashmap
-                    for &(s,ref b) in overflows_eaten.iter() {
-                        if s == segment.root_page {
-                            blocks.add_blocklist_no_reorder(b);
-                        }
-                    }
-                    now_inactive.insert(segment.root_page, blocks);
+                MergingFrom::YoungLeaf{segment, ..} => {
+                    let mut blocks = BlockList::new();
+                    blocks.add_page_no_reorder(segment);
+                    assert!(overflows_eaten.is_empty());
+                    now_inactive.insert(segment, blocks);
                 },
-                MergingFrom::OtherWhole{ref segment, ..} => {
-                    let mut blocks = segment.node_pages.clone();
-                    blocks.add_page_no_reorder(segment.root_page);
-                    // TODO overflows_eaten should be a hashmap
-                    for &(s,ref b) in overflows_eaten.iter() {
-                        if s == segment.root_page {
-                            blocks.add_blocklist_no_reorder(b);
-                        }
-                    }
-                    now_inactive.insert(segment.root_page, blocks);
+                MergingFrom::OtherLeaf{segment, ..} => {
+                    let mut blocks = BlockList::new();
+                    blocks.add_page_no_reorder(segment);
+                    assert!(overflows_eaten.is_empty());
+                    now_inactive.insert(segment, blocks);
                 },
                 MergingFrom::YoungPartial{..} => {
                     // this is done below
                 },
-                MergingFrom::Other{..} => {
+                MergingFrom::OtherPartial{..} => {
                     // this is done below
                 },
             }
@@ -8494,14 +8462,14 @@ impl InnerPart {
                         segments: segments,
                     }
                 },
-                MergingFrom::YoungWhole{segment, ..} => {
+                MergingFrom::YoungLeaf{segment, ..} => {
                     MergeFrom::Young{
-                        old_segment: segment.root_page,
+                        old_segment: segment,
                         new_segment: None,
                     }
                 },
                 MergingFrom::YoungPartial{old_segment, promote_pages, promote_depth, promote_lineage, promote_blocks, ..} => {
-                    // TODO this code is very similar to the MergingFrom::Other case below
+                    // TODO this code is very similar to the MergingFrom::OtherPartial case below
                     //println!("promote_lineage: {:?}", promote_lineage);
                     //println!("promote_blocks: {:?}", promote_blocks);
                     let wrote = try!(write_survivors(&mut pw, &promote_pages, promote_depth, &promote_lineage, &old_segment, &inner.path, f.clone(), from_level.get_dest_level()));
@@ -8535,14 +8503,14 @@ impl InnerPart {
                     now_inactive.insert(old_segment.pagenum, blocks);
                     from
                 },
-                MergingFrom::OtherWhole{level, segment, ..} => {
+                MergingFrom::OtherLeaf{level, segment, ..} => {
                     MergeFrom::Other{
                         level: level,
-                        old_segment: segment.root_page,
+                        old_segment: segment,
                         new_segment: None,
                     }
                 },
-                MergingFrom::Other{level, old_segment, promote_pages, promote_depth, promote_lineage, promote_blocks, ..} => {
+                MergingFrom::OtherPartial{level, old_segment, promote_pages, promote_depth, promote_lineage, promote_blocks, ..} => {
                     //println!("promote_lineage: {:?}", promote_lineage);
                     //println!("promote_blocks: {:?}", promote_blocks);
                     let wrote = try!(write_survivors(&mut pw, &promote_pages, promote_depth, &promote_lineage, &old_segment, &inner.path, f.clone(), from_level.get_dest_level()));
