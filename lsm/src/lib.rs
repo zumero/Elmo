@@ -454,7 +454,7 @@ impl BlockList {
                 );
     }
 
-    fn encode(&self, pb: &mut Vec<u8>) {
+    fn encode(&self, pb: &mut PageBuilder) {
         // we store each PageBlock as first/offset instead of first/last, since the
         // offset will always compress better as a varint.
         
@@ -462,21 +462,21 @@ impl BlockList {
         // of all blocks after the first one as offsets from th first one.
         // this requires that the list was sorted before this func was called.
 
-        let len_before = pb.len();
-        misc::push_varint(pb, self.blocks.len() as u64);
+        let len_before = pb.sofar();
+        pb.PutVarint( self.blocks.len() as u64);
         if self.blocks.len() > 0 {
             let first_page = self.blocks[0].firstPage;
-            misc::push_varint(pb, self.blocks[0].firstPage as u64);
-            misc::push_varint(pb, (self.blocks[0].lastPage - self.blocks[0].firstPage) as u64);
+            pb.PutVarint( self.blocks[0].firstPage as u64);
+            pb.PutVarint( (self.blocks[0].lastPage - self.blocks[0].firstPage) as u64);
             if self.blocks.len() > 1 {
                 for i in 1 .. self.blocks.len() {
                     assert!(self.blocks[i].firstPage > first_page);
-                    misc::push_varint(pb, (self.blocks[i].firstPage - first_page) as u64);
-                    misc::push_varint(pb, (self.blocks[i].lastPage - self.blocks[i].firstPage) as u64);
+                    pb.PutVarint( (self.blocks[i].firstPage - first_page) as u64);
+                    pb.PutVarint( (self.blocks[i].lastPage - self.blocks[i].firstPage) as u64);
                 }
             }
         }
-        let len_after = pb.len();
+        let len_after = pb.sofar();
         assert!(len_after - len_before == self.encoded_len());
     }
 
@@ -531,23 +531,6 @@ impl std::ops::Index<usize> for BlockList {
     fn index<'a>(&'a self, i: usize) -> &'a PageBlock {
         &self.blocks[i]
     }
-}
-
-#[inline]
-fn read_page_into_buf(f: &std::rc::Rc<std::cell::RefCell<File>>, page: PageNum, buf: &mut [u8]) -> Result<()> {
-    {
-        let f = &mut *(f.borrow_mut());
-        try!(utils::SeekPage(f, buf.len(), page));
-        try!(misc::io::read_fully(f, buf));
-    }
-    Ok(())
-}
-
-#[inline]
-fn read_and_alloc_page(f: &std::rc::Rc<std::cell::RefCell<File>>, page: PageNum, pgsz: usize) -> Result<Box<[u8]>> {
-    let mut buf = vec![0; pgsz].into_boxed_slice();
-    try!(read_page_into_buf(f, page, &mut buf));
-    Ok(buf)
 }
 
 fn get_level_size(i: usize) -> u64 {
@@ -872,8 +855,7 @@ impl<'a> KeyRef<'a> {
 
 pub enum ValueRef<'a> {
     Slice(&'a [u8]),
-    // TODO should the file and pgsz be in here?
-    Overflowed(String, usize, u64, BlockList),
+    Overflowed(std::sync::Arc<PageCache>, u64, BlockList),
     Tombstone,
 }
 
@@ -881,15 +863,14 @@ pub enum ValueRef<'a> {
 /// only from a LivingCursor.
 pub enum LiveValueRef<'a> {
     Slice(&'a [u8]),
-    // TODO should the file and pgsz be in here?
-    Overflowed(String, usize, u64, BlockList),
+    Overflowed(std::sync::Arc<PageCache>, u64, BlockList),
 }
 
 impl<'a> ValueRef<'a> {
     pub fn len(&self) -> Option<u64> {
         match *self {
             ValueRef::Slice(a) => Some(a.len() as u64),
-            ValueRef::Overflowed(_, _, len, _) => Some(len),
+            ValueRef::Overflowed(_, len, _) => Some(len),
             ValueRef::Tombstone => None,
         }
     }
@@ -901,7 +882,7 @@ impl<'a> ValueRef<'a> {
                 k.extend_from_slice(a);
                 Blob::Boxed(k.into_boxed_slice())
             },
-            ValueRef::Overflowed(path, pgsz, len, blocks) => Blob::SameFileOverflow(len, blocks),
+            ValueRef::Overflowed(_, len, blocks) => Blob::SameFileOverflow(len, blocks),
             ValueRef::Tombstone => Blob::Tombstone,
         }
     }
@@ -912,7 +893,7 @@ impl<'a> std::fmt::Debug for ValueRef<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         match *self {
             ValueRef::Slice(a) => write!(f, "Array, len={:?}", a),
-            ValueRef::Overflowed(_, _, len, _) => write!(f, "Overflowed, len={}", len),
+            ValueRef::Overflowed(_, len, _) => write!(f, "Overflowed, len={}", len),
             ValueRef::Tombstone => write!(f, "Tombstone"),
         }
     }
@@ -922,7 +903,7 @@ impl<'a> LiveValueRef<'a> {
     pub fn len(&self) -> u64 {
         match *self {
             LiveValueRef::Slice(a) => a.len() as u64,
-            LiveValueRef::Overflowed(_, _, len, _) => len,
+            LiveValueRef::Overflowed(_, len, _) => len,
         }
     }
 
@@ -933,7 +914,7 @@ impl<'a> LiveValueRef<'a> {
                 k.extend_from_slice(a);
                 Blob::Boxed(k.into_boxed_slice())
             },
-            LiveValueRef::Overflowed(path, pgsz, len, blocks) => Blob::SameFileOverflow(len, blocks),
+            LiveValueRef::Overflowed(_, len, blocks) => Blob::SameFileOverflow(len, blocks),
         }
     }
 
@@ -947,7 +928,7 @@ impl<'a> LiveValueRef<'a> {
                 v.extend_from_slice(a);
                 Ok(v.into_boxed_slice())
             },
-            LiveValueRef::Overflowed(ref path, pgsz, len, ref blocks) => {
+            LiveValueRef::Overflowed(_, len, ref blocks) => {
                 let mut a = Vec::with_capacity(len);
                 let mut strm = try!(OverflowReader::new(path, pgsz, blocks.blocks[0].firstPage, len));
                 try!(strm.read_to_end(&mut a));
@@ -968,9 +949,9 @@ impl<'a> LiveValueRef<'a> {
                 let t = try!(func(a));
                 Ok(t)
             },
-            LiveValueRef::Overflowed(ref path, pgsz, len, ref blocks) => {
+            LiveValueRef::Overflowed(ref f, len, ref blocks) => {
                 let mut a = Vec::with_capacity(len as usize);
-                let mut strm = try!(OverflowReader::new(path, pgsz, blocks.blocks[0].firstPage, len));
+                let mut strm = try!(OverflowReader::new(f.clone(), blocks.blocks[0].firstPage, len));
                 try!(strm.read_to_end(&mut a));
                 assert!((len as usize) == a.len());
                 let t = try!(func(&a));
@@ -984,7 +965,7 @@ impl<'a> std::fmt::Debug for LiveValueRef<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         match *self {
             LiveValueRef::Slice(a) => write!(f, "Array, len={:?}", a),
-            LiveValueRef::Overflowed(_, _, len, _) => write!(f, "Overflowed, len={}", len),
+            LiveValueRef::Overflowed(_, len, _) => write!(f, "Overflowed, len={}", len),
         }
     }
 }
@@ -1324,7 +1305,7 @@ pub const DEFAULT_SETTINGS: DbSettings =
 #[derive(Clone)]
 pub struct SegmentHeaderInfo {
     pub root_page: PageNum,
-    buf: Box<[u8]>,
+    buf: std::sync::Arc<Box<[u8]>>,
 }
 
 impl std::fmt::Debug for SegmentHeaderInfo {
@@ -1334,7 +1315,7 @@ impl std::fmt::Debug for SegmentHeaderInfo {
 }
 
 impl SegmentHeaderInfo {
-    pub fn new(root_page: PageNum, buf: Box<[u8]>) -> Self {
+    pub fn new(root_page: PageNum, buf: std::sync::Arc<Box<[u8]>>) -> Self {
         SegmentHeaderInfo {
             root_page: root_page,
             buf: buf,
@@ -1356,22 +1337,17 @@ impl SegmentHeaderInfo {
 
     // note that the resulting blocklist here does not include the root page
     fn blocklist_unsorted(&self, 
-                          path: &str,
-                          f: std::rc::Rc<std::cell::RefCell<File>>,
+                          f: &std::sync::Arc<PageCache>,
                           ) -> Result<BlockList> {
-        let done_page = move |_| -> () {
-        };
-        let buf = Lend::new(self.buf.clone(), box done_page);
-
         let pt = try!(PageType::from_u8(self.buf[0]));
         let blocks =
             match pt {
                 PageType::LEAF_NODE => {
-                    let page = try!(LeafPage::new_already_read_page(path, f.clone(), self.root_page, buf));
+                    let page = try!(LeafPage::new(f.clone(), self.root_page));
                     page.blocklist_unsorted()
                 },
                 PageType::PARENT_NODE => {
-                    let parent = try!(ParentPage::new_already_read_page(path, f.clone(), self.root_page, buf));
+                    let parent = try!(ParentPage::new(f.clone(), self.root_page));
                     try!(parent.blocklist_unsorted())
                 },
             };
@@ -1381,21 +1357,17 @@ impl SegmentHeaderInfo {
     // TODO this is only used for diag purposes
     fn count_keys(&self, 
                           path: &str,
-                          f: std::rc::Rc<std::cell::RefCell<File>>,
+                          f: &std::sync::Arc<PageCache>,
                           ) -> Result<usize> {
-        let done_page = move |_| -> () {
-        };
-        let buf = Lend::new(self.buf.clone(), box done_page);
-
         let pt = try!(PageType::from_u8(self.buf[0]));
         let count =
             match pt {
                 PageType::LEAF_NODE => {
-                    let page = try!(LeafPage::new_already_read_page(path, f.clone(), self.root_page, buf));
+                    let page = try!(LeafPage::new(f.clone(), self.root_page));
                     page.count_keys()
                 },
                 PageType::PARENT_NODE => {
-                    let parent = try!(ParentPage::new_already_read_page(path, f.clone(), self.root_page, buf));
+                    let parent = try!(ParentPage::new(f.clone(), self.root_page));
                     let mut cursor = try!(ParentCursor::new(parent));
                     let mut count = 0;
                     try!(cursor.First());
@@ -2332,7 +2304,7 @@ impl IForwardCursor for MergeCursor {
                                     {
                                         let v = try!(self.subcursors[n].ValueRef());
                                         match v {
-                                            ValueRef::Overflowed(path, pgsz, len, blocks) => {
+                                            ValueRef::Overflowed(_, len, blocks) => {
                                                 let k = try!(self.subcursors[n].KeyRef());
                                                 //println!("eaten: {:?} -- {:?}", k, blocks);
                                                 self.overflows_eaten.push((try!(self.subcursors[n].current_pagenum()), blocks));
@@ -2385,7 +2357,7 @@ impl LivingCursor {
     pub fn LiveValueRef<'a>(&'a self) -> Result<LiveValueRef<'a>> {
         match try!(self.chain.ValueRef()) {
             ValueRef::Slice(a) => Ok(LiveValueRef::Slice(a)),
-            ValueRef::Overflowed(path, pgsz, len, blocks) => Ok(LiveValueRef::Overflowed(path, pgsz, len, blocks)),
+            ValueRef::Overflowed(f, len, blocks) => Ok(LiveValueRef::Overflowed(f, len, blocks)),
             ValueRef::Tombstone => Err(Error::Misc(String::from("LiveValueRef tombstone TODO unreachable"))),
         }
     }
@@ -3023,10 +2995,7 @@ fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (KeyWithLocation, Blo
             },
             KeyLocation::Overflowed(ref blocks) => {
                 pb.PutVarint(lp.key.len_with_overflow_flag());
-                // TODO capacity, no temp vec
-                let mut v = vec![];
-                blocks.encode(&mut v);
-                pb.PutArray(&v);
+                blocks.encode(pb);
                 list.add_blocklist_no_reorder(blocks);
             },
         }
@@ -3043,10 +3012,7 @@ fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (KeyWithLocation, Blo
             ValueLocation::Overflowed(vlen, ref blocks) => {
                 pb.PutByte(ValueFlag::FLAG_OVERFLOW);
                 pb.PutVarint(vlen as u64);
-                // TODO capacity, no temp vec
-                let mut v = vec![];
-                blocks.encode(&mut v);
-                pb.PutArray(&v);
+                blocks.encode(pb);
                 list.add_blocklist_no_reorder(blocks);
             },
         }
@@ -3367,6 +3333,7 @@ fn flush_leaf(st: &mut LeafState,
 fn write_leaves<I: Iterator<Item=Result<kvp>>, >(
                     pw: &mut PageWriter,
                     mut pairs: I,
+                    f: std::sync::Arc<PageCache>,
                     ) -> Result<Option<SegmentHeaderInfo>> {
 
     let mut pb = PageBuilder::new(pw.page_size());
@@ -3389,7 +3356,6 @@ fn write_leaves<I: Iterator<Item=Result<kvp>>, >(
     for result_pair in pairs {
         let pair = try!(result_pair);
         if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
-            //try!(pg.verify(pw.page_size(), path, f.clone()));
             try!(chain.add_child(pw, pg, 0));
         }
     }
@@ -3399,20 +3365,30 @@ fn write_leaves<I: Iterator<Item=Result<kvp>>, >(
 
     let (count_parent_nodes, seg) = try!(chain.done(pw));
 
-    let seg = seg.map(
-        move |seg| {
-            match seg.buf {
-                Some(buf) => {
-                    SegmentHeaderInfo::new(seg.root_page, buf)
-                },
-                None => {
-                    let (pb_seg, pb_buf) = pb.into_buf();
-                    assert!(pb_seg == seg.root_page);
-                    SegmentHeaderInfo::new(seg.root_page, pb_buf)
-                },
-            }
-        }
-     );
+    let seg =
+        match seg {
+            Some(seg) => {
+                let buf = 
+                    match seg.buf {
+                        Some(buf) => {
+                            buf
+                        },
+                        None => {
+                            let (pb_seg, buf) = pb.into_buf();
+                            assert!(pb_seg == seg.root_page);
+                            buf
+                        },
+                    };
+
+                let buf = std::sync::Arc::new(buf);
+                try!(f.put(seg.root_page, &buf));
+                let seg = SegmentHeaderInfo::new(seg.root_page, buf);
+                Some(seg)
+            },
+            None => {
+                None
+            },
+        };
 
     Ok(seg)
 }
@@ -3707,7 +3683,7 @@ fn merge_rewrite_parent(
                 nodes_rewritten[parent.depth() as usize - 1].push(parent.child_pagenum(i));
                 if parent.depth() == 1 {
                     let pg = try!(parent.child_pgitem(i));
-                    try!(leaf.read_page(pg.page));
+                    try!(leaf.move_to_page(pg.page));
                     let (sub_keys_promoted, sub_keys_rewritten, sub_keys_shadowed, sub_tombstones_removed) = try!(merge_rewrite_leaf(st, pb, pw, vbuf, pairs, leaf, behind, chain, overflows_freed, dest_level));
 
                     // in the case where we rewrote a page that didn't really NEED to be,
@@ -3742,7 +3718,7 @@ fn write_merge(
                 into: &MergingInto,
                 mut behind: Option<Vec<PageCursor>>,
                 path: &str,
-                f: std::rc::Rc<std::cell::RefCell<File>>,
+                f: std::sync::Arc<PageCache>,
                 dest_level: DestLevel,
                 ) -> Result<WroteMerge> {
 
@@ -3808,15 +3784,13 @@ fn write_merge(
                     6 => 3,
                     _ => 3,
                 };
-            let mut mine = parent.make_parent_page();
-            try!(mine.read_page(parent.pagenum));
-            let it = mine.into_node_iter(rewrite_level);
-            let mut leaf = LeafPage::new(path, f.clone(), pw.page_size(), );
-            let mut sub = parent.make_parent_page();
+            let it = try!(ParentPage::new(f.clone(), parent.pagenum)).into_node_iter(rewrite_level);
+            let mut leaf = LeafPage::new_empty(f.clone(), );
+            let mut sub = ParentPage::new_empty(f.clone());
             for r in it {
                 let nd = try!(r);
                 if nd.depth == rewrite_level {
-                    try!(sub.read_page(nd.page));
+                    try!(sub.move_to_page(nd.page));
                     let (sub_keys_promoted, sub_keys_rewritten, sub_keys_shadowed, sub_tombstones_removed) = try!(merge_rewrite_parent(&mut st, &mut pb, pw, &mut vbuf, pairs, &mut leaf, &sub, &mut behind, &mut chain, &mut overflows_freed, &mut nodes_rewritten, &mut nodes_recycled, dest_level));
                     keys_promoted += sub_keys_promoted;
                     keys_rewritten += sub_keys_rewritten;
@@ -3867,20 +3841,30 @@ fn write_merge(
             },
         };
 
-    let seg = seg.map(
-        move |seg| {
-            match seg.buf {
-                Some(buf) => {
-                    SegmentHeaderInfo::new(seg.root_page, buf)
-                },
-                None => {
-                    let (pb_seg, pb_buf) = pb.into_buf();
-                    assert!(pb_seg == seg.root_page);
-                    SegmentHeaderInfo::new(seg.root_page, pb_buf)
-                },
-            }
-        }
-     );
+    let seg =
+        match seg {
+            Some(seg) => {
+                let buf = 
+                    match seg.buf {
+                        Some(buf) => {
+                            buf
+                        },
+                        None => {
+                            let (pb_seg, buf) = pb.into_buf();
+                            assert!(pb_seg == seg.root_page);
+                            buf
+                        },
+                    };
+
+                let buf = std::sync::Arc::new(buf);
+                try!(f.put(seg.root_page, &buf));
+                let seg = SegmentHeaderInfo::new(seg.root_page, buf);
+                Some(seg)
+            },
+            None => {
+                None
+            },
+        };
 
     let t2 = time::PreciseTime::now();
     let elapsed = t1.to(t2);
@@ -3996,9 +3980,6 @@ fn survivors_rewrite_node(
     Ok(())
 }
 
-// TODO if this is going to be used by merge from Young,
-// it needs to be able to handle the case where there are
-// no survivors.  or do we just catch that in the caller?
 fn write_survivors(
                 pw: &mut PageWriter,
                 skip_pages: &Vec<PageNum>,
@@ -4006,7 +3987,7 @@ fn write_survivors(
                 skip_lineage: &Vec<PageNum>,
                 parent: &ParentPage,
                 path: &str,
-                f: std::rc::Rc<std::cell::RefCell<File>>,
+                f: &PageCache,
                 dest_level: DestLevel,
                 ) -> Result<WroteSurvivors> {
 
@@ -4029,10 +4010,12 @@ fn write_survivors(
             Some(seg) => {
                 match seg.buf {
                     Some(buf) => {
+                        let buf = std::sync::Arc::new(buf);
+                        try!(f.put(seg.root_page, &buf));
                         Some(SegmentHeaderInfo::new(seg.root_page, buf))
                     },
                     None => {
-                        let buf = try!(read_and_alloc_page(&f, seg.root_page, pw.page_size()));
+                        let buf = try!(f.get(seg.root_page));
                         Some(SegmentHeaderInfo::new(seg.root_page, buf))
                     },
                 }
@@ -4103,10 +4086,7 @@ impl ParentNodeWriter {
                 self.pb.PutArray(&k.key[prefix_len .. ]);
             },
             KeyLocation::Overflowed(ref blocks) => {
-                // TODO capacity, no temp vec
-                let mut v = vec![];
-                blocks.encode(&mut v);
-                self.pb.PutArray(&v);
+                blocks.encode(&mut self.pb);
             },
         }
     }
@@ -4119,10 +4099,7 @@ impl ParentNodeWriter {
                 count_tombstones,
             } => {
                 assert!(self.my_depth == 1);
-                // TODO capacity, no temp vec
-                let mut v = vec![];
-                blocks_overflows.encode(&mut v);
-                self.pb.PutArray(&v);
+                blocks_overflows.encode(&mut self.pb);
                 self.pb.PutVarint(count_tombstones as u64);
                 *total_count_leaves += 1;
                 *total_count_tombstones += count_tombstones;
@@ -4335,7 +4312,7 @@ impl ParentNodeWriter {
         }
 
         // TODO change this code to be more like the leaf version, only calc the
-        // prefix len once.
+        // prefix len once.  it shows up in the profiler high.
 
         // see if the prefix len actually did change
         let new_prefix_len = self.calc_prefix_len(&child);
@@ -4432,7 +4409,7 @@ impl ParentNodeWriter {
             if let Some(chain) = self.results_chain {
                 assert!(self.result_one.is_none());
                 let (count_chain, seg) = try!(chain.done(pw));
-                let (pb_page, pb_buf) = self.pb.into_buf();
+                let (pb_page, buf) = self.pb.into_buf();
                 let seg = seg.map(
                     |seg| {
                         match seg.buf {
@@ -4442,7 +4419,7 @@ impl ParentNodeWriter {
                             None => {
                                 let buf =
                                     if pb_page == seg.root_page {
-                                        Some(pb_buf)
+                                        Some(buf)
                                     } else {
                                         None
                                     };
@@ -4495,10 +4472,10 @@ impl ParentNodeSegment {
 
 fn create_segment<I>(mut pw: PageWriter, 
                         source: I,
-                        f: std::rc::Rc<std::cell::RefCell<File>>,
+                        f: std::sync::Arc<PageCache>,
                        ) -> Result<Option<SegmentHeaderInfo>> where I: Iterator<Item=Result<kvp>> {
 
-    let seg = try!(write_leaves(&mut pw, source));
+    let seg = try!(write_leaves(&mut pw, source, f));
 
     try!(pw.end());
 
@@ -4506,7 +4483,7 @@ fn create_segment<I>(mut pw: PageWriter,
 }
 
 pub struct OverflowReader {
-    fs: File,
+    fs: std::sync::Arc<PageCache>,
     len: u64,
     firstPage: PageNum, // TODO this will be needed later for Seek trait
     buf: Box<[u8]>,
@@ -4518,21 +4495,15 @@ pub struct OverflowReader {
 }
     
 impl OverflowReader {
-    pub fn new(path: &str, pgsz: usize, firstPage: PageNum, len: u64) -> Result<OverflowReader> {
-        // TODO I wonder if maybe we should defer the opening of the file until
-        // somebody actually tries to read from it?  so that constructing a
-        // ValueRef object (which contains one of these) would be a lighter-weight
-        // operation.
-        let f = try!(OpenOptions::new()
-                .read(true)
-                .open(path));
+    pub fn new(fs: std::sync::Arc<PageCache>, firstPage: PageNum, len: u64) -> Result<OverflowReader> {
+        // TODO the vec new below is really slow.  use a pool?
+        let buf = vec![0; fs.page_size()].into_boxed_slice();
         let mut res = 
-            // TODO the vec new below is really slow.  use a pool?
             OverflowReader {
-                fs: f,
+                fs: fs,
                 len: len,
                 firstPage: firstPage,
-                buf: vec![0; pgsz].into_boxed_slice(),
+                buf: buf,
                 currentPage: firstPage,
                 sofarOverall: 0,
                 sofarThisPage: 0,
@@ -4546,8 +4517,7 @@ impl OverflowReader {
     // TODO consider supporting Seek trait
 
     fn ReadPage(&mut self) -> Result<()> {
-        try!(utils::SeekPage(&mut self.fs, self.buf.len(), self.currentPage));
-        try!(misc::io::read_fully(&mut self.fs, &mut *self.buf));
+        try!(self.fs.read_page(self.currentPage, &mut *self.buf));
         if self.buf[0] != PAGE_TYPE_OVERFLOW {
             return Err(Error::CorruptFile("first overflow page has invalid page type"));
         }
@@ -4617,9 +4587,8 @@ impl Read for OverflowReader {
 }
 
 pub struct LeafPage {
-    path: String,
-    f: std::rc::Rc<std::cell::RefCell<File>>,
-    pr: Lend<Box<[u8]>>,
+    f: std::sync::Arc<PageCache>,
+    pr: std::sync::Arc<Box<[u8]>>,
     pagenum: PageNum,
 
     prefix: Option<Box<[u8]>>,
@@ -4629,17 +4598,16 @@ pub struct LeafPage {
 }
 
 impl LeafPage {
-    fn new_already_read_page(path: &str, 
-           f: std::rc::Rc<std::cell::RefCell<File>>,
+    fn new(
+           f: std::sync::Arc<PageCache>,
            pagenum: PageNum,
-           buf: Lend<Box<[u8]>>
           ) -> Result<LeafPage> {
 
+        let buf = try!(f.get(pagenum));
         let mut pairs = vec![];
         let (prefix, bytes_used_on_page) = try!(Self::parse_page(pagenum, &buf, &mut pairs));
 
         let mut res = LeafPage {
-            path: String::from(path),
             f: f,
             pagenum: pagenum,
             pr: buf,
@@ -4651,20 +4619,13 @@ impl LeafPage {
         Ok(res)
     }
 
-    fn new(
-        path: &str, 
-           f: std::rc::Rc<std::cell::RefCell<File>>,
-           pgsz: usize,
+    fn new_empty(
+           f: std::sync::Arc<PageCache>,
           ) -> LeafPage {
 
-        // TODO it's a little silly here to construct a Lend<>
-        let buf = vec![0; pgsz].into_boxed_slice();
-        let done_page = move |_| -> () {
-        };
-        let mut buf = Lend::new(buf, box done_page);
-
+        // TODO this is dumb
+        let buf = std::sync::Arc::new(vec![0; 1].into_boxed_slice());
         let res = LeafPage {
-            path: String::from(path),
             f: f,
             pagenum: 0,
             pr: buf,
@@ -4783,15 +4744,9 @@ impl LeafPage {
         self.bytes_used_on_page
     }
 
-    pub fn read_page(&mut self, pgnum: PageNum) -> Result<()> {
-        // TODO
-        // this code is the only reason this object needs to own its buffer.
-        // for the top Leaf/Parent Page object, the one corresponding to a
-        // segment, we want it to borrow the buffer in the header.
-        // but for a child, we want to be able to switch it from one
-        // page to another without re-allocating memory.
+    pub fn move_to_page(&mut self, pgnum: PageNum) -> Result<()> {
         //println!("leaf read page: {}", pgnum);
-        try!(read_page_into_buf(&self.f, pgnum, &mut self.pr));
+        self.pr = try!(self.f.get(pgnum));
         self.pagenum = pgnum;
         let (prefix, bytes_used_on_page) = try!(Self::parse_page(pgnum, &self.pr, &mut self.pairs));
         self.prefix = prefix;
@@ -4807,7 +4762,7 @@ impl LeafPage {
                 Some(ref b) => Some(b),
                 None => None,
             };
-        let k = try!(self.pairs[n].key.keyref(&self.pr, prefix, &self.path));
+        let k = try!(self.pairs[n].key.keyref(&self.pr, prefix, &self.f));
         Ok(k)
     }
 
@@ -4831,7 +4786,7 @@ impl LeafPage {
                 Ok(ValueRef::Slice(&self.pr[pos .. pos + vlen]))
             },
             &ValueInLeaf::Overflowed(vlen, ref blocks) => {
-                Ok(ValueRef::Overflowed(self.path.clone(), self.pr.len(), vlen, blocks.clone()))
+                Ok(ValueRef::Overflowed(self.f.clone(), vlen, blocks.clone()))
             },
         }
     }
@@ -4916,8 +4871,8 @@ impl LeafCursor {
         }
     }
 
-    fn read_page(&mut self, pgnum: PageNum) -> Result<()> {
-        self.page.read_page(pgnum)
+    fn move_to_page(&mut self, pgnum: PageNum) -> Result<()> {
+        self.page.move_to_page(pgnum)
     }
 
     pub fn blocklist_unsorted(&self) -> BlockList {
@@ -5030,22 +4985,22 @@ pub enum PageCursor {
 }
 
 impl PageCursor {
-    fn new_already_read_page(path: &str, 
-           f: std::rc::Rc<std::cell::RefCell<File>>,
+    fn new(
+           f: std::sync::Arc<PageCache>,
            pagenum: PageNum,
-           mut buf: Lend<Box<[u8]>>
           ) -> Result<PageCursor> {
 
+        let buf = try!(f.get(pagenum));
         let pt = try!(PageType::from_u8(buf[0]));
         let sub = 
             match pt {
                 PageType::LEAF_NODE => {
-                    let page = try!(LeafPage::new_already_read_page(path, f, pagenum, buf));
+                    let page = try!(LeafPage::new(f, pagenum));
                     let sub = LeafCursor::new(page);
                     PageCursor::Leaf(sub)
                 },
                 PageType::PARENT_NODE => {
-                    let page = try!(ParentPage::new_already_read_page(path, f, pagenum, buf));
+                    let page = try!(ParentPage::new(f, pagenum));
                     let sub = try!(ParentCursor::new(page));
                     PageCursor::Parent(sub)
                 },
@@ -5087,13 +5042,13 @@ impl PageCursor {
         }
     }
 
-    fn read_page(&mut self, pg: PageNum) -> Result<()> {
+    fn move_to_page(&mut self, pg: PageNum) -> Result<()> {
         match self {
             &mut PageCursor::Leaf(ref mut c) => {
-                try!(c.read_page(pg));
+                try!(c.move_to_page(pg));
             },
             &mut PageCursor::Parent(ref mut c) => {
-                try!(c.read_page(pg));
+                try!(c.move_to_page(pg));
             },
         }
         Ok(())
@@ -5213,7 +5168,7 @@ impl KeyInPage {
     }
 
     #[inline]
-    fn keyref<'a>(&self, pr: &'a [u8], prefix: Option<&'a [u8]>, path: &str) -> Result<KeyRef<'a>> { 
+    fn keyref<'a>(&self, pr: &'a [u8], prefix: Option<&'a [u8]>, f: &std::sync::Arc<PageCache>) -> Result<KeyRef<'a>> { 
         match self {
             &KeyInPage::Inline(klen, at) => {
                 match prefix {
@@ -5227,7 +5182,7 @@ impl KeyInPage {
             },
             &KeyInPage::Overflowed(klen, ref blocks) => {
                 // TODO KeyRef::Overflow...
-                let mut ostrm = try!(OverflowReader::new(path, pr.len(), blocks.blocks[0].firstPage, klen as u64));
+                let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.blocks[0].firstPage, klen as u64));
                 let mut x_k = Vec::with_capacity(klen);
                 try!(ostrm.read_to_end(&mut x_k));
                 let x_k = x_k.into_boxed_slice();
@@ -5237,7 +5192,7 @@ impl KeyInPage {
     }
 
     #[inline]
-    fn key_with_location(&self, pr: &[u8], prefix: Option<&[u8]>, path: &str) -> Result<KeyWithLocation> { 
+    fn key_with_location(&self, pr: &[u8], prefix: Option<&[u8]>, f: &std::sync::Arc<PageCache>) -> Result<KeyWithLocation> { 
         match self {
             &KeyInPage::Inline(klen, at) => {
                 let k = 
@@ -5268,7 +5223,7 @@ impl KeyInPage {
             },
             &KeyInPage::Overflowed(klen, ref blocks) => {
                 let k = {
-                    let mut ostrm = try!(OverflowReader::new(path, pr.len(), blocks.blocks[0].firstPage, klen as u64));
+                    let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.blocks[0].firstPage, klen as u64));
                     let mut x_k = Vec::with_capacity(klen);
                     try!(ostrm.read_to_end(&mut x_k));
                     let x_k = x_k.into_boxed_slice();
@@ -5436,9 +5391,8 @@ impl Iterator for NodeIterator {
 }
 
 pub struct ParentPage {
-    path: String,
-    f: std::rc::Rc<std::cell::RefCell<File>>,
-    pr: Lend<Box<[u8]>>,
+    f: std::sync::Arc<PageCache>,
+    pr: std::sync::Arc<Box<[u8]>>,
     pagenum: PageNum,
 
     prefix: Option<Box<[u8]>>,
@@ -5448,17 +5402,16 @@ pub struct ParentPage {
 }
 
 impl ParentPage {
-    fn new_already_read_page(path: &str, 
-           f: std::rc::Rc<std::cell::RefCell<File>>,
+    fn new(
+           f: std::sync::Arc<PageCache>,
            pagenum: PageNum,
-           buf: Lend<Box<[u8]>>
           ) -> Result<ParentPage> {
 
+        let buf = try!(f.get(pagenum));
         let (prefix, children, bytes_used_on_page) = try!(Self::parse_page(pagenum, &buf));
         assert!(children.len() > 0);
 
         let res = ParentPage {
-            path: String::from(path),
             f: f,
             pr: buf,
             pagenum: pagenum,
@@ -5472,19 +5425,14 @@ impl ParentPage {
         Ok(res)
     }
 
-    fn new(path: &str, 
-           f: std::rc::Rc<std::cell::RefCell<File>>,
-           pgsz: usize,
+    fn new_empty(
+           f: std::sync::Arc<PageCache>,
           ) -> ParentPage {
 
-        // TODO it's a little silly here to construct a Lend<>
-        let buf = vec![0; pgsz].into_boxed_slice();
-        let done_page = move |_| -> () {
-        };
-        let mut buf = Lend::new(buf, box done_page);
+        // TODO this is dumb
+        let buf = std::sync::Arc::new(vec![0; 1].into_boxed_slice());
 
         let res = ParentPage {
-            path: String::from(path),
             f: f,
             pr: buf,
             pagenum: 0,
@@ -5515,12 +5463,7 @@ impl ParentPage {
                 assert!(self.depth() > 1);
                 let pagenum = self.children[i].page;
 
-                let buf = try!(read_and_alloc_page(&self.f, pagenum, self.pr.len()));
-                let done_page = move |_| -> () {
-                };
-                let buf = Lend::new(buf, box done_page);
-
-                let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, buf));
+                let page = try!(ParentPage::new(self.f.clone(), pagenum));
                 page.blocklist_unsorted()
                 // TODO assert that count matches the blocklist?
             },
@@ -5533,11 +5476,12 @@ impl ParentPage {
     }
 
     fn child_pgitem(&self, i: usize) -> Result<pgitem> {
+        // TODO this func shows up as a common offender of malloc calls
         let last_key = try!(self.key_with_location(&self.children[i].last_key));
         // TODO pgitem::new
         let pg = pgitem {
             page: self.children[i].page,
-            info: self.children[i].info.clone(),
+            info: self.children[i].info.clone(), // TODO sad clone
             last_key: last_key,
         };
         Ok(pg)
@@ -5553,14 +5497,14 @@ impl ParentPage {
         self.depth() > 1
     }
 
-// TODO name
+    // TODO name
     pub fn make_leaf_page(&self) -> LeafPage {
-        LeafPage::new(&self.path, self.f.clone(), self.pr.len(), )
+        LeafPage::new_empty(self.f.clone())
     }
 
-// TODO name
+    // TODO name
     pub fn make_parent_page(&self) -> ParentPage {
-        ParentPage::new(&self.path, self.f.clone(), self.pr.len(), )
+        ParentPage::new_empty(self.f.clone())
     }
 
     pub fn into_node_iter(self, min_depth: u8) -> Box<Iterator<Item=Result<Node>>> {
@@ -5601,7 +5545,7 @@ impl ParentPage {
                 Some(ref b) => Some(b),
                 None => None,
             };
-        let k = try!(k.keyref(&self.pr, prefix, &self.path));
+        let k = try!(k.keyref(&self.pr, prefix, &self.f));
         Ok(k)
     }
 
@@ -5611,11 +5555,13 @@ impl ParentPage {
                 Some(ref b) => Some(b),
                 None => None,
             };
-        let k = try!(k.key_with_location(&self.pr, prefix, &self.path));
+        let k = try!(k.key_with_location(&self.pr, prefix, &self.f));
         Ok(k)
     }
 
     fn parse_page(pgnum: PageNum, pr: &[u8]) -> Result<(Option<Box<[u8]>>, Vec<ParentPageItem>, usize)> {
+        // TODO it would be nice if this could accept a vec and reuse
+        // it, like the leaf version does.
         let mut cur = 0;
         let pt = try!(PageType::from_u8(misc::buf_advance::get_byte(pr, &mut cur)));
         if  pt != PageType::PARENT_NODE {
@@ -5810,24 +5756,14 @@ impl ParentPage {
 
             let i = self.choose_one();
             let pagenum = self.child_pagenum(i);
-            let buf = try!(read_and_alloc_page(&self.f, pagenum, self.pr.len()));
-            let done_page = move |_| -> () {
-            };
-            let buf = Lend::new(buf, box done_page);
 
-            let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, buf));
+            let page = try!(ParentPage::new(self.f.clone(), pagenum));
             page.choose_nodes_to_promote(depth, lineage, want)
         }
     }
 
-    pub fn read_page(&mut self, pgnum: PageNum) -> Result<()> {
-        // TODO
-        // this code is the only reason this object needs to own its buffer.
-        // for the top Leaf/Parent Page object, the one corresponding to a
-        // segment, we want it to borrow the buffer in the header.
-        // but for a child, we want to be able to switch it from one
-        // page to another without re-allocating memory.
-        try!(read_page_into_buf(&self.f, pgnum, &mut self.pr));
+    pub fn move_to_page(&mut self, pgnum: PageNum) -> Result<()> {
+        self.pr = try!(self.f.get(pgnum));
         self.pagenum = pgnum;
         let (prefix, children, bytes_used_on_page) = try!(Self::parse_page(pgnum, &self.pr));
         self.prefix = prefix;
@@ -5843,13 +5779,7 @@ impl ParentPage {
     }
 
     fn get_child_cursor(&self, i: usize) -> Result<PageCursor> {
-        let pagenum = self.children[i].page;
-        let buf = try!(read_and_alloc_page(&self.f, pagenum, self.pr.len()));
-        let done_page = move |_| -> () {
-        };
-        let buf = Lend::new(buf, box done_page);
-
-        let sub = try!(PageCursor::new_already_read_page(&self.path, self.f.clone(), self.children[i].page, buf));
+        let sub = try!(PageCursor::new(self.f.clone(), self.children[i].page));
         Ok(sub)
     }
 
@@ -5858,19 +5788,12 @@ impl ParentPage {
     }
 
     fn fetch_item_parent(&self, i: usize) -> Result<ParentPage> {
-        let pagenum = self.children[i].page;
-        let buf = try!(read_and_alloc_page(&self.f, pagenum, self.pr.len()));
-        let done_page = move |_| -> () {
-        };
-        let buf = Lend::new(buf, box done_page);
-
-        let child = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, buf));
+        let child = try!(ParentPage::new(self.f.clone(), self.children[i].page));
         Ok(child)
     }
 
 }
 
-// TODO generic for child type?
 pub struct ParentCursor {
     page: ParentPage,
     cur: Option<usize>,
@@ -5907,15 +5830,16 @@ impl ParentCursor {
             },
         }
         let pagenum = self.page.child_pagenum(i);
-        try!(self.sub.read_page(pagenum));
+        // TODO or should we just get a new sub PageCursor?
+        try!(self.sub.move_to_page(pagenum));
         self.cur = Some(i);
         Ok(())
     }
 
-    fn read_page(&mut self, pgnum: PageNum) -> Result<()> {
-        try!(self.page.read_page(pgnum));
+    fn move_to_page(&mut self, pgnum: PageNum) -> Result<()> {
+        try!(self.page.move_to_page(pgnum));
         let pagenum = self.page.child_pagenum(0);
-        try!(self.sub.read_page(pagenum));
+        try!(self.sub.move_to_page(pagenum));
         self.cur = Some(0);
         Ok(())
     }
@@ -6071,30 +5995,22 @@ impl ICursor for ParentCursor {
 }
 
 pub struct MultiPageCursor {
-    path: String,
     children: Vec<PageNum>,
     cur: Option<usize>,
     sub: Box<PageCursor>,
 }
 
 impl MultiPageCursor {
-    fn new(path: &str, 
-           f: std::rc::Rc<std::cell::RefCell<File>>,
-           pagesize: usize,
+    fn new(
+           f: std::sync::Arc<PageCache>,
            children: Vec<PageNum>,
           ) -> Result<MultiPageCursor> {
 
         assert!(children.len() > 0);
 
-        let buf = try!(read_and_alloc_page(&f, children[0], pagesize));
-        let done_page = move |_| -> () {
-        };
-        let buf = Lend::new(buf, box done_page);
-
-        let sub = try!(PageCursor::new_already_read_page(path, f, children[0], buf));
+        let sub = try!(PageCursor::new(f, children[0]));
 
         let res = MultiPageCursor {
-            path: String::from(path),
             children: children,
             cur: Some(0),
             sub: box sub,
@@ -6127,7 +6043,7 @@ impl MultiPageCursor {
             },
         }
         let pagenum = self.children[i];
-        try!(self.sub.read_page(pagenum));
+        try!(self.sub.move_to_page(pagenum));
         self.cur = Some(i);
         Ok(())
     }
@@ -6220,7 +6136,7 @@ struct HeaderStuff {
 // database file.
 const HEADER_SIZE_IN_BYTES: usize = 4096;
 
-fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
+fn read_header(path: &str) -> Result<(HeaderData, PageCache, PageNum)> {
     fn read<R>(fs: &mut R) -> Result<Box<[u8]>> where R : Read {
         let mut pr = vec![0; HEADER_SIZE_IN_BYTES].into_boxed_slice();
         let got = try!(misc::io::read_fully(fs, &mut pr));
@@ -6231,7 +6147,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
         }
     }
 
-    fn parse(pr: &Box<[u8]>, f: std::rc::Rc<std::cell::RefCell<File>>) -> Result<(HeaderData, usize)> {
+    fn parse(pr: &Box<[u8]>, f: File) -> Result<(HeaderData, PageCache)> {
         fn read_segment_list(pr: &Box<[u8]>, cur: &mut usize) -> Result<Vec<PageNum>> {
             let count = varint::read(&pr, cur) as usize;
             let mut a = Vec::with_capacity(count);
@@ -6242,21 +6158,18 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
             Ok(a)
         }
 
-        fn fix_segment_list(segments: Vec<PageNum>, pgsz: usize, f: std::rc::Rc<std::cell::RefCell<File>>) -> Result<Vec<SegmentHeaderInfo>> {
+        fn fix_segment_list(segments: Vec<PageNum>, f: &PageCache) -> Result<Vec<SegmentHeaderInfo>> {
             let mut v = Vec::with_capacity(segments.len());
             for page in segments.iter() {
                 let pagenum = *page;
-
-                let buf = try!(read_and_alloc_page(&f, pagenum, pgsz));
-
+                let buf = try!(f.get(pagenum));
                 let seg = SegmentHeaderInfo::new(pagenum, buf);
-
                 v.push(seg);
             }
             Ok(v)
         }
 
-        fn fix_main_segment_list(segments: Vec<PageNum>, pgsz: usize, f: std::rc::Rc<std::cell::RefCell<File>>) -> Result<Vec<Option<SegmentHeaderInfo>>> {
+        fn fix_main_segment_list(segments: Vec<PageNum>, f: &PageCache) -> Result<Vec<Option<SegmentHeaderInfo>>> {
             let mut v = Vec::with_capacity(segments.len());
             for page in segments.iter() {
                 let pagenum = *page;
@@ -6264,7 +6177,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
                 if pagenum == 0 {
                     v.push(None)
                 } else {
-                    let buf = try!(read_and_alloc_page(&f, pagenum, pgsz));
+                    let buf = try!(f.get(pagenum));
                     let seg = SegmentHeaderInfo::new(pagenum, buf);
                     v.push(Some(seg));
                 }
@@ -6278,13 +6191,15 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
         let changeCounter = varint::read(&pr, &mut cur);
         let mergeCounter = varint::read(&pr, &mut cur);
 
+        let f = PageCache::new(f, pgsz);
+
         let fresh = try!(read_segment_list(pr, &mut cur));
         let young = try!(read_segment_list(pr, &mut cur));
         let levels = try!(read_segment_list(pr, &mut cur));
 
-        let fresh = try!(fix_segment_list(fresh, pgsz, f.clone()));
-        let young = try!(fix_segment_list(young, pgsz, f.clone()));
-        let levels = try!(fix_main_segment_list(levels, pgsz, f.clone()));
+        let fresh = try!(fix_segment_list(fresh, &f));
+        let young = try!(fix_segment_list(young, &f));
+        let levels = try!(fix_main_segment_list(levels, &f));
 
         let hd = 
             HeaderData {
@@ -6295,7 +6210,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
                 mergeCounter: mergeCounter,
             };
 
-        Ok((hd, pgsz))
+        Ok((hd, f))
     }
 
     fn calcNextPage(pgsz: usize, len: usize) -> PageNum {
@@ -6313,11 +6228,9 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
     let len = try!(f.metadata()).len();
     if len > 0 {
         let pr = try!(read(&mut f));
-        let f = std::cell::RefCell::new(f);
-        let f = std::rc::Rc::new(f);
-        let (h, pgsz) = try!(parse(&pr, f));
-        let nextAvailablePage = calcNextPage(pgsz, len as usize);
-        Ok((h, pgsz, nextAvailablePage))
+        let (h, f) = try!(parse(&pr, f));
+        let nextAvailablePage = calcNextPage(f.page_size(), len as usize);
+        Ok((h, f, nextAvailablePage))
     } else {
         // TODO shouldn't this use settings passed in?
         let defaultPageSize = DEFAULT_SETTINGS.default_page_size;
@@ -6331,34 +6244,33 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
             }
         };
         let nextAvailablePage = calcNextPage(defaultPageSize, HEADER_SIZE_IN_BYTES);
-        Ok((h, defaultPageSize, nextAvailablePage))
+        let f = PageCache::new(f, defaultPageSize);
+        Ok((h, f, nextAvailablePage))
     }
 
 }
 
 fn list_all_blocks(
-    path: &str,
-    f: std::rc::Rc<std::cell::RefCell<File>>,
+    f: &std::sync::Arc<PageCache>,
     h: &HeaderData, 
-    pgsz: usize,
     ) -> Result<BlockList> {
     let mut blocks = BlockList::new();
 
-    let headerBlock = PageBlock::new(1, (HEADER_SIZE_IN_BYTES / pgsz) as PageNum);
+    let headerBlock = PageBlock::new(1, (HEADER_SIZE_IN_BYTES / f.page_size()) as PageNum);
     blocks.add_block_no_reorder(headerBlock);
 
-    fn do_seglist<'a, I: Iterator<Item=&'a SegmentHeaderInfo>>(path: &str, f: std::rc::Rc<std::cell::RefCell<File>>, segments: I, blocks: &mut BlockList) -> Result<()> {
+    fn do_seglist<'a, I: Iterator<Item=&'a SegmentHeaderInfo>>(f: &std::sync::Arc<PageCache>, segments: I, blocks: &mut BlockList) -> Result<()> {
         for seg in segments {
-            let b = try!(seg.blocklist_unsorted(path, f.clone()));
+            let b = try!(seg.blocklist_unsorted(f));
             blocks.add_blocklist_no_reorder(&b);
             blocks.add_page_no_reorder(seg.root_page);
         }
         Ok(())
     }
 
-    try!(do_seglist(path, f.clone(), h.fresh.iter(), &mut blocks));
-    try!(do_seglist(path, f.clone(), h.young.iter(), &mut blocks));
-    try!(do_seglist(path, f.clone(), h.levels.iter().filter_map(|s| s.as_ref()), &mut blocks));
+    try!(do_seglist(f, h.fresh.iter(), &mut blocks));
+    try!(do_seglist(f, h.young.iter(), &mut blocks));
+    try!(do_seglist(f, h.levels.iter().filter_map(|s| s.as_ref()), &mut blocks));
 
     blocks.sort_and_consolidate();
 
@@ -6749,10 +6661,93 @@ struct Senders {
     notify_levels: Vec<mpsc::Sender<MergeMessage>>,
 }
 
+struct InnerPageCache {
+    f: File,
+    pages: HashMap<PageNum, std::sync::Weak<Box<[u8]>>>,
+}
+
+pub struct PageCache {
+    pgsz: usize,
+    stuff: Mutex<InnerPageCache>,
+    // TODO pool of empty pages to be reused?
+}
+
+impl PageCache {
+    fn new(f: File, pgsz: usize) -> Self {
+        let stuff = InnerPageCache {
+            f: f,
+            pages: HashMap::new(),
+        };
+        PageCache {
+            pgsz: pgsz,
+            stuff: Mutex::new(stuff),
+        }
+    }
+
+    fn page_size(&self) -> usize {
+        self.pgsz
+    }
+
+    fn inner_read(stuff: &mut InnerPageCache, page: PageNum, buf: &mut [u8]) -> Result<()> {
+        try!(utils::SeekPage(&mut stuff.f, buf.len(), page));
+        try!(misc::io::read_fully(&mut stuff.f, buf));
+        Ok(())
+    }
+
+    fn read_page(&self, page: PageNum, buf: &mut [u8]) -> Result<()> {
+        let mut stuff = try!(self.stuff.lock());
+        // TODO assert pgsz?
+        try!(Self::inner_read(&mut stuff, page, buf));
+        Ok(())
+    }
+
+    fn inner_put(stuff: &mut InnerPageCache, pgnum: PageNum, strong: &std::sync::Arc<Box<[u8]>>) {
+        let weak = std::sync::Arc::downgrade(strong);
+        match stuff.pages.entry(pgnum) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(weak);
+            },
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                assert!(e.get().upgrade().is_none());
+                e.insert(weak);
+            },
+        }
+    }
+
+    fn put(&self, pgnum: PageNum, strong: &std::sync::Arc<Box<[u8]>>) -> Result<()> {
+        let mut stuff = try!(self.stuff.lock());
+        Self::inner_put(&mut stuff, pgnum, strong);
+        Ok(())
+    }
+
+    fn get(&self, pgnum: PageNum) -> Result<std::sync::Arc<Box<[u8]>>> {
+        let mut stuff = try!(self.stuff.lock());
+        match stuff.pages.entry(pgnum) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+            },
+            std::collections::hash_map::Entry::Occupied(e) => {
+                match e.get().upgrade() {
+                    Some(strong) => {
+                        return Ok(strong)
+                    },
+                    None => {
+                        e.remove();
+                    },
+                }
+            },
+        }
+
+        let mut buf = vec![0; self.pgsz].into_boxed_slice();
+        try!(Self::inner_read(&mut stuff, pgnum, &mut buf));
+        let strong = std::sync::Arc::new(buf);
+        Self::inner_put(&mut stuff, pgnum, &strong);
+        Ok(strong)
+    }
+}
+
 // there can be only one InnerPart instance per path
 struct InnerPart {
     path: String,
-    pgsz: usize,
     settings: DbSettings,
 
     // TODO are we concerned here about readers starving the
@@ -6761,8 +6756,8 @@ struct InnerPart {
     header: RwLock<HeaderStuff>,
 
     space: Mutex<Space>,
-    pagepool: Mutex<SafePagePool>,
     senders: Mutex<Senders>,
+    page_cache: std::sync::Arc<PageCache>,
 
     // TODO the contents of these mutexes should be something useful
     mergelock_fresh: Mutex<u32>,
@@ -6841,18 +6836,14 @@ impl DatabaseFile {
     pub fn new(path: String, settings: DbSettings) -> Result<std::sync::Arc<DatabaseFile>> {
 
         // TODO we should pass in settings to read_header, right?
-        let (header, pgsz, first_available_page) = try!(read_header(&path));
+        let (header, f, first_available_page) = try!(read_header(&path));
 
         // when we first open the file, we find all the blocks that are in use by
         // an active segment.  all OTHER blocks are considered free.
-        let f = 
-            try!(OpenOptions::new()
-                    .read(true)
-                    .open(&path));
-        let f = std::cell::RefCell::new(f);
-        let f = std::rc::Rc::new(f);
 
-        let mut blocks = try!(list_all_blocks(&path, f, &header, pgsz));
+        let f = std::sync::Arc::new(f);
+
+        let mut blocks = try!(list_all_blocks(&f, &header));
 
         if cfg!(expensive_check) 
         {
@@ -6885,7 +6876,7 @@ impl DatabaseFile {
             // TODO maybe we should just ignore the actual end of the file
             // and set nextPage to last_page_used + 1, and not add the block above
             path: path.clone(),
-            page_size: pgsz,
+            page_size: f.page_size(),
             nextPage: first_available_page, 
             pages_per_block: settings.pages_per_block,
             fresh_free: vec![],
@@ -6894,10 +6885,6 @@ impl DatabaseFile {
             rlocks: HashMap::new(),
             zombies: HashMap::new(),
             dependencies: HashMap::new(),
-        };
-
-        let pagepool = SafePagePool {
-            pages: vec![],
         };
 
         // each merge level is handled by its own thread.  a Rust channel is used to
@@ -6939,11 +6926,10 @@ impl DatabaseFile {
 
         let inner = InnerPart {
             path: path,
-            pgsz: pgsz,
+            page_cache: f,
             settings: settings, 
             header: RwLock::new(header),
             space: Mutex::new(space),
-            pagepool: Mutex::new(pagepool),
             mergelock_fresh: Mutex::new(0),
             mergelock_young: Mutex::new(0),
             mergelock_levels: mergelock_levels,
@@ -7240,7 +7226,7 @@ impl DatabaseFile {
         InnerPart::list_free_blocks(&self.inner)
     }
 
-    pub fn get_page(&self, pgnum: PageNum) -> Result<Box<[u8]>> {
+    pub fn get_page(&self, pgnum: PageNum) -> Result<std::sync::Arc<Box<[u8]>>> {
         InnerPart::get_page(&self.inner, pgnum)
     }
 }
@@ -7309,6 +7295,7 @@ impl HeaderStuff {
 
 impl InnerPart {
 
+    #[cfg(remove_me)]
     fn return_page_to_pool(&self, page: Box<[u8]>) {
         //println!("return_page_to_pool");
         match self.pagepool.try_lock() {
@@ -7348,13 +7335,6 @@ impl InnerPart {
                 .open(&self.path)
     }
 
-    fn open_file_for_cursor(&self) -> io::Result<std::rc::Rc<std::cell::RefCell<File>>> {
-        let f = try!(self.OpenForReading());
-        let f = std::cell::RefCell::new(f);
-        let f = std::rc::Rc::new(f);
-        Ok(f)
-    }
-
     // this code should not be called in a release build.  it helps
     // finds problems by zeroing out pages in blocks that
     // have been freed.
@@ -7381,6 +7361,7 @@ impl InnerPart {
     // level
     // all in varints
 
+    #[cfg(remove_me)]
     fn get_loaner_page(inner: &std::sync::Arc<InnerPart>) -> Result<Lend<Box<[u8]>>> {
         let page = {
             match inner.pagepool.try_lock() {
@@ -7407,63 +7388,38 @@ impl InnerPart {
     }
 
     fn open_cursor_on_page(inner: &std::sync::Arc<InnerPart>, pg: PageNum) -> Result<PageCursor> {
-        let mut buf = try!(Self::get_loaner_page(inner));
-        let f = try!(inner.open_file_for_cursor());
-
-        try!(read_page_into_buf(&f, pg, &mut buf));
-
-        let cursor = try!(PageCursor::new_already_read_page(&inner.path, f, pg, buf));
+        let cursor = try!(PageCursor::new(inner.page_cache.clone(), pg));
         Ok(cursor)
     }
 
     fn open_cursor_on_leaf_page(inner: &std::sync::Arc<InnerPart>, pg: PageNum) -> Result<LeafCursor> {
-        let mut buf = try!(Self::get_loaner_page(inner));
-        let f = try!(inner.open_file_for_cursor());
-
-        try!(read_page_into_buf(&f, pg, &mut buf));
-
-        let page = try!(LeafPage::new_already_read_page(&inner.path, f, pg, buf));
+        let page = try!(LeafPage::new(inner.page_cache.clone(), pg));
         let cursor = LeafCursor::new(page);
         Ok(cursor)
     }
 
     fn open_cursor_on_parent_page(inner: &std::sync::Arc<InnerPart>, pg: PageNum) -> Result<ParentCursor> {
-        let mut buf = try!(Self::get_loaner_page(inner));
-        let f = try!(inner.open_file_for_cursor());
-
-        try!(read_page_into_buf(&f, pg, &mut buf));
-
-        let page = try!(ParentPage::new_already_read_page(&inner.path, f, pg, buf));
+        let page = try!(ParentPage::new(inner.page_cache.clone(), pg));
         let cursor = try!(ParentCursor::new(page));
         Ok(cursor)
     }
 
     fn read_parent_page(inner: &std::sync::Arc<InnerPart>, pg: PageNum) -> Result<ParentPage> {
-        let mut buf = try!(Self::get_loaner_page(inner));
-        let f = try!(inner.open_file_for_cursor());
-
-        try!(read_page_into_buf(&f, pg, &mut buf));
-
-        let page = try!(ParentPage::new_already_read_page(&inner.path, f, pg, buf));
+        let page = try!(ParentPage::new(inner.page_cache.clone(), pg));
         Ok(page)
     }
 
     fn open_cursor(inner: &std::sync::Arc<InnerPart>) -> Result<LivingCursor> {
         let headerstuff = try!(inner.header.read());
         let header = &headerstuff.data;
-        let f = try!(inner.open_file_for_cursor());
+        let f = inner.page_cache.clone(); // TODO one extra clone?
 
         let cursors = 
             header.fresh.iter()
             .chain(header.young.iter())
             .chain(header.levels.iter().filter_map(|s| s.as_ref()))
             .map(|seg| {
-                let buf = seg.buf.clone();
-// TODO it would be nice to just let pagecursor have a reference. Arc?
-                let done_page = move |_| -> () {
-                };
-                let buf = Lend::new(buf, box done_page);
-                let csr = try!(PageCursor::new_already_read_page(&inner.path, f.clone(), seg.root_page, buf));
+                let csr = try!(PageCursor::new(f.clone(), seg.root_page));
                 Ok(csr)
             })
             .collect::<Result<Vec<_>>>();
@@ -7510,15 +7466,8 @@ impl InnerPart {
         Ok(lc)
     }
 
-    fn get_page(inner: &std::sync::Arc<InnerPart>, pgnum: PageNum) -> Result<Box<[u8]>> {
-        // OpenForReading?
-        let mut f = try!(OpenOptions::new()
-                .read(true)
-                .create(true)
-                .open(&inner.path));
-        let mut buf = vec![0; inner.pgsz].into_boxed_slice();
-        try!(utils::SeekPage(&mut f, inner.pgsz, pgnum));
-        try!(misc::io::read_fully(&mut f, &mut buf));
+    fn get_page(inner: &std::sync::Arc<InnerPart>, pgnum: PageNum) -> Result<std::sync::Arc<Box<[u8]>>> {
+        let buf = try!(inner.page_cache.get(pgnum));
         Ok(buf)
     }
 
@@ -7585,7 +7534,7 @@ impl InnerPart {
 
             newHeader.changeCounter = newHeader.changeCounter + 1;
 
-            try!(headerstuff.write_header(newHeader, self.pgsz));
+            try!(headerstuff.write_header(newHeader, self.page_cache.page_size()));
         }
 
         // note that we intentionally do not release the writeLock here.
@@ -7604,8 +7553,7 @@ impl InnerPart {
             Ok(kvp {Key:k, Value:v})
         });
         let pw = try!(PageWriter::new(inner.clone()));
-        let f = try!(inner.open_file_for_cursor());
-        let seg = try!(create_segment(pw, source, f));
+        let seg = try!(create_segment(pw, source, inner.page_cache.clone()));
         /*
         if cfg!(expensive_check) 
         {
@@ -7627,8 +7575,7 @@ impl InnerPart {
     fn write_segment_from_sorted_sequence<I>(inner: &std::sync::Arc<InnerPart>, source: I) -> Result<Option<SegmentHeaderInfo>> 
         where I: Iterator<Item=Result<kvp>>  {
         let pw = try!(PageWriter::new(inner.clone()));
-        let f = try!(inner.open_file_for_cursor());
-        let seg = try!(create_segment(pw, source, f));
+        let seg = try!(create_segment(pw, source, inner.page_cache.clone()));
         Ok(seg)
     }
 
@@ -7735,7 +7682,7 @@ impl InnerPart {
                                 if count_tombstones > 0 {
                                     return Ok(NeedsMerge::Yes);
                                 }
-                                let size = (count_leaves as u64) * (inner.pgsz as u64);
+                                let size = (count_leaves as u64) * (inner.page_cache.page_size() as u64);
                                 if size < get_level_size(i) {
                                     // this level doesn't need a merge because it is doesn't have enough data in it
                                     return Ok(NeedsMerge::No);
@@ -7793,7 +7740,7 @@ impl InnerPart {
             },
         }
 
-        let f = try!(inner.open_file_for_cursor());
+        let f = &inner.page_cache;
 
         let (cursor, from, into, behind_cursors, behind_rlock) = {
             let headerstuff = try!(inner.header.read());
@@ -7809,11 +7756,11 @@ impl InnerPart {
                 // something that is still being read by something else.
                 // two merges promoting the same stuff are not allowed.
 
-                fn get_cursors(inner: &std::sync::Arc<InnerPart>, f: std::rc::Rc<std::cell::RefCell<File>>, merge_segments: &[SegmentHeaderInfo]) -> Result<Vec<MultiPageCursor>> {
+                fn get_cursors(inner: &std::sync::Arc<InnerPart>, f: &std::sync::Arc<PageCache>, merge_segments: &[SegmentHeaderInfo]) -> Result<Vec<MultiPageCursor>> {
                     let mut cursors = Vec::with_capacity(merge_segments.len());
                     for i in 0 .. merge_segments.len() {
                         let pagenum = merge_segments[i].root_page;
-                        let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, vec![pagenum]));
+                        let cursor = try!(MultiPageCursor::new(f.clone(), vec![pagenum]));
                         cursors.push(cursor);
                     }
 
@@ -7848,7 +7795,7 @@ impl InnerPart {
 
                                 let merge_segments = slice_from_end(&header.fresh, header.fresh.len() - i);
 
-                                let cursors = try!(get_cursors(inner, f.clone(), &merge_segments));
+                                let cursors = try!(get_cursors(inner, f, &merge_segments));
 
                                 let merge_segments = 
                                     merge_segments
@@ -7900,7 +7847,7 @@ impl InnerPart {
                                 let count_tombstones = try!(LeafPage::count_tombstones(segment.root_page, &segment.buf));
 
                                 // TODO sad that this will re-read the leaf page
-                                let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, vec![segment.root_page]));
+                                let cursor = try!(MultiPageCursor::new(f.clone(), vec![segment.root_page]));
 
                                 let from = MergingFrom::YoungLeaf{
                                     segment: segment.root_page,
@@ -7912,18 +7859,14 @@ impl InnerPart {
                             PageType::PARENT_NODE => {
                                 let promote_depth = 0;
 
-                                // TODO it's a little silly here to construct a Lend<>
-                                let done_page = move |_| -> () {
-                                };
-                                let buf = Lend::new(segment.buf.clone(), box done_page);
-                                let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), segment.root_page, buf));
+                                let parent = try!(ParentPage::new(f.clone(), segment.root_page));
 
                                 let mut lineage = vec![0; parent.depth() as usize + 1];
                                 let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, inner.settings.num_leaves_promote));
                                 //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
                                 //println!("lineage: {}", lineage);
 
-                                let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, chosen_pages.clone()));
+                                let cursor = try!(MultiPageCursor::new(f.clone(), chosen_pages.clone()));
 
                                 let from = MergingFrom::YoungPartial{
                                     old_segment: parent, 
@@ -7946,7 +7889,7 @@ impl InnerPart {
                                 let count_tombstones = try!(LeafPage::count_tombstones(old_from_segment.root_page, &old_from_segment.buf));
 
                                 // TODO sad that this will re-read the leaf page
-                                let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, vec![old_from_segment.root_page]));
+                                let cursor = try!(MultiPageCursor::new(f.clone(), vec![old_from_segment.root_page]));
 
                                 let from = MergingFrom::OtherLeaf{
                                     level: level,
@@ -7963,16 +7906,12 @@ impl InnerPart {
                                 // TODO do we really ever want to promote from a depth other than leaves?
                                 let promote_depth = 0;
 
-                                // TODO it's a little silly here to construct a Lend<>
-                                let done_page = move |_| -> () {
-                                };
-                                let buf = Lend::new(old_from_segment.buf.clone(), box done_page);
-                                let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), old_from_segment.root_page, buf));
+                                let parent = try!(ParentPage::new(f.clone(), old_from_segment.root_page));
 
                                 let mut lineage = vec![0; parent.depth() as usize + 1];
                                 let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, inner.settings.num_leaves_promote));
                                 //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
-                                let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, chosen_pages.clone()));
+                                let cursor = try!(MultiPageCursor::new(f.clone(), chosen_pages.clone()));
                                 //println!("lineage: {}", lineage);
 
                                 let promote_blocks =
@@ -8017,20 +7956,14 @@ impl InnerPart {
                                 &Some(ref dest_segment) => {
                                     let pt = try!(PageType::from_u8(dest_segment.buf[0]));
 
-                                    // TODO it's a little silly here to construct a Lend<>
-                                    let done_page = move |_| -> () {
-                                    };
-                                    // TODO and the clone below is silly too
-                                    let buf = Lend::new(dest_segment.buf.clone(), box done_page);
-
                                     match pt {
                                         PageType::LEAF_NODE => {
                                             //println!("root of the dest segment is a leaf");
-                                            let leaf = try!(LeafPage::new_already_read_page(&inner.path, f.clone(), dest_segment.root_page, buf));
+                                            let leaf = try!(LeafPage::new(f.clone(), dest_segment.root_page));
                                             MergingInto::Leaf(leaf)
                                         },
                                         PageType::PARENT_NODE => {
-                                            let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), dest_segment.root_page, buf));
+                                            let parent = try!(ParentPage::new(f.clone(), dest_segment.root_page));
                                             MergingInto::Parent(parent)
                                         },
                                     }
@@ -8133,24 +8066,17 @@ impl InnerPart {
 
                         let behind_cursors = {
                             fn get_cursor(
-                                path: &str, 
-                                f: std::rc::Rc<std::cell::RefCell<File>>,
+                                f: std::sync::Arc<PageCache>,
                                 seg: &SegmentHeaderInfo,
                                 ) -> Result<PageCursor> {
-
-                                let done_page = move |_| -> () {
-                                };
-                                // TODO and the clone below is silly too
-                                let buf = Lend::new(seg.buf.clone(), box done_page);
-
-                                let cursor = try!(PageCursor::new_already_read_page(path, f, seg.root_page, buf));
+                                let cursor = try!(PageCursor::new(f, seg.root_page));
                                 Ok(cursor)
                             }
 
                             let behind_cursors = 
                                 behind_segments
                                 .iter()
-                                .map(|seg| get_cursor(&inner.path, f.clone(), seg))
+                                .map(|seg| get_cursor(f.clone(), seg))
                                 .collect::<Result<Vec<_>>>();
                             let behind_cursors = try!(behind_cursors);
                             Some(behind_cursors)
@@ -8218,8 +8144,7 @@ impl InnerPart {
                                 leaf.count_keys()
                             },
                             &MergingInto::Parent(ref parent) => {
-                                let mut mine = parent.make_parent_page();
-                                try!(mine.read_page(parent.pagenum));
+                                let mine = try!(ParentPage::new(f.clone(), parent.pagenum));
                                 let mut cursor = try!(ParentCursor::new(mine));
                                 let mut count = 0;
                                 try!(cursor.First());
@@ -8234,7 +8159,7 @@ impl InnerPart {
                     let count_dest_keys_after =
                         match wrote.segment {
                             Some(ref seg) => {
-                                try!(seg.count_keys(&inner.path, f.clone()))
+                                try!(seg.count_keys(&inner.path, f))
                             },
                             None => {
                                 0
@@ -8370,7 +8295,7 @@ impl InnerPart {
                     // TODO this code is very similar to the MergingFrom::OtherPartial case below
                     //println!("promote_lineage: {:?}", promote_lineage);
                     //println!("promote_blocks: {:?}", promote_blocks);
-                    let wrote = try!(write_survivors(&mut pw, &promote_pages, promote_depth, &promote_lineage, &old_segment, &inner.path, f.clone(), from_level.get_dest_level()));
+                    let wrote = try!(write_survivors(&mut pw, &promote_pages, promote_depth, &promote_lineage, &old_segment, &inner.path, &f, from_level.get_dest_level()));
 
                     println!("survivors,from,{:?}, leaves_rewritten,{}, leaves_recycled,{}, parent1_rewritten,{}, parent1_recycled,{}, ms,{}", 
                              from_level, 
@@ -8411,7 +8336,7 @@ impl InnerPart {
                 MergingFrom::OtherPartial{level, old_segment, promote_pages, promote_depth, promote_lineage, promote_blocks, ..} => {
                     //println!("promote_lineage: {:?}", promote_lineage);
                     //println!("promote_blocks: {:?}", promote_blocks);
-                    let wrote = try!(write_survivors(&mut pw, &promote_pages, promote_depth, &promote_lineage, &old_segment, &inner.path, f.clone(), from_level.get_dest_level()));
+                    let wrote = try!(write_survivors(&mut pw, &promote_pages, promote_depth, &promote_lineage, &old_segment, &inner.path, &f, from_level.get_dest_level()));
                     println!("survivors,from,{:?}, leaves_rewritten,{}, leaves_recycled,{}, parent1_rewritten,{}, parent1_recycled,{}, ms,{}", 
                              from_level, 
                              if wrote.nodes_rewritten.len() > 0 { wrote.nodes_rewritten[0].len() } else { 0 },
@@ -8455,24 +8380,19 @@ impl InnerPart {
             // of which is already in the header.
             fn get_blocklist_for_segment_including_root(
                 page: PageNum,
-                pgsz: usize,
-                path: &str,
-                f: std::rc::Rc<std::cell::RefCell<File>>,
+                f: &std::sync::Arc<PageCache>,
                 ) -> Result<BlockList> {
-                let buf = try!(read_and_alloc_page(&f, page, pgsz));
-                let done_page = move |_| -> () {
-                };
-                let buf = Lend::new(buf, box done_page);
+                let buf = try!(f.get(page));
 
                 let pt = try!(PageType::from_u8(buf[0]));
                 let mut blocks =
                     match pt {
                         PageType::LEAF_NODE => {
-                            let page = try!(LeafPage::new_already_read_page(path, f.clone(), page, buf));
+                            let page = try!(LeafPage::new(f.clone(), page));
                             page.blocklist_unsorted()
                         },
                         PageType::PARENT_NODE => {
-                            let parent = try!(ParentPage::new_already_read_page(path, f.clone(), page, buf));
+                            let parent = try!(ParentPage::new(f.clone(), page));
                             try!(parent.blocklist_unsorted())
                         },
                     };
@@ -8485,24 +8405,24 @@ impl InnerPart {
                 match from {
                     MergeFrom::Fresh{ref segments} => {
                         for &seg in segments.iter() {
-                            let blocks = try!(get_blocklist_for_segment_including_root(seg, inner.pgsz, &inner.path, f.clone()));
+                            let blocks = try!(get_blocklist_for_segment_including_root(seg, f));
                             now_inactive.insert(seg, blocks);
                         }
                     },
                     MergeFrom::FreshNoRewrite{..} => {
                     },
                     MergeFrom::Young{old_segment, ..} => {
-                        let blocks = try!(get_blocklist_for_segment_including_root(old_segment, inner.pgsz, &inner.path, f.clone()));
+                        let blocks = try!(get_blocklist_for_segment_including_root(old_segment, f));
                         now_inactive.insert(old_segment, blocks);
                     },
                     MergeFrom::Other{old_segment, ..} => {
-                        let blocks = try!(get_blocklist_for_segment_including_root(old_segment, inner.pgsz, &inner.path, f.clone()));
+                        let blocks = try!(get_blocklist_for_segment_including_root(old_segment, f));
                         now_inactive.insert(old_segment, blocks);
                     },
                 }
                 match old_dest_segment {
                     Some(seg) => {
-                        let blocks = try!(get_blocklist_for_segment_including_root(seg, inner.pgsz, &inner.path, f.clone()));
+                        let blocks = try!(get_blocklist_for_segment_including_root(seg, f));
                         now_inactive.insert(seg, blocks);
                     },
                     None => {
@@ -8515,7 +8435,7 @@ impl InnerPart {
                 let mut old_now_inactive = old_now_inactive;
                 match new_dest_segment {
                     Some(ref seg) => {
-                        let mut blocks = try!(seg.blocklist_unsorted(&inner.path, f.clone()));
+                        let mut blocks = try!(seg.blocklist_unsorted(f));
                         blocks.add_page_no_reorder(seg.root_page);
                         for (k,b) in old_now_inactive.iter_mut() {
                             b.remove_anything_in(&blocks);
@@ -8527,7 +8447,7 @@ impl InnerPart {
                 match from {
                     MergeFrom::Young{ref new_segment, ..} => {
                         if let &Some(ref new_segment) = new_segment {
-                            let mut blocks = try!(new_segment.blocklist_unsorted(&inner.path, f.clone()));
+                            let mut blocks = try!(new_segment.blocklist_unsorted(f));
                             blocks.add_page_no_reorder(new_segment.root_page);
                             for (k, b) in old_now_inactive.iter_mut() {
                                 b.remove_anything_in(&blocks);
@@ -8536,7 +8456,7 @@ impl InnerPart {
                     },
                     MergeFrom::Other{ref new_segment, ..} => {
                         if let &Some(ref new_segment) = new_segment {
-                            let mut blocks = try!(new_segment.blocklist_unsorted(&inner.path, f.clone()));
+                            let mut blocks = try!(new_segment.blocklist_unsorted(f));
                             blocks.add_page_no_reorder(new_segment.root_page);
                             for (k, b) in old_now_inactive.iter_mut() {
                                 b.remove_anything_in(&blocks);
@@ -8574,7 +8494,7 @@ impl InnerPart {
                     {
                         match new_dest_segment {
                             Some(ref new_dest_segment) => {
-                                let mut blocks = try!(new_dest_segment.blocklist_unsorted(&inner.path, f.clone()));
+                                let mut blocks = try!(new_dest_segment.blocklist_unsorted(f));
                                 blocks.add_page_no_reorder(new_dest_segment.root_page);
 
                                 let both = blocks.remove_anything_in(&new_blocks);
@@ -8597,7 +8517,7 @@ impl InnerPart {
                         match from {
                             MergeFrom::Young{ref new_segment, ..} => {
                                 if let &Some(ref new_segment) = new_segment {
-                                    let mut blocks = try!(new_segment.blocklist_unsorted(&inner.path, f.clone()));
+                                    let mut blocks = try!(new_segment.blocklist_unsorted(f));
                                     blocks.add_page_no_reorder(new_segment.root_page);
 
                                     let both = blocks.remove_anything_in(&new_blocks);
@@ -8612,7 +8532,7 @@ impl InnerPart {
                             },
                             MergeFrom::Other{ref new_segment, ..} => {
                                 if let &Some(ref new_segment) = new_segment {
-                                    let mut blocks = try!(new_segment.blocklist_unsorted(&inner.path, f.clone()));
+                                    let mut blocks = try!(new_segment.blocklist_unsorted(f));
                                     blocks.add_page_no_reorder(new_segment.root_page);
 
                                     let both = blocks.remove_anything_in(&new_blocks);
@@ -8872,7 +8792,7 @@ impl InnerPart {
 
             newHeader.mergeCounter = newHeader.mergeCounter + 1;
 
-            try!(headerstuff.write_header(newHeader, self.pgsz));
+            try!(headerstuff.write_header(newHeader, self.page_cache.page_size()));
             //println!("merge committed");
 
             let mut space = try!(self.space.lock());
@@ -9110,7 +9030,7 @@ impl PageWriter {
     }
 
     fn page_size(&self) -> usize {
-        self.inner.pgsz
+        self.inner.page_cache.page_size()
     }
 
     fn is_group_on_block_boundary(&mut self, group: &BlockList, limit: usize) -> Result<Option<PageNum>> {
@@ -9132,7 +9052,7 @@ impl PageWriter {
 
     fn do_write(&mut self, buf: &[u8], pg: PageNum) -> Result<()> {
         if pg != self.last_page + 1 {
-            try!(utils::SeekPage(&mut self.f, self.inner.pgsz, pg));
+            try!(utils::SeekPage(&mut self.f, self.inner.page_cache.page_size(), pg));
         }
         try!(self.f.write_all(buf));
         self.last_page = pg;

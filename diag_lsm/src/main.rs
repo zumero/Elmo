@@ -123,12 +123,12 @@ fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
             let nd = try!(r);
             let (count_items, len) =
                 if nd.depth == 0 {
-                    try!(leaf.read_page(nd.page));
+                    try!(leaf.move_to_page(nd.page));
                     let count_items = leaf.count_keys();
                     let len = leaf.len_on_page();
                     (count_items, len)
                 } else {
-                    try!(parent.read_page(nd.page));
+                    try!(parent.move_to_page(nd.page));
                     let count_items = parent.count_items();
                     let len = parent.len_on_page();
                     (count_items, len)

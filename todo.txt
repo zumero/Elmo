@@ -1,4 +1,37 @@
 
+child_pgitem clone
+
+fix BlockList::encode to just write to the PageBuilder
+
+in parent building page, only calc prefix len once
+
+do we need new_empty() at all?  its main purpose was to
+have a LeafPage or ParentPage that could be switched to
+a new page without realloc, and now that problem is
+abstracted away.
+
+make sure we also use hashmap.insert() understanding that
+it does not overwrite
+
+should PageCache also keep some strong references so
+it can try to keep pages it might need?  but then we
+would need a way to toss pages out when they become
+freed.
+
+fix the thing where pages are going into SegmentHeaderInfo
+without being in the cache
+
+problem:  header contains Arc references into a pagecache,
+but the model for the file for cursor is Rc, not Arc.
+multithreaded access to that cache?
+
+but then we can't use borrow_mut
+
+alloc a page buffer.  this is not just an alloc, but it
+also zeros all the bytes.  now we're going to immediately
+overwrite it by reading from the file.  how do we do this
+efficiently, without zeroing the bytes?
+
 need to make merges more parallelizable.  two merges in
 the same level but different key range.
 
