@@ -7752,6 +7752,9 @@ impl InnerPart {
                     return Ok(NeedsMerge::Desperate);
                 }
 
+                // TODO consider always returning Yes here.  but
+                // doing that seems to cause a big perf hit.  why?
+                // the idea was to just keep Fresh empty.
                 let i = header.fresh.len() - 1;
                 let pt = try!(PageType::from_u8(header.fresh[i].buf[0]));
                 match pt {
@@ -7796,6 +7799,12 @@ impl InnerPart {
                                 if count_tombstones > 0 {
                                     return Ok(NeedsMerge::Yes);
                                 }
+                                /*
+                                // TODO this causes a mysterious perf loss
+                                if i + 1 < header.levels.len() {
+                                    return Ok(NeedsMerge::Yes);
+                                }
+                                */
                                 return Ok(NeedsMerge::No);
                             },
                             PageType::PARENT_NODE => {
@@ -7834,15 +7843,9 @@ impl InnerPart {
     fn prepare_merge(inner: &std::sync::Arc<InnerPart>, from_level: FromLevel) -> Result<PendingMerge> {
         let t1 = time::PreciseTime::now();
 
-        struct FromWholeSegment {
-            // TODO it would be nice if this were a &SegmentHeaderInfo
-            root_page: PageNum,
-            node_pages: BlockList,
-        }
-
         enum MergingFrom {
-            Fresh{
-                segments: Vec<FromWholeSegment>,
+            FreshLeaves{
+                segments: Vec<PageNum>,
             },
             YoungLeaf{
                 segment: PageNum,
@@ -7932,21 +7935,10 @@ impl InnerPart {
                                 let merge_segments = 
                                     merge_segments
                                     .iter()
-                                    .map(
-                                        |seg| {
-                                            // TODO use node iterator
-                                            let node_pages = try!(seg.blocklist_unsorted_no_overflows(&inner.path, f.clone()));
-                                            let seg = FromWholeSegment {
-                                                root_page: seg.root_page,
-                                                node_pages: node_pages,
-                                            };
-                                            Ok(seg)
-                                        }
-                                        )
-                                    .collect::<Result<Vec<_>>>();;
-                                let merge_segments = try!(merge_segments);
+                                    .map( |seg| seg.root_page)
+                                    .collect::<Vec<_>>();;
 
-                                (cursors, MergingFrom::Fresh{segments: merge_segments})
+                                (cursors, MergingFrom::FreshLeaves{segments: merge_segments})
                             },
                             PageType::PARENT_NODE => {
                                 let mut i = i;
@@ -8162,7 +8154,7 @@ impl InnerPart {
 
                 let behind_segments = {
                     match from {
-                        MergingFrom::Fresh{..} => {
+                        MergingFrom::FreshLeaves{..} => {
                             None
                         },
                         MergingFrom::YoungLeaf{count_tombstones, ..} => {
@@ -8403,17 +8395,17 @@ impl InnerPart {
         let mut now_inactive: HashMap<PageNum, BlockList> = {
             let mut now_inactive = HashMap::new();
             match from {
-                MergingFrom::Fresh{ref segments} => {
-                    for seg in segments.iter() {
-                        let mut blocks = seg.node_pages.clone();
-                        blocks.add_page_no_reorder(seg.root_page);
+                MergingFrom::FreshLeaves{ref segments} => {
+                    for &seg in segments.iter() {
+                        let mut blocks = BlockList::new();
+                        blocks.add_page_no_reorder(seg);
                         // TODO overflows_eaten should be a hashmap
                         for &(s,ref b) in overflows_eaten.iter() {
-                            if s == seg.root_page {
+                            if s == seg {
                                 blocks.add_blocklist_no_reorder(b);
                             }
                         }
-                        now_inactive.insert(seg.root_page, blocks);
+                        now_inactive.insert(seg, blocks);
                     }
                 },
                 MergingFrom::YoungLeaf{segment, ..} => {
@@ -8456,8 +8448,7 @@ impl InnerPart {
 
         let from = 
             match from {
-                MergingFrom::Fresh{segments} => {
-                    let segments = segments.into_iter().map(|seg| seg.root_page).collect::<Vec<_>>();
+                MergingFrom::FreshLeaves{segments} => {
                     MergeFrom::Fresh{
                         segments: segments,
                     }

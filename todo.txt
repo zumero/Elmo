@@ -1,6 +1,36 @@
 
+why does promoting the only leaf from main 0 cause
+a perf loss?  it seems it would be better to promote
+it so that main 0 could be empty and would therefore
+not affect open_cursor.
+
+why does promoting the only leaf from fresh cause
+a big perf loss?  Young is kept empty.  why is
+there a problem with fresh?
+
+when promoting into a main level that is empty,
+just move without rewrite?
+
+we can get rid of blocklist_unsorted_no_overflows
+
 why did we get rid of header overflow?  if we brought
 it back, maybe we would never need levels to be "desperate".
+
+at startup, we find all pages in use by a segment, and
+then assume that all other pages are free.  this is the only
+time we can do that, because later, there may be segments
+in progress, as well as segments written but not yet
+committed, and we don't keep track of those.  should we?
+then we could always know everything that is in use.
+
+segments in waiting?
+
+we could decide that the main levels are always in the
+first 4k page, but fresh and young, which can grow
+arbitrarily large, are elsewhere.  and fresh and young
+only have things in them when we haven't had time to
+merge them yet?  which means fresh and young always
+need merge when they are not empty?
 
 seems like it should be impossible for a tombstone
 to exist anymore in a main level.  the presence of
