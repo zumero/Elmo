@@ -1380,29 +1380,6 @@ impl SegmentHeaderInfo {
         Ok(blocks)
     }
 
-    // TODO blocklist_unsorted_no_overflows is basically the same as NodeIterator
-    fn blocklist_unsorted_no_overflows(&self, 
-                          path: &str,
-                          f: std::rc::Rc<std::cell::RefCell<File>>,
-                          ) -> Result<BlockList> {
-        let done_page = move |_| -> () {
-        };
-        let buf = Lend::new(self.buf.clone(), box done_page);
-
-        let pt = try!(PageType::from_u8(self.buf[0]));
-        let blocks =
-            match pt {
-                PageType::LEAF_NODE => {
-                    BlockList::new()
-                },
-                PageType::PARENT_NODE => {
-                    let parent = try!(ParentPage::new_already_read_page(path, f.clone(), self.root_page, buf));
-                    try!(parent.blocklist_unsorted_no_overflows())
-                },
-            };
-        Ok(blocks)
-    }
-
     // TODO this is only used for diag purposes
     fn count_keys(&self, 
                           path: &str,
@@ -4738,10 +4715,6 @@ impl LeafPage {
         list
     }
 
-    pub fn blocklist_unsorted_no_overflows(&self) -> BlockList {
-        BlockList::new()
-    }
-
     fn parse_page(pgnum: PageNum, pr: &[u8], pairs: &mut Vec<PairInLeaf>) -> Result<(Option<Box<[u8]>>, usize)> {
         let mut prefix = None;
 
@@ -4953,10 +4926,6 @@ impl LeafCursor {
         self.page.blocklist_unsorted()
     }
 
-    pub fn blocklist_unsorted_no_overflows(&self) -> BlockList {
-        // TODO silly.  just an empty list, right?
-        self.page.blocklist_unsorted_no_overflows()
-    }
 }
 
 impl IForwardCursor for LeafCursor {
@@ -5116,18 +5085,6 @@ impl PageCursor {
             },
             &PageCursor::Parent(ref c) => {
                 c.blocklist_unsorted()
-            },
-        }
-    }
-
-    pub fn blocklist_unsorted_no_overflows(&self) -> Result<BlockList> {
-        match self {
-            &PageCursor::Leaf(ref c) => {
-                // TODO silly.  just an empty list, right?
-                Ok(c.blocklist_unsorted_no_overflows())
-            },
-            &PageCursor::Parent(ref c) => {
-                c.blocklist_unsorted_no_overflows()
             },
         }
     }
@@ -5572,24 +5529,6 @@ impl ParentPage {
         }
     }
 
-    fn child_blocklist_no_overflows(&self, i: usize) -> Result<BlockList> {
-        let pagenum = self.children[i].page;
-        if self.depth() == 1 {
-            Ok(BlockList::new())
-        } else {
-            assert!(self.depth() > 1);
-
-            let buf = try!(read_and_alloc_page(&self.f, pagenum, self.pr.len()));
-            let done_page = move |_| -> () {
-            };
-            let buf = Lend::new(buf, box done_page);
-
-            let page = try!(ParentPage::new_already_read_page(&self.path, self.f.clone(), pagenum, buf));
-            page.blocklist_unsorted_no_overflows()
-            // TODO assert that count matches the blocklist?
-        }
-    }
-
     pub fn child_key<'a>(&'a self, i: usize) -> Result<KeyRef<'a>> {
         let last_key = try!(self.key(&self.children[i].last_key));
         Ok(last_key)
@@ -5648,20 +5587,6 @@ impl ParentPage {
             // its leaf.
             list.add_page_no_reorder(self.children[i].page);
             let blocks = try!(self.child_blocklist(i));
-            list.add_blocklist_no_reorder(&blocks);
-        }
-        Ok(list)
-    }
-
-    fn blocklist_unsorted_no_overflows(&self) -> Result<BlockList> {
-        let mut list = BlockList::new();
-        for i in 0 .. self.children.len() {
-            // we do not add the blocklist for any overflow keys,
-            // because we don't own that blocklist.  it is simply a reference
-            // to the blocklist for an overflow key when it was written into
-            // its leaf.
-            list.add_page_no_reorder(self.children[i].page);
-            let blocks = try!(self.child_blocklist_no_overflows(i));
             list.add_blocklist_no_reorder(&blocks);
         }
         Ok(list)
@@ -5999,10 +5924,6 @@ impl ParentCursor {
 
     pub fn blocklist_unsorted(&self) -> Result<BlockList> {
         self.page.blocklist_unsorted()
-    }
-
-    pub fn blocklist_unsorted_no_overflows(&self) -> Result<BlockList> {
-        self.page.blocklist_unsorted_no_overflows()
     }
 
     fn seek(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
@@ -8043,15 +7964,7 @@ impl InnerPart {
                                 //println!("old_from_segment: {}, depth: {}", old_from_segment.root_page, depth_root);
                                 assert!(depth_root >= 1);
                                 // TODO do we really ever want to promote from a depth other than leaves?
-                                let promote_depth =
-                                    if depth_root == 1 {
-                                        0
-                                    } else {
-                                        // TODO config setting?
-                                        // TODO should this depend on the size of the dest segment?
-                                        0
-                                    };
-                                //println!("promote_depth: {}", promote_depth);
+                                let promote_depth = 0;
 
                                 // TODO it's a little silly here to construct a Lend<>
                                 let done_page = move |_| -> () {
@@ -8066,14 +7979,12 @@ impl InnerPart {
                                 let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, chosen_pages.clone()));
                                 //println!("lineage: {}", lineage);
 
-                                // TODO use node iterator
-                                //let promote_blocks = try!(cursor.blocklist_unsorted_no_overflows());
                                 let promote_blocks =
                                     // TODO if promote_depth is always 0, this is silly
                                     if promote_depth == 0 {
                                         BlockList::new()
                                     } else {
-                                        // TODO
+                                        // TODO don't include the overflows here
                                         unreachable!();
                                     };
 

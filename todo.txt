@@ -2,6 +2,18 @@
 need to make merges more parallelizable.  two merges in
 the same level but different key range.
 
+once we find leaves to promote, walk up and identify
+a parent in the dest.  then we know the other parents
+that are safe from change.
+
+or, find stuff to promote according to a key range.
+suppose we know what parent we want our promoted leaves
+to land under.
+
+multiple merge threads?  one whose job is to always
+prioritize tombstones.  others with a different
+priority?
+
 so yeah, it would seem that the blocklist stored for
 the leaf children of a depth 1 parent is only used at
 startup to identify all the pages in use.  is that
