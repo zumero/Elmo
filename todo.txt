@@ -1,4 +1,41 @@
 
+need to make merges more parallelizable.  two merges in
+the same level but different key range.
+
+so yeah, it would seem that the blocklist stored for
+the leaf children of a depth 1 parent is only used at
+startup to identify all the pages in use.  is that
+right?  if so, how feasible would it be to remove these
+and calculate them?  any way to do this in a background
+thread?
+
+reuse key overflows.
+
+parent node writer gets in trouble, overflows its stack,
+when it has to deal with lots of pages that only hold one
+key.  problem is that if only one key fits in the leaf,
+then only one key fits in its parent, so the generation
+of parent nodes is the same size, so depth increases
+forever.  maybe we need to overflow keys unless two of
+them can fit in a parent page.  or maybe a parent page
+needs the ability to overflow a key even if the leaf
+did not, just to ensure that at least two keys fit in
+every parent.
+
+too many open/close of the file for PageWriter as well.
+
+bufadvance and PageBuilder should use trait implementations 
+for Read and Write on slices/vecs.  varint::read too.
+
+vec capacities
+
+can we have the segment page objects reference the buf in the
+header instead of cloning it?  Arc<buf> ?  but then how do we deal
+with ParentPage that wants to walk through all of its children without
+realloc on each one?  separate implementations?  one form of the
+page object borrows its buf (from the one in the SegmentHeaderInfo).
+the other one owns its buf (so it can read a different page into it).
+
 why does promoting the only leaf from main 0 cause
 a perf loss?  it seems it would be better to promote
 it so that main 0 could be empty and would therefore
@@ -58,43 +95,6 @@ do not cause any perf problem with open_cursor, but
 a single-leaf segment does have a cost.
 
 should the level multiplier be stored in the file header?
-
-so yeah, it would seem that the blocklist stored for
-the leaf children of a depth 1 parent is only used at
-startup to identify all the pages in use.  is that
-right?  if so, how feasible would it be to remove these
-and calculate them?  any way to do this in a background
-thread?
-
-reuse key overflows.
-
-parent node writer gets in trouble, overflows its stack,
-when it has to deal with lots of pages that only hold one
-key.  problem is that if only one key fits in the leaf,
-then only one key fits in its parent, so the generation
-of parent nodes is the same size, so depth increases
-forever.  maybe we need to overflow keys unless two of
-them can fit in a parent page.  or maybe a parent page
-needs the ability to overflow a key even if the leaf
-did not, just to ensure that at least two keys fit in
-every parent.
-
-too many open/close of the file for PageWriter as well.
-
-need to make merges more parallelizable.  two merges in
-the same level but different key range.
-
-bufadvance and PageBuilder should use trait implementations 
-for Read and Write on slices/vecs.  varint::read too.
-
-vec capacities
-
-can we have the segment page objects reference the buf in the
-header instead of cloning it?  Arc<buf> ?  but then how do we deal
-with ParentPage that wants to walk through all of its children without
-realloc on each one?  separate implementations?  one form of the
-page object borrows its buf (from the one in the SegmentHeaderInfo).
-the other one owns its buf (so it can read a different page into it).
 
 lots of bufadvance and varint read calls should probably return Result
 so they can properly error on invalid pages read from the file.
