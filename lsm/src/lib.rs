@@ -17,9 +17,7 @@
 #![feature(box_syntax)]
 #![feature(convert)]
 #![feature(associated_consts)]
-#![feature(vec_push_all)]
 #![feature(clone_from_slice)]
-#![feature(drain)]
 #![feature(iter_arith)]
 
 // TODO turn the following warnings back on later
@@ -729,10 +727,10 @@ impl<'a> KeyRef<'a> {
                     // the range we want is split across the front and back.
                     // in this case we have to alloc.
                     let mut a = Vec::with_capacity(end - begin);
-                    a.push_all(&front[begin .. ]);
+                    a.extend_from_slice(&front[begin .. ]);
                     let end = end - front.len();
                     if end <= back.len() {
-                        a.push_all(&back[0 .. end]);
+                        a.extend_from_slice(&back[0 .. end]);
                         let t = try!(func(&a));
                         Ok(t)
                     } else {
@@ -758,13 +756,13 @@ impl<'a> KeyRef<'a> {
             },
             KeyRef::Slice(a) => {
                 let mut k = Vec::with_capacity(a.len());
-                k.push_all(a);
+                k.extend_from_slice(a);
                 k.into_boxed_slice()
             },
             KeyRef::Prefixed(front,back) => {
                 let mut k = Vec::with_capacity(front.len() + back.len());
-                k.push_all(front);
-                k.push_all(back);
+                k.extend_from_slice(front);
+                k.extend_from_slice(back);
                 k.into_boxed_slice()
             },
         }
@@ -900,7 +898,7 @@ impl<'a> ValueRef<'a> {
         match self {
             ValueRef::Slice(a) => {
                 let mut k = Vec::with_capacity(a.len());
-                k.push_all(a);
+                k.extend_from_slice(a);
                 Blob::Boxed(k.into_boxed_slice())
             },
             ValueRef::Overflowed(path, pgsz, len, blocks) => Blob::SameFileOverflow(len, blocks),
@@ -932,7 +930,7 @@ impl<'a> LiveValueRef<'a> {
         match self {
             LiveValueRef::Slice(a) => {
                 let mut k = Vec::with_capacity(a.len());
-                k.push_all(a);
+                k.extend_from_slice(a);
                 Blob::Boxed(k.into_boxed_slice())
             },
             LiveValueRef::Overflowed(path, pgsz, len, blocks) => Blob::SameFileOverflow(len, blocks),
@@ -946,7 +944,7 @@ impl<'a> LiveValueRef<'a> {
         match self {
             LiveValueRef::Slice(a) => {
                 let mut v = Vec::with_capacity(a.len());
-                v.push_all(a);
+                v.extend_from_slice(a);
                 Ok(v.into_boxed_slice())
             },
             LiveValueRef::Overflowed(ref path, pgsz, len, ref blocks) => {
@@ -1297,9 +1295,9 @@ pub trait ICursor : IForwardCursor {
 pub struct DbSettings {
     pub default_page_size: usize,
     pub pages_per_block: PageCount,
-    pub sleep_desperate_fresh: u32,
-    pub sleep_desperate_young: u32,
-    pub sleep_desperate_level: u32,
+    pub sleep_desperate_fresh: u64,
+    pub sleep_desperate_young: u64,
+    pub sleep_desperate_level: u64,
     pub desperate_fresh: usize,
     pub desperate_young: usize,
     pub desperate_level_factor: u64,
@@ -5247,8 +5245,8 @@ impl KeyInPage {
                         Some(a) => {
                             let k = {
                                 let mut k = Vec::with_capacity(klen);
-                                k.push_all(a);
-                                k.push_all(&pr[at .. at + klen - a.len()]);
+                                k.extend_from_slice(a);
+                                k.extend_from_slice(&pr[at .. at + klen - a.len()]);
                                 k.into_boxed_slice()
                             };
                             k
@@ -5256,7 +5254,7 @@ impl KeyInPage {
                         None => {
                             let k = {
                                 let mut k = Vec::with_capacity(klen);
-                                k.push_all(&pr[at .. at + klen]);
+                                k.extend_from_slice(&pr[at .. at + klen]);
                                 k.into_boxed_slice()
                             };
                             k
@@ -5687,7 +5685,7 @@ impl ParentPage {
         let mut total_count_tombstones = 0;
         for item in children {
             match item.info {
-                ChildInfo::Leaf{blocks_overflows, count_tombstones, ..} => {
+                ChildInfo::Leaf{count_tombstones, ..} => {
                     total_count_leaves += 1;
                     total_count_tombstones += count_tombstones;
                 },
@@ -6233,7 +6231,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
         }
     }
 
-    fn parse(pr: &Box<[u8]>, f: std::rc::Rc<std::cell::RefCell<File>>, path: &str) -> Result<(HeaderData, usize)> {
+    fn parse(pr: &Box<[u8]>, f: std::rc::Rc<std::cell::RefCell<File>>) -> Result<(HeaderData, usize)> {
         fn read_segment_list(pr: &Box<[u8]>, cur: &mut usize) -> Result<Vec<PageNum>> {
             let count = varint::read(&pr, cur) as usize;
             let mut a = Vec::with_capacity(count);
@@ -6244,7 +6242,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
             Ok(a)
         }
 
-        fn fix_segment_list(segments: Vec<PageNum>, pgsz: usize, f: std::rc::Rc<std::cell::RefCell<File>>, path: &str) -> Result<Vec<SegmentHeaderInfo>> {
+        fn fix_segment_list(segments: Vec<PageNum>, pgsz: usize, f: std::rc::Rc<std::cell::RefCell<File>>) -> Result<Vec<SegmentHeaderInfo>> {
             let mut v = Vec::with_capacity(segments.len());
             for page in segments.iter() {
                 let pagenum = *page;
@@ -6258,7 +6256,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
             Ok(v)
         }
 
-        fn fix_main_segment_list(segments: Vec<PageNum>, pgsz: usize, f: std::rc::Rc<std::cell::RefCell<File>>, path: &str) -> Result<Vec<Option<SegmentHeaderInfo>>> {
+        fn fix_main_segment_list(segments: Vec<PageNum>, pgsz: usize, f: std::rc::Rc<std::cell::RefCell<File>>) -> Result<Vec<Option<SegmentHeaderInfo>>> {
             let mut v = Vec::with_capacity(segments.len());
             for page in segments.iter() {
                 let pagenum = *page;
@@ -6284,9 +6282,9 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
         let young = try!(read_segment_list(pr, &mut cur));
         let levels = try!(read_segment_list(pr, &mut cur));
 
-        let fresh = try!(fix_segment_list(fresh, pgsz, f.clone(), path));
-        let young = try!(fix_segment_list(young, pgsz, f.clone(), path));
-        let levels = try!(fix_main_segment_list(levels, pgsz, f.clone(), path));
+        let fresh = try!(fix_segment_list(fresh, pgsz, f.clone()));
+        let young = try!(fix_segment_list(young, pgsz, f.clone()));
+        let levels = try!(fix_main_segment_list(levels, pgsz, f.clone()));
 
         let hd = 
             HeaderData {
@@ -6317,7 +6315,7 @@ fn read_header(path: &str) -> Result<(HeaderData, usize, PageNum)> {
         let pr = try!(read(&mut f));
         let f = std::cell::RefCell::new(f);
         let f = std::rc::Rc::new(f);
-        let (h, pgsz) = try!(parse(&pr, f, &path));
+        let (h, pgsz) = try!(parse(&pr, f));
         let nextAvailablePage = calcNextPage(pgsz, len as usize);
         Ok((h, pgsz, nextAvailablePage))
     } else {
@@ -7086,7 +7084,7 @@ impl DatabaseFile {
         // but we do need to make sure merges are not stepping
         // on other merges.
 
-        fn guts(inner: &std::sync::Arc<InnerPart>, write_lock: &std::sync::Arc<Mutex<WriteLock>>, level: FromLevel) -> Result<Option<u32>> {
+        fn guts(inner: &std::sync::Arc<InnerPart>, write_lock: &std::sync::Arc<Mutex<WriteLock>>, level: FromLevel) -> Result<Option<u64>> {
             match try!(InnerPart::needs_merge(&inner, level)) {
                 NeedsMerge::No => {
                     Ok(None)
@@ -7129,7 +7127,7 @@ impl DatabaseFile {
                     };
                     if delay > 0 {
                         println!("desperate,{:?},sleeping,{}", level, inner.settings.sleep_desperate_fresh);
-                        std::thread::sleep_ms(delay);
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
                     }
                 }
             },
@@ -7151,7 +7149,7 @@ impl DatabaseFile {
                     };
                     if delay > 0 {
                         println!("desperate,{:?},sleeping,{}", level, inner.settings.sleep_desperate_fresh);
-                        std::thread::sleep_ms(delay);
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
                     }
                 }
             },
@@ -7173,7 +7171,7 @@ impl DatabaseFile {
                     };
                     if delay > 0 {
                         println!("desperate,{:?},sleeping,{}", level, inner.settings.sleep_desperate_fresh);
-                        std::thread::sleep_ms(delay);
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
                     }
                 }
             },
@@ -7189,7 +7187,7 @@ impl DatabaseFile {
             // every time?
             try!(self.inner.notify_work(FromLevel::Fresh));
             println!("desperate,main,sleeping,{}", self.inner.settings.sleep_desperate_fresh);
-            std::thread::sleep_ms(self.inner.settings.sleep_desperate_fresh);
+            std::thread::sleep(std::time::Duration::from_millis(self.inner.settings.sleep_desperate_fresh));
         }
 
         let lck = try!(self.write_lock.lock());
@@ -7729,7 +7727,6 @@ impl InnerPart {
                                 return Ok(NeedsMerge::No);
                             },
                             PageType::PARENT_NODE => {
-                                let depth = seg.buf[2];
                                 // TODO this is a fairly expensive way to count the stuff.
                                 // it parses the page out of the buffer.
                                 // store the count in SegmentHeaderInfo ?
@@ -7973,7 +7970,6 @@ impl InnerPart {
                                 let parent = try!(ParentPage::new_already_read_page(&inner.path, f.clone(), old_from_segment.root_page, buf));
 
                                 let mut lineage = vec![0; parent.depth() as usize + 1];
-                                let count_leaves = parent.count_leaves();
                                 let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, inner.settings.num_leaves_promote));
                                 //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
                                 let cursor = try!(MultiPageCursor::new(&inner.path, f.clone(), inner.pgsz, chosen_pages.clone()));
