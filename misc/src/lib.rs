@@ -345,7 +345,7 @@ pub mod bufndx {
     }
 
     #[inline]
-    pub fn slurp_cstring(ba: &[u8], i: &mut usize) -> Result<String,std::str::Utf8Error> {
+    pub fn slurp_cstring(ba: &[u8], i: &mut usize) -> Result<String, std::str::Utf8Error> {
         let mut len = 0;
         while ba[*i + len] != 0 {
             len = len + 1;
@@ -358,6 +358,9 @@ pub mod bufndx {
 }
 
 pub mod varint {
+    use std;
+    use super::io;
+
     // TODO this doesn't need to be usize.  u8 is enough.
     #[inline]
     pub fn space_needed_for(v: u64) -> usize {
@@ -396,48 +399,50 @@ pub mod varint {
 
     // TODO stronger inline hint?
     #[inline]
-    pub fn read(buf: &[u8], cur: &mut usize) -> u64 {
-        let c = *cur;
-        let a0 = buf[c] as u64;
+    pub fn read2<R: std::io::Read>(r: &mut R) -> std::io::Result<u64> {
+        let mut buf = [0u8; 9];
+        try!(io::read_all(r, &mut buf[0 .. 1]));
+        let c = 0;
+        let a0 = buf[0] as u64;
         if a0 <= 240u64 { 
-            *cur = *cur + 1;
-            a0
+            Ok(a0)
         } else if a0 <= 248u64 {
+            try!(io::read_all(r, &mut buf[1 .. 2]));
             let a1 = buf[c+1] as u64;
             let r = 240u64 + 256u64 * (a0 - 241u64) + a1;
-            *cur = *cur + 2;
-            r
+            Ok(r)
         } else if a0 == 249u64 {
+            try!(io::read_all(r, &mut buf[1 .. 3]));
             let a1 = buf[c+1] as u64;
             let a2 = buf[c+2] as u64;
             let r = 2288u64 + 256u64 * a1 + a2;
-            *cur = *cur + 3;
-            r
+            Ok(r)
         } else if a0 == 250u64 {
+            try!(io::read_all(r, &mut buf[1 .. 4]));
             let a1 = buf[c+1] as u64;
             let a2 = buf[c+2] as u64;
             let a3 = buf[c+3] as u64;
             let r = (a1 << 16) | (a2 << 8) | a3;
-            *cur = *cur + 4;
-            r
+            Ok(r)
         } else if a0 == 251u64 {
+            try!(io::read_all(r, &mut buf[1 .. 5]));
             let a1 = buf[c+1] as u64;
             let a2 = buf[c+2] as u64;
             let a3 = buf[c+3] as u64;
             let a4 = buf[c+4] as u64;
             let r = (a1 << 24) | (a2 << 16) | (a3 << 8) | a4;
-            *cur = *cur + 5;
-            r
+            Ok(r)
         } else if a0 == 252u64 {
+            try!(io::read_all(r, &mut buf[1 .. 6]));
             let a1 = buf[c+1] as u64;
             let a2 = buf[c+2] as u64;
             let a3 = buf[c+3] as u64;
             let a4 = buf[c+4] as u64;
             let a5 = buf[c+5] as u64;
             let r = (a1 << 32) | (a2 << 24) | (a3 << 16) | (a4 << 8) | a5;
-            *cur = *cur + 6;
-            r
+            Ok(r)
         } else if a0 == 253u64 {
+            try!(io::read_all(r, &mut buf[1 .. 7]));
             let a1 = buf[c+1] as u64;
             let a2 = buf[c+2] as u64;
             let a3 = buf[c+3] as u64;
@@ -445,9 +450,9 @@ pub mod varint {
             let a5 = buf[c+5] as u64;
             let a6 = buf[c+6] as u64;
             let r = (a1 << 40) | (a2 << 32) | (a3 << 24) | (a4 << 16) | (a5 << 8) | a6;
-            *cur = *cur + 7;
-            r
+            Ok(r)
         } else if a0 == 254u64 {
+            try!(io::read_all(r, &mut buf[1 .. 8]));
             let a1 = buf[c+1] as u64;
             let a2 = buf[c+2] as u64;
             let a3 = buf[c+3] as u64;
@@ -456,9 +461,9 @@ pub mod varint {
             let a6 = buf[c+6] as u64;
             let a7 = buf[c+7] as u64;
             let r = (a1 << 48) | (a2 << 40) | (a3 << 32) | (a4 << 24) | (a5 << 16) | (a6 << 8) | a7;
-            *cur = *cur + 8;
-            r
+            Ok(r)
         } else {
+            try!(io::read_all(r, &mut buf[1 .. 9]));
             let a1 = buf[c+1] as u64;
             let a2 = buf[c+2] as u64;
             let a3 = buf[c+3] as u64;
@@ -468,9 +473,19 @@ pub mod varint {
             let a7 = buf[c+7] as u64;
             let a8 = buf[c+8] as u64;
             let r = (a1 << 56) | (a2 << 48) | (a3 << 40) | (a4 << 32) | (a5 << 24) | (a6 << 16) | (a7 << 8) | a8;
-            *cur = *cur + 9;
-            r
+            Ok(r)
         }
+    }
+
+    // TODO stronger inline hint?
+    #[inline]
+    pub fn read(buf: &[u8], cur: &mut usize) -> u64 {
+        let c = *cur;
+        let a0 = buf[c];
+        let len = first_byte_to_len(a0);
+        let v = read2(&mut &buf[c .. c + len]).unwrap();
+        *cur += len;
+        v
     }
 
     #[inline]
@@ -544,6 +559,7 @@ pub mod varint {
 }
 
 pub mod io {
+    use std;
     use std::io;
     use std::io::Seek;
     use std::io::Read;
@@ -551,6 +567,8 @@ pub mod io {
     use std::io::SeekFrom;
     use super::endian;
 
+    // TODO shouldn't this be a generic instead of a trait object?
+    #[inline]
     pub fn write_fully(strm: &mut Write, buf: &[u8]) -> io::Result<usize> {
         let mut sofar = 0;
         let len = buf.len();
@@ -568,6 +586,8 @@ pub mod io {
         Ok(sofar)
     }
 
+    // TODO shouldn't this be a generic instead of a trait object?
+    #[inline]
     pub fn read_fully(strm: &mut Read, buf: &mut [u8]) -> io::Result<usize> {
         let mut sofar = 0;
         let len = buf.len();
@@ -585,6 +605,43 @@ pub mod io {
         Ok(sofar)
     }
 
+    #[inline]
+    fn read_fully2<R: std::io::Read>(strm: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut sofar = 0;
+        let len = buf.len();
+        loop {
+            let cur = &mut buf[sofar..len];
+            let n = try!(strm.read(cur));
+            if n == 0 {
+                break;
+            }
+            sofar += n;
+            if sofar == len {
+                break;
+            }
+        }
+        Ok(sofar)
+    }
+
+    #[inline]
+    pub fn read_all<R: std::io::Read>(strm: &mut R, buf: &mut [u8]) -> std::io::Result<()> {
+        let mut sofar = 0;
+        let len = buf.len();
+        loop {
+            let cur = &mut buf[sofar..len];
+            let n = try!(strm.read(cur));
+            if n == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "TODO"));
+            }
+            sofar += n;
+            if sofar == len {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    // TODO shouldn't this be a generic instead of a trait object?
     pub fn read_4(strm: &mut Read) -> io::Result<[u8; 4]> {
         let mut a = [0; 4];
         let got = try!(read_fully(strm, &mut a));
@@ -595,11 +652,13 @@ pub mod io {
         Ok(a)
     }
 
+    // TODO shouldn't this be a generic instead of a trait object?
     pub fn read_u32_le(strm: &mut Read) -> io::Result<u32> {
         let ba = try!(read_4(strm));
         Ok(endian::u32_from_bytes_le(ba))
     }
 
+    // TODO shouldn't this be a generic instead of a trait object?
     pub fn read_i32_le(strm: &mut Read) -> io::Result<i32> {
         let ba = try!(read_4(strm));
         Ok(endian::i32_from_bytes_le(ba))
