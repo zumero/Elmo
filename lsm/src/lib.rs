@@ -6306,6 +6306,7 @@ impl Space {
         //println!("add_rlock: {:?}", segments);
         let rlock = self.next_rlock;
         self.next_rlock += 1;
+        assert!(!self.rlocks.contains_key(&rlock));
         let was = self.rlocks.insert(rlock, segments);
         assert!(was.is_none());
         rlock
@@ -6402,6 +6403,7 @@ impl Space {
             for pg in new_zombie_segments {
                 let b = blocks.remove(&pg).unwrap();
                 //println!("seg {} has rlock so zombie: {:?}", pg, b);
+                assert!(!self.zombies.contains_key(&pg));
                 self.zombies.insert(pg, b);
             }
             if !blocks.is_empty() {
@@ -8237,6 +8239,7 @@ impl InnerPart {
                                 blocks.add_blocklist_no_reorder(b);
                             }
                         }
+                        assert!(!now_inactive.contains_key(&seg));
                         now_inactive.insert(seg, blocks);
                     }
                 },
@@ -8244,12 +8247,14 @@ impl InnerPart {
                     let mut blocks = BlockList::new();
                     blocks.add_page_no_reorder(segment);
                     assert!(overflows_eaten.is_empty());
+                    assert!(!now_inactive.contains_key(&segment));
                     now_inactive.insert(segment, blocks);
                 },
                 MergingFrom::OtherLeaf{segment, ..} => {
                     let mut blocks = BlockList::new();
                     blocks.add_page_no_reorder(segment);
                     assert!(overflows_eaten.is_empty());
+                    assert!(!now_inactive.contains_key(&segment));
                     now_inactive.insert(segment, blocks);
                 },
                 MergingFrom::YoungPartial{..} => {
@@ -8270,6 +8275,7 @@ impl InnerPart {
                     for b in overflows_freed {
                         blocks.add_blocklist_no_reorder(&b);
                     }
+                    assert!(!now_inactive.contains_key(&old_segment));
                     now_inactive.insert(old_segment, blocks);
                 },
                 None => {
@@ -8406,6 +8412,7 @@ impl InnerPart {
                     MergeFrom::Fresh{ref segments} => {
                         for &seg in segments.iter() {
                             let blocks = try!(get_blocklist_for_segment_including_root(seg, f));
+                            assert!(!now_inactive.contains_key(&seg));
                             now_inactive.insert(seg, blocks);
                         }
                     },
@@ -8413,16 +8420,19 @@ impl InnerPart {
                     },
                     MergeFrom::Young{old_segment, ..} => {
                         let blocks = try!(get_blocklist_for_segment_including_root(old_segment, f));
+                        assert!(!now_inactive.contains_key(&old_segment));
                         now_inactive.insert(old_segment, blocks);
                     },
                     MergeFrom::Other{old_segment, ..} => {
                         let blocks = try!(get_blocklist_for_segment_including_root(old_segment, f));
+                        assert!(!now_inactive.contains_key(&old_segment));
                         now_inactive.insert(old_segment, blocks);
                     },
                 }
                 match old_dest_segment {
                     Some(seg) => {
                         let blocks = try!(get_blocklist_for_segment_including_root(seg, f));
+                        assert!(!now_inactive.contains_key(&seg));
                         now_inactive.insert(seg, blocks);
                     },
                     None => {
@@ -8705,6 +8715,7 @@ impl InnerPart {
                         None => {
                         },
                     }
+                    assert!(!deps.contains_key(&new_seg.root_page));
                     deps.insert(new_seg.root_page, deps_dest);
                 },
             }
@@ -8719,6 +8730,7 @@ impl InnerPart {
                 MergeFrom::Young{old_segment, ref new_segment} => {
                     match new_segment {
                         &Some(ref new_segment) => {
+                            assert!(!deps.contains_key(&new_segment.root_page));
                             deps.insert(new_segment.root_page, vec![old_segment]);
                         },
                         &None => {
@@ -8728,6 +8740,7 @@ impl InnerPart {
                 MergeFrom::Other{level, old_segment, ref new_segment} => {
                     match new_segment {
                         &Some(ref new_segment) => {
+                            assert!(!deps.contains_key(&new_segment.root_page));
                             deps.insert(new_segment.root_page, vec![old_segment]);
                         },
                         &None => {

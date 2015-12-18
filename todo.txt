@@ -1,7 +1,8 @@
 
-child_pgitem clone
+can varint::read be made faster using transmute for
+some of the cases?
 
-fix BlockList::encode to just write to the PageBuilder
+child_pgitem clone
 
 in parent building page, only calc prefix len once
 
@@ -18,14 +19,9 @@ it can try to keep pages it might need?  but then we
 would need a way to toss pages out when they become
 freed.
 
-fix the thing where pages are going into SegmentHeaderInfo
-without being in the cache
-
-problem:  header contains Arc references into a pagecache,
-but the model for the file for cursor is Rc, not Arc.
-multithreaded access to that cache?
-
-but then we can't use borrow_mut
+consider having the PageCache be the only way to produce
+a SegmentHeaderInfo, so that we can be sure any buffer
+inside is also in the cache.
 
 alloc a page buffer.  this is not just an alloc, but it
 also zeros all the bytes.  now we're going to immediately
@@ -70,16 +66,11 @@ every parent.
 too many open/close of the file for PageWriter as well.
 
 bufadvance and PageBuilder should use trait implementations 
-for Read and Write on slices/vecs.  varint::read too.
+for Read and Write on slices/vecs.  varint::read too.  but
+note that switching varint::read to use a Read trait did
+seem to cause a perf loss.
 
 vec capacities
-
-can we have the segment page objects reference the buf in the
-header instead of cloning it?  Arc<buf> ?  but then how do we deal
-with ParentPage that wants to walk through all of its children without
-realloc on each one?  separate implementations?  one form of the
-page object borrows its buf (from the one in the SegmentHeaderInfo).
-the other one owns its buf (so it can read a different page into it).
 
 why does promoting the only leaf from main 0 cause
 a perf loss?  it seems it would be better to promote
