@@ -545,13 +545,11 @@ pub mod varint {
 
 pub mod io {
     use std::io;
-    use std::io::Seek;
     use std::io::Read;
     use std::io::Write;
-    use std::io::SeekFrom;
     use super::endian;
 
-    pub fn write_fully(strm: &mut Write, buf: &[u8]) -> io::Result<usize> {
+    pub fn write_fully<W: Write>(strm: &mut W, buf: &[u8]) -> io::Result<usize> {
         let mut sofar = 0;
         let len = buf.len();
         loop {
@@ -568,7 +566,7 @@ pub mod io {
         Ok(sofar)
     }
 
-    pub fn read_fully(strm: &mut Read, buf: &mut [u8]) -> io::Result<usize> {
+    pub fn read_fully<R: Read>(strm: &mut R, buf: &mut [u8]) -> io::Result<usize> {
         let mut sofar = 0;
         let len = buf.len();
         loop {
@@ -585,7 +583,7 @@ pub mod io {
         Ok(sofar)
     }
 
-    pub fn read_4(strm: &mut Read) -> io::Result<[u8; 4]> {
+    pub fn read_4<R: Read>(strm: &mut R) -> io::Result<[u8; 4]> {
         let mut a = [0; 4];
         let got = try!(read_fully(strm, &mut a));
         // TODO if got == 0 this is just normal end of file
@@ -595,12 +593,12 @@ pub mod io {
         Ok(a)
     }
 
-    pub fn read_u32_le(strm: &mut Read) -> io::Result<u32> {
+    pub fn read_u32_le<R: Read>(strm: &mut R) -> io::Result<u32> {
         let ba = try!(read_4(strm));
         Ok(endian::u32_from_bytes_le(ba))
     }
 
-    pub fn read_i32_le(strm: &mut Read) -> io::Result<i32> {
+    pub fn read_i32_le<R: Read>(strm: &mut R) -> io::Result<i32> {
         let ba = try!(read_4(strm));
         Ok(endian::i32_from_bytes_le(ba))
     }

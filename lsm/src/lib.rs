@@ -1409,7 +1409,7 @@ pub mod utils {
     use super::Error;
     use super::Result;
 
-    pub fn SeekPage(strm: &mut Seek, pgsz: usize, pageNumber: PageNum) -> Result<u64> {
+    pub fn SeekPage<S: Seek>(strm: &mut S, pgsz: usize, pageNumber: PageNum) -> Result<u64> {
         if 0 == pageNumber { 
             // TODO should this panic?
             return Err(Error::InvalidPageNumber);
@@ -1509,7 +1509,7 @@ impl PageBuilder {
         Ok(())
     }
 
-    fn Write(&self, strm: &mut Write) -> io::Result<()> {
+    fn Write<W: Write>(&self, strm: &mut W) -> io::Result<()> {
         strm.write_all(&*self.buf)
     }
 
@@ -1522,7 +1522,7 @@ impl PageBuilder {
         self.cur = self.cur + 1;
     }
 
-    fn PutStream2(&mut self, s: &mut Read, len: usize) -> io::Result<usize> {
+    fn PutStream2<R: Read>(&mut self, s: &mut R, len: usize) -> io::Result<usize> {
         let n = try!(misc::io::read_fully(s, &mut self.buf[self.cur .. self.cur + len]));
         self.cur = self.cur + n;
         let res : io::Result<usize> = Ok(n);
@@ -2917,13 +2917,13 @@ struct LeafState {
 
 }
 
-fn write_overflow(
-                    ba: &mut Read, 
+fn write_overflow<R: Read>(
+                    ba: &mut R, 
                     pw: &mut PageWriter,
                     limit : usize,
                    ) -> Result<(u64, BlockList)> {
 
-    fn write_page(ba: &mut Read, pb: &mut PageBuilder, pgsz: usize, pw: &mut PageWriter, blocks: &mut BlockList, limit: usize) -> Result<(usize, bool)> {
+    fn write_page<R: Read>(ba: &mut R, pb: &mut PageBuilder, pgsz: usize, pw: &mut PageWriter, blocks: &mut BlockList, limit: usize) -> Result<(usize, bool)> {
         pb.Reset();
         pb.PutByte(PAGE_TYPE_OVERFLOW);
         let boundary = try!(pw.is_group_on_block_boundary(blocks, limit));

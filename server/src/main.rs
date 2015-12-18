@@ -186,7 +186,7 @@ fn slurp_header(ba: &[u8], i: &mut usize) -> (i32,i32,i32,i32) {
     v
 }
 
-fn read_message_bytes(stream: &mut Read) -> Result<Option<Box<[u8]>>> {
+fn read_message_bytes<R: Read>(stream: &mut R) -> Result<Option<Box<[u8]>>> {
     let mut a = [0; 4];
     let got = try!(misc::io::read_fully(stream, &mut a));
     if got == 0 {
