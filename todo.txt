@@ -1,4 +1,86 @@
 
+need to make merges more parallelizable.  two merges in
+the same level but different key range.
+
+need lock on both levels, just to get access to the
+list of pages locked.
+
+for each segment involved, we need a list of locks
+on pages.  page X in the promote segment and page Y
+in the dest.  no other merges are allowed to involve
+those pages or their descendants.  but peers are okay.
+and ancestors will get rewritten when the merge is
+committed.
+
+once we identify X and Y, we can drop the list lock
+itself.
+
+then we process the merge, which is basically a
+rewrite of Y, incorporating promoted stuff from X.
+the promotion segment only gets changed by omitting
+stuff from it.  in other words, the ancestor chain
+of X has to get rewritten.  this can happen at commit
+time.
+
+if we can have more merges going on simultaneously,
+maybe we should consider allowing merges to be bigger.
+the ancestor rewrites have to be deferred until commit
+time.  so the only thing happening in parallel is the
+work of merging keys with leaves and checking behind.
+which is still pretty substantial.
+
+when we decide whether the merge is needed, do we account
+for other merges in the same segemnt that are already
+in progress?
+
+once we find leaves to promote, walk up and identify
+a parent in the dest.  then we know the other parents
+that are safe from change.
+
+or, find stuff to promote according to a key range.
+suppose we know what parent we want our promoted leaves
+to land under.
+
+multiple merge threads?  one whose job is to always
+prioritize tombstones.  others with a different
+priority?
+
+PendingMerge would become a command to replace a given
+parent with something.  might be nothing.  might be one
+page at the same level.  might be multiple.  might not
+fit anymore.  depth might have changed in the meantime.
+
+why does promoting the only leaf from main 0 cause
+a perf loss?  it seems it would be better to promote
+it so that main 0 could be empty and would therefore
+not affect open_cursor.
+
+why does promoting the only leaf from fresh cause
+a big perf loss?  Young is kept empty.  why is
+there a problem with fresh?
+
+probably answer is that yes, these things should happen,
+but only when nothing else is happening.  don't promote
+the only leaf from main 0 if another one is about to come
+in.  1 leaf in main 0 is a needs merge state but not a
+less urgent one.  like Desperate, but NeedsMergeButNotUrgent.
+
+when promoting into a main level that is empty,
+just move without rewrite?
+
+parent node writer gets in trouble, overflows its stack,
+when it has to deal with lots of pages that only hold one
+key.  problem is that if only one key fits in the leaf,
+then only one key fits in its parent, so the generation
+of parent nodes is the same size, so depth increases
+forever.  maybe we need to overflow keys unless two of
+them can fit in a parent page.  or maybe a parent page
+needs the ability to overflow a key even if the leaf
+did not, just to ensure that at least two keys fit in
+every parent.
+
+reuse key overflows.
+
 can varint::read be made faster using transmute for
 some of the cases?
 
@@ -28,40 +110,12 @@ also zeros all the bytes.  now we're going to immediately
 overwrite it by reading from the file.  how do we do this
 efficiently, without zeroing the bytes?
 
-need to make merges more parallelizable.  two merges in
-the same level but different key range.
-
-once we find leaves to promote, walk up and identify
-a parent in the dest.  then we know the other parents
-that are safe from change.
-
-or, find stuff to promote according to a key range.
-suppose we know what parent we want our promoted leaves
-to land under.
-
-multiple merge threads?  one whose job is to always
-prioritize tombstones.  others with a different
-priority?
-
 so yeah, it would seem that the blocklist stored for
 the leaf children of a depth 1 parent is only used at
 startup to identify all the pages in use.  is that
 right?  if so, how feasible would it be to remove these
 and calculate them?  any way to do this in a background
 thread?
-
-reuse key overflows.
-
-parent node writer gets in trouble, overflows its stack,
-when it has to deal with lots of pages that only hold one
-key.  problem is that if only one key fits in the leaf,
-then only one key fits in its parent, so the generation
-of parent nodes is the same size, so depth increases
-forever.  maybe we need to overflow keys unless two of
-them can fit in a parent page.  or maybe a parent page
-needs the ability to overflow a key even if the leaf
-did not, just to ensure that at least two keys fit in
-every parent.
 
 too many open/close of the file for PageWriter as well.
 
@@ -71,18 +125,6 @@ note that switching varint::read to use a Read trait did
 seem to cause a perf loss.
 
 vec capacities
-
-why does promoting the only leaf from main 0 cause
-a perf loss?  it seems it would be better to promote
-it so that main 0 could be empty and would therefore
-not affect open_cursor.
-
-why does promoting the only leaf from fresh cause
-a big perf loss?  Young is kept empty.  why is
-there a problem with fresh?
-
-when promoting into a main level that is empty,
-just move without rewrite?
 
 we can get rid of blocklist_unsorted_no_overflows
 
