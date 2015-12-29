@@ -3130,7 +3130,8 @@ fn process_pair_into_leaf(st: &mut LeafState,
             // rather than calculate the actual hard limit, we provide an arbitrary
             // fraction of the page which would still be pathological.
             let hard_limit = pgsz / 4;
-            let (len, blocks) = try!(write_overflow(&mut &*k, pw, hard_limit));
+            let mut r = misc::ByteSliceRead::new(&k);
+            let (len, blocks) = try!(write_overflow(&mut r, pw, hard_limit));
             assert!((len as usize) == k.len());
             KeyLocation::Overflowed(blocks)
         }
@@ -3224,7 +3225,9 @@ fn process_pair_into_leaf(st: &mut LeafState,
                 if a.len() < maxValueInline {
                     ValueLocation::Buffer(a)
                 } else {
-                    let (len, blocks) = try!(write_overflow(&mut &*a, pw, hard_limit_for_value_overflow));
+                    let mut r = misc::ByteSliceRead::new(&a);
+                    let (len, blocks) = try!(write_overflow(&mut r, pw, hard_limit_for_value_overflow));
+                    assert!(len as usize == a.len());
                     ValueLocation::Overflowed(len, blocks)
                 }
             },
