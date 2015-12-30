@@ -3096,6 +3096,24 @@ fn process_pair_into_leaf(st: &mut LeafState,
         // in pathological cases, whereas a really short value could be smaller.
         // nevermind that.
 
+        // TODO maybe the max value inline should be configured low enough to
+        // ensure that two keys with no prefix can fit in a parent page.  but
+        // this is tricky, as the extra child info stuff per item in a parent
+        // page can be hard to predict.
+
+        // alternatively, we could set the max value inline to ensure that
+        // enough room is left in a parent page to store an overflowed item,
+        // but that has some of the same issues, and it also introduces the
+        // possibility that a key might be inline in the leaf but overflowed
+        // in the parent.
+
+        // also, we could look at the previous key.  the only screw case is
+        // when we get 2 or more keys in a row which can't fit in a parent
+        // page, so we end up with one parent per leaf, which means the
+        // depth of the btree grows forever.  so we could look for this case
+        // specifically, and when we see two long keys in a row, overflow the
+        // second one.
+
         // TODO the following code still needs tuning
 
         // TODO the following code is even more pessimistic now that we do
@@ -3146,24 +3164,6 @@ fn process_pair_into_leaf(st: &mut LeafState,
     const LEAF_PAGE_OVERHEAD: usize = 2 + 2;
 
     let vloc = {
-        // TODO maybe the max value inline should be configured low enough to
-        // ensure that two keys with no prefix can fit in a parent page.  but
-        // this is tricky, as the extra child info stuff per item in a parent
-        // page can be hard to predict.
-
-        // alternatively, we could set the max value inline to ensure that
-        // enough room is left in a parent page to store an overflowed item,
-        // but that has some of the same issues, and it also introduces the
-        // possibility that a key might be inline in the leaf but overflowed
-        // in the parent.
-
-        // also, we could look at the previous key.  the only screw case is
-        // when we get 2 or more keys in a row which can't fit in a parent
-        // page, so we end up with one parent per leaf, which means the
-        // depth of the btree grows forever.  so we could look for this case
-        // specifically, and when we see two long keys in a row, overflow the
-        // second one.
-
         let maxValueInline = {
             // TODO use calc_leaf_page_len
             let fixed_costs_on_new_page =
@@ -4241,10 +4241,10 @@ impl ParentNodeWriter {
         // to fit this child into this parent page, we need room for
         // the root page
         // the block list (if child is a leaf) or the page count
-        // key len, varint, shifted for overflow flag
+        // key len, varint, shifted for overflow flags
         // key
         //     if inline, the key, minus prefix
-        //     if overflow, the blocklist (borrowed from child)
+        //     if overflow, the blocklist (borrowed from child, or not)
 
         // the key is stored just as it was in the child, inline or overflow.
         // if it is overflowed, we just store the same blocklist reference.
