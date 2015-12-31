@@ -4263,40 +4263,24 @@ impl ParentNodeWriter {
         // calculating whether the second one will fit, we have to overflow
         // it to make sure that the parent has two items.
 
+        let would_be_prefix_len = self.calc_prefix_len(&child);
+        let would_be_sofar_before_this_key = 
+            if would_be_prefix_len != self.st.prefixLen {
+                assert!(self.st.prefixLen == 0 || would_be_prefix_len < self.st.prefixLen);
+                // the prefixLen would change with the addition of this key,
+                // so we need to recalc sofar
+                let sum = self.st.items.iter().map(|lp| lp.need(would_be_prefix_len, self.my_depth) ).sum();;
+                sum
+            } else {
+                self.st.sofar
+            };
         let fits = {
-            let would_be_prefix_len = self.calc_prefix_len(&child);
-            let would_be_sofar = 
-                if would_be_prefix_len != self.st.prefixLen {
-                    assert!(self.st.prefixLen == 0 || would_be_prefix_len < self.st.prefixLen);
-                    // the prefixLen would change with the addition of this key,
-                    // so we need to recalc sofar
-                    let sum = self.st.items.iter().map(|lp| lp.need(would_be_prefix_len, self.my_depth) ).sum();;
-                    sum
-                } else {
-                    self.st.sofar
-                };
-            let would_be_len_page = Self::calc_page_len(would_be_prefix_len, would_be_sofar);
-            if pgsz > would_be_len_page {
-                let available = pgsz - would_be_len_page;
-                let fits = available >= child.need(would_be_prefix_len, self.my_depth);
-                if !fits && self.st.items.len() == 0 {
-                    println!("would_be_len_page: {}", would_be_len_page);
-                    println!("would_be_so_far: {}", would_be_sofar);
-                    println!("child: {:?}", child);
-                    println!("child need: {}",child.need(would_be_prefix_len, self.my_depth));
-                    //println!("child blocklist blocks: {}", child.blocks.len());
-                    //println!("child blocklist pages: {}", child.blocks.count_pages());
-                    //println!("child blocklist encoded_len: {}", child.blocks.encoded_len());
-                    panic!();
-                }
+            let would_be_len_page_before_this_key = Self::calc_page_len(would_be_prefix_len, would_be_sofar_before_this_key);
+            if pgsz > would_be_len_page_before_this_key {
+                let avalable_for_this_key = pgsz - would_be_len_page_before_this_key;
+                let fits = avalable_for_this_key >= child.need(would_be_prefix_len, self.my_depth);
                 fits
             } else {
-                if self.st.items.len() == 0 {
-                    println!("would_be_len_page: {}", would_be_len_page);
-                    println!("would_be_so_far: {}", would_be_sofar);
-                    println!("child: {:?}", child);
-                    panic!();
-                }
                 false
             }
         };
@@ -4311,26 +4295,16 @@ impl ParentNodeWriter {
             self.count_emit += 1;
             assert!(should_be == count_bytes);
             try!(self.emit(pw, pg));
+            assert!(self.st.sofar == 0);
+            assert!(self.st.prefixLen == 0);
             assert!(self.st.items.is_empty());
+            self.st.prefixLen = child.last_key.key.len();
+            self.st.sofar = child.need(self.st.prefixLen, self.my_depth);
+        } else {
+            self.st.prefixLen = would_be_prefix_len;
+            self.st.sofar = would_be_sofar_before_this_key + child.need(self.st.prefixLen, self.my_depth);
         }
 
-        // TODO change this code to be more like the leaf version, only calc the
-        // prefix len once.  it shows up in the profiler high.
-
-        // see if the prefix len actually did change
-        let new_prefix_len = self.calc_prefix_len(&child);
-        let sofar = 
-            if new_prefix_len != self.st.prefixLen {
-                assert!(self.st.prefixLen == 0 || new_prefix_len < self.st.prefixLen);
-                // the prefixLen changed with the addition of this item,
-                // so we need to recalc sofar
-                let sum = self.st.items.iter().map(|lp| lp.need(new_prefix_len, self.my_depth) ).sum();;
-                sum
-            } else {
-                self.st.sofar
-            };
-        self.st.sofar = sofar + child.need(new_prefix_len, self.my_depth);
-        self.st.prefixLen = new_prefix_len;
         self.st.items.push(child);
 
         Ok(())
