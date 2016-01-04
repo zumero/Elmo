@@ -2768,23 +2768,20 @@ impl ChildInfo {
     }
 }
 
+// this type is used during construction of a page
 #[derive(Debug, Clone)]
-// this struct is used to remember pages we have written, and to
-// provide info needed to write parent nodes.
-// TODO rename, revisit pub, etc
-// TODO ChildItem?
-pub struct pgitem {
+pub struct ItemForParent {
     pub page: PageNum,
     info: ChildInfo,
 
-    last_key: KeyWithLocation,
+    last_key: KeyWithLocationForParent,
 }
 
-impl pgitem {
+impl ItemForParent {
     #[cfg(remove_me)]
-    fn new(page: PageNum, blocks: BlockList, last_key: KeyWithLocation) -> pgitem {
+    fn new(page: PageNum, blocks: BlockList, last_key: KeyWithLocation) -> ItemForParent {
         assert!(!blocks.contains_page(page));
-        pgitem {
+        ItemForParent {
             page: page,
             blocks: blocks,
             last_key: last_key,
@@ -2802,19 +2799,25 @@ impl pgitem {
 
 }
 
-struct ParentState {
-    prefixLen: usize,
+struct ParentUnderConstruction {
+    prefix_len: usize,
     sofar: usize,
-    items: Vec<pgitem>,
+    items: Vec<ItemForParent>,
 }
 
-// this enum keeps track of what happened to a key as we
-// processed it.  either we determined that it will fit
-// inline or we wrote it as an overflow.
+// this type is used during construction of a page
 #[derive(Debug, Clone)]
-enum KeyLocation {
+enum KeyLocationForLeaf {
     Inline,
     Overflowed(BlockList),
+}
+
+// this type is used during construction of a page
+#[derive(Debug, Clone)]
+enum KeyLocationForParent {
+    Inline,
+    Overflowed(BlockList),
+    // TODO borrowed vs owned overflow
 }
 
 impl ValueLocation {
@@ -2835,18 +2838,45 @@ impl ValueLocation {
 
 }
 
-impl KeyLocation {
-    fn need(&self, k: &[u8], prefixLen: usize) -> usize {
+impl KeyLocationForLeaf {
+    fn need(&self, k: &[u8], prefix_len: usize) -> usize {
         let klen = k.len();
-        assert!(klen >= prefixLen);
+        assert!(klen >= prefix_len);
         match *self {
-            KeyLocation::Inline => {
+            KeyLocationForLeaf::Inline => {
                 0 // no key flags
                 + varint::space_needed_for((klen * 2) as u64) 
                 + klen 
-                - prefixLen
+                - prefix_len
             },
-            KeyLocation::Overflowed(ref blocks) => {
+            KeyLocationForLeaf::Overflowed(ref blocks) => {
+                0 // no key flags
+                + varint::space_needed_for((klen * 2 + 1) as u64) 
+                + blocks.encoded_len()
+            },
+        }
+    }
+
+    fn for_parent(self) -> KeyLocationForParent {
+        match self {
+            KeyLocationForLeaf::Inline => KeyLocationForParent::Inline,
+            KeyLocationForLeaf::Overflowed(blocks) => KeyLocationForParent::Overflowed(blocks),
+        }
+    }
+}
+
+impl KeyLocationForParent {
+    fn need(&self, k: &[u8], prefix_len: usize) -> usize {
+        let klen = k.len();
+        assert!(klen >= prefix_len);
+        match *self {
+            KeyLocationForParent::Inline => {
+                0 // no key flags
+                + varint::space_needed_for((klen * 2) as u64) 
+                + klen 
+                - prefix_len
+            },
+            KeyLocationForParent::Overflowed(ref blocks) => {
                 0 // no key flags
                 + varint::space_needed_for((klen * 2 + 1) as u64) 
                 + blocks.encoded_len()
@@ -2855,7 +2885,37 @@ impl KeyLocation {
     }
 }
 
-impl KeyWithLocation {
+impl KeyWithLocationForLeaf {
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    fn for_parent(self) -> KeyWithLocationForParent {
+        KeyWithLocationForParent {
+            key: self.key,
+            location: self.location.for_parent(),
+        }
+    }
+
+    fn len_with_overflow_flag(&self) -> u64 {
+        // inline key len is stored * 2, always an even number
+        // overflowed key len is stored * 2 + 1, always odd
+        match self.location {
+            KeyLocationForLeaf::Inline => {
+                (self.key.len() * 2) as u64
+            },
+            KeyLocationForLeaf::Overflowed(_) => {
+                (self.key.len() * 2 + 1) as u64
+            },
+        }
+    }
+
+    fn need(&self, prefix_len: usize) -> usize {
+        self.location.need(&self.key, prefix_len)
+    }
+}
+
+impl KeyWithLocationForParent {
     pub fn key(&self) -> &[u8] {
         &self.key
     }
@@ -2864,10 +2924,10 @@ impl KeyWithLocation {
         // inline key len is stored * 2, always an even number
         // overflowed key len is stored * 2 + 1, always odd
         match self.location {
-            KeyLocation::Inline => {
+            KeyLocationForParent::Inline => {
                 (self.key.len() * 2) as u64
             },
-            KeyLocation::Overflowed(_) => {
+            KeyLocationForParent::Overflowed(_) => {
                 (self.key.len() * 2 + 1) as u64
             },
         }
@@ -2879,9 +2939,15 @@ impl KeyWithLocation {
 }
 
 #[derive(Debug, Clone)]
-pub struct KeyWithLocation {
+pub struct KeyWithLocationForLeaf {
     key: Box<[u8]>,
-    location: KeyLocation,
+    location: KeyLocationForLeaf,
+}
+
+#[derive(Debug, Clone)]
+pub struct KeyWithLocationForParent {
+    key: Box<[u8]>,
+    location: KeyLocationForParent,
 }
 
 // this enum keeps track of what happened to a value as we
@@ -2896,23 +2962,24 @@ enum ValueLocation {
     Overflowed(u64, BlockList),
 }
 
-struct LeafPair {
-    key: KeyWithLocation,
+// this type is used during construction of a page
+struct ItemForLeaf {
+    key: KeyWithLocationForLeaf,
     value: ValueLocation,
 }
 
-impl LeafPair {
+impl ItemForLeaf {
     fn need(&self, prefix_len: usize) -> usize {
         self.key.need(prefix_len) + self.value.need()
     }
 }
 
-struct LeafState {
-    sofarLeaf: usize,
-    keys_in_this_leaf: Vec<LeafPair>,
-    prefixLen: usize,
+struct LeafUnderConstruction {
+    sofar: usize,
+    items: Vec<ItemForLeaf>,
+    prefix_len: usize,
     // TODO why do we need prev_key here?  can't we just look at the
-    // last entry of keys_in_this_leaf ?
+    // last entry of items ?
     prev_key: Option<Box<[u8]>>,
 
 }
@@ -2974,26 +3041,26 @@ fn calc_leaf_page_len(prefix_len: usize, sofar: usize) -> usize {
 }
 
 // TODO return tuple is too big
-fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (KeyWithLocation, BlockList, usize, usize, u64) {
+fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> (KeyWithLocationForLeaf, BlockList, usize, usize, u64) {
     pb.Reset();
     pb.PutByte(PageType::LEAF_NODE.to_u8());
     pb.PutByte(0u8); // flags
-    pb.PutVarint(st.prefixLen as u64);
-    if st.prefixLen > 0 {
-        pb.PutArray(&st.keys_in_this_leaf[0].key.key[0 .. st.prefixLen]);
+    pb.PutVarint(st.prefix_len as u64);
+    if st.prefix_len > 0 {
+        pb.PutArray(&st.items[0].key.key[0 .. st.prefix_len]);
     }
-    let count_keys_in_this_leaf = st.keys_in_this_leaf.len();
+    let count_keys_in_this_leaf = st.items.len();
     // TODO should we support more than 64k keys in a leaf?
     // either way, overflow-check this cast.
     pb.PutInt16(count_keys_in_this_leaf as u16);
 
-    fn f(pb: &mut PageBuilder, prefixLen: usize, lp: &LeafPair, list: &mut BlockList, count_tombstones: &mut u64) {
+    fn f(pb: &mut PageBuilder, prefix_len: usize, lp: &ItemForLeaf, list: &mut BlockList, count_tombstones: &mut u64) {
         match lp.key.location {
-            KeyLocation::Inline => {
+            KeyLocationForLeaf::Inline => {
                 pb.PutVarint(lp.key.len_with_overflow_flag());
-                pb.PutArray(&lp.key.key[prefixLen .. ]);
+                pb.PutArray(&lp.key.key[prefix_len .. ]);
             },
-            KeyLocation::Overflowed(ref blocks) => {
+            KeyLocationForLeaf::Overflowed(ref blocks) => {
                 pb.PutVarint(lp.key.len_with_overflow_flag());
                 blocks.encode(pb);
                 list.add_blocklist_no_reorder(blocks);
@@ -3022,34 +3089,35 @@ fn build_leaf(st: &mut LeafState, pb: &mut PageBuilder) -> (KeyWithLocation, Blo
     let mut count_tombstones = 0;
 
     // deal with all the keys except the last one
-    for lp in st.keys_in_this_leaf.drain(0 .. count_keys_in_this_leaf - 1) {
-        f(pb, st.prefixLen, &lp, &mut blocks, &mut count_tombstones);
+    for lp in st.items.drain(0 .. count_keys_in_this_leaf - 1) {
+        f(pb, st.prefix_len, &lp, &mut blocks, &mut count_tombstones);
     }
 
     // now the last key
-    assert!(st.keys_in_this_leaf.len() == 1);
+    assert!(st.items.len() == 1);
     let last_key = {
-        let lp = st.keys_in_this_leaf.remove(0); 
-        assert!(st.keys_in_this_leaf.is_empty());
-        f(pb, st.prefixLen, &lp, &mut blocks, &mut count_tombstones);
+        let lp = st.items.remove(0); 
+        assert!(st.items.is_empty());
+        f(pb, st.prefix_len, &lp, &mut blocks, &mut count_tombstones);
         lp.key
     };
     blocks.sort_and_consolidate();
     (last_key, blocks, pb.sofar(), count_keys_in_this_leaf, count_tombstones)
 }
 
-fn write_leaf(st: &mut LeafState, 
+fn write_leaf(st: &mut LeafUnderConstruction, 
                 pb: &mut PageBuilder, 
                 pw: &mut PageWriter,
-               ) -> Result<(usize, pgitem)> {
+               ) -> Result<(usize, ItemForParent)> {
     let (last_key, blocks, len_page, count_pairs, count_tombstones) = build_leaf(st, pb);
+    let last_key = last_key.for_parent();
     //println!("leaf blocklist: {:?}", blocks);
     //println!("leaf blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
-    assert!(st.keys_in_this_leaf.is_empty());
+    assert!(st.items.is_empty());
     try!(pb.write_page(pw));
     assert!(!blocks.contains_page(pb.last_page_written));
-    // TODO pgitem::new
-    let pg = pgitem {
+    // TODO ItemForParent::new
+    let pg = ItemForParent {
         page: pb.last_page_written, 
         info: ChildInfo::Leaf{
             blocks_overflows: blocks, 
@@ -3057,17 +3125,17 @@ fn write_leaf(st: &mut LeafState,
         },
         last_key: last_key
     };
-    st.sofarLeaf = 0;
-    st.prefixLen = 0;
+    st.sofar = 0;
+    st.prefix_len = 0;
     Ok((len_page, pg))
 }
 
-fn process_pair_into_leaf(st: &mut LeafState, 
+fn process_pair_into_leaf(st: &mut LeafUnderConstruction, 
                 pb: &mut PageBuilder, 
                 pw: &mut PageWriter,
                 vbuf: &mut [u8],
                 mut pair: kvp,
-               ) -> Result<Option<pgitem>> {
+               ) -> Result<Option<ItemForParent>> {
     let pgsz = pw.page_size();
     let k = pair.Key;
 
@@ -3132,14 +3200,14 @@ fn process_pair_into_leaf(st: &mut LeafState,
             pgsz 
             - 2 // page type and flags
             - 2 // count keys
-            - 1 // prefixLen of 0
+            - 1 // prefix_len of 0
             - varint::space_needed_for((pgsz * 2) as u64) // approx worst case inline key len
             - 1 // value flags
             - 9 // worst case varint value len
             - PESSIMISTIC_OVERFLOW_INFO_SIZE; // overflowed value page
 
         if k.len() <= maxKeyInline {
-            KeyLocation::Inline
+            KeyLocationForLeaf::Inline
         } else {
             // for an overflowed key, there is probably no practical hard limit on the size
             // of the encoded block list.  we want things to be as contiguous as
@@ -3151,7 +3219,7 @@ fn process_pair_into_leaf(st: &mut LeafState,
             let mut r = misc::ByteSliceRead::new(&k);
             let (len, blocks) = try!(write_overflow(&mut r, pw, hard_limit));
             assert!((len as usize) == k.len());
-            KeyLocation::Overflowed(blocks)
+            KeyLocationForLeaf::Overflowed(blocks)
         }
     };
 
@@ -3239,35 +3307,35 @@ fn process_pair_into_leaf(st: &mut LeafState,
     // or not.  note that it is possible to overflow these and then have them not
     // fit into the current leaf and end up landing in the next leaf.
 
-    fn calc_prefix_len(st: &LeafState, k: &[u8], kloc: &KeyLocation) -> usize {
-        if st.keys_in_this_leaf.is_empty() {
+    fn calc_prefix_len(st: &LeafUnderConstruction, k: &[u8], kloc: &KeyLocationForLeaf) -> usize {
+        if st.items.is_empty() {
             0
         } else {
             match kloc {
-                &KeyLocation::Inline => {
+                &KeyLocationForLeaf::Inline => {
                     let max_prefix =
-                        if st.prefixLen > 0 {
-                            st.prefixLen
+                        if st.prefix_len > 0 {
+                            st.prefix_len
                         } else {
                             k.len()
                         };
-                    bcmp::PrefixMatch(&*st.keys_in_this_leaf[0].key.key, &k, max_prefix)
+                    bcmp::PrefixMatch(&*st.items[0].key.key, &k, max_prefix)
                 },
-                &KeyLocation::Overflowed(_) => {
+                &KeyLocationForLeaf::Overflowed(_) => {
                     // an overflowed key does not change the prefix
-                    st.prefixLen
+                    st.prefix_len
                 },
             }
         }
     }
 
-    // note that the LeafPair struct gets ownership of the key provided
+    // note that the ItemForLeaf struct gets ownership of the key provided
     // from above.
-    let kwloc = KeyWithLocation {
+    let kwloc = KeyWithLocationForLeaf {
         key: k,
         location: kloc,
     };
-    let lp = LeafPair {
+    let lp = ItemForLeaf {
                 key: kwloc,
                 value: vloc,
                 };
@@ -3275,14 +3343,14 @@ fn process_pair_into_leaf(st: &mut LeafState,
     let would_be_prefix_len = calc_prefix_len(&st, &lp.key.key, &lp.key.location);
     assert!(would_be_prefix_len <= lp.key.key.len());
     let would_be_sofar_before_this_pair = 
-        if would_be_prefix_len != st.prefixLen {
-            assert!(st.prefixLen == 0 || would_be_prefix_len < st.prefixLen);
-            // the prefixLen would change with the addition of this key,
+        if would_be_prefix_len != st.prefix_len {
+            assert!(st.prefix_len == 0 || would_be_prefix_len < st.prefix_len);
+            // the prefix_len would change with the addition of this key,
             // so we need to recalc sofar
-            let sum = st.keys_in_this_leaf.iter().map(|lp| lp.need(would_be_prefix_len) ).sum();;
+            let sum = st.items.iter().map(|lp| lp.need(would_be_prefix_len) ).sum();;
             sum
         } else {
-            st.sofarLeaf
+            st.sofar
         };
     let fits = {
         let would_be_len_page_before_this_pair = calc_leaf_page_len(would_be_prefix_len, would_be_sofar_before_this_pair);
@@ -3296,34 +3364,34 @@ fn process_pair_into_leaf(st: &mut LeafState,
     };
     let wrote =
         if !fits {
-            assert!(st.keys_in_this_leaf.len() > 0);
-            let should_be = calc_leaf_page_len(st.prefixLen, st.sofarLeaf);
+            assert!(st.items.len() > 0);
+            let should_be = calc_leaf_page_len(st.prefix_len, st.sofar);
             let (len_page, pg) = try!(write_leaf(st, pb, pw));
             //println!("should_be = {}   len_page = {}", should_be, len_page);
             assert!(should_be == len_page);
-            assert!(st.sofarLeaf == 0);
-            assert!(st.prefixLen == 0);
-            assert!(st.keys_in_this_leaf.is_empty());
-            st.sofarLeaf = lp.need(st.prefixLen);
+            assert!(st.sofar == 0);
+            assert!(st.prefix_len == 0);
+            assert!(st.items.is_empty());
+            st.sofar = lp.need(st.prefix_len);
             Some(pg)
         } else {
-            st.prefixLen = would_be_prefix_len;
-            st.sofarLeaf = would_be_sofar_before_this_pair + lp.need(st.prefixLen);
+            st.prefix_len = would_be_prefix_len;
+            st.sofar = would_be_sofar_before_this_pair + lp.need(st.prefix_len);
             None
         };
 
-    st.keys_in_this_leaf.push(lp);
+    st.items.push(lp);
 
     Ok(wrote)
 }
 
-fn flush_leaf(st: &mut LeafState, 
+fn flush_leaf(st: &mut LeafUnderConstruction, 
                 pb: &mut PageBuilder, 
                 pw: &mut PageWriter,
-               ) -> Result<Option<pgitem>> {
-    if !st.keys_in_this_leaf.is_empty() {
-        assert!(st.keys_in_this_leaf.len() > 0);
-        let should_be = calc_leaf_page_len(st.prefixLen, st.sofarLeaf);
+               ) -> Result<Option<ItemForParent>> {
+    if !st.items.is_empty() {
+        assert!(st.items.len() > 0);
+        let should_be = calc_leaf_page_len(st.prefix_len, st.sofar);
         let (len_page, pg) = try!(write_leaf(st, pb, pw));
         //println!("should_be = {}   len_page = {}", should_be, len_page);
         assert!(should_be == len_page);
@@ -3335,7 +3403,7 @@ fn flush_leaf(st: &mut LeafState,
 
 fn write_leaves<I: Iterator<Item=Result<kvp>>, >(
                     pw: &mut PageWriter,
-                    mut pairs: I,
+                    pairs: I,
                     f: std::sync::Arc<PageCache>,
                     ) -> Result<Option<SegmentHeaderInfo>> {
 
@@ -3347,10 +3415,10 @@ fn write_leaves<I: Iterator<Item=Result<kvp>>, >(
     // than overflow.
     let mut vbuf = vec![0; pw.page_size()].into_boxed_slice(); 
 
-    let mut st = LeafState {
-        sofarLeaf: 0,
-        keys_in_this_leaf: Vec::new(),
-        prefixLen: 0,
+    let mut st = LeafUnderConstruction {
+        sofar: 0,
+        items: Vec::new(),
+        prefix_len: 0,
         prev_key: None,
     };
 
@@ -3420,7 +3488,7 @@ struct WroteSurvivors {
 
 fn merge_process_pair(
     pair: kvp,
-    st: &mut LeafState,
+    st: &mut LeafUnderConstruction,
     pb: &mut PageBuilder,
     pw: &mut PageWriter,
     vbuf: &mut [u8],
@@ -3486,7 +3554,7 @@ fn merge_process_pair(
 
 // TODO return tuple too large
 fn merge_rewrite_leaf(
-                    st: &mut LeafState,
+                    st: &mut LeafUnderConstruction,
                     pb: &mut PageBuilder,
                     pw: &mut PageWriter,
                     vbuf: &mut [u8],
@@ -3501,7 +3569,7 @@ fn merge_rewrite_leaf(
     #[derive(Debug)]
     enum Action {
         Pairs,
-        LeafPair,
+        ItemForLeaf,
     }
 
     let mut i = 0;
@@ -3547,12 +3615,12 @@ fn merge_rewrite_leaf(
                             Action::Pairs
                         },
                         Ordering::Less => {
-                            Action::LeafPair
+                            Action::ItemForLeaf
                         },
                     }
                 },
                 None => {
-                    Action::LeafPair
+                    Action::ItemForLeaf
                 },
             };
         //println!("dest,{:?},action,{:?}", dest_level, action);
@@ -3565,7 +3633,7 @@ fn merge_rewrite_leaf(
                     tombstones_removed += 1;
                 }
             },
-            Action::LeafPair => {
+            Action::ItemForLeaf => {
                 let pair = try!(leafreader.kvp_for_merge(i));
                 // TODO it is interesting to note that (in not-very-thorough testing), if we
                 // put a tombstone check here, it never skips a tombstone.
@@ -3583,7 +3651,7 @@ fn merge_rewrite_leaf(
 
 // TODO return tuple too large
 fn merge_rewrite_parent(
-                    st: &mut LeafState,
+                    st: &mut LeafUnderConstruction,
                     pb: &mut PageBuilder,
                     pw: &mut PageWriter,
                     vbuf: &mut [u8],
@@ -3675,7 +3743,7 @@ fn merge_rewrite_parent(
                     try!(chain.add_child(pw, pg, 0));
                 }
                 for _ in 0 .. n {
-                    let pg = try!(parent.child_pgitem(i));
+                    let pg = try!(parent.child_as_item_for_parent(i));
                     try!(chain.add_child(pw, pg, parent.depth() - 1));
                     nodes_recycled[parent.depth() as usize - 1] += 1;
                     i += 1;
@@ -3685,7 +3753,7 @@ fn merge_rewrite_parent(
                 //println!("rewriting node of depth {}", parent.depth() - 1);
                 nodes_rewritten[parent.depth() as usize - 1].push(parent.child_pagenum(i));
                 if parent.depth() == 1 {
-                    let pg = try!(parent.child_pgitem(i));
+                    let pg = try!(parent.child_as_item_for_parent(i));
                     try!(leaf.move_to_page(pg.page));
                     let (sub_keys_promoted, sub_keys_rewritten, sub_keys_shadowed, sub_tombstones_removed) = try!(merge_rewrite_leaf(st, pb, pw, vbuf, pairs, leaf, behind, chain, overflows_freed, dest_level));
 
@@ -3727,7 +3795,7 @@ fn write_merge(
 
     let t1 = time::PreciseTime::now();
 
-    // TODO could/should pb and vbuf move into LeafState?
+    // TODO could/should pb and vbuf move into LeafUnderConstruction?
 
     // TODO this is a buffer just for the purpose of being reused
     // in cases where the blob is provided as a stream, and we need
@@ -3735,10 +3803,10 @@ fn write_merge(
     // than overflow.
     let mut vbuf = vec![0; pw.page_size()].into_boxed_slice(); 
     let mut pb = PageBuilder::new(pw.page_size());
-    let mut st = LeafState {
-        sofarLeaf: 0,
-        keys_in_this_leaf: Vec::new(),
-        prefixLen: 0,
+    let mut st = LeafUnderConstruction {
+        sofar: 0,
+        items: Vec::new(),
+        prefix_len: 0,
         prev_key: None,
     };
     let mut chain = ParentNodeWriter::new(pw.page_size(), 1);
@@ -3747,7 +3815,7 @@ fn write_merge(
             MergingInto::None => {
                 0
             },
-            MergingInto::Leaf(ref leaf) => {
+            MergingInto::Leaf(_) => {
                 1
             },
             MergingInto::Parent(ref parent) => {
@@ -3919,7 +3987,7 @@ fn survivors_rewrite_immediate_parent_of_skip(
         if i >= first_skip && i <= last_skip {
             // skip
         } else {
-            let pg = try!(parent.child_pgitem(i));
+            let pg = try!(parent.child_as_item_for_parent(i));
             try!(chain.add_child(pw, pg, parent.depth() - 1));
             nodes_recycled += 1;
         }
@@ -3953,7 +4021,7 @@ fn survivors_rewrite_ancestor(
             let sub = try!(parent.fetch_item_parent(i));
             try!(survivors_rewrite_node(pw, skip_pages, skip_depth, skip_lineage, &sub, chain, nodes_rewritten, nodes_recycled,));
         } else {
-            let pg = try!(parent.child_pgitem(i));
+            let pg = try!(parent.child_as_item_for_parent(i));
             try!(chain.add_child(pw, pg, parent.depth() - 1));
             nodes_recycled[parent.depth() as usize - 1] += 1;
         }
@@ -4042,11 +4110,11 @@ fn write_survivors(
 
 struct ParentNodeWriter {
     pb: PageBuilder,
-    st: ParentState,
-    prev_child: Option<pgitem>,
+    st: ParentUnderConstruction,
+    prev_child: Option<ItemForParent>,
     my_depth: u8,
 
-    result_one: Option<pgitem>,
+    result_one: Option<ItemForParent>,
     results_chain: Option<Box<ParentNodeWriter>>,
 
     count_emit: usize,
@@ -4057,8 +4125,8 @@ impl ParentNodeWriter {
         pgsz: usize, 
         my_depth: u8,
         ) -> Self {
-        let st = ParentState {
-            prefixLen: 0,
+        let st = ParentUnderConstruction {
+            prefix_len: 0,
             sofar: 0,
             items: vec![],
         };
@@ -4083,18 +4151,18 @@ impl ParentNodeWriter {
         + sofar // sum of size of all the actual items
     }
 
-    fn put_key(&mut self, k: &KeyWithLocation, prefix_len: usize) {
+    fn put_key(&mut self, k: &KeyWithLocationForParent, prefix_len: usize) {
         match k.location {
-            KeyLocation::Inline => {
+            KeyLocationForParent::Inline => {
                 self.pb.PutArray(&k.key[prefix_len .. ]);
             },
-            KeyLocation::Overflowed(ref blocks) => {
+            KeyLocationForParent::Overflowed(ref blocks) => {
                 blocks.encode(&mut self.pb);
             },
         }
     }
 
-    fn put_item(&mut self, total_count_leaves: &mut PageCount, total_count_tombstones: &mut u64, item: &pgitem, prefix_len: usize) {
+    fn put_item(&mut self, total_count_leaves: &mut PageCount, total_count_tombstones: &mut u64, item: &ItemForParent, prefix_len: usize) {
         self.pb.PutVarint(item.page as u64);
         match &item.info {
             &ChildInfo::Leaf{
@@ -4128,17 +4196,17 @@ impl ParentNodeWriter {
     }
 
     fn build_parent_page(&mut self,
-                      ) -> (KeyWithLocation, PageCount, u64, usize, usize) {
+                      ) -> (KeyWithLocationForParent, PageCount, u64, usize, usize) {
         // TODO? assert!(st.items.len() > 1);
-        //println!("build_parent_page, prefixLen: {:?}", st.prefixLen);
+        //println!("build_parent_page, prefix_len: {:?}", st.prefix_len);
         //println!("build_parent_page, items: {:?}", st.items);
         self.pb.Reset();
         self.pb.PutByte(PageType::PARENT_NODE.to_u8());
         self.pb.PutByte(0u8);
         self.pb.PutByte(self.my_depth);
-        self.pb.PutVarint(self.st.prefixLen as u64);
-        if self.st.prefixLen > 0 {
-            self.pb.PutArray(&self.st.items[0].last_key.key[0 .. self.st.prefixLen]);
+        self.pb.PutVarint(self.st.prefix_len as u64);
+        if self.st.prefix_len > 0 {
+            self.pb.PutArray(&self.st.items[0].last_key.key[0 .. self.st.prefix_len]);
         }
         let count_items = self.st.items.len();
         self.pb.PutInt16(count_items as u16);
@@ -4150,7 +4218,7 @@ impl ParentNodeWriter {
         // deal with all the items except the last one
         let tmp_count = self.st.items.len() - 1;
         let tmp_vec = self.st.items.drain(0 .. tmp_count).collect::<Vec<_>>();
-        let prefix_len = self.st.prefixLen;
+        let prefix_len = self.st.prefix_len;
         for item in tmp_vec {
             self.put_item(&mut count_leaves, &mut count_tombstones, &item, prefix_len);
         }
@@ -4160,7 +4228,7 @@ impl ParentNodeWriter {
         // now the last item
         let last_key = {
             let item = self.st.items.remove(0); 
-            let prefix_len = self.st.prefixLen;
+            let prefix_len = self.st.prefix_len;
             self.put_item(&mut count_leaves, &mut count_tombstones, &item, prefix_len);
             item.last_key
         };
@@ -4171,15 +4239,15 @@ impl ParentNodeWriter {
 
     fn write_parent_page(&mut self,
                           pw: &mut PageWriter,
-                         ) -> Result<(usize, pgitem)> {
+                         ) -> Result<(usize, ItemForParent)> {
         // assert st.sofar > 0
         let (last_key, count_leaves, count_tombstones, count_items, count_bytes) = self.build_parent_page();
         assert!(self.st.items.is_empty());
         //println!("parent blocklist: {:?}", blocks);
         //println!("parent blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
         try!(self.pb.write_page(pw));
-        // TODO pgitem::new
-        let pg = pgitem {
+        // TODO ItemForParent::new
+        let pg = ItemForParent {
             page: self.pb.last_page_written, 
             info: ChildInfo::Parent{
                 count_leaves: count_leaves, 
@@ -4190,23 +4258,23 @@ impl ParentNodeWriter {
             last_key: last_key,
         };
         self.st.sofar = 0;
-        self.st.prefixLen = 0;
+        self.st.prefix_len = 0;
         Ok((count_bytes, pg))
     }
 
-    fn calc_prefix_len(&self, item: &pgitem) -> usize {
+    fn calc_prefix_len(&self, item: &ItemForParent) -> usize {
         if self.st.items.is_empty() {
             item.last_key.key.len()
         } else {
-            if self.st.prefixLen > 0 {
+            if self.st.prefix_len > 0 {
                 let a =
                     match &item.last_key.location {
-                        &KeyLocation::Inline => {
-                            bcmp::PrefixMatch(&*self.st.items[0].last_key.key, &item.last_key.key, self.st.prefixLen)
+                        &KeyLocationForParent::Inline => {
+                            bcmp::PrefixMatch(&*self.st.items[0].last_key.key, &item.last_key.key, self.st.prefix_len)
                         },
-                        &KeyLocation::Overflowed(_) => {
+                        &KeyLocationForParent::Overflowed(_) => {
                             // an overflowed key does not change the prefix
-                            self.st.prefixLen
+                            self.st.prefix_len
                         },
                     };
                 a
@@ -4216,13 +4284,13 @@ impl ParentNodeWriter {
         }
     }
 
-    fn add_child_to_current(&mut self, pw: &mut PageWriter, child: pgitem) -> Result<()> {
+    fn add_child_to_current(&mut self, pw: &mut PageWriter, child: ItemForParent) -> Result<()> {
         let pgsz = pw.page_size();
 
         if cfg!(expensive_check) 
         {
             // TODO FYI this code is the only reason we need to derive Clone on
-            // pgitem and its parts
+            // ItemForParent and its parts
             match self.prev_child {
                 None => {
                 },
@@ -4265,9 +4333,9 @@ impl ParentNodeWriter {
 
         let would_be_prefix_len = self.calc_prefix_len(&child);
         let would_be_sofar_before_this_key = 
-            if would_be_prefix_len != self.st.prefixLen {
-                assert!(self.st.prefixLen == 0 || would_be_prefix_len < self.st.prefixLen);
-                // the prefixLen would change with the addition of this key,
+            if would_be_prefix_len != self.st.prefix_len {
+                assert!(self.st.prefix_len == 0 || would_be_prefix_len < self.st.prefix_len);
+                // the prefix_len would change with the addition of this key,
                 // so we need to recalc sofar
                 let sum = self.st.items.iter().map(|lp| lp.need(would_be_prefix_len, self.my_depth) ).sum();;
                 sum
@@ -4290,19 +4358,19 @@ impl ParentNodeWriter {
             // then one of them should have been overflowed.
             assert!(self.st.items.len() > 1);
             
-            let should_be = Self::calc_page_len(self.st.prefixLen, self.st.sofar);
+            let should_be = Self::calc_page_len(self.st.prefix_len, self.st.sofar);
             let (count_bytes, pg) = try!(self.write_parent_page(pw));
             self.count_emit += 1;
             assert!(should_be == count_bytes);
             try!(self.emit(pw, pg));
             assert!(self.st.sofar == 0);
-            assert!(self.st.prefixLen == 0);
+            assert!(self.st.prefix_len == 0);
             assert!(self.st.items.is_empty());
-            self.st.prefixLen = child.last_key.key.len();
-            self.st.sofar = child.need(self.st.prefixLen, self.my_depth);
+            self.st.prefix_len = child.last_key.key.len();
+            self.st.sofar = child.need(self.st.prefix_len, self.my_depth);
         } else {
-            self.st.prefixLen = would_be_prefix_len;
-            self.st.sofar = would_be_sofar_before_this_key + child.need(self.st.prefixLen, self.my_depth);
+            self.st.prefix_len = would_be_prefix_len;
+            self.st.sofar = would_be_sofar_before_this_key + child.need(self.st.prefix_len, self.my_depth);
         }
 
         self.st.items.push(child);
@@ -4310,7 +4378,7 @@ impl ParentNodeWriter {
         Ok(())
     }
 
-    fn add_child(&mut self, pw: &mut PageWriter, child: pgitem, depth: u8) -> Result<()> {
+    fn add_child(&mut self, pw: &mut PageWriter, child: ItemForParent, depth: u8) -> Result<()> {
         //println!("add_child: my_depth: {}, child_depth: {}, child_page: {} {}", self.my_depth, depth, child.page, if child.blocks.underfull() { "UNDERFULL" } else { "" } );
         if depth == self.my_depth - 1 {
             try!(self.add_child_to_current(pw, child));
@@ -4336,13 +4404,13 @@ impl ParentNodeWriter {
             try!(chain.add_child(pw, first, self.my_depth));
             self.results_chain = Some(box chain);
         } else {
-            let mut chain = ParentNodeWriter::new(self.pb.buf.len(), self.my_depth + 1);
+            let chain = ParentNodeWriter::new(self.pb.buf.len(), self.my_depth + 1);
             self.results_chain = Some(box chain);
         }
         Ok(())
     }
 
-    fn emit(&mut self, pw: &mut PageWriter, pg: pgitem) -> Result<()> {
+    fn emit(&mut self, pw: &mut PageWriter, pg: ItemForParent) -> Result<()> {
         if self.results_chain.is_some() {
             assert!(self.result_one.is_none());
             let mut chain = self.results_chain.as_mut().unwrap();
@@ -4359,7 +4427,7 @@ impl ParentNodeWriter {
 
     fn flush_page(&mut self, pw: &mut PageWriter) -> Result<()> {
         if !self.st.items.is_empty() {
-            let should_be = Self::calc_page_len(self.st.prefixLen, self.st.sofar);
+            let should_be = Self::calc_page_len(self.st.prefix_len, self.st.sofar);
             let (count_bytes, pg) = try!(self.write_parent_page(pw));
             // TODO try!(pg.verify(pw.page_size(), path, f.clone()));
             self.count_emit += 1;
@@ -4570,7 +4638,7 @@ pub struct LeafPage {
 
     prefix: Option<Box<[u8]>>,
 
-    pairs: Vec<PairInLeaf>,
+    pairs: Vec<ItemInLeafPage>,
     bytes_used_on_page: usize,
 }
 
@@ -4584,7 +4652,7 @@ impl LeafPage {
         let mut pairs = vec![];
         let (prefix, bytes_used_on_page) = try!(Self::parse_page(pagenum, &buf, &mut pairs));
 
-        let mut res = LeafPage {
+        let res = LeafPage {
             f: f,
             pagenum: pagenum,
             pr: buf,
@@ -4624,16 +4692,16 @@ impl LeafPage {
         let mut list = vec![];
         for i in 0 .. self.pairs.len() {
             match &self.pairs[i].key {
-                &KeyInPage::Inline(_, _) => {
+                &KeyInLeafPage::Inline{..} => {
                 },
-                &KeyInPage::Overflowed(_, ref blocks) => {
+                &KeyInLeafPage::Overflowed{ref blocks, ..} => {
                     list.push(blocks);
                 },
             }
             match &self.pairs[i].value {
                 &ValueInLeaf::Tombstone => {
                 },
-                &ValueInLeaf::Inline(_, _) => {
+                &ValueInLeaf::Inline(_,_) => {
                 },
                 &ValueInLeaf::Overflowed(_, ref blocks) => {
                     list.push(blocks);
@@ -4651,7 +4719,7 @@ impl LeafPage {
         list
     }
 
-    fn parse_page(pgnum: PageNum, pr: &[u8], pairs: &mut Vec<PairInLeaf>) -> Result<(Option<Box<[u8]>>, usize)> {
+    fn parse_page(pgnum: PageNum, pr: &[u8], pairs: &mut Vec<ItemInLeafPage>) -> Result<(Option<Box<[u8]>>, usize)> {
         let mut prefix = None;
 
         let mut cur = 0;
@@ -4688,9 +4756,9 @@ impl LeafPage {
         }
 
         for i in 0 .. count_keys {
-            let k = try!(KeyInPage::read(pr, &mut cur, prefix_len));
+            let k = try!(KeyInLeafPage::read(pr, &mut cur, prefix_len));
             let v = try!(ValueInLeaf::read(pr, &mut cur));
-            let pair = PairInLeaf {
+            let pair = ItemInLeafPage {
                 key: k,
                 value: v,
             };
@@ -5117,12 +5185,19 @@ pub enum Overlap {
 }
 
 #[derive(Debug)]
-pub enum KeyInPage {
-    Inline(usize, usize),
-    Overflowed(usize, BlockList),
+pub enum KeyInLeafPage {
+    Inline{len: usize, offset: usize},
+    Overflowed{len: usize, blocks: BlockList},
 }
 
-impl KeyInPage {
+#[derive(Debug)]
+pub enum KeyInParentPage {
+    Inline{len: usize, offset: usize},
+    Overflowed{len: usize, blocks: BlockList},
+    // TODO diff between borrowed overflow and owned overflow
+}
+
+impl KeyInLeafPage {
     #[inline]
     fn read(pr: &[u8], cur: &mut usize, prefix_len: usize) -> Result<Self> {
         let klen = varint::read(pr, cur) as usize;
@@ -5133,12 +5208,12 @@ impl KeyInPage {
         let klen = klen / 2;
         let k = 
             if inline {
-                let k = KeyInPage::Inline(klen, *cur);
+                let k = KeyInLeafPage::Inline{len: klen, offset: *cur};
                 *cur += klen - prefix_len;
                 k
             } else {
                 let blocks = BlockList::read(&pr, cur);
-                let k = KeyInPage::Overflowed(klen, blocks);
+                let k = KeyInLeafPage::Overflowed{len: klen, blocks: blocks};
                 k
             };
         Ok(k)
@@ -5147,17 +5222,65 @@ impl KeyInPage {
     #[inline]
     fn keyref<'a>(&self, pr: &'a [u8], prefix: Option<&'a [u8]>, f: &std::sync::Arc<PageCache>) -> Result<KeyRef<'a>> { 
         match self {
-            &KeyInPage::Inline(klen, at) => {
+            &KeyInLeafPage::Inline{len: klen, offset} => {
                 match prefix {
                     Some(a) => {
-                        Ok(KeyRef::Prefixed(&a, &pr[at .. at + klen - a.len()]))
+                        Ok(KeyRef::Prefixed(&a, &pr[offset .. offset + klen - a.len()]))
                     },
                     None => {
-                        Ok(KeyRef::Slice(&pr[at .. at + klen]))
+                        Ok(KeyRef::Slice(&pr[offset .. offset + klen]))
                     },
                 }
             },
-            &KeyInPage::Overflowed(klen, ref blocks) => {
+            &KeyInLeafPage::Overflowed{len: klen, ref blocks} => {
+                // TODO KeyRef::Overflow...
+                let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.blocks[0].firstPage, klen as u64));
+                let mut x_k = Vec::with_capacity(klen);
+                try!(ostrm.read_to_end(&mut x_k));
+                let x_k = x_k.into_boxed_slice();
+                Ok(KeyRef::Boxed(x_k))
+            },
+        }
+    }
+
+}
+
+impl KeyInParentPage {
+    #[inline]
+    fn read(pr: &[u8], cur: &mut usize, prefix_len: usize) -> Result<Self> {
+        let klen = varint::read(pr, cur) as usize;
+        if klen == 0 {
+            return Err(Error::CorruptFile("key cannot be zero length"));
+        }
+        let inline = 0 == klen % 2;
+        let klen = klen / 2;
+        let k = 
+            if inline {
+                let k = KeyInParentPage::Inline{len: klen, offset: *cur};
+                *cur += klen - prefix_len;
+                k
+            } else {
+                let blocks = BlockList::read(&pr, cur);
+                let k = KeyInParentPage::Overflowed{len: klen, blocks: blocks};
+                k
+            };
+        Ok(k)
+    }
+
+    #[inline]
+    fn keyref<'a>(&self, pr: &'a [u8], prefix: Option<&'a [u8]>, f: &std::sync::Arc<PageCache>) -> Result<KeyRef<'a>> { 
+        match self {
+            &KeyInParentPage::Inline{len: klen, offset} => {
+                match prefix {
+                    Some(a) => {
+                        Ok(KeyRef::Prefixed(&a, &pr[offset .. offset + klen - a.len()]))
+                    },
+                    None => {
+                        Ok(KeyRef::Slice(&pr[offset .. offset + klen]))
+                    },
+                }
+            },
+            &KeyInParentPage::Overflowed{len: klen, ref blocks} => {
                 // TODO KeyRef::Overflow...
                 let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.blocks[0].firstPage, klen as u64));
                 let mut x_k = Vec::with_capacity(klen);
@@ -5169,16 +5292,16 @@ impl KeyInPage {
     }
 
     #[inline]
-    fn key_with_location(&self, pr: &[u8], prefix: Option<&[u8]>, f: &std::sync::Arc<PageCache>) -> Result<KeyWithLocation> { 
+    fn key_with_location_for_parent(&self, pr: &[u8], prefix: Option<&[u8]>, f: &std::sync::Arc<PageCache>) -> Result<KeyWithLocationForParent> { 
         match self {
-            &KeyInPage::Inline(klen, at) => {
+            &KeyInParentPage::Inline{len: klen, offset} => {
                 let k = 
                     match prefix {
                         Some(a) => {
                             let k = {
                                 let mut k = Vec::with_capacity(klen);
                                 k.extend_from_slice(a);
-                                k.extend_from_slice(&pr[at .. at + klen - a.len()]);
+                                k.extend_from_slice(&pr[offset .. offset + klen - a.len()]);
                                 k.into_boxed_slice()
                             };
                             k
@@ -5186,19 +5309,19 @@ impl KeyInPage {
                         None => {
                             let k = {
                                 let mut k = Vec::with_capacity(klen);
-                                k.extend_from_slice(&pr[at .. at + klen]);
+                                k.extend_from_slice(&pr[offset .. offset + klen]);
                                 k.into_boxed_slice()
                             };
                             k
                         },
                     };
-                let kw = KeyWithLocation {
+                let kw = KeyWithLocationForParent {
                     key: k,
-                    location: KeyLocation::Inline,
+                    location: KeyLocationForParent::Inline,
                 };
                 Ok(kw)
             },
-            &KeyInPage::Overflowed(klen, ref blocks) => {
+            &KeyInParentPage::Overflowed{len: klen, ref blocks} => {
                 let k = {
                     let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.blocks[0].firstPage, klen as u64));
                     let mut x_k = Vec::with_capacity(klen);
@@ -5206,9 +5329,9 @@ impl KeyInPage {
                     let x_k = x_k.into_boxed_slice();
                     x_k
                 };
-                let kw = KeyWithLocation {
+                let kw = KeyWithLocationForParent {
                     key: k,
-                    location: KeyLocation::Overflowed(blocks.clone()),
+                    location: KeyLocationForParent::Overflowed(blocks.clone()),
                 };
                 Ok(kw)
             },
@@ -5255,28 +5378,28 @@ impl ValueInLeaf {
 }
 
 #[derive(Debug)]
-struct PairInLeaf {
-    key: KeyInPage,
+struct ItemInLeafPage {
+    key: KeyInLeafPage,
     value: ValueInLeaf,
 }
 
 #[derive(Debug)]
-pub struct ParentPageItem {
+pub struct ItemInParentPage {
     page: PageNum,
 
     info: ChildInfo,
 
     // the ChildInfo does NOT contain page, whether it is a block list or a page count
 
-    last_key: KeyInPage,
+    last_key: KeyInParentPage,
 }
 
-impl ParentPageItem {
+impl ItemInParentPage {
     pub fn page(&self) -> PageNum {
         self.page
     }
 
-    pub fn last_key(&self) -> &KeyInPage {
+    pub fn last_key(&self) -> &KeyInParentPage {
         &self.last_key
     }
 
@@ -5373,7 +5496,7 @@ pub struct ParentPage {
     pagenum: PageNum,
 
     prefix: Option<Box<[u8]>>,
-    children: Vec<ParentPageItem>,
+    children: Vec<ItemInParentPage>,
 
     bytes_used_on_page: usize,
 }
@@ -5452,11 +5575,11 @@ impl ParentPage {
         Ok(last_key)
     }
 
-    fn child_pgitem(&self, i: usize) -> Result<pgitem> {
+    fn child_as_item_for_parent(&self, i: usize) -> Result<ItemForParent> {
         // TODO this func shows up as a common offender of malloc calls
-        let last_key = try!(self.key_with_location(&self.children[i].last_key));
-        // TODO pgitem::new
-        let pg = pgitem {
+        let last_key = try!(self.key_with_location_for_parent(&self.children[i].last_key));
+        // TODO ItemForParent::new
+        let pg = ItemForParent {
             page: self.children[i].page,
             info: self.children[i].info.clone(), // TODO sad clone
             last_key: last_key,
@@ -5516,7 +5639,7 @@ impl ParentPage {
     }
 
     #[inline]
-    fn key<'a>(&'a self, k: &KeyInPage) -> Result<KeyRef<'a>> { 
+    fn key<'a>(&'a self, k: &KeyInParentPage) -> Result<KeyRef<'a>> { 
         let prefix: Option<&[u8]> = 
             match self.prefix {
                 Some(ref b) => Some(b),
@@ -5526,17 +5649,17 @@ impl ParentPage {
         Ok(k)
     }
 
-    fn key_with_location(&self, k: &KeyInPage) -> Result<KeyWithLocation> { 
+    fn key_with_location_for_parent(&self, k: &KeyInParentPage) -> Result<KeyWithLocationForParent> { 
         let prefix: Option<&[u8]> = 
             match self.prefix {
                 Some(ref b) => Some(b),
                 None => None,
             };
-        let k = try!(k.key_with_location(&self.pr, prefix, &self.f));
+        let k = try!(k.key_with_location_for_parent(&self.pr, prefix, &self.f));
         Ok(k)
     }
 
-    fn parse_page(pgnum: PageNum, pr: &[u8]) -> Result<(Option<Box<[u8]>>, Vec<ParentPageItem>, usize)> {
+    fn parse_page(pgnum: PageNum, pr: &[u8]) -> Result<(Option<Box<[u8]>>, Vec<ItemInParentPage>, usize)> {
         // TODO it would be nice if this could accept a vec and reuse
         // it, like the leaf version does.
         let mut cur = 0;
@@ -5587,9 +5710,9 @@ impl ParentPage {
                 };
             //println!("childinfo: {:?}", blocks);
 
-            let last_key = try!(KeyInPage::read(pr, &mut cur, prefix_len));
+            let last_key = try!(KeyInParentPage::read(pr, &mut cur, prefix_len));
 
-            let pg = ParentPageItem {
+            let pg = ItemInParentPage {
                 page: page, 
                 info: info,
                 last_key: last_key,
@@ -6628,12 +6751,6 @@ pub struct PendingMerge {
     now_inactive: HashMap<PageNum, BlockList>,
 }
 
-struct SafePagePool {
-    // we keep a pool of page buffers so we can lend them to
-    // SegmentCursors.
-    pages: Vec<Box<[u8]>>,
-}
-
 struct Senders {
     notify_fresh: mpsc::Sender<MergeMessage>,
     notify_young: mpsc::Sender<MergeMessage>,
@@ -7299,19 +7416,6 @@ impl InnerPart {
         //println!("cursor_dropped");
         let mut space = self.space.lock().unwrap(); // TODO gotta succeed
         space.release_rlock(rlock);
-    }
-
-    fn OpenForWriting(&self) -> io::Result<File> {
-        OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&self.path)
-    }
-
-    fn OpenForReading(&self) -> io::Result<File> {
-        OpenOptions::new()
-                .read(true)
-                .open(&self.path)
     }
 
     // this code should not be called in a release build.  it helps
@@ -8816,7 +8920,10 @@ struct PageWriter {
 
 impl PageWriter {
     fn new(inner: std::sync::Arc<InnerPart>) -> Result<Self> {
-        let f = try!(inner.OpenForWriting());
+        let f = try!(OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&inner.path));
         let pw = PageWriter {
             inner: inner,
             f: f,
