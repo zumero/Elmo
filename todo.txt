@@ -1,4 +1,37 @@
 
+rustfmt issues:
+    sometimes removes braces around single-statement
+    match arms.  but sometimes not, or even adds them.
+
+    BlockList { blocks: vec![] }
+
+    removes oxford commas
+
+    removes commas after braced match arms?
+
+    but adds the oxford comma when converting multi-field struct to multi-line
+
+    commented-out lines get an extra space after //
+
+    has trouble with deeply nested long lines
+
+    sometimes converts multi-field struct to single line?
+
+    need to make it stop reformatting my multiline integer sums.
+    loses comments on these too.
+
+    // comment in struct decl gets moved after a field.  bad.
+
+    if cfg! brace gets moved up
+
+    kinda wish arms of a match were either all braces or all not
+
+    /* gets converted to //, always?
+
+    need longer line len
+
+    for .iter() chains, I wish it would leave the first item on its own line
+
 when promoting into a Regular level that is empty,
 just move without rewrite?
 
