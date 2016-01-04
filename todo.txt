@@ -1,4 +1,34 @@
 
+incoming, arriving, new, newborn, lobby, entry, frontdoor, intake, porch, valet, stoop, gate, ingress, threshold,
+grouped, bundled, triage, middle, prep, groomed, foyer,
+main, regular
+
+gate
+lobby
+main
+
+porch
+foyer
+main
+
+lobby
+waiting
+main
+
+lobby
+triage
+main
+
+lobby
+concourse
+main
+
+lobby
+hall
+main
+
+lobby
+
 when promoting into a main level that is empty,
 just move without rewrite?
 

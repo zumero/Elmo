@@ -50,12 +50,10 @@ use std::collections::HashSet;
 const SIZE_32: usize = 4; // like std::mem::size_of::<u32>()
 const SIZE_16: usize = 2; // like std::mem::size_of::<u16>()
 
-// the fresh and young levels are not included in the following count
-
 // TODO does this need to be a constant?  maybe we should just allow it
 // to grow as needed?  but then we would need to start up new threads
 // and channels.
-const NUM_LEVELS: usize = 8;
+const NUM_REGULAR_LEVELS: usize = 8;
 
 pub type PageNum = u32;
 pub type PageCount = u32;
@@ -1276,15 +1274,15 @@ pub trait ICursor : IForwardCursor {
 pub struct DbSettings {
     pub default_page_size: usize,
     pub pages_per_block: PageCount,
-    pub sleep_desperate_fresh: u64,
-    pub sleep_desperate_young: u64,
-    pub sleep_desperate_level: u64,
-    pub desperate_fresh: usize,
-    pub desperate_young: usize,
+    pub sleep_desperate_incoming: u64,
+    pub sleep_desperate_waiting: u64,
+    pub sleep_desperate_regular: u64,
+    pub desperate_incoming: usize,
+    pub desperate_waiting: usize,
     pub desperate_level_factor: u64,
     pub num_leaves_promote: usize,
     // TODO min consecutive recycle
-    // TODO fresh free
+    // TODO recent_free
     // TODO level factor
     // TODO what to promote from level N to N+1
 }
@@ -1293,11 +1291,11 @@ pub const DEFAULT_SETTINGS: DbSettings =
     DbSettings {
         default_page_size: 4096,
         pages_per_block: 256,
-        sleep_desperate_fresh: 20,
-        sleep_desperate_young: 20,
-        sleep_desperate_level: 50,
-        desperate_fresh: 128,
-        desperate_young: 128,
+        sleep_desperate_incoming: 20,
+        sleep_desperate_waiting: 20,
+        sleep_desperate_regular: 50,
+        desperate_incoming: 128,
+        desperate_waiting: 128,
         desperate_level_factor: 2,
         num_leaves_promote: 16,
     };
@@ -6243,9 +6241,9 @@ impl IForwardCursor for MultiPageCursor {
 
 #[derive(Clone)]
 struct HeaderData {
-    fresh: Vec<SegmentHeaderInfo>,
-    young: Vec<SegmentHeaderInfo>,
-    levels: Vec<Option<SegmentHeaderInfo>>,
+    incoming: Vec<SegmentHeaderInfo>,
+    waiting: Vec<SegmentHeaderInfo>,
+    regular: Vec<Option<SegmentHeaderInfo>>,
 
     changeCounter: u64,
     mergeCounter: u64,
@@ -6293,7 +6291,7 @@ fn read_header(path: &str) -> Result<(HeaderData, PageCache, PageNum)> {
             Ok(v)
         }
 
-        fn fix_main_segment_list(segments: Vec<PageNum>, f: &PageCache) -> Result<Vec<Option<SegmentHeaderInfo>>> {
+        fn fix_regular_segment_list(segments: Vec<PageNum>, f: &PageCache) -> Result<Vec<Option<SegmentHeaderInfo>>> {
             let mut v = Vec::with_capacity(segments.len());
             for page in segments.iter() {
                 let pagenum = *page;
@@ -6317,19 +6315,19 @@ fn read_header(path: &str) -> Result<(HeaderData, PageCache, PageNum)> {
 
         let f = PageCache::new(f, pgsz);
 
-        let fresh = try!(read_segment_list(pr, &mut cur));
-        let young = try!(read_segment_list(pr, &mut cur));
-        let levels = try!(read_segment_list(pr, &mut cur));
+        let incoming = try!(read_segment_list(pr, &mut cur));
+        let waiting = try!(read_segment_list(pr, &mut cur));
+        let regular = try!(read_segment_list(pr, &mut cur));
 
-        let fresh = try!(fix_segment_list(fresh, &f));
-        let young = try!(fix_segment_list(young, &f));
-        let levels = try!(fix_main_segment_list(levels, &f));
+        let incoming = try!(fix_segment_list(incoming, &f));
+        let waiting = try!(fix_segment_list(waiting, &f));
+        let regular = try!(fix_regular_segment_list(regular, &f));
 
         let hd = 
             HeaderData {
-                fresh: fresh,
-                young: young,
-                levels: levels,
+                incoming: incoming,
+                waiting: waiting,
+                regular: regular,
                 changeCounter: changeCounter,
                 mergeCounter: mergeCounter,
             };
@@ -6360,9 +6358,9 @@ fn read_header(path: &str) -> Result<(HeaderData, PageCache, PageNum)> {
         let defaultPageSize = DEFAULT_SETTINGS.default_page_size;
         let h = {
             HeaderData {
-                fresh: vec![],
-                young: vec![],
-                levels: vec![],
+                incoming: vec![],
+                waiting: vec![],
+                regular: vec![],
                 changeCounter: 0,
                 mergeCounter: 0,
             }
@@ -6392,9 +6390,9 @@ fn list_all_blocks(
         Ok(())
     }
 
-    try!(do_seglist(f, h.fresh.iter(), &mut blocks));
-    try!(do_seglist(f, h.young.iter(), &mut blocks));
-    try!(do_seglist(f, h.levels.iter().filter_map(|s| s.as_ref()), &mut blocks));
+    try!(do_seglist(f, h.incoming.iter(), &mut blocks));
+    try!(do_seglist(f, h.waiting.iter(), &mut blocks));
+    try!(do_seglist(f, h.regular.iter().filter_map(|s| s.as_ref()), &mut blocks));
 
     blocks.sort_and_consolidate();
 
@@ -6411,7 +6409,7 @@ struct Space {
     pages_per_block: PageCount,
     nextPage: PageNum,
 
-    fresh_free: Vec<BlockList>,
+    recent_free: Vec<BlockList>,
     free_blocks: BlockList,
 
     next_rlock: u64,
@@ -6557,18 +6555,18 @@ impl Space {
         // organizing the free block list can be expensive
         // if the list is large, so we only do it every so
         // often.
-        self.fresh_free.push(blocks);
+        self.recent_free.push(blocks);
         // TODO tunable parameter, not constant
-        if self.fresh_free.len() >= 8 {
+        if self.recent_free.len() >= 8 {
             self.organize_free_blocks();
         }
     }
 
     fn step1_sort_and_consolidate(&mut self) {
-        for list in self.fresh_free.iter() {
+        for list in self.recent_free.iter() {
             self.free_blocks.add_blocklist_no_reorder(list);
         }
-        self.fresh_free.clear();
+        self.recent_free.clear();
 
         self.free_blocks.sort_and_consolidate();
         if self.free_blocks.count_blocks() > 0 && self.free_blocks.last_page() == self.nextPage - 1 {
@@ -6666,7 +6664,7 @@ impl Space {
             assert!(self.nextPage > after);
         }
 
-        if self.free_blocks.is_empty() && !self.fresh_free.is_empty() {
+        if self.free_blocks.is_empty() && !self.recent_free.is_empty() {
             self.organize_free_blocks();
         }
 
@@ -6743,19 +6741,19 @@ impl MergingInto {
 
 #[derive(Debug)]
 enum MergeFrom {
-    Fresh{segments: Vec<PageNum>},
-    FreshNoRewrite{segments: Vec<PageNum>},
-    Young{old_segment: PageNum, new_segment: Option<SegmentHeaderInfo>},
-    Other{level: usize, old_segment: PageNum, new_segment: Option<SegmentHeaderInfo>},
+    Incoming{segments: Vec<PageNum>},
+    IncomingNoRewrite{segments: Vec<PageNum>},
+    Waiting{old_segment: PageNum, new_segment: Option<SegmentHeaderInfo>},
+    Regular{level: usize, old_segment: PageNum, new_segment: Option<SegmentHeaderInfo>},
 }
 
 impl MergeFrom {
     fn get_dest_level(&self) -> DestLevel {
         match self {
-            &MergeFrom::Fresh{..} => DestLevel::Young,
-            &MergeFrom::FreshNoRewrite{..} => DestLevel::Young,
-            &MergeFrom::Young{..} => DestLevel::Other(0),
-            &MergeFrom::Other{level, ..} => DestLevel::Other(level + 1),
+            &MergeFrom::Incoming{..} => DestLevel::Waiting,
+            &MergeFrom::IncomingNoRewrite{..} => DestLevel::Waiting,
+            &MergeFrom::Waiting{..} => DestLevel::Regular(0),
+            &MergeFrom::Regular{level, ..} => DestLevel::Regular(level + 1),
         }
     }
 }
@@ -6776,9 +6774,9 @@ pub struct PendingMerge {
 }
 
 struct Senders {
-    notify_fresh: mpsc::Sender<MergeMessage>,
-    notify_young: mpsc::Sender<MergeMessage>,
-    notify_levels: Vec<mpsc::Sender<MergeMessage>>,
+    notify_incoming: mpsc::Sender<MergeMessage>,
+    notify_waiting: mpsc::Sender<MergeMessage>,
+    notify_regular: Vec<mpsc::Sender<MergeMessage>>,
 }
 
 struct InnerPageCache {
@@ -6880,41 +6878,41 @@ struct InnerPart {
     page_cache: std::sync::Arc<PageCache>,
 
     // TODO the contents of these mutexes should be something useful
-    mergelock_fresh: Mutex<u32>,
-    mergelock_young: Mutex<u32>,
+    mergelock_incoming: Mutex<u32>,
+    mergelock_waiting: Mutex<u32>,
     // TODO vec, or boxed slice?
-    mergelock_levels: Vec<Mutex<u32>>,
+    mergelock_regular: Vec<Mutex<u32>>,
 
 }
 
 #[derive(Debug, Copy, Clone)]
 pub enum FromLevel {
-    Fresh,
-    Young,
-    Other(usize),
+    Incoming,
+    Waiting,
+    Regular(usize),
 }
 
 impl FromLevel {
     fn get_dest_level(&self) -> DestLevel {
         match self {
-            &FromLevel::Fresh => DestLevel::Young,
-            &FromLevel::Young => DestLevel::Other(0),
-            &FromLevel::Other(level) => DestLevel::Other(level + 1),
+            &FromLevel::Incoming => DestLevel::Waiting,
+            &FromLevel::Waiting => DestLevel::Regular(0),
+            &FromLevel::Regular(level) => DestLevel::Regular(level + 1),
         }
     }
 }
 
 #[derive(Debug, Copy, Clone)]
 enum DestLevel {
-    Young,
-    Other(usize),
+    Waiting,
+    Regular(usize),
 }
 
 impl DestLevel {
     fn as_from_level(&self) -> FromLevel {
         match self {
-            &DestLevel::Young => FromLevel::Young,
-            &DestLevel::Other(n) => FromLevel::Other(n),
+            &DestLevel::Waiting => FromLevel::Waiting,
+            &DestLevel::Regular(n) => FromLevel::Regular(n),
         }
     }
 }
@@ -6946,10 +6944,10 @@ pub struct DatabaseFile {
     inner: std::sync::Arc<InnerPart>,
     write_lock: std::sync::Arc<Mutex<WriteLock>>,
 
-    thread_fresh: thread::JoinHandle<()>,
-    thread_young: thread::JoinHandle<()>,
+    thread_incoming: thread::JoinHandle<()>,
+    thread_waiting: thread::JoinHandle<()>,
     // TODO vec, or boxed slice?
-    thread_levels: Vec<thread::JoinHandle<()>>,
+    thread_regular: Vec<thread::JoinHandle<()>>,
 }
 
 impl DatabaseFile {
@@ -6999,7 +6997,7 @@ impl DatabaseFile {
             page_size: f.page_size(),
             nextPage: first_available_page, 
             pages_per_block: settings.pages_per_block,
-            fresh_free: vec![],
+            recent_free: vec![],
             free_blocks: blocks,
             next_rlock: 1,
             rlocks: HashMap::new(),
@@ -7011,26 +7009,26 @@ impl DatabaseFile {
         // notify that thread that there may be merge work to be done, or that it needs
         // to terminate.
 
-        let (tx_fresh, rx_fresh): (mpsc::Sender<MergeMessage>, mpsc::Receiver<MergeMessage>) = mpsc::channel();
-        let (tx_young, rx_young): (mpsc::Sender<MergeMessage>, mpsc::Receiver<MergeMessage>) = mpsc::channel();
+        let (tx_incoming, rx_incoming): (mpsc::Sender<MergeMessage>, mpsc::Receiver<MergeMessage>) = mpsc::channel();
+        let (tx_waiting, rx_waiting): (mpsc::Sender<MergeMessage>, mpsc::Receiver<MergeMessage>) = mpsc::channel();
 
         let mut senders = vec![];
         let mut receivers = vec![];
-        for level in 0 .. NUM_LEVELS {
+        for level in 0 .. NUM_REGULAR_LEVELS {
             let (tx, rx): (mpsc::Sender<MergeMessage>, mpsc::Receiver<MergeMessage>) = mpsc::channel();
             senders.push(tx);
             receivers.push(rx);
         }
 
         let senders = Senders {
-            notify_fresh: tx_fresh,
-            notify_young: tx_young,
-            notify_levels: senders,
+            notify_incoming: tx_incoming,
+            notify_waiting: tx_waiting,
+            notify_regular: senders,
         };
 
-        let mut mergelock_levels = vec![];
-        for level in 0 .. NUM_LEVELS {
-            mergelock_levels.push(Mutex::new(0));
+        let mut mergelock_regular = vec![];
+        for level in 0 .. NUM_REGULAR_LEVELS {
+            mergelock_regular.push(Mutex::new(0));
         }
 
         let file_header_write = 
@@ -7050,9 +7048,9 @@ impl DatabaseFile {
             settings: settings, 
             header: RwLock::new(header),
             space: Mutex::new(space),
-            mergelock_fresh: Mutex::new(0),
-            mergelock_young: Mutex::new(0),
-            mergelock_levels: mergelock_levels,
+            mergelock_incoming: Mutex::new(0),
+            mergelock_waiting: Mutex::new(0),
+            mergelock_regular: mergelock_regular,
             senders: Mutex::new(senders),
         };
 
@@ -7095,34 +7093,34 @@ impl DatabaseFile {
             }
         }
 
-        let thread_fresh = {
+        let thread_incoming = {
             let inner = inner.clone();
             let lck = lck.clone();
-            try!(thread::Builder::new().name("fresh".to_string()).spawn(move || merge_loop(inner, lck, rx_fresh, FromLevel::Fresh)))
+            try!(thread::Builder::new().name("incoming".to_string()).spawn(move || merge_loop(inner, lck, rx_incoming, FromLevel::Incoming)))
         };
 
-        let thread_young = {
+        let thread_waiting = {
             let inner = inner.clone();
             let lck = lck.clone();
-            try!(thread::Builder::new().name("young".to_string()).spawn(move || merge_loop(inner, lck, rx_young, FromLevel::Young)))
+            try!(thread::Builder::new().name("waiting".to_string()).spawn(move || merge_loop(inner, lck, rx_waiting, FromLevel::Waiting)))
         };
 
-        let mut thread_levels = vec![];
+        let mut thread_regular = vec![];
         for (level, rx) in receivers.into_iter().enumerate() {
             let thread = {
                 let inner = inner.clone();
                 let lck = lck.clone();
-                try!(thread::Builder::new().name(format!("level_{}", level)).spawn(move || merge_loop(inner, lck, rx, FromLevel::Other(level))))
+                try!(thread::Builder::new().name(format!("regular_{}", level)).spawn(move || merge_loop(inner, lck, rx, FromLevel::Regular(level))))
             };
-            thread_levels.push(thread);
+            thread_regular.push(thread);
         }
 
         let db = DatabaseFile {
             inner: inner,
             write_lock: lck,
-            thread_fresh: thread_fresh,
-            thread_young: thread_young,
-            thread_levels: thread_levels,
+            thread_incoming: thread_incoming,
+            thread_waiting: thread_waiting,
+            thread_regular: thread_regular,
         };
         let db = std::sync::Arc::new(db);
 
@@ -7134,13 +7132,13 @@ impl DatabaseFile {
         // have one of them stop while another one is still sending notifications
         // to it.
 
-        println!("---------------- Stopping fresh");
+        println!("---------------- Stopping incoming");
         {
             let senders = try!(self.inner.senders.lock());
-            try!(senders.notify_fresh.send(MergeMessage::Terminate).map_err(wrap_err));
+            try!(senders.notify_incoming.send(MergeMessage::Terminate).map_err(wrap_err));
         }
 
-        match self.thread_fresh.join() {
+        match self.thread_incoming.join() {
             Ok(()) => {
             },
             Err(e) => {
@@ -7148,13 +7146,13 @@ impl DatabaseFile {
             },
         }
 
-        println!("---------------- Stopping young");
+        println!("---------------- Stopping waiting");
         {
             let senders = try!(self.inner.senders.lock());
-            try!(senders.notify_young.send(MergeMessage::Terminate).map_err(wrap_err));
+            try!(senders.notify_waiting.send(MergeMessage::Terminate).map_err(wrap_err));
         }
 
-        match self.thread_young.join() {
+        match self.thread_waiting.join() {
             Ok(()) => {
             },
             Err(e) => {
@@ -7162,14 +7160,14 @@ impl DatabaseFile {
             },
         }
 
-        for i in 0 .. NUM_LEVELS {
-            println!("---------------- Stopping level {}", i);
+        for i in 0 .. NUM_REGULAR_LEVELS {
+            println!("---------------- Stopping regular {}", i);
             {
                 let mut senders = try!(self.inner.senders.lock());
-                let tx = &senders.notify_levels[i];
+                let tx = &senders.notify_regular[i];
                 try!(tx.send(MergeMessage::Terminate).map_err(wrap_err));
             }
-            let j = self.thread_levels.remove(0);
+            let j = self.thread_regular.remove(0);
             match j.join() {
                 Ok(()) => {
                 },
@@ -7184,7 +7182,7 @@ impl DatabaseFile {
 
     fn merge(inner: &std::sync::Arc<InnerPart>, write_lock: &std::sync::Arc<Mutex<WriteLock>>, level: FromLevel) -> Result<()> {
         // no merge should prevent writes of new segments
-        // into fresh.  merges do not need the main write lock
+        // into incoming.  merges do not need the big write lock
         // until commit_merge() is called.
 
         // but we do need to make sure merges are not stepping
@@ -7199,7 +7197,7 @@ impl DatabaseFile {
                     match try!(InnerPart::needs_merge(&inner, level.get_dest_level().as_from_level())) {
                         NeedsMerge::Desperate => {
                             try!(inner.notify_work(level.get_dest_level().as_from_level()));
-                            Ok(Some(inner.settings.sleep_desperate_level))
+                            Ok(Some(inner.settings.sleep_desperate_regular))
                         },
                         _ => {
                             let pm = try!(InnerPart::prepare_merge(&inner, level));
@@ -7215,11 +7213,11 @@ impl DatabaseFile {
         }
 
         match level {
-            FromLevel::Fresh => {
+            FromLevel::Incoming => {
                 loop {
                     let delay = {
-                        let foo = try!(inner.mergelock_fresh.lock());
-                        // no mergelock_young needed here
+                        let foo = try!(inner.mergelock_incoming.lock());
+                        // no mergelock_waiting needed here
                         let delay = 
                             match try!(guts(&inner, &write_lock, level)) {
                                 Some(delay) => {
@@ -7232,16 +7230,16 @@ impl DatabaseFile {
                         delay
                     };
                     if delay > 0 {
-                        println!("desperate,{:?},sleeping,{}", level, inner.settings.sleep_desperate_fresh);
+                        println!("desperate,{:?},sleeping,{}", level, inner.settings.sleep_desperate_incoming);
                         std::thread::sleep(std::time::Duration::from_millis(delay));
                     }
                 }
             },
-            FromLevel::Young => {
+            FromLevel::Waiting => {
                 loop {
                     let delay = {
-                        let foo = try!(inner.mergelock_young.lock());
-                        let bar = try!(inner.mergelock_levels[0].lock());
+                        let foo = try!(inner.mergelock_waiting.lock());
+                        let bar = try!(inner.mergelock_regular[0].lock());
                         let delay = 
                             match try!(guts(&inner, &write_lock, level)) {
                                 Some(delay) => {
@@ -7254,16 +7252,16 @@ impl DatabaseFile {
                         delay
                     };
                     if delay > 0 {
-                        println!("desperate,{:?},sleeping,{}", level, inner.settings.sleep_desperate_fresh);
+                        println!("desperate,{:?},sleeping,{}", level, inner.settings.sleep_desperate_incoming);
                         std::thread::sleep(std::time::Duration::from_millis(delay));
                     }
                 }
             },
-            FromLevel::Other(n) => {
+            FromLevel::Regular(n) => {
                 loop {
                     let delay = {
-                        let foo = try!(inner.mergelock_levels[n].lock());
-                        let bar = try!(inner.mergelock_levels[n + 1].lock());
+                        let foo = try!(inner.mergelock_regular[n].lock());
+                        let bar = try!(inner.mergelock_regular[n + 1].lock());
                         let delay = 
                             match try!(guts(&inner, &write_lock, level)) {
                                 Some(delay) => {
@@ -7276,7 +7274,7 @@ impl DatabaseFile {
                         delay
                     };
                     if delay > 0 {
-                        println!("desperate,{:?},sleeping,{}", level, inner.settings.sleep_desperate_fresh);
+                        println!("desperate,{:?},sleeping,{}", level, inner.settings.sleep_desperate_incoming);
                         std::thread::sleep(std::time::Duration::from_millis(delay));
                     }
                 }
@@ -7288,12 +7286,12 @@ impl DatabaseFile {
     // TODO func to ask for the write lock without blocking?
 
     pub fn get_write_lock(&self) -> Result<std::sync::MutexGuard<WriteLock>> {
-        while NeedsMerge::Desperate == try!(InnerPart::needs_merge(&self.inner, FromLevel::Fresh)) {
+        while NeedsMerge::Desperate == try!(InnerPart::needs_merge(&self.inner, FromLevel::Incoming)) {
             // TODO if we need to sleep more than once, do we really need to notify_work
             // every time?
-            try!(self.inner.notify_work(FromLevel::Fresh));
-            println!("desperate,main,sleeping,{}", self.inner.settings.sleep_desperate_fresh);
-            std::thread::sleep(std::time::Duration::from_millis(self.inner.settings.sleep_desperate_fresh));
+            try!(self.inner.notify_work(FromLevel::Incoming));
+            println!("desperate,regular,sleeping,{}", self.inner.settings.sleep_desperate_incoming);
+            std::thread::sleep(std::time::Duration::from_millis(self.inner.settings.sleep_desperate_incoming));
         }
 
         let lck = try!(self.write_lock.lock());
@@ -7364,7 +7362,7 @@ impl HeaderStuff {
                 }
             }
 
-            fn add_main_list(pb: &mut Vec<u8>, v: &Vec<Option<SegmentHeaderInfo>>) {
+            fn add_regular_list(pb: &mut Vec<u8>, v: &Vec<Option<SegmentHeaderInfo>>) {
                 misc::push_varint(pb, v.len() as u64);
                 for seg in v.iter() {
                     match seg {
@@ -7378,14 +7376,14 @@ impl HeaderStuff {
                 }
             }
 
-            add_list(&mut pb, &h.fresh);
-            add_list(&mut pb, &h.young);
-            add_main_list(&mut pb, &h.levels);
+            add_list(&mut pb, &h.incoming);
+            add_list(&mut pb, &h.waiting);
+            add_regular_list(&mut pb, &h.regular);
 
             pb
         }
 
-        //println!("header, fresh,{}, young,{}, levels,{}", hdr.fresh.len(), hdr.young.len(), hdr.levels.len());
+        //println!("header, incoming,{}, waiting,{}, regular,{}", hdr.incoming.len(), hdr.waiting.len(), hdr.regular.len());
 
         let mut pb = PageBuilder::new(HEADER_SIZE_IN_BYTES);
         // TODO format version number
@@ -7465,7 +7463,6 @@ impl InnerPart {
     // root page
     // number of pairs
     // each pair is startBlock,countBlocks
-    // level
     // all in varints
 
     #[cfg(remove_me)]
@@ -7522,9 +7519,9 @@ impl InnerPart {
         let f = inner.page_cache.clone(); // TODO one extra clone?
 
         let cursors = 
-            header.fresh.iter()
-            .chain(header.young.iter())
-            .chain(header.levels.iter().filter_map(|s| s.as_ref()))
+            header.incoming.iter()
+            .chain(header.waiting.iter())
+            .chain(header.regular.iter().filter_map(|s| s.as_ref()))
             .map(|seg| {
                 let csr = try!(PageCursor::new(f.clone(), seg.root_page));
                 Ok(csr)
@@ -7533,9 +7530,9 @@ impl InnerPart {
         let cursors = try!(cursors);
 
         let segments = 
-            header.fresh.iter()
-            .chain(header.young.iter())
-            .chain(header.levels.iter().filter_map(|s| s.as_ref()))
+            header.incoming.iter()
+            .chain(header.waiting.iter())
+            .chain(header.regular.iter().filter_map(|s| s.as_ref()))
             .map(|seg| {
                 seg.root_page
             })
@@ -7547,14 +7544,14 @@ impl InnerPart {
             rlock
         };
 
-        println!("open_cursor,{}, fresh,{}, young,{}, levels,{}", rlock, header.fresh.len(), header.young.len(), header.levels.len());
+        println!("open_cursor,{}, incoming,{}, waiting,{}, regular,{}", rlock, header.incoming.len(), header.waiting.len(), header.regular.len());
 
         if cfg!(expensive_check) 
         {
             let segnums = 
-                header.fresh.iter()
-                .chain(header.young.iter())
-                .chain(header.levels.iter().filter_map(|s| s.as_ref()))
+                header.incoming.iter()
+                .chain(header.waiting.iter())
+                .chain(header.regular.iter().filter_map(|s| s.as_ref()))
                 .map(|seg| seg.root_page)
                 .collect::<Vec<_>>();
             println!("open_cursor,{},{:?}", rlock, segnums);
@@ -7605,7 +7602,7 @@ impl InnerPart {
             Ok(v)
         }
 
-        fn do_main_group(segments: &[Option<SegmentHeaderInfo>]) -> Result<Vec<(PageNum, PageCount)>> {
+        fn do_regular_group(segments: &[Option<SegmentHeaderInfo>]) -> Result<Vec<(PageNum, PageCount)>> {
             let mut v = vec![];
             for seg in segments.iter() {
                 match seg {
@@ -7622,11 +7619,11 @@ impl InnerPart {
             Ok(v)
         }
 
-        let fresh = try!(do_group(&header.fresh));
-        let young = try!(do_group(&header.young));
-        let levels = try!(do_main_group(&header.levels));
+        let incoming = try!(do_group(&header.incoming));
+        let waiting = try!(do_group(&header.waiting));
+        let regular = try!(do_regular_group(&header.regular));
 
-        Ok((fresh, young, levels))
+        Ok((incoming, waiting, regular))
     }
 
     fn commit_segment(&self, seg: SegmentHeaderInfo) -> Result<()> {
@@ -7637,7 +7634,7 @@ impl InnerPart {
 
             let mut newHeader = headerstuff.data.clone();
 
-            newHeader.fresh.insert(0, seg);
+            newHeader.incoming.insert(0, seg);
 
             newHeader.changeCounter = newHeader.changeCounter + 1;
 
@@ -7648,7 +7645,7 @@ impl InnerPart {
         // you can change the segment list more than once while holding
         // the writeLock.  the writeLock gets released when you Dispose() it.
 
-        try!(self.notify_work(FromLevel::Fresh));
+        try!(self.notify_work(FromLevel::Incoming));
 
         Ok(())
     }
@@ -7689,14 +7686,14 @@ impl InnerPart {
     fn notify_work(&self, from_level: FromLevel) -> Result<()> {
         let senders = try!(self.senders.lock());
         match from_level {
-            FromLevel::Fresh => {
-                try!(senders.notify_fresh.send(MergeMessage::Work).map_err(wrap_err));
+            FromLevel::Incoming => {
+                try!(senders.notify_incoming.send(MergeMessage::Work).map_err(wrap_err));
             },
-            FromLevel::Young => {
-                try!(senders.notify_young.send(MergeMessage::Work).map_err(wrap_err));
+            FromLevel::Waiting => {
+                try!(senders.notify_waiting.send(MergeMessage::Work).map_err(wrap_err));
             },
-            FromLevel::Other(i) => {
-                try!(senders.notify_levels[i].send(MergeMessage::Work).map_err(wrap_err));
+            FromLevel::Regular(i) => {
+                try!(senders.notify_regular[i].send(MergeMessage::Work).map_err(wrap_err));
             },
         }
         Ok(())
@@ -7704,9 +7701,10 @@ impl InnerPart {
 
     fn needs_merge(inner: &std::sync::Arc<InnerPart>, from_level: FromLevel) -> Result<NeedsMerge> {
         match from_level {
-            FromLevel::Other(i) => {
-                if i == NUM_LEVELS - 1 {
+            FromLevel::Regular(i) => {
+                if i == NUM_REGULAR_LEVELS - 1 {
                     // this level doesn't need a merge because it has nowhere to promote to
+                    // TODO this hard-coded restriction on number of regular levels should go away
                     return Ok(NeedsMerge::No);
                 }
             },
@@ -7716,27 +7714,27 @@ impl InnerPart {
         let headerstuff = try!(inner.header.read());
         let header = &headerstuff.data;
         match from_level {
-            FromLevel::Fresh => {
-                if header.fresh.is_empty() {
+            FromLevel::Incoming => {
+                if header.incoming.is_empty() {
                     return Ok(NeedsMerge::No);
                 }
 
-                if header.fresh.len() > inner.settings.desperate_fresh {
+                if header.incoming.len() > inner.settings.desperate_incoming {
                     return Ok(NeedsMerge::Desperate);
                 }
 
                 // TODO consider always returning Yes here.  but
                 // doing that seems to cause a big perf hit.  why?
-                // the idea was to just keep Fresh empty.
-                let i = header.fresh.len() - 1;
-                let pt = try!(PageType::from_u8(header.fresh[i].buf[0]));
+                // the idea was to just keep Incoming empty.
+                let i = header.incoming.len() - 1;
+                let pt = try!(PageType::from_u8(header.incoming[i].buf[0]));
                 match pt {
                     PageType::PARENT_NODE => {
-                        // a parent node is promoted from Fresh without a rewrite
+                        // a parent node is promoted from Incoming without a rewrite
                         return Ok(NeedsMerge::Yes);
                     },
                     PageType::LEAF_NODE => {
-                        if header.fresh.len() > 1 {
+                        if header.incoming.len() > 1 {
                             return Ok(NeedsMerge::Yes);
                         } else {
                             return Ok(NeedsMerge::No);
@@ -7746,23 +7744,23 @@ impl InnerPart {
 
                 return Ok(NeedsMerge::Yes);
             },
-            FromLevel::Young => {
-                if header.young.is_empty() {
+            FromLevel::Waiting => {
+                if header.waiting.is_empty() {
                     return Ok(NeedsMerge::No);
                 }
 
-                if header.young.len() > inner.settings.desperate_young {
+                if header.waiting.len() > inner.settings.desperate_waiting {
                     return Ok(NeedsMerge::Desperate);
                 }
 
                 return Ok(NeedsMerge::Yes);
             },
-            FromLevel::Other(i) => {
-                if header.levels.len() <= i {
-                    // this level doesn't need a merge because it doesn't exist
+            FromLevel::Regular(i) => {
+                if header.regular.len() <= i {
+                    // this level doesn't need a merge because it currently doesn't exist
                     return Ok(NeedsMerge::No);
                 }
-                match &header.levels[i] {
+                match &header.regular[i] {
                     &Some(ref seg) => {
                         match try!(PageType::from_u8(seg.buf[0])) {
                             PageType::LEAF_NODE => {
@@ -7774,7 +7772,7 @@ impl InnerPart {
                                 }
                                 /*
                                 // TODO this causes a mysterious perf loss
-                                if i + 1 < header.levels.len() {
+                                if i + 1 < header.regular.len() {
                                     return Ok(NeedsMerge::Yes);
                                 }
                                 */
@@ -7796,7 +7794,7 @@ impl InnerPart {
                                 }
                                 if size > inner.settings.desperate_level_factor * get_level_size(i) {
                                     // TODO not sure we need this.  but without it,
-                                    // Other(0) gets out of control on 5M urls.
+                                    // Regular(0) gets out of control on 5M urls.
                                     // maybe a locking and starvation issue.
                                     return Ok(NeedsMerge::Desperate);
                                 }
@@ -7816,14 +7814,18 @@ impl InnerPart {
         let t1 = time::PreciseTime::now();
 
         enum MergingFrom {
-            FreshLeaves{
+            IncomingLeaves{
+                // Segments of depth > 0 are moved from Incoming to Waiting
+                // without rewriting them.
+                // Leaf segments are moved from Incoming to Waiting by
+                // grouping them together into bigger segments.
                 segments: Vec<PageNum>,
             },
-            YoungLeaf{
+            WaitingLeaf{
                 segment: PageNum,
                 count_tombstones: u64,
             },
-            YoungPartial{
+            WaitingPartial{
                 old_segment: ParentPage,
                 promote_pages: Vec<PageNum>, // must be contig within same parent
                 promote_depth: u8,
@@ -7831,12 +7833,12 @@ impl InnerPart {
                 promote_lineage: Vec<PageNum>, 
                 count_tombstones: u64,
             },
-            OtherLeaf{
+            RegularLeaf{
                 level: usize,  // TODO why is this here?
                 segment: PageNum,
                 count_tombstones: u64,
             },
-            OtherPartial{
+            RegularPartial{
                 level: usize,  // TODO why is this here?
                 old_segment: ParentPage, 
                 promote_pages: Vec<PageNum>, // must be contig within same parent
@@ -7882,9 +7884,9 @@ impl InnerPart {
                 }
 
                 match from_level {
-                    FromLevel::Fresh => {
-                        let i = header.fresh.len() - 1;
-                        match try!(PageType::from_u8(header.fresh[i].buf[0])) {
+                    FromLevel::Incoming => {
+                        let i = header.incoming.len() - 1;
+                        match try!(PageType::from_u8(header.incoming[i].buf[0])) {
                             PageType::LEAF_NODE => {
                                 let mut i = i;
                                 // TODO should there be a limit to how many leaves we will take at one time?
@@ -7893,14 +7895,14 @@ impl InnerPart {
                                 // otherwise, we could get stuck with the last segment being a leaf
                                 // and the second-to-last segment being a parent.
                                 while i > 0 {
-                                    if PageType::LEAF_NODE == try!(PageType::from_u8(header.fresh[i - 1].buf[0])) {
+                                    if PageType::LEAF_NODE == try!(PageType::from_u8(header.incoming[i - 1].buf[0])) {
                                         i -= 1;
                                     } else {
                                         break;
                                     }
                                 }
 
-                                let merge_segments = slice_from_end(&header.fresh, header.fresh.len() - i);
+                                let merge_segments = slice_from_end(&header.incoming, header.incoming.len() - i);
 
                                 let cursors = try!(get_cursors(inner, f, &merge_segments));
 
@@ -7910,19 +7912,19 @@ impl InnerPart {
                                     .map( |seg| seg.root_page)
                                     .collect::<Vec<_>>();;
 
-                                (cursors, MergingFrom::FreshLeaves{segments: merge_segments})
+                                (cursors, MergingFrom::IncomingLeaves{segments: merge_segments})
                             },
                             PageType::PARENT_NODE => {
                                 let mut i = i;
                                 while i > 0 {
-                                    if PageType::PARENT_NODE == try!(PageType::from_u8(header.fresh[i - 1].buf[0])) {
+                                    if PageType::PARENT_NODE == try!(PageType::from_u8(header.incoming[i - 1].buf[0])) {
                                         i -= 1;
                                     } else {
                                         break;
                                     }
                                 }
 
-                                let merge_segments = slice_from_end(&header.fresh, header.fresh.len() - i);
+                                let merge_segments = slice_from_end(&header.incoming, header.incoming.len() - i);
 
                                 let merge_segments = 
                                     merge_segments
@@ -7933,7 +7935,7 @@ impl InnerPart {
                                 // TODO dislike early return
                                 let pm = 
                                     PendingMerge {
-                                        from: MergeFrom::FreshNoRewrite{segments: merge_segments},
+                                        from: MergeFrom::IncomingNoRewrite{segments: merge_segments},
                                         old_dest_segment: None,
                                         new_dest_segment: None,
                                         now_inactive: HashMap::new(),
@@ -7946,17 +7948,17 @@ impl InnerPart {
                         }
 
                     },
-                    FromLevel::Young => {
-                        let i = header.young.len() - 1;
-                        let segment = &header.young[i];
-                        match try!(PageType::from_u8(header.young[i].buf[0])) {
+                    FromLevel::Waiting => {
+                        let i = header.waiting.len() - 1;
+                        let segment = &header.waiting[i];
+                        match try!(PageType::from_u8(header.waiting[i].buf[0])) {
                             PageType::LEAF_NODE => {
                                 let count_tombstones = try!(LeafPage::count_tombstones(segment.root_page, &segment.buf));
 
                                 // TODO sad that this will re-read the leaf page
                                 let cursor = try!(MultiPageCursor::new(f.clone(), vec![segment.root_page]));
 
-                                let from = MergingFrom::YoungLeaf{
+                                let from = MergingFrom::WaitingLeaf{
                                     segment: segment.root_page,
                                     count_tombstones: count_tombstones,
                                 };
@@ -7975,7 +7977,7 @@ impl InnerPart {
 
                                 let cursor = try!(MultiPageCursor::new(f.clone(), chosen_pages.clone()));
 
-                                let from = MergingFrom::YoungPartial{
+                                let from = MergingFrom::WaitingPartial{
                                     old_segment: parent, 
                                     promote_lineage: lineage, 
                                     promote_pages: chosen_pages, 
@@ -7987,10 +7989,10 @@ impl InnerPart {
                             }
                         }
                     },
-                    FromLevel::Other(level) => {
-                        assert!(header.levels.len() > level);
+                    FromLevel::Regular(level) => {
+                        assert!(header.regular.len() > level);
                         // TODO unwrap here is ugly.  but needs_merge happpened first
-                        let old_from_segment = header.levels[level].as_ref().unwrap();
+                        let old_from_segment = header.regular[level].as_ref().unwrap();
                         match try!(PageType::from_u8(old_from_segment.buf[0])) {
                             PageType::LEAF_NODE => {
                                 let count_tombstones = try!(LeafPage::count_tombstones(old_from_segment.root_page, &old_from_segment.buf));
@@ -7998,7 +8000,7 @@ impl InnerPart {
                                 // TODO sad that this will re-read the leaf page
                                 let cursor = try!(MultiPageCursor::new(f.clone(), vec![old_from_segment.root_page]));
 
-                                let from = MergingFrom::OtherLeaf{
+                                let from = MergingFrom::RegularLeaf{
                                     level: level,
                                     segment: old_from_segment.root_page,
                                     count_tombstones: count_tombstones,
@@ -8030,7 +8032,7 @@ impl InnerPart {
                                         unreachable!();
                                     };
 
-                                let from = MergingFrom::OtherPartial{
+                                let from = MergingFrom::RegularPartial{
                                     level: level, 
                                     old_segment: parent, 
                                     promote_lineage: lineage, 
@@ -8053,13 +8055,13 @@ impl InnerPart {
 
             let into = 
                 match from_level.get_dest_level() {
-                    DestLevel::Young => {
-                        // for merges from Fresh into Young, there is no dest segment.
+                    DestLevel::Waiting => {
+                        // for merges from Incoming into Waiting, there is no dest segment.
                         MergingInto::None
                     },
-                    DestLevel::Other(dest_level) => {
-                        if header.levels.len() > dest_level {
-                            match &header.levels[dest_level] {
+                    DestLevel::Regular(dest_level) => {
+                        if header.regular.len() > dest_level {
+                            match &header.regular[dest_level] {
                                 &Some(ref dest_segment) => {
                                     let pt = try!(PageType::from_u8(dest_segment.buf[0]));
 
@@ -8101,59 +8103,59 @@ impl InnerPart {
 
                 let behind_segments = {
                     match from {
-                        MergingFrom::FreshLeaves{..} => {
+                        MergingFrom::IncomingLeaves{..} => {
                             None
                         },
-                        MergingFrom::YoungLeaf{count_tombstones, ..} => {
+                        MergingFrom::WaitingLeaf{count_tombstones, ..} => {
                             if count_tombstones == 0 {
                                 None
                             } else {
                                 let dest_level = 0;
-                                let mut behind_segments = Vec::with_capacity(header.levels.len());
-                                for i in dest_level + 1 .. header.levels.len() {
-                                    let seg = &header.levels[i];
+                                let mut behind_segments = Vec::with_capacity(header.regular.len());
+                                for i in dest_level + 1 .. header.regular.len() {
+                                    let seg = &header.regular[i];
 
                                     behind_segments.push(seg);
                                 }
                                 Some(behind_segments)
                             }
                         },
-                        MergingFrom::YoungPartial{count_tombstones, ..} => {
+                        MergingFrom::WaitingPartial{count_tombstones, ..} => {
                             if count_tombstones == 0 {
                                 None
                             } else {
                                 let dest_level = 0;
-                                let mut behind_segments = Vec::with_capacity(header.levels.len());
-                                for i in dest_level + 1 .. header.levels.len() {
-                                    let seg = &header.levels[i];
+                                let mut behind_segments = Vec::with_capacity(header.regular.len());
+                                for i in dest_level + 1 .. header.regular.len() {
+                                    let seg = &header.regular[i];
 
                                     behind_segments.push(seg);
                                 }
                                 Some(behind_segments)
                             }
                         },
-                        MergingFrom::OtherLeaf{level, count_tombstones, ..} => {
+                        MergingFrom::RegularLeaf{level, count_tombstones, ..} => {
                             if count_tombstones == 0 {
                                 None
                             } else {
                                 let dest_level = level + 1;
-                                let mut behind_segments = Vec::with_capacity(header.levels.len());
-                                for i in dest_level + 1 .. header.levels.len() {
-                                    let seg = &header.levels[i];
+                                let mut behind_segments = Vec::with_capacity(header.regular.len());
+                                for i in dest_level + 1 .. header.regular.len() {
+                                    let seg = &header.regular[i];
 
                                     behind_segments.push(seg);
                                 }
                                 Some(behind_segments)
                             }
                         },
-                        MergingFrom::OtherPartial{level, count_tombstones, ..} => {
+                        MergingFrom::RegularPartial{level, count_tombstones, ..} => {
                             if count_tombstones == 0 {
                                 None
                             } else {
                                 let dest_level = level + 1;
-                                let mut behind_segments = Vec::with_capacity(header.levels.len());
-                                for i in dest_level + 1 .. header.levels.len() {
-                                    let seg = &header.levels[i];
+                                let mut behind_segments = Vec::with_capacity(header.regular.len());
+                                for i in dest_level + 1 .. header.regular.len() {
+                                    let seg = &header.regular[i];
 
                                     behind_segments.push(seg);
                                 }
@@ -8321,9 +8323,9 @@ impl InnerPart {
             };
 
         // there are four sources of pages in this operation:
-        //     the fresh segments being promoted
-        //     the young segments being promoted
-        //     the level segment being promoted
+        //     the incoming segments being promoted
+        //     the waiting segments being promoted
+        //     the regular segment being promoted
         //     the dest segment
         //
         // all those pages must end up in one of three places:
@@ -8334,7 +8336,7 @@ impl InnerPart {
         let mut now_inactive: HashMap<PageNum, BlockList> = {
             let mut now_inactive = HashMap::new();
             match from {
-                MergingFrom::FreshLeaves{ref segments} => {
+                MergingFrom::IncomingLeaves{ref segments} => {
                     for &seg in segments.iter() {
                         let mut blocks = BlockList::new();
                         blocks.add_page_no_reorder(seg);
@@ -8348,24 +8350,24 @@ impl InnerPart {
                         now_inactive.insert(seg, blocks);
                     }
                 },
-                MergingFrom::YoungLeaf{segment, ..} => {
+                MergingFrom::WaitingLeaf{segment, ..} => {
                     let mut blocks = BlockList::new();
                     blocks.add_page_no_reorder(segment);
                     assert!(overflows_eaten.is_empty());
                     assert!(!now_inactive.contains_key(&segment));
                     now_inactive.insert(segment, blocks);
                 },
-                MergingFrom::OtherLeaf{segment, ..} => {
+                MergingFrom::RegularLeaf{segment, ..} => {
                     let mut blocks = BlockList::new();
                     blocks.add_page_no_reorder(segment);
                     assert!(overflows_eaten.is_empty());
                     assert!(!now_inactive.contains_key(&segment));
                     now_inactive.insert(segment, blocks);
                 },
-                MergingFrom::YoungPartial{..} => {
+                MergingFrom::WaitingPartial{..} => {
                     // this is done below
                 },
-                MergingFrom::OtherPartial{..} => {
+                MergingFrom::RegularPartial{..} => {
                     // this is done below
                 },
             }
@@ -8391,19 +8393,19 @@ impl InnerPart {
 
         let from = 
             match from {
-                MergingFrom::FreshLeaves{segments} => {
-                    MergeFrom::Fresh{
+                MergingFrom::IncomingLeaves{segments} => {
+                    MergeFrom::Incoming{
                         segments: segments,
                     }
                 },
-                MergingFrom::YoungLeaf{segment, ..} => {
-                    MergeFrom::Young{
+                MergingFrom::WaitingLeaf{segment, ..} => {
+                    MergeFrom::Waiting{
                         old_segment: segment,
                         new_segment: None,
                     }
                 },
-                MergingFrom::YoungPartial{old_segment, promote_pages, promote_depth, promote_lineage, promote_blocks, ..} => {
-                    // TODO this code is very similar to the MergingFrom::OtherPartial case below
+                MergingFrom::WaitingPartial{old_segment, promote_pages, promote_depth, promote_lineage, promote_blocks, ..} => {
+                    // TODO this code is very similar to the MergingFrom::RegularPartial case below
                     //println!("promote_lineage: {:?}", promote_lineage);
                     //println!("promote_blocks: {:?}", promote_blocks);
                     let wrote = try!(write_survivors(&mut pw, &promote_pages, promote_depth, &promote_lineage, &old_segment, &inner.path, &f, from_level.get_dest_level()));
@@ -8418,7 +8420,7 @@ impl InnerPart {
                             );
 
                     let from = 
-                        MergeFrom::Young{
+                        MergeFrom::Waiting{
                             old_segment: old_segment.pagenum,
                             new_segment: wrote.segment,
                         };
@@ -8437,14 +8439,14 @@ impl InnerPart {
                     now_inactive.insert(old_segment.pagenum, blocks);
                     from
                 },
-                MergingFrom::OtherLeaf{level, segment, ..} => {
-                    MergeFrom::Other{
+                MergingFrom::RegularLeaf{level, segment, ..} => {
+                    MergeFrom::Regular{
                         level: level,
                         old_segment: segment,
                         new_segment: None,
                     }
                 },
-                MergingFrom::OtherPartial{level, old_segment, promote_pages, promote_depth, promote_lineage, promote_blocks, ..} => {
+                MergingFrom::RegularPartial{level, old_segment, promote_pages, promote_depth, promote_lineage, promote_blocks, ..} => {
                     //println!("promote_lineage: {:?}", promote_lineage);
                     //println!("promote_blocks: {:?}", promote_blocks);
                     let wrote = try!(write_survivors(&mut pw, &promote_pages, promote_depth, &promote_lineage, &old_segment, &inner.path, &f, from_level.get_dest_level()));
@@ -8458,7 +8460,7 @@ impl InnerPart {
                             );
 
                     let from = 
-                        MergeFrom::Other {
+                        MergeFrom::Regular {
                             level: level,
                             old_segment: old_segment.pagenum,
                             new_segment: wrote.segment,
@@ -8514,21 +8516,21 @@ impl InnerPart {
             let old_now_inactive = {
                 let mut now_inactive = HashMap::new();
                 match from {
-                    MergeFrom::Fresh{ref segments} => {
+                    MergeFrom::Incoming{ref segments} => {
                         for &seg in segments.iter() {
                             let blocks = try!(get_blocklist_for_segment_including_root(seg, f));
                             assert!(!now_inactive.contains_key(&seg));
                             now_inactive.insert(seg, blocks);
                         }
                     },
-                    MergeFrom::FreshNoRewrite{..} => {
+                    MergeFrom::IncomingNoRewrite{..} => {
                     },
-                    MergeFrom::Young{old_segment, ..} => {
+                    MergeFrom::Waiting{old_segment, ..} => {
                         let blocks = try!(get_blocklist_for_segment_including_root(old_segment, f));
                         assert!(!now_inactive.contains_key(&old_segment));
                         now_inactive.insert(old_segment, blocks);
                     },
-                    MergeFrom::Other{old_segment, ..} => {
+                    MergeFrom::Regular{old_segment, ..} => {
                         let blocks = try!(get_blocklist_for_segment_including_root(old_segment, f));
                         assert!(!now_inactive.contains_key(&old_segment));
                         now_inactive.insert(old_segment, blocks);
@@ -8560,7 +8562,7 @@ impl InnerPart {
                     },
                 }
                 match from {
-                    MergeFrom::Young{ref new_segment, ..} => {
+                    MergeFrom::Waiting{ref new_segment, ..} => {
                         if let &Some(ref new_segment) = new_segment {
                             let mut blocks = try!(new_segment.blocklist_unsorted(f));
                             blocks.add_page_no_reorder(new_segment.root_page);
@@ -8569,7 +8571,7 @@ impl InnerPart {
                             }
                         }
                     },
-                    MergeFrom::Other{ref new_segment, ..} => {
+                    MergeFrom::Regular{ref new_segment, ..} => {
                         if let &Some(ref new_segment) = new_segment {
                             let mut blocks = try!(new_segment.blocklist_unsorted(f));
                             blocks.add_page_no_reorder(new_segment.root_page);
@@ -8630,7 +8632,7 @@ impl InnerPart {
                     //if cfg!(expensive_check) 
                     {
                         match from {
-                            MergeFrom::Young{ref new_segment, ..} => {
+                            MergeFrom::Waiting{ref new_segment, ..} => {
                                 if let &Some(ref new_segment) = new_segment {
                                     let mut blocks = try!(new_segment.blocklist_unsorted(f));
                                     blocks.add_page_no_reorder(new_segment.root_page);
@@ -8645,7 +8647,7 @@ impl InnerPart {
                                 }
 
                             },
-                            MergeFrom::Other{ref new_segment, ..} => {
+                            MergeFrom::Regular{ref new_segment, ..} => {
                                 if let &Some(ref new_segment) = new_segment {
                                     let mut blocks = try!(new_segment.blocklist_unsorted(f));
                                     blocks.add_page_no_reorder(new_segment.root_page);
@@ -8722,21 +8724,21 @@ impl InnerPart {
                         // multiple promoted segments cancelled each other out.
                         // but there wasn't anything in this level anyway, either
                         // because it didn't exist or had been depleted.
-                        if newHeader.levels.len() == dest_level {
+                        if newHeader.regular.len() == dest_level {
                             // fine
                         } else {
-                            assert!(newHeader.levels[dest_level].is_none());
+                            assert!(newHeader.regular[dest_level].is_none());
                         }
                     },
                     (None, Some(new_seg)) => {
-                        if newHeader.levels.len() == dest_level {
+                        if newHeader.regular.len() == dest_level {
                             // first merge into this new level
-                            newHeader.levels.push(Some(new_seg));
+                            newHeader.regular.push(Some(new_seg));
                         } else {
                             // merge into a previously depleted level
-                            assert!(dest_level < newHeader.levels.len());
-                            assert!(newHeader.levels[dest_level].is_none());
-                            newHeader.levels[dest_level] = Some(new_seg);
+                            assert!(dest_level < newHeader.regular.len());
+                            assert!(newHeader.regular[dest_level].is_none());
+                            newHeader.regular[dest_level] = Some(new_seg);
                             println!("level {} resurrected", dest_level);
                         }
                     },
@@ -8744,17 +8746,17 @@ impl InnerPart {
                         // a merge resulted in what would have been an empty segment.
                         // promoted segments cancelled out everything that was in
                         // the dest level.
-                        assert!(dest_level < newHeader.levels.len());
-                        assert!(newHeader.levels[dest_level].as_ref().unwrap().root_page == old);
+                        assert!(dest_level < newHeader.regular.len());
+                        assert!(newHeader.regular[dest_level].as_ref().unwrap().root_page == old);
                         // TODO if this is the last level, just remove it?
-                        newHeader.levels[dest_level] = None;
+                        newHeader.regular[dest_level] = None;
                         println!("level {} depleted", dest_level);
                     },
                     (Some(old), Some(new_seg)) => {
                         // level already exists
-                        assert!(dest_level < newHeader.levels.len());
-                        assert!(newHeader.levels[dest_level].as_ref().unwrap().root_page == old);
-                        newHeader.levels[dest_level] = Some(new_seg);
+                        assert!(dest_level < newHeader.regular.len());
+                        assert!(newHeader.regular[dest_level].as_ref().unwrap().root_page == old);
+                        newHeader.regular[dest_level] = Some(new_seg);
                     },
                 }
             }
@@ -8798,18 +8800,18 @@ impl InnerPart {
                 Some(ref new_seg) => {
                     let mut deps_dest = vec![];
                     match pm.from {
-                        MergeFrom::Fresh{ref segments} => {
+                        MergeFrom::Incoming{ref segments} => {
                             for seg in segments {
                                 deps_dest.push(*seg);
                             }
                         },
-                        MergeFrom::FreshNoRewrite{..} => {
+                        MergeFrom::IncomingNoRewrite{..} => {
                             assert!(pm.now_inactive.is_empty());
                         },
-                        MergeFrom::Young{old_segment, ..} => {
+                        MergeFrom::Waiting{old_segment, ..} => {
                             deps_dest.push(old_segment);
                         },
-                        MergeFrom::Other{old_segment, ..} => {
+                        MergeFrom::Regular{old_segment, ..} => {
                             deps_dest.push(old_segment);
                         },
                     }
@@ -8828,11 +8830,11 @@ impl InnerPart {
             // also, the survivors must depend on the old segment
 
             match pm.from {
-                MergeFrom::Fresh{..} => {
+                MergeFrom::Incoming{..} => {
                 },
-                MergeFrom::FreshNoRewrite{..} => {
+                MergeFrom::IncomingNoRewrite{..} => {
                 },
-                MergeFrom::Young{old_segment, ref new_segment} => {
+                MergeFrom::Waiting{old_segment, ref new_segment} => {
                     match new_segment {
                         &Some(ref new_segment) => {
                             assert!(!deps.contains_key(&new_segment.root_page));
@@ -8842,7 +8844,7 @@ impl InnerPart {
                         },
                     }
                 },
-                MergeFrom::Other{level, old_segment, ref new_segment} => {
+                MergeFrom::Regular{level, old_segment, ref new_segment} => {
                     match new_segment {
                         &Some(ref new_segment) => {
                             assert!(!deps.contains_key(&new_segment.root_page));
@@ -8855,10 +8857,10 @@ impl InnerPart {
             }
 
             match pm.from {
-                MergeFrom::Fresh{ref segments} => {
-                    let ndx = find_segments_in_list(segments, &headerstuff.data.fresh);
+                MergeFrom::Incoming{ref segments} => {
+                    let ndx = find_segments_in_list(segments, &headerstuff.data.incoming);
                     for _ in segments {
-                        newHeader.fresh.remove(ndx);
+                        newHeader.incoming.remove(ndx);
                     }
 
                     assert!(pm.old_dest_segment.is_none());
@@ -8866,42 +8868,42 @@ impl InnerPart {
                         None => {
                             // a merge resulted in what would have been an empty segment.
                             // this happens because tombstones.
-                            // multiple segments from the fresh level cancelled each other out.
-                            // nothing needs to be inserted in the young level.
+                            // multiple segments from the incoming level cancelled each other out.
+                            // nothing needs to be inserted in the waiting level.
                         },
                         Some(new_seg) => {
-                            newHeader.young.insert(0, new_seg);
+                            newHeader.waiting.insert(0, new_seg);
                         },
                     }
                 },
-                MergeFrom::FreshNoRewrite{ref segments} => {
-                    let ndx = find_segments_in_list(segments, &headerstuff.data.fresh);
+                MergeFrom::IncomingNoRewrite{ref segments} => {
+                    let ndx = find_segments_in_list(segments, &headerstuff.data.incoming);
                     for _ in segments {
-                        let s = newHeader.fresh.remove(ndx);
-                        newHeader.young.insert(0, s);
+                        let s = newHeader.incoming.remove(ndx);
+                        newHeader.waiting.insert(0, s);
                     }
 
                     assert!(pm.old_dest_segment.is_none());
                     assert!(pm.new_dest_segment.is_none());
                 },
-                MergeFrom::Young{old_segment, new_segment} => {
-                    let i = newHeader.young.len() - 1;
-                    assert!(old_segment == newHeader.young[i].root_page);
+                MergeFrom::Waiting{old_segment, new_segment} => {
+                    let i = newHeader.waiting.len() - 1;
+                    assert!(old_segment == newHeader.waiting[i].root_page);
                     match new_segment {
                         Some(new_segment) => {
-                            newHeader.young[i] = new_segment;
+                            newHeader.waiting[i] = new_segment;
                         },
                         None => {
-                            newHeader.young.remove(i);
+                            newHeader.waiting.remove(i);
                         },
                     }
 
                     let dest_level = 0;
                     update_header(&mut newHeader, pm.old_dest_segment, pm.new_dest_segment, dest_level);
                 },
-                MergeFrom::Other{level, old_segment, new_segment} => {
-                    assert!(old_segment == newHeader.levels[level].as_ref().unwrap().root_page);
-                    newHeader.levels[level] = new_segment;
+                MergeFrom::Regular{level, old_segment, new_segment} => {
+                    assert!(old_segment == newHeader.regular[level].as_ref().unwrap().root_page);
+                    newHeader.regular[level] = new_segment;
 
                     let dest_level = level + 1;
                     update_header(&mut newHeader, pm.old_dest_segment, pm.new_dest_segment, dest_level);
