@@ -3040,8 +3040,15 @@ fn calc_leaf_page_len(prefix_len: usize, sofar: usize) -> usize {
     + sofar // sum of size of all the actual items
 }
 
-// TODO return tuple is too big
-fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> (KeyWithLocationForLeaf, BlockList, usize, usize, u64) {
+struct BuildLeafReturnValue {
+    last_key: KeyWithLocationForLeaf,
+    blocks: BlockList,
+    len_page: usize,
+    count_pairs: usize,
+    count_tombstones: u64,
+}
+
+fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> BuildLeafReturnValue {
     pb.Reset();
     pb.PutByte(PageType::LEAF_NODE.to_u8());
     pb.PutByte(0u8); // flags
@@ -3102,14 +3109,20 @@ fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> (KeyWithL
         lp.key
     };
     blocks.sort_and_consolidate();
-    (last_key, blocks, pb.sofar(), count_keys_in_this_leaf, count_tombstones)
+    BuildLeafReturnValue {
+        last_key: last_key,
+        blocks: blocks,
+        len_page: pb.sofar(),
+        count_pairs: count_keys_in_this_leaf,
+        count_tombstones: count_tombstones,
+    }
 }
 
 fn write_leaf(st: &mut LeafUnderConstruction, 
                 pb: &mut PageBuilder, 
                 pw: &mut PageWriter,
                ) -> Result<(usize, ItemForParent)> {
-    let (last_key, blocks, len_page, count_pairs, count_tombstones) = build_leaf(st, pb);
+    let BuildLeafReturnValue {last_key, blocks, len_page, count_pairs, count_tombstones} = build_leaf(st, pb);
     let last_key = last_key.for_parent();
     //println!("leaf blocklist: {:?}", blocks);
     //println!("leaf blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
@@ -3552,7 +3565,13 @@ fn merge_process_pair(
     Ok(keep)
 }
 
-// TODO return tuple too large
+struct MergeRewriteReturnValue {
+    keys_promoted: usize,
+    keys_rewritten: usize,
+    keys_shadowed: usize,
+    tombstones_removed: usize,
+}
+
 fn merge_rewrite_leaf(
                     st: &mut LeafUnderConstruction,
                     pb: &mut PageBuilder,
@@ -3564,7 +3583,7 @@ fn merge_rewrite_leaf(
                     chain: &mut ParentNodeWriter,
                     overflows_freed: &mut Vec<BlockList>,
                     dest_level: DestLevel,
-                    ) -> Result<(usize, usize, usize, usize)> {
+                    ) -> Result<MergeRewriteReturnValue> {
 
     #[derive(Debug)]
     enum Action {
@@ -3573,10 +3592,13 @@ fn merge_rewrite_leaf(
     }
 
     let mut i = 0;
-    let mut keys_promoted = 0;
-    let mut keys_rewritten = 0;
-    let mut keys_shadowed = 0;
-    let mut tombstones_removed = 0;
+    let mut ret =
+        MergeRewriteReturnValue {
+            keys_promoted: 0,
+            keys_rewritten: 0,
+            keys_shadowed: 0,
+            tombstones_removed: 0,
+        };
 
     let len = leafreader.count_keys();
     while i < len {
@@ -3610,7 +3632,7 @@ fn merge_rewrite_leaf(
                                 _ => {
                                 },
                             }
-                            keys_shadowed += 1;
+                            ret.keys_shadowed += 1;
                             i += 1;
                             Action::Pairs
                         },
@@ -3628,9 +3650,9 @@ fn merge_rewrite_leaf(
             Action::Pairs => {
                 let pair = try!(misc::inside_out(pairs.next())).unwrap();
                 if try!(merge_process_pair(pair, st, pb, pw, vbuf, behind, chain, dest_level)) {
-                    keys_promoted += 1;
+                    ret.keys_promoted += 1;
                 } else {
-                    tombstones_removed += 1;
+                    ret.tombstones_removed += 1;
                 }
             },
             Action::ItemForLeaf => {
@@ -3640,16 +3662,15 @@ fn merge_rewrite_leaf(
                 if let Some(pg) = try!(process_pair_into_leaf(st, pb, pw, vbuf, pair)) {
                     try!(chain.add_child(pw, pg, 0));
                 }
-                keys_rewritten += 1;
+                ret.keys_rewritten += 1;
                 i += 1;
             },
         }
     }
 
-    Ok((keys_promoted, keys_rewritten, keys_shadowed, tombstones_removed))
+    Ok(ret)
 }
 
-// TODO return tuple too large
 fn merge_rewrite_parent(
                     st: &mut LeafUnderConstruction,
                     pb: &mut PageBuilder,
@@ -3664,7 +3685,7 @@ fn merge_rewrite_parent(
                     nodes_rewritten: &mut Box<[Vec<PageNum>]>,
                     nodes_recycled: &mut Box<[usize]>,
                     dest_level: DestLevel,
-                    ) -> Result<(usize, usize, usize, usize)> {
+                    ) -> Result<MergeRewriteReturnValue> {
 
     #[derive(Debug)]
     enum Action {
@@ -3672,10 +3693,13 @@ fn merge_rewrite_parent(
         RecycleNodes(usize),
     }
 
-    let mut keys_promoted = 0;
-    let mut keys_rewritten = 0;
-    let mut keys_shadowed = 0;
-    let mut tombstones_removed = 0;
+    let mut ret =
+        MergeRewriteReturnValue {
+            keys_promoted: 0,
+            keys_rewritten: 0,
+            keys_shadowed: 0,
+            tombstones_removed: 0,
+        };
 
     let len = parent.count_items();
 // TODO doesn't i increment every time through the loop now?
@@ -3755,32 +3779,32 @@ fn merge_rewrite_parent(
                 if parent.depth() == 1 {
                     let pg = try!(parent.child_as_item_for_parent(i));
                     try!(leaf.move_to_page(pg.page));
-                    let (sub_keys_promoted, sub_keys_rewritten, sub_keys_shadowed, sub_tombstones_removed) = try!(merge_rewrite_leaf(st, pb, pw, vbuf, pairs, leaf, behind, chain, overflows_freed, dest_level));
+                    let sub = try!(merge_rewrite_leaf(st, pb, pw, vbuf, pairs, leaf, behind, chain, overflows_freed, dest_level));
 
                     // in the case where we rewrote a page that didn't really NEED to be,
                     // the following assert is not true
                     //assert!(sub_keys_promoted > 0 || sub_tombstones_removed > 0);
 
-                    assert!(sub_keys_rewritten > 0 || sub_keys_shadowed > 0);
+                    assert!(sub.keys_rewritten > 0 || sub.keys_shadowed > 0);
 
-                    keys_promoted += sub_keys_promoted;
-                    keys_rewritten += sub_keys_rewritten;
-                    keys_shadowed += sub_keys_shadowed;
-                    tombstones_removed += sub_tombstones_removed;
+                    ret.keys_promoted += sub.keys_promoted;
+                    ret.keys_rewritten += sub.keys_rewritten;
+                    ret.keys_shadowed += sub.keys_shadowed;
+                    ret.tombstones_removed += sub.tombstones_removed;
                 } else {
                     let sub = try!(parent.fetch_item_parent(i));
-                    let (sub_keys_promoted, sub_keys_rewritten, sub_keys_shadowed, sub_tombstones_removed) = try!(merge_rewrite_parent(st, pb, pw, vbuf, pairs, leaf, &sub, behind, chain, overflows_freed, nodes_rewritten, nodes_recycled, dest_level));
-                    keys_promoted += sub_keys_promoted;
-                    keys_rewritten += sub_keys_rewritten;
-                    keys_shadowed += sub_keys_shadowed;
-                    tombstones_removed += sub_tombstones_removed;
+                    let sub = try!(merge_rewrite_parent(st, pb, pw, vbuf, pairs, leaf, &sub, behind, chain, overflows_freed, nodes_rewritten, nodes_recycled, dest_level));
+                    ret.keys_promoted += sub.keys_promoted;
+                    ret.keys_rewritten += sub.keys_rewritten;
+                    ret.keys_shadowed += sub.keys_shadowed;
+                    ret.tombstones_removed += sub.tombstones_removed;
                 }
                 i += 1;
             },
         }
     }
 
-    Ok((keys_promoted, keys_rewritten, keys_shadowed, tombstones_removed))
+    Ok(ret)
 }
 
 fn write_merge(
@@ -3836,11 +3860,11 @@ fn write_merge(
             // nothing to do here
         },
         MergingInto::Leaf(ref leaf) => {
-            let (sub_keys_promoted, sub_keys_rewritten, sub_keys_shadowed, sub_tombstones_removed) = try!(merge_rewrite_leaf(&mut st, &mut pb, pw, &mut vbuf, pairs, leaf, &mut behind, &mut chain, &mut overflows_freed, dest_level));
-            keys_promoted = sub_keys_promoted;
-            keys_rewritten = sub_keys_rewritten;
-            keys_shadowed = sub_keys_shadowed;
-            tombstones_removed = sub_tombstones_removed;
+            let sub = try!(merge_rewrite_leaf(&mut st, &mut pb, pw, &mut vbuf, pairs, leaf, &mut behind, &mut chain, &mut overflows_freed, dest_level));
+            keys_promoted = sub.keys_promoted;
+            keys_rewritten = sub.keys_rewritten;
+            keys_shadowed = sub.keys_shadowed;
+            tombstones_removed = sub.tombstones_removed;
             nodes_rewritten[0].push(leaf.pagenum);
         },
         MergingInto::Parent(ref parent) => {
@@ -3862,11 +3886,11 @@ fn write_merge(
                 let nd = try!(r);
                 if nd.depth == rewrite_level {
                     try!(sub.move_to_page(nd.page));
-                    let (sub_keys_promoted, sub_keys_rewritten, sub_keys_shadowed, sub_tombstones_removed) = try!(merge_rewrite_parent(&mut st, &mut pb, pw, &mut vbuf, pairs, &mut leaf, &sub, &mut behind, &mut chain, &mut overflows_freed, &mut nodes_rewritten, &mut nodes_recycled, dest_level));
-                    keys_promoted += sub_keys_promoted;
-                    keys_rewritten += sub_keys_rewritten;
-                    keys_shadowed += sub_keys_shadowed;
-                    tombstones_removed += sub_tombstones_removed;
+                    let sub = try!(merge_rewrite_parent(&mut st, &mut pb, pw, &mut vbuf, pairs, &mut leaf, &sub, &mut behind, &mut chain, &mut overflows_freed, &mut nodes_rewritten, &mut nodes_recycled, dest_level));
+                    keys_promoted += sub.keys_promoted;
+                    keys_rewritten += sub.keys_rewritten;
+                    keys_shadowed += sub.keys_shadowed;
+                    tombstones_removed += sub.tombstones_removed;
                 }
                 nodes_rewritten[nd.depth as usize].push(nd.page);
             }
