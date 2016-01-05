@@ -2300,14 +2300,19 @@ impl IForwardCursor for MergeCursor {
                                     //println!("MergeCursor shadowed: {:?}", k, );
                                     self.count_keys_shadowed += 1;
                                     {
+                                        // TODO we probably need to check and see if the shadowed
+                                        // key was an owned overflow, right?
+
                                         let v = try!(self.subcursors[n].ValueRef());
                                         match v {
+                                            ValueRef::Slice(_) => {
+                                            },
+                                            ValueRef::Tombstone => {
+                                            },
                                             ValueRef::Overflowed(_, len, blocks) => {
                                                 let k = try!(self.subcursors[n].KeyRef());
                                                 //println!("eaten: {:?} -- {:?}", k, blocks);
                                                 self.overflows_eaten.push((try!(self.subcursors[n].current_pagenum()), blocks));
-                                            },
-                                            _ => {
                                             },
                                         }
                                     }
@@ -2807,15 +2812,15 @@ struct ParentUnderConstruction {
 #[derive(Debug, Clone)]
 enum KeyLocationForLeaf {
     Inline,
-    Overflowed(BlockList),
+    Overflow(BlockList),
 }
 
 // this type is used during construction of a page
 #[derive(Debug, Clone)]
 enum KeyLocationForParent {
     Inline,
-    Overflowed(BlockList),
-    // TODO borrowed vs owned overflow
+    BorrowedOverflow(BlockList),
+    OwnedOverflow(BlockList),
 }
 
 impl ValueLocation {
@@ -2837,49 +2842,54 @@ impl ValueLocation {
 }
 
 impl KeyLocationForLeaf {
-    fn need(&self, k: &[u8], prefix_len: usize) -> usize {
-        let klen = k.len();
-        assert!(klen >= prefix_len);
+    fn len_with_overflow_flag(&self, k: &[u8]) -> u64 {
+        let klen = (k.len() as u64) << 1;
         match *self {
             KeyLocationForLeaf::Inline => {
-                0 // no key flags
-                + varint::space_needed_for((klen * 2) as u64) 
-                + klen 
-                - prefix_len
+                klen
             },
-            KeyLocationForLeaf::Overflowed(ref blocks) => {
-                0 // no key flags
-                + varint::space_needed_for((klen * 2 + 1) as u64) 
-                + blocks.encoded_len()
+            KeyLocationForLeaf::Overflow(ref blocks) => {
+                klen | 1
             },
         }
+    }
+
+    fn need(&self, k: &[u8], prefix_len: usize) -> usize {
+        assert!(k.len() >= prefix_len);
+        varint::space_needed_for(self.len_with_overflow_flag(k))
+            + k.len()
+            - prefix_len
     }
 
     fn for_parent(self) -> KeyLocationForParent {
         match self {
             KeyLocationForLeaf::Inline => KeyLocationForParent::Inline,
-            KeyLocationForLeaf::Overflowed(blocks) => KeyLocationForParent::Overflowed(blocks),
+            KeyLocationForLeaf::Overflow(blocks) => KeyLocationForParent::BorrowedOverflow(blocks),
         }
     }
 }
 
 impl KeyLocationForParent {
-    fn need(&self, k: &[u8], prefix_len: usize) -> usize {
-        let klen = k.len();
-        assert!(klen >= prefix_len);
+    fn len_with_overflow_flag(&self, k: &[u8]) -> u64 {
+        let klen = (k.len() as u64) << 2;
         match *self {
             KeyLocationForParent::Inline => {
-                0 // no key flags
-                + varint::space_needed_for((klen * 2) as u64) 
-                + klen 
-                - prefix_len
+                klen
             },
-            KeyLocationForParent::Overflowed(ref blocks) => {
-                0 // no key flags
-                + varint::space_needed_for((klen * 2 + 1) as u64) 
-                + blocks.encoded_len()
+            KeyLocationForParent::BorrowedOverflow(_) => {
+                klen | 1
+            },
+            KeyLocationForParent::OwnedOverflow(_) => {
+                klen | 1 | 2
             },
         }
+    }
+
+    fn need(&self, k: &[u8], prefix_len: usize) -> usize {
+        assert!(k.len() >= prefix_len);
+        varint::space_needed_for(self.len_with_overflow_flag(k))
+            + k.len()
+            - prefix_len
     }
 }
 
@@ -2896,16 +2906,7 @@ impl KeyWithLocationForLeaf {
     }
 
     fn len_with_overflow_flag(&self) -> u64 {
-        // inline key len is stored * 2, always an even number
-        // overflowed key len is stored * 2 + 1, always odd
-        match self.location {
-            KeyLocationForLeaf::Inline => {
-                (self.key.len() * 2) as u64
-            },
-            KeyLocationForLeaf::Overflowed(_) => {
-                (self.key.len() * 2 + 1) as u64
-            },
-        }
+        self.location.len_with_overflow_flag(&self.key)
     }
 
     fn need(&self, prefix_len: usize) -> usize {
@@ -2919,16 +2920,7 @@ impl KeyWithLocationForParent {
     }
 
     fn len_with_overflow_flag(&self) -> u64 {
-        // inline key len is stored * 2, always an even number
-        // overflowed key len is stored * 2 + 1, always odd
-        match self.location {
-            KeyLocationForParent::Inline => {
-                (self.key.len() * 2) as u64
-            },
-            KeyLocationForParent::Overflowed(_) => {
-                (self.key.len() * 2 + 1) as u64
-            },
-        }
+        self.location.len_with_overflow_flag(&self.key)
     }
 
     fn need(&self, prefix_len: usize) -> usize {
@@ -3065,7 +3057,7 @@ fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> BuildLeaf
                 pb.PutVarint(lp.key.len_with_overflow_flag());
                 pb.PutArray(&lp.key.key[prefix_len .. ]);
             },
-            KeyLocationForLeaf::Overflowed(ref blocks) => {
+            KeyLocationForLeaf::Overflow(ref blocks) => {
                 pb.PutVarint(lp.key.len_with_overflow_flag());
                 blocks.encode(pb);
                 list.add_blocklist_no_reorder(blocks);
@@ -3230,7 +3222,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
             let mut r = misc::ByteSliceRead::new(&k);
             let (len, blocks) = try!(write_overflow(&mut r, pw, hard_limit));
             assert!((len as usize) == k.len());
-            KeyLocationForLeaf::Overflowed(blocks)
+            KeyLocationForLeaf::Overflow(blocks)
         }
     };
 
@@ -3332,7 +3324,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                         };
                     bcmp::PrefixMatch(&*st.items[0].key.key, &k, max_prefix)
                 },
-                &KeyLocationForLeaf::Overflowed(_) => {
+                &KeyLocationForLeaf::Overflow(_) => {
                     // an overflowed key does not change the prefix
                     st.prefix_len
                 },
@@ -4178,7 +4170,9 @@ impl ParentNodeWriter {
             KeyLocationForParent::Inline => {
                 self.pb.PutArray(&k.key[prefix_len .. ]);
             },
-            KeyLocationForParent::Overflowed(ref blocks) => {
+            KeyLocationForParent::BorrowedOverflow(ref blocks)
+            | KeyLocationForParent::OwnedOverflow(ref blocks) => 
+            {
                 blocks.encode(&mut self.pb);
             },
         }
@@ -4294,7 +4288,9 @@ impl ParentNodeWriter {
                         &KeyLocationForParent::Inline => {
                             bcmp::PrefixMatch(&*self.st.items[0].last_key.key, &item.last_key.key, self.st.prefix_len)
                         },
-                        &KeyLocationForParent::Overflowed(_) => {
+                        &KeyLocationForParent::BorrowedOverflow(_)
+                        | &KeyLocationForParent::OwnedOverflow(_) => 
+                        {
                             // an overflowed key does not change the prefix
                             self.st.prefix_len
                         },
@@ -4716,7 +4712,7 @@ impl LeafPage {
             match &self.pairs[i].key {
                 &KeyInLeafPage::Inline{..} => {
                 },
-                &KeyInLeafPage::Overflowed{ref blocks, ..} => {
+                &KeyInLeafPage::Overflow{ref blocks, ..} => {
                     list.push(blocks);
                 },
             }
@@ -5209,25 +5205,25 @@ pub enum Overlap {
 #[derive(Debug)]
 pub enum KeyInLeafPage {
     Inline{len: usize, offset: usize},
-    Overflowed{len: usize, blocks: BlockList},
+    Overflow{len: usize, blocks: BlockList},
 }
 
 #[derive(Debug)]
 pub enum KeyInParentPage {
     Inline{len: usize, offset: usize},
-    Overflowed{len: usize, blocks: BlockList},
-    // TODO diff between borrowed overflow and owned overflow
+    BorrowedOverflow{len: usize, blocks: BlockList},
+    OwnedOverflow{len: usize, blocks: BlockList},
 }
 
 impl KeyInLeafPage {
     #[inline]
     fn read(pr: &[u8], cur: &mut usize, prefix_len: usize) -> Result<Self> {
         let klen = varint::read(pr, cur) as usize;
+        let inline = 0 == (klen & 1);
+        let klen = klen >> 1;
         if klen == 0 {
             return Err(Error::CorruptFile("key cannot be zero length"));
         }
-        let inline = 0 == klen % 2;
-        let klen = klen / 2;
         let k = 
             if inline {
                 let k = KeyInLeafPage::Inline{len: klen, offset: *cur};
@@ -5235,7 +5231,7 @@ impl KeyInLeafPage {
                 k
             } else {
                 let blocks = BlockList::read(&pr, cur);
-                let k = KeyInLeafPage::Overflowed{len: klen, blocks: blocks};
+                let k = KeyInLeafPage::Overflow{len: klen, blocks: blocks};
                 k
             };
         Ok(k)
@@ -5254,7 +5250,7 @@ impl KeyInLeafPage {
                     },
                 }
             },
-            &KeyInLeafPage::Overflowed{len: klen, ref blocks} => {
+            &KeyInLeafPage::Overflow{len: klen, ref blocks} => {
                 // TODO KeyRef::Overflow...
                 let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.blocks[0].firstPage, klen as u64));
                 let mut x_k = Vec::with_capacity(klen);
@@ -5271,11 +5267,12 @@ impl KeyInParentPage {
     #[inline]
     fn read(pr: &[u8], cur: &mut usize, prefix_len: usize) -> Result<Self> {
         let klen = varint::read(pr, cur) as usize;
+        let inline = 0 == (klen & 1);
+        let borrowed = 0 == (klen & 2);
+        let klen = klen >> 2;
         if klen == 0 {
             return Err(Error::CorruptFile("key cannot be zero length"));
         }
-        let inline = 0 == klen % 2;
-        let klen = klen / 2;
         let k = 
             if inline {
                 let k = KeyInParentPage::Inline{len: klen, offset: *cur};
@@ -5283,8 +5280,13 @@ impl KeyInParentPage {
                 k
             } else {
                 let blocks = BlockList::read(&pr, cur);
-                let k = KeyInParentPage::Overflowed{len: klen, blocks: blocks};
-                k
+                if borrowed {
+                    let k = KeyInParentPage::BorrowedOverflow{len: klen, blocks: blocks};
+                    k
+                } else {
+                    let k = KeyInParentPage::OwnedOverflow{len: klen, blocks: blocks};
+                    k
+                }
             };
         Ok(k)
     }
@@ -5302,7 +5304,9 @@ impl KeyInParentPage {
                     },
                 }
             },
-            &KeyInParentPage::Overflowed{len: klen, ref blocks} => {
+            &KeyInParentPage::BorrowedOverflow{len: klen, ref blocks}
+            | &KeyInParentPage::OwnedOverflow{len: klen, ref blocks} => 
+            {
                 // TODO KeyRef::Overflow...
                 let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.blocks[0].firstPage, klen as u64));
                 let mut x_k = Vec::with_capacity(klen);
@@ -5343,7 +5347,9 @@ impl KeyInParentPage {
                 };
                 Ok(kw)
             },
-            &KeyInParentPage::Overflowed{len: klen, ref blocks} => {
+            &KeyInParentPage::BorrowedOverflow{len: klen, ref blocks}
+            | &KeyInParentPage::OwnedOverflow{len: klen, ref blocks} => 
+            {
                 let k = {
                     let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.blocks[0].firstPage, klen as u64));
                     let mut x_k = Vec::with_capacity(klen);
@@ -5353,7 +5359,7 @@ impl KeyInParentPage {
                 };
                 let kw = KeyWithLocationForParent {
                     key: k,
-                    location: KeyLocationForParent::Overflowed(blocks.clone()),
+                    location: KeyLocationForParent::BorrowedOverflow(blocks.clone()),
                 };
                 Ok(kw)
             },
