@@ -2800,6 +2800,20 @@ impl ItemForParent {
         needed
     }
 
+    fn is_inline(&self) -> bool {
+        self.last_key.is_inline()
+    }
+
+    fn to_owned_overflow(&mut self, pw: &mut PageWriter) -> Result<()> {
+        // TODO magic number
+        let hard_limit = 1024;
+        let k = &self.last_key.key;
+        let mut r = misc::ByteSliceRead::new(&k);
+        let (len, blocks) = try!(write_overflow(&mut r, pw, hard_limit));
+        assert!((len as usize) == k.len());
+        self.last_key.location = KeyLocationForParent::OwnedOverflow(blocks);
+        Ok(())
+    }
 }
 
 struct ParentUnderConstruction {
@@ -2856,9 +2870,17 @@ impl KeyLocationForLeaf {
 
     fn need(&self, k: &[u8], prefix_len: usize) -> usize {
         assert!(k.len() >= prefix_len);
-        varint::space_needed_for(self.len_with_overflow_flag(k))
-            + k.len()
-            - prefix_len
+        match *self {
+            KeyLocationForLeaf::Inline => {
+                varint::space_needed_for(self.len_with_overflow_flag(k)) 
+                + k.len() 
+                - prefix_len
+            },
+            KeyLocationForLeaf::Overflow(ref blocks) => {
+                varint::space_needed_for(self.len_with_overflow_flag(k)) 
+                + blocks.encoded_len()
+            },
+        }
     }
 
     fn for_parent(self) -> KeyLocationForParent {
@@ -2867,6 +2889,14 @@ impl KeyLocationForLeaf {
             KeyLocationForLeaf::Overflow(blocks) => KeyLocationForParent::BorrowedOverflow(blocks),
         }
     }
+
+    fn is_inline(&self) -> bool {
+        match *self {
+            KeyLocationForLeaf::Inline => true,
+            KeyLocationForLeaf::Overflow(_) => false,
+        }
+    }
+
 }
 
 impl KeyLocationForParent {
@@ -2886,10 +2916,28 @@ impl KeyLocationForParent {
     }
 
     fn need(&self, k: &[u8], prefix_len: usize) -> usize {
-        assert!(k.len() >= prefix_len);
-        varint::space_needed_for(self.len_with_overflow_flag(k))
-            + k.len()
-            - prefix_len
+        match *self {
+            KeyLocationForParent::Inline => {
+                assert!(k.len() >= prefix_len);
+                varint::space_needed_for(self.len_with_overflow_flag(k)) 
+                + k.len() 
+                - prefix_len
+            },
+            KeyLocationForParent::BorrowedOverflow(ref blocks) 
+            | KeyLocationForParent::OwnedOverflow(ref blocks) => 
+            {
+                varint::space_needed_for(self.len_with_overflow_flag(k)) 
+                + blocks.encoded_len()
+            },
+        }
+    }
+
+    fn is_inline(&self) -> bool {
+        match *self {
+            KeyLocationForParent::Inline => true,
+            KeyLocationForParent::BorrowedOverflow(_) => false,
+            KeyLocationForParent::OwnedOverflow(_) => false,
+        }
     }
 }
 
@@ -2912,6 +2960,10 @@ impl KeyWithLocationForLeaf {
     fn need(&self, prefix_len: usize) -> usize {
         self.location.need(&self.key, prefix_len)
     }
+
+    fn is_inline(&self) -> bool {
+        self.location.is_inline()
+    }
 }
 
 impl KeyWithLocationForParent {
@@ -2925,6 +2977,10 @@ impl KeyWithLocationForParent {
 
     fn need(&self, prefix_len: usize) -> usize {
         self.location.need(&self.key, prefix_len)
+    }
+
+    fn is_inline(&self) -> bool {
+        self.location.is_inline()
     }
 }
 
@@ -2961,6 +3017,10 @@ struct ItemForLeaf {
 impl ItemForLeaf {
     fn need(&self, prefix_len: usize) -> usize {
         self.key.need(prefix_len) + self.value.need()
+    }
+
+    fn is_key_inline(&self) -> bool {
+        self.key.is_inline()
     }
 }
 
@@ -3044,7 +3104,21 @@ fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> BuildLeaf
     pb.PutByte(0u8); // flags
     pb.PutVarint(st.prefix_len as u64);
     if st.prefix_len > 0 {
-        pb.PutArray(&st.items[0].key.key[0 .. st.prefix_len]);
+        let mut other = None;
+        for i in 0..st.items.len() {
+            if st.items[i].is_key_inline() {
+                other = Some(i);
+                break;
+            }
+        }
+        match other {
+            Some(i) => {
+                pb.PutArray(&st.items[i].key.key[0 .. st.prefix_len]);
+            },
+            None => {
+                unreachable!();
+            },
+        }
     }
     let count_keys_in_this_leaf = st.items.len();
     // TODO should we support more than 64k keys in a leaf?
@@ -3244,7 +3318,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                 + 1 // value flags
                 + varint::space_needed_for(pgsz as u64) // vlen can't be larger than this for inline
                 ;
-            assert!(fixed_costs_on_new_page < pgsz);
+            assert!(fixed_costs_on_new_page < pgsz); // TODO lte?
             let available_for_inline_value_on_new_page = pgsz - fixed_costs_on_new_page;
             available_for_inline_value_on_new_page
         };
@@ -3322,7 +3396,22 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                         } else {
                             k.len()
                         };
-                    bcmp::PrefixMatch(&*st.items[0].key.key, &k, max_prefix)
+                    let mut other = None;
+                    for i in 0..st.items.len() {
+                        if st.items[i].is_key_inline() {
+                            other = Some(i);
+                            break;
+                        }
+                    }
+                    match other {
+                        Some(i) => {
+                            bcmp::PrefixMatch(&*st.items[i].key.key, &k, max_prefix)
+                        },
+                        None => {
+                            // in a leaf, with only one inline item, the prefix_len is 0
+                            0
+                        },
+                    }
                 },
                 &KeyLocationForLeaf::Overflow(_) => {
                     // an overflowed key does not change the prefix
@@ -4222,7 +4311,21 @@ impl ParentNodeWriter {
         self.pb.PutByte(self.my_depth);
         self.pb.PutVarint(self.st.prefix_len as u64);
         if self.st.prefix_len > 0 {
-            self.pb.PutArray(&self.st.items[0].last_key.key[0 .. self.st.prefix_len]);
+            let mut inlined = None;
+            for i in 0..self.st.items.len() {
+                if self.st.items[i].is_inline() {
+                    inlined = Some(i);
+                    break;
+                }
+            }
+            match inlined {
+                Some(i) => {
+                    self.pb.PutArray(&self.st.items[i].last_key.key[0 .. self.st.prefix_len]);
+                },
+                None => {
+                    unreachable!();
+                },
+            }
         }
         let count_items = self.st.items.len();
         self.pb.PutInt16(count_items as u16);
@@ -4279,26 +4382,30 @@ impl ParentNodeWriter {
     }
 
     fn calc_prefix_len(&self, item: &ItemForParent) -> usize {
-        if self.st.items.is_empty() {
-            item.last_key.key.len()
-        } else {
-            if self.st.prefix_len > 0 {
-                let a =
-                    match &item.last_key.location {
-                        &KeyLocationForParent::Inline => {
-                            bcmp::PrefixMatch(&*self.st.items[0].last_key.key, &item.last_key.key, self.st.prefix_len)
-                        },
-                        &KeyLocationForParent::BorrowedOverflow(_)
-                        | &KeyLocationForParent::OwnedOverflow(_) => 
-                        {
-                            // an overflowed key does not change the prefix
-                            self.st.prefix_len
-                        },
-                    };
-                a
-            } else {
-                0
-            }
+        match &item.last_key.location {
+            &KeyLocationForParent::Inline => {
+                let mut other = None;
+                for i in 0..self.st.items.len() {
+                    if self.st.items[i].is_inline() {
+                        other = Some(i);
+                        break;
+                    }
+                }
+                match other {
+                    Some(i) => {
+                        bcmp::PrefixMatch(&*self.st.items[i].last_key.key, &item.last_key.key, self.st.prefix_len)
+                    },
+                    None => {
+                        item.last_key.key.len()
+                    },
+                }
+            },
+            &KeyLocationForParent::BorrowedOverflow(_)
+            | &KeyLocationForParent::OwnedOverflow(_) => 
+            {
+                // an overflowed key does not change the prefix
+                self.st.prefix_len
+            },
         }
     }
 
@@ -4350,6 +4457,7 @@ impl ParentNodeWriter {
         // it to make sure that the parent has two items.
 
         let would_be_prefix_len = self.calc_prefix_len(&child);
+        assert!(would_be_prefix_len < pgsz);
         let would_be_sofar_before_this_key = 
             if would_be_prefix_len != self.st.prefix_len {
                 assert!(self.st.prefix_len == 0 || would_be_prefix_len < self.st.prefix_len);
@@ -4360,7 +4468,10 @@ impl ParentNodeWriter {
             } else {
                 self.st.sofar
             };
-        let fits = {
+        let fits = if self.st.items.len() < 2 {
+            // a parent page is required to accept at least 2 items
+            true
+        } else {
             let would_be_len_page_before_this_key = Self::calc_page_len(would_be_prefix_len, would_be_sofar_before_this_key);
             if pgsz > would_be_len_page_before_this_key {
                 let avalable_for_this_key = pgsz - would_be_len_page_before_this_key;
@@ -4384,7 +4495,13 @@ impl ParentNodeWriter {
             assert!(self.st.sofar == 0);
             assert!(self.st.prefix_len == 0);
             assert!(self.st.items.is_empty());
-            self.st.prefix_len = child.last_key.key.len();
+            self.st.prefix_len = 
+                if child.is_inline() {
+                    // in a parent page, with only one inline item, prefix_len is that item's len
+                    child.last_key.key.len()
+                } else {
+                    0
+                };
             self.st.sofar = child.need(self.st.prefix_len, self.my_depth);
         } else {
             self.st.prefix_len = would_be_prefix_len;
@@ -4392,6 +4509,45 @@ impl ParentNodeWriter {
         }
 
         self.st.items.push(child);
+
+        if self.st.items.len() == 2 && Self::calc_page_len(self.st.prefix_len, self.st.sofar) > pgsz {
+            if self.st.items[0].is_inline() {
+                if self.st.items[1].is_inline() {
+                    let remaining_inline =
+                        if self.st.items[0].last_key.key.len() > self.st.items[1].last_key.key.len() {
+                            try!(self.st.items[0].to_owned_overflow(pw));
+                            1
+                        } else {
+                            try!(self.st.items[1].to_owned_overflow(pw));
+                            0
+                        };
+                    self.st.prefix_len = self.st.items[remaining_inline].last_key.key.len();
+                    let sofar = self.st.items[0].need(self.st.prefix_len, self.my_depth) + self.st.items[1].need(self.st.prefix_len, self.my_depth);
+                    if Self::calc_page_len(self.st.prefix_len, sofar) > pgsz {
+                        //println!("TWOFER");
+                        try!(self.st.items[remaining_inline].to_owned_overflow(pw));
+                        self.st.prefix_len = 0;
+                    }
+                } else {
+                    try!(self.st.items[0].to_owned_overflow(pw));
+                    self.st.prefix_len = 0;
+                }
+            } else {
+                if self.st.items[1].is_inline() {
+                    try!(self.st.items[1].to_owned_overflow(pw));
+                    self.st.prefix_len = 0;
+                } else {
+                    unreachable!();
+                }
+            }
+            //println!("sofar before: {}", self.st.sofar);
+            self.st.sofar = self.st.items[0].need(self.st.prefix_len, self.my_depth) + self.st.items[1].need(self.st.prefix_len, self.my_depth);
+            //println!("sofar after: {}", self.st.sofar);
+        }
+        //println!("items: {}", self.st.items.len());
+        //println!("prefix_len: {}", self.st.prefix_len);
+        //println!("sofar: {}", self.st.sofar);
+        assert!(Self::calc_page_len(self.st.prefix_len, self.st.sofar) <= pgsz);
 
         Ok(())
     }
