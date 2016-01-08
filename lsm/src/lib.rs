@@ -64,39 +64,56 @@ pub type PageCount = u32;
 // isn't so much so that we can change it, but rather, to make
 // reading the code easier.
 
-pub enum Blob {
+#[derive(Debug)]
+pub enum KeyForStorage {
+// TODO maybe just a struct, with the box, and optional/private blocklist?
+    Boxed(Box<[u8]>),
+    SameFileOverflow(Box<[u8]>, BlockList),
+}
+
+impl KeyForStorage {
+    fn as_ref(&self) -> &[u8] {
+        match *self {
+            KeyForStorage::Boxed(ref b) => b,
+            KeyForStorage::SameFileOverflow(ref b, _) => b,
+        }
+    }
+
+}
+
+pub enum ValueForStorage {
     Stream(Box<Read>),
     Boxed(Box<[u8]>),
     Tombstone,
     SameFileOverflow(u64, BlockList),
 }
 
-impl std::fmt::Debug for Blob {
+impl std::fmt::Debug for ValueForStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            &Blob::Tombstone => {
+            &ValueForStorage::Tombstone => {
                 write!(f, "Tombstone")
             },
-            &Blob::Stream(_) => {
+            &ValueForStorage::Stream(_) => {
                 write!(f, "Stream")
             },
-            &Blob::Boxed(ref a) => {
+            &ValueForStorage::Boxed(ref a) => {
                 write!(f, "{:?}", a)
             },
-            &Blob::SameFileOverflow(_, _) => {
+            &ValueForStorage::SameFileOverflow(_, _) => {
                 write!(f, "SameFileOverflow")
             },
         }
     }
 }
 
-impl Blob {
+impl ValueForStorage {
     fn is_tombstone(&self) -> bool {
         match self {
-            &Blob::Tombstone => true,
-            &Blob::Stream(_) => false,
-            &Blob::Boxed(_) => false,
-            &Blob::SameFileOverflow(_, _) => false,
+            &ValueForStorage::Tombstone => true,
+            &ValueForStorage::Stream(_) => false,
+            &ValueForStorage::Boxed(_) => false,
+            &ValueForStorage::SameFileOverflow(_, _) => false,
         }
     }
 }
@@ -207,12 +224,9 @@ impl BlockRequest {
     }
 }
 
-// kvp is the struct used to provide key-value pairs downward,
-// for storage into the database.
-pub struct kvp {
-    // TODO note that there is no provision here for SameFileOverflow from a merge
-    Key: Box<[u8]>,
-    Value: Blob,
+pub struct PairForStorage {
+    key: KeyForStorage,
+    value: ValueForStorage,
 }
 
 #[derive(Debug, Clone)]
@@ -548,22 +562,17 @@ fn split3<T>(a: &mut [T], i: usize) -> (&mut [T], &mut [T], &mut [T]) {
 }
 
 pub enum KeyRef<'a> {
-    // TODO consider a type representing an overflow reference with len and blocks?
-    // TODO should the file and pgsz be in here?
-    //Overflowed(String, usize, u64, BlockList),
-
-    Boxed(Box<[u8]>),
+    Overflowed(Box<[u8]>, std::sync::Arc<PageCache>, BlockList),
 
     // the other two are references into the page
     Prefixed(&'a [u8],&'a [u8]),
-
     Slice(&'a [u8]),
 }
 
 impl<'a> std::fmt::Debug for KeyRef<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         match *self {
-            KeyRef::Boxed(ref a) => write!(f, "Boxed, a={:?}", a),
+            KeyRef::Overflowed(ref a, _, _) => write!(f, "Overflowed, a={:?}", a),
             KeyRef::Prefixed(front,back) => write!(f, "Prefixed, front={:?}, back={:?}", front, back),
             KeyRef::Slice(a) => write!(f, "Array, val={:?}", a),
         }
@@ -571,9 +580,28 @@ impl<'a> std::fmt::Debug for KeyRef<'a> {
 }
 
 impl<'a> KeyRef<'a> {
+    fn into_key_for_merge(self) -> KeyForStorage {
+        match self {
+            KeyRef::Overflowed(a, _, blocks) => {
+                KeyForStorage::SameFileOverflow(a, blocks)
+            },
+            KeyRef::Slice(a) => {
+                let mut k = Vec::with_capacity(a.len());
+                k.extend_from_slice(a);
+                KeyForStorage::Boxed(k.into_boxed_slice())
+            },
+            KeyRef::Prefixed(front,back) => {
+                let mut k = Vec::with_capacity(front.len() + back.len());
+                k.extend_from_slice(front);
+                k.extend_from_slice(back);
+                KeyForStorage::Boxed(k.into_boxed_slice())
+            },
+        }
+    }
+
     pub fn len(&self) -> usize {
         match *self {
-            KeyRef::Boxed(ref a) => a.len(),
+            KeyRef::Overflowed(ref a, _, _) => a.len(),
             KeyRef::Slice(a) => a.len(),
             KeyRef::Prefixed(front, back) => front.len() + back.len(),
         }
@@ -581,7 +609,7 @@ impl<'a> KeyRef<'a> {
 
     pub fn u8_at(&self, i: usize) -> Result<u8> {
         match self {
-            &KeyRef::Boxed(ref a) => {
+            &KeyRef::Overflowed(ref a, _, _) => {
                 if i < a.len() {
                     Ok(a[i])
                 } else {
@@ -628,7 +656,7 @@ impl<'a> KeyRef<'a> {
 
     pub fn compare_with(&self, k: &[u8]) -> Ordering {
         match self {
-            &KeyRef::Boxed(ref a) => {
+            &KeyRef::Overflowed(ref a, _, _) => {
                 bcmp::Compare(&a, &k)
             },
             &KeyRef::Slice(a) => {
@@ -645,7 +673,7 @@ impl<'a> KeyRef<'a> {
             return false;
         } else {
             match self {
-                &KeyRef::Boxed(ref a) => {
+                &KeyRef::Overflowed(ref a, _, _) => {
                     k == &a[0 .. k.len()]
                 },
                 &KeyRef::Slice(a) => {
@@ -683,7 +711,7 @@ impl<'a> KeyRef<'a> {
                     Err(Error::Misc(String::from("map_range: out of range 1")))
                 }
             },
-            &KeyRef::Boxed(ref a) => {
+            &KeyRef::Overflowed(ref a, _, _) => {
                 if end <= a.len() {
                     let t = try!(func(&a[begin .. end]));
                     Ok(t)
@@ -722,17 +750,13 @@ impl<'a> KeyRef<'a> {
         }
     }
 
-    pub fn from_boxed_slice(k: Box<[u8]>) -> KeyRef<'a> {
-        KeyRef::Boxed(k)
-    }
-
     pub fn for_slice(k: &[u8]) -> KeyRef {
         KeyRef::Slice(k)
     }
 
     pub fn into_boxed_slice(self) -> Box<[u8]> {
         match self {
-            KeyRef::Boxed(a) => {
+            KeyRef::Overflowed(a, _, _) => {
                 a
             },
             KeyRef::Slice(a) => {
@@ -819,19 +843,19 @@ impl<'a> KeyRef<'a> {
 
     pub fn cmp(x: &KeyRef, y: &KeyRef) -> Ordering {
         match (x,y) {
-            (&KeyRef::Boxed(ref x_k), &KeyRef::Boxed(ref y_k)) => {
+            (&KeyRef::Overflowed(ref x_k, _, _), &KeyRef::Overflowed(ref y_k, _, _)) => {
                 bcmp::Compare(&x_k, &y_k)
             },
-            (&KeyRef::Boxed(ref x_k), &KeyRef::Prefixed(ref y_p, ref y_k)) => {
+            (&KeyRef::Overflowed(ref x_k, _, _), &KeyRef::Prefixed(ref y_p, ref y_k)) => {
                 Self::compare_x_py(&x_k, y_p, y_k)
             },
-            (&KeyRef::Boxed(ref x_k), &KeyRef::Slice(ref y_k)) => {
+            (&KeyRef::Overflowed(ref x_k, _, _), &KeyRef::Slice(ref y_k)) => {
                 bcmp::Compare(&x_k, &y_k)
             },
-            (&KeyRef::Prefixed(ref x_p, ref x_k), &KeyRef::Boxed(ref y_k)) => {
+            (&KeyRef::Prefixed(ref x_p, ref x_k), &KeyRef::Overflowed(ref y_k, _, _)) => {
                 Self::compare_px_y(x_p, x_k, &y_k)
             },
-            (&KeyRef::Slice(ref x_k), &KeyRef::Boxed(ref y_k)) => {
+            (&KeyRef::Slice(ref x_k), &KeyRef::Overflowed(ref y_k, _, _)) => {
                 bcmp::Compare(&x_k, &y_k)
             },
             (&KeyRef::Prefixed(ref x_p, ref x_k), &KeyRef::Prefixed(ref y_p, ref y_k)) => {
@@ -873,15 +897,15 @@ impl<'a> ValueRef<'a> {
         }
     }
 
-    pub fn into_blob_for_merge(self) -> Blob {
+    pub fn into_value_for_merge(self) -> ValueForStorage {
         match self {
             ValueRef::Slice(a) => {
                 let mut k = Vec::with_capacity(a.len());
                 k.extend_from_slice(a);
-                Blob::Boxed(k.into_boxed_slice())
+                ValueForStorage::Boxed(k.into_boxed_slice())
             },
-            ValueRef::Overflowed(_, len, blocks) => Blob::SameFileOverflow(len, blocks),
-            ValueRef::Tombstone => Blob::Tombstone,
+            ValueRef::Overflowed(_, len, blocks) => ValueForStorage::SameFileOverflow(len, blocks),
+            ValueRef::Tombstone => ValueForStorage::Tombstone,
         }
     }
 
@@ -905,14 +929,14 @@ impl<'a> LiveValueRef<'a> {
         }
     }
 
-    pub fn into_blob_for_merge(self) -> Blob {
+    pub fn into_value_for_merge(self) -> ValueForStorage {
         match self {
             LiveValueRef::Slice(a) => {
                 let mut k = Vec::with_capacity(a.len());
                 k.extend_from_slice(a);
-                Blob::Boxed(k.into_boxed_slice())
+                ValueForStorage::Boxed(k.into_boxed_slice())
             },
-            LiveValueRef::Overflowed(_, len, blocks) => Blob::SameFileOverflow(len, blocks),
+            LiveValueRef::Overflowed(_, len, blocks) => ValueForStorage::SameFileOverflow(len, blocks),
         }
     }
 
@@ -1108,10 +1132,10 @@ pub enum SeekOp {
 }
 
 // TODO consider changing the name of this to make it clear that is only for merge,
-// since it uses Blob::SameFileOverflow.
+// since it uses SameFileOverflow.
 struct CursorIterator {
     csr: MergeCursor,
-    peeked: Option<Result<kvp>>,
+    peeked: Option<Result<PairForStorage>>,
 }
 
 impl CursorIterator {
@@ -1134,7 +1158,7 @@ impl CursorIterator {
         self.csr.overflows_eaten()
     }
 
-    fn peek(&mut self) -> Option<&Result<kvp>> {
+    fn peek(&mut self) -> Option<&Result<PairForStorage>> {
         if self.peeked.is_none() {
             self.peeked = self.get_next();
         }
@@ -1144,14 +1168,14 @@ impl CursorIterator {
         }
     }
 
-    fn get_next(&mut self) -> Option<Result<kvp>> {
+    fn get_next(&mut self) -> Option<Result<PairForStorage>> {
         if self.csr.IsValid() {
             let k = {
                 let k = self.csr.KeyRef();
                 if k.is_err() {
                     return Some(Err(k.err().unwrap()));
                 }
-                let k = k.unwrap().into_boxed_slice();
+                let k = k.unwrap().into_key_for_merge();
                 k
             };
             let v = {
@@ -1159,14 +1183,14 @@ impl CursorIterator {
                 if v.is_err() {
                     return Some(Err(v.err().unwrap()));
                 }
-                let v = v.unwrap().into_blob_for_merge();
+                let v = v.unwrap().into_value_for_merge();
                 v
             };
             let r = self.csr.Next();
             if r.is_err() {
                 return Some(Err(r.err().unwrap()));
             }
-            Some(Ok(kvp{Key:k, Value:v}))
+            Some(Ok(PairForStorage {key: k, value: v}))
         } else {
             return None;
         }
@@ -1175,8 +1199,8 @@ impl CursorIterator {
 }
 
 impl Iterator for CursorIterator {
-    type Item = Result<kvp>;
-    fn next(&mut self) -> Option<Result<kvp>> {
+    type Item = Result<PairForStorage>;
+    fn next(&mut self) -> Option<Result<PairForStorage>> {
          match self.peeked {
              Some(_) => self.peeked.take(),
              None => self.get_next(),
@@ -1997,12 +2021,12 @@ impl ICursor for MultiCursor {
                 Err(Error::CursorNotValid)
             },
             Some(icur) => {
-                let k = {
+                let kboxed = {
                     let k = try!(self.subcursors[icur].KeyRef());
                     let k = k.into_boxed_slice();
-                    let k = KeyRef::from_boxed_slice(k);
                     k
                 };
+                let k = KeyRef::Slice(&kboxed);
                 for j in 0 .. self.subcursors.len() {
                     let csr = &mut self.subcursors[j];
                     if (self.dir != Direction::Backward) && (icur != j) { 
@@ -2300,18 +2324,22 @@ impl IForwardCursor for MergeCursor {
                                     //println!("MergeCursor shadowed: {:?}", k, );
                                     self.count_keys_shadowed += 1;
                                     {
-                                        // TODO we probably need to check and see if the shadowed
-                                        // key was an owned overflow, right?
+                                        match try!(self.subcursors[n].KeyRef()) {
+                                            KeyRef::Prefixed(_, _) => {
+                                            },
+                                            KeyRef::Slice(_) => {
+                                            },
+                                            KeyRef::Overflowed(_, _, blocks) => {
+                                                self.overflows_eaten.push((try!(self.subcursors[n].current_pagenum()), blocks));
+                                            },
+                                        }
 
-                                        let v = try!(self.subcursors[n].ValueRef());
-                                        match v {
+                                        match try!(self.subcursors[n].ValueRef()) {
                                             ValueRef::Slice(_) => {
                                             },
                                             ValueRef::Tombstone => {
                                             },
                                             ValueRef::Overflowed(_, len, blocks) => {
-                                                let k = try!(self.subcursors[n].KeyRef());
-                                                //println!("eaten: {:?} -- {:?}", k, blocks);
                                                 self.overflows_eaten.push((try!(self.subcursors[n].current_pagenum()), blocks));
                                             },
                                         }
@@ -2811,6 +2839,7 @@ impl ItemForParent {
         let mut r = misc::ByteSliceRead::new(&k);
         let (len, blocks) = try!(write_overflow(&mut r, pw, hard_limit));
         assert!((len as usize) == k.len());
+        println!("OwnedOverflow: {:?}", blocks);
         self.last_key.location = KeyLocationForParent::OwnedOverflow(blocks);
         Ok(())
     }
@@ -3003,7 +3032,7 @@ pub struct KeyWithLocationForParent {
 #[derive(Debug)]
 enum ValueLocation {
     Tombstone,
-    // when this is a Buffer, this gets ownership of kvp.Value
+    // when this is a Buffer, this gets ownership of PairForStorage.value
     Buffer(Box<[u8]>),
     Overflowed(u64, BlockList),
 }
@@ -3211,19 +3240,19 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                 pb: &mut PageBuilder, 
                 pw: &mut PageWriter,
                 vbuf: &mut [u8],
-                mut pair: kvp,
+                mut pair: PairForStorage,
                ) -> Result<Option<ItemForParent>> {
     let pgsz = pw.page_size();
-    let k = pair.Key;
+    let k = pair.key;
 
     if cfg!(expensive_check) 
     {
-       // this code can be used to verify that we are being given kvps in order
+       // this code can be used to verify that we are being given keys in order
         match st.prev_key {
             None => {
             },
             Some(ref prev_key) => {
-                let c = k.cmp(&prev_key);
+                let c = k.as_ref().cmp(&prev_key);
                 if c != Ordering::Greater {
                     println!("prev_key: {:?}", prev_key);
                     println!("k: {:?}", k);
@@ -3231,74 +3260,68 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                 }
             },
         }
-        st.prev_key = Some(k.clone());
+        st.prev_key = {
+            let mut a = Vec::with_capacity(k.as_ref().len());
+            a.extend_from_slice(k.as_ref());
+            Some(a.into_boxed_slice())
+        };
     }
 
-    let kloc = {
-        // the max limit of an inline key is when that key is the only
-        // one in the leaf, and its value is overflowed.  well actually,
-        // the reference to an overflowed value can take up a few dozen bytes 
-        // in pathological cases, whereas a really short value could be smaller.
-        // nevermind that.
+    let (k, kloc) =
+        match k {
+            KeyForStorage::Boxed(k) => {
+                // the max limit of an inline key is when that key is the only
+                // one in the leaf, and its value is overflowed.  well actually,
+                // the reference to an overflowed value can take up a few dozen bytes 
+                // in pathological cases, whereas a really short value could be smaller.
+                // nevermind that.
 
-        // TODO maybe the max value inline should be configured low enough to
-        // ensure that two keys with no prefix can fit in a parent page.  but
-        // this is tricky, as the extra child info stuff per item in a parent
-        // page can be hard to predict.
+                // TODO the following code still needs tuning
 
-        // alternatively, we could set the max value inline to ensure that
-        // enough room is left in a parent page to store an overflowed item,
-        // but that has some of the same issues, and it also introduces the
-        // possibility that a key might be inline in the leaf but overflowed
-        // in the parent.
+                // TODO the following code is even more pessimistic now that we do
+                // offsets in encoded blocklists
+                const PESSIMISTIC_OVERFLOW_INFO_SIZE: usize = 
+                    1 // number of blocks
+                    +
+                    (
+                    5 // varint, block start page num, worst case
+                    + 4 // varint, num pages in block, pathological
+                    )
+                    * 8 // crazy case
+                    ;
 
-        // also, we could look at the previous key.  the only screw case is
-        // when we get 2 or more keys in a row which can't fit in a parent
-        // page, so we end up with one parent per leaf, which means the
-        // depth of the btree grows forever.  so we could look for this case
-        // specifically, and when we see two long keys in a row, overflow the
-        // second one.
+                let maxKeyInline = 
+                    pgsz 
+                    - 2 // page type and flags
+                    - 2 // count keys
+                    - 1 // prefix_len of 0
+                    - varint::space_needed_for((pgsz * 2) as u64) // approx worst case inline key len
+                    - 1 // value flags
+                    - 9 // worst case varint value len
+                    - PESSIMISTIC_OVERFLOW_INFO_SIZE; // overflowed value page
 
-        // TODO the following code still needs tuning
-
-        // TODO the following code is even more pessimistic now that we do
-        // offsets in encoded blocklists
-        const PESSIMISTIC_OVERFLOW_INFO_SIZE: usize = 
-            1 // number of blocks
-            +
-            (
-            5 // varint, block start page num, worst case
-            + 4 // varint, num pages in block, pathological
-            )
-            * 8 // crazy case
-            ;
-
-        let maxKeyInline = 
-            pgsz 
-            - 2 // page type and flags
-            - 2 // count keys
-            - 1 // prefix_len of 0
-            - varint::space_needed_for((pgsz * 2) as u64) // approx worst case inline key len
-            - 1 // value flags
-            - 9 // worst case varint value len
-            - PESSIMISTIC_OVERFLOW_INFO_SIZE; // overflowed value page
-
-        if k.len() <= maxKeyInline {
-            KeyLocationForLeaf::Inline
-        } else {
-            // for an overflowed key, there is probably no practical hard limit on the size
-            // of the encoded block list.  we want things to be as contiguous as
-            // possible, but if the block list won't fit on the usable part of a
-            // fresh page, something is seriously wrong.
-            // rather than calculate the actual hard limit, we provide an arbitrary
-            // fraction of the page which would still be pathological.
-            let hard_limit = pgsz / 4;
-            let mut r = misc::ByteSliceRead::new(&k);
-            let (len, blocks) = try!(write_overflow(&mut r, pw, hard_limit));
-            assert!((len as usize) == k.len());
-            KeyLocationForLeaf::Overflow(blocks)
-        }
-    };
+                if k.len() <= maxKeyInline {
+                    (k, KeyLocationForLeaf::Inline)
+                } else {
+                    // for an overflowed key, there is probably no practical hard limit on the size
+                    // of the encoded block list.  we want things to be as contiguous as
+                    // possible, but if the block list won't fit on the usable part of a
+                    // fresh page, something is seriously wrong.
+                    // rather than calculate the actual hard limit, we provide an arbitrary
+                    // fraction of the page which would still be pathological.
+                    let hard_limit = pgsz / 4;
+                    let (len, blocks) = {
+                        let mut r = misc::ByteSliceRead::new(&k.as_ref());
+                        try!(write_overflow(&mut r, pw, hard_limit))
+                    };
+                    assert!((len as usize) == k.len());
+                    (k, KeyLocationForLeaf::Overflow(blocks))
+                }
+            },
+            KeyForStorage::SameFileOverflow(k, blocks) => {
+                (k, KeyLocationForLeaf::Overflow(blocks))
+            },
+        };
 
     // we have decided whether the key is going to be inlined or overflowed.  but
     // we have NOT yet decided which page the key is going on.  will it fit on the
@@ -3338,11 +3361,11 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
             - 9 // worst case varint for value len
             ;
 
-        match pair.Value {
-            Blob::Tombstone => {
+        match pair.value {
+            ValueForStorage::Tombstone => {
                 ValueLocation::Tombstone
             },
-            Blob::Stream(ref mut strm) => {
+            ValueForStorage::Stream(ref mut strm) => {
                 // TODO
                 // not sure reusing vbuf is worth it.  maybe we should just
                 // alloc here.  ownership will get passed into the
@@ -3362,10 +3385,10 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                     ValueLocation::Overflowed(len, blocks)
                 }
             },
-            Blob::SameFileOverflow(len, blocks) => {
+            ValueForStorage::SameFileOverflow(len, blocks) => {
                 ValueLocation::Overflowed(len, blocks)
             },
-            Blob::Boxed(a) => {
+            ValueForStorage::Boxed(a) => {
                 // TODO should be <= ?
                 if a.len() < maxValueInline {
                     ValueLocation::Buffer(a)
@@ -3493,7 +3516,7 @@ fn flush_leaf(st: &mut LeafUnderConstruction,
     }
 }
 
-fn write_leaves<I: Iterator<Item=Result<kvp>>, >(
+fn write_leaves<I: Iterator<Item=Result<PairForStorage>>, >(
                     pw: &mut PageWriter,
                     pairs: I,
                     f: std::sync::Arc<PageCache>,
@@ -3569,9 +3592,6 @@ struct WroteMerge {
 }
 
 struct WroteSurvivors {
-    // TODO segment None can never happen, because a merge from
-    // level N to N+1 is not allowed to deplete N, because that
-    // would mean that N did not need to be merged.
     segment: Option<SegmentHeaderInfo>,
     nodes_rewritten: Box<[Vec<PageNum>]>,
     nodes_recycled: Box<[usize]>,
@@ -3579,7 +3599,7 @@ struct WroteSurvivors {
 }
 
 fn merge_process_pair(
-    pair: kvp,
+    pair: PairForStorage,
     st: &mut LeafUnderConstruction,
     pb: &mut PageBuilder,
     pw: &mut PageWriter,
@@ -3619,8 +3639,8 @@ fn merge_process_pair(
     let keep =
         match behind {
             &mut Some(ref mut behind) => {
-                if pair.Value.is_tombstone() {
-                    if try!(necessary_tombstone(&pair.Key, behind)) {
+                if pair.value.is_tombstone() {
+                    if try!(necessary_tombstone(&pair.key.as_ref(), behind)) {
                         true
                     } else {
                         //println!("dest,{:?},skip_tombstone_promoted", dest_level, );
@@ -3691,10 +3711,10 @@ fn merge_rewrite_leaf(
                     // we are in the middle of a leaf being rewritten
 
                     // TODO if there is an otherleaf, we know that it
-                    // is greater than pair or kvp/i.  assert that.
+                    // is greater than pair or PairForStorage/i.  assert that.
                     let c = {
                         let k = try!(leafreader.key(i));
-                        k.compare_with(&peek_pair.Key)
+                        k.compare_with(&peek_pair.key.as_ref())
                     };
                     match c {
                         Ordering::Greater => {
@@ -3702,10 +3722,16 @@ fn merge_rewrite_leaf(
                         },
                         Ordering::Equal => {
                             // whatever value is coming from the rewritten leaf, it is shadowed
-// TODO if the key was overflowed, we need that too.
-                            let pair = try!(leafreader.kvp_for_merge(i));
-                            match &pair.Value {
-                                &Blob::SameFileOverflow(_, ref blocks) => {
+                            let pair = try!(leafreader.pair_for_merge(i));
+                            match &pair.key {
+                                &KeyForStorage::SameFileOverflow(_, ref blocks) => {
+                                    overflows_freed.push(blocks.clone());
+                                },
+                                _ => {
+                                },
+                            }
+                            match &pair.value {
+                                &ValueForStorage::SameFileOverflow(_, ref blocks) => {
                                     overflows_freed.push(blocks.clone());
                                 },
                                 _ => {
@@ -3735,7 +3761,7 @@ fn merge_rewrite_leaf(
                 }
             },
             Action::ItemForLeaf => {
-                let pair = try!(leafreader.kvp_for_merge(i));
+                let pair = try!(leafreader.pair_for_merge(i));
                 // TODO it is interesting to note that (in not-very-thorough testing), if we
                 // put a tombstone check here, it never skips a tombstone.
                 if let Some(pg) = try!(process_pair_into_leaf(st, pb, pw, vbuf, pair)) {
@@ -3796,7 +3822,7 @@ fn merge_rewrite_parent(
                     Action::RecycleNodes(1)
                 },
                 Some(&Ok(ref peek_pair)) => {
-                    let k = &KeyRef::Slice(&peek_pair.Key);
+                    let k = &KeyRef::Slice(&peek_pair.key.as_ref());
                     match try!(parent.cmp_with_child_last_key(i, k)) {
                         Ordering::Less | Ordering::Equal => {
                             Action::RewriteNode
@@ -3882,6 +3908,9 @@ fn merge_rewrite_parent(
             },
         }
     }
+    // TODO this will fail if an owned overflow gets re-borrowed by a
+    // another parent page, right?
+    parent.get_owned_overflows(overflows_freed);
 
     Ok(ret)
 }
@@ -4692,7 +4721,7 @@ impl ParentNodeSegment {
 fn create_segment<I>(mut pw: PageWriter, 
                         source: I,
                         f: std::sync::Arc<PageCache>,
-                       ) -> Result<Option<SegmentHeaderInfo>> where I: Iterator<Item=Result<kvp>> {
+                       ) -> Result<Option<SegmentHeaderInfo>> where I: Iterator<Item=Result<PairForStorage>> {
 
     let seg = try!(write_leaves(&mut pw, source, f));
 
@@ -4985,12 +5014,12 @@ impl LeafPage {
         Ok(k)
     }
 
-    fn kvp_for_merge(&self, n: usize) -> Result<kvp> {
-        let k = try!(self.key(n)).into_boxed_slice();
-        let v = try!(self.value(n)).into_blob_for_merge();
-        let p = kvp {
-            Key: k,
-            Value: v,
+    fn pair_for_merge(&self, n: usize) -> Result<PairForStorage> {
+        let k = try!(self.key(n)).into_key_for_merge();
+        let v = try!(self.value(n)).into_value_for_merge();
+        let p = PairForStorage {
+            key: k,
+            value: v,
         };
         Ok(p)
     }
@@ -5407,12 +5436,11 @@ impl KeyInLeafPage {
                 }
             },
             &KeyInLeafPage::Overflow{len: klen, ref blocks} => {
-                // TODO KeyRef::Overflow...
                 let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.blocks[0].firstPage, klen as u64));
                 let mut x_k = Vec::with_capacity(klen);
                 try!(ostrm.read_to_end(&mut x_k));
                 let x_k = x_k.into_boxed_slice();
-                Ok(KeyRef::Boxed(x_k))
+                Ok(KeyRef::Overflowed(x_k, f.clone(), blocks.clone()))
             },
         }
     }
@@ -5463,12 +5491,11 @@ impl KeyInParentPage {
             &KeyInParentPage::BorrowedOverflow{len: klen, ref blocks}
             | &KeyInParentPage::OwnedOverflow{len: klen, ref blocks} => 
             {
-                // TODO KeyRef::Overflow...
                 let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.blocks[0].firstPage, klen as u64));
                 let mut x_k = Vec::with_capacity(klen);
                 try!(ostrm.read_to_end(&mut x_k));
                 let x_k = x_k.into_boxed_slice();
-                Ok(KeyRef::Boxed(x_k))
+                Ok(KeyRef::Overflowed(x_k, f.clone(), blocks.clone()))
             },
         }
     }
@@ -5804,15 +5831,30 @@ impl ParentPage {
             .sum()
     }
 
+    fn get_owned_overflows(&self, list: &mut Vec<BlockList>) {
+        for i in 0 .. self.children.len() {
+            match &self.children[i].last_key {
+                &KeyInParentPage::Inline{..} => {
+                },
+                &KeyInParentPage::BorrowedOverflow{..} => {
+                },
+                &KeyInParentPage::OwnedOverflow{len: klen, ref blocks} => {
+                    list.push(blocks.clone());
+                },
+            }
+        }
+    }
+
     fn blocklist_unsorted(&self) -> Result<BlockList> {
         let mut list = BlockList::new();
         for i in 0 .. self.children.len() {
-            // we do not add the blocklist for any overflow keys,
-            // because we don't own that blocklist.  it is simply a reference
-            // to the blocklist for an overflow key when it was written into
-            // its leaf.
             list.add_page_no_reorder(self.children[i].page);
             let blocks = try!(self.child_blocklist(i));
+            list.add_blocklist_no_reorder(&blocks);
+        }
+        let mut a = vec![];
+        self.get_owned_overflows(&mut a);
+        for blocks in a {
             list.add_blocklist_no_reorder(&blocks);
         }
         Ok(list)
@@ -7484,13 +7526,13 @@ impl DatabaseFile {
         InnerPart::read_parent_page(&self.inner, pg)
     }
 
-    pub fn write_segment(&self, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<Option<SegmentHeaderInfo>> {
+    pub fn write_segment(&self, pairs: BTreeMap<Box<[u8]>, ValueForStorage>) -> Result<Option<SegmentHeaderInfo>> {
         InnerPart::write_segment(&self.inner, pairs)
     }
 
     // tests use this
     pub fn write_segment_from_sorted_sequence<I>(&self, source: I) -> Result<Option<SegmentHeaderInfo>>
-        where I: Iterator<Item=Result<kvp>>  {
+        where I: Iterator<Item=Result<PairForStorage>>  {
         InnerPart::write_segment_from_sorted_sequence(&self.inner, source)
     }
 
@@ -7812,11 +7854,12 @@ impl InnerPart {
         Ok(())
     }
 
-    fn write_segment(inner: &std::sync::Arc<InnerPart>, pairs: BTreeMap<Box<[u8]>, Blob>) -> Result<Option<SegmentHeaderInfo>> {
+    fn write_segment(inner: &std::sync::Arc<InnerPart>, pairs: BTreeMap<Box<[u8]>, ValueForStorage>) -> Result<Option<SegmentHeaderInfo>> {
         //println!("writing segment with {} pairs", pairs.len());
         let source = pairs.into_iter().map(|t| {
             let (k, v) = t;
-            Ok(kvp {Key:k, Value:v})
+            let k = KeyForStorage::Boxed(k);
+            Ok(PairForStorage {key: k, value: v})
         });
         let pw = try!(PageWriter::new(inner.clone()));
         let seg = try!(create_segment(pw, source, inner.page_cache.clone()));
@@ -7839,7 +7882,7 @@ impl InnerPart {
 
     // tests use this
     fn write_segment_from_sorted_sequence<I>(inner: &std::sync::Arc<InnerPart>, source: I) -> Result<Option<SegmentHeaderInfo>> 
-        where I: Iterator<Item=Result<kvp>>  {
+        where I: Iterator<Item=Result<PairForStorage>>  {
         let pw = try!(PageWriter::new(inner.clone()));
         let seg = try!(create_segment(pw, source, inner.page_cache.clone()));
         Ok(seg)
@@ -8570,6 +8613,8 @@ impl InnerPart {
                     // TODO this code is very similar to the MergingFrom::RegularPartial case below
                     //println!("promote_lineage: {:?}", promote_lineage);
                     //println!("promote_blocks: {:?}", promote_blocks);
+                    // TODO this seems to be the place where overflowed keys are getting lost
+                    // instead of becoming inactive
                     let wrote = try!(write_survivors(&mut pw, &promote_pages, promote_depth, &promote_lineage, &old_segment, &inner.path, &f, from_level.get_dest_level()));
 
                     println!("survivors,from,{:?}, leaves_rewritten,{}, leaves_recycled,{}, parent1_rewritten,{}, parent1_recycled,{}, ms,{}", 
@@ -8646,8 +8691,7 @@ impl InnerPart {
 
         try!(pw.end());
 
-        // TODO bizarre.  with the following expensive_check turned on,
-        // the multiple runs of the test suite are faster.
+        // bizarre
         if cfg!(expensive_check) 
         {
             // TODO function is inherently inefficient when called on a segment that
@@ -8832,6 +8876,7 @@ impl InnerPart {
 
                     if old_blocks.count_pages() != new_blocks.count_pages() {
                         println!("{:?}: inactive mismatch: segment {}", from_level, seg);
+                        println!("from: {:?}", from);
                         println!("old count: {:?}", old_blocks.count_pages());
                         println!("new count: {:?}", new_blocks.count_pages());
                         println!("old: {:?}", old_blocks);
@@ -9386,16 +9431,17 @@ pub struct GenerateNumbers {
 }
 
 impl Iterator for GenerateNumbers {
-    type Item = Result<kvp>;
+    type Item = Result<PairForStorage>;
     // TODO allow the number of digits to be customized?
-    fn next(&mut self) -> Option<Result<kvp>> {
+    fn next(&mut self) -> Option<Result<PairForStorage>> {
         if self.cur > self.end {
             None
         }
         else {
             let k = format!("{:08}", self.cur).into_bytes().into_boxed_slice();
             let v = format!("{}", self.cur * 2).into_bytes().into_boxed_slice();
-            let r = kvp{Key:k, Value:Blob::Boxed(v)};
+            let k = KeyForStorage::Boxed(k);
+            let r = PairForStorage {key: k, value: ValueForStorage::Boxed(v) };
             self.cur = self.cur + self.step;
             Some(Ok(r))
         }
@@ -9410,8 +9456,8 @@ pub struct GenerateWeirdPairs {
 }
 
 impl Iterator for GenerateWeirdPairs {
-    type Item = Result<kvp>;
-    fn next(&mut self) -> Option<Result<kvp>> {
+    type Item = Result<PairForStorage>;
+    fn next(&mut self) -> Option<Result<PairForStorage>> {
         if self.cur > self.end {
             None
         }
@@ -9438,7 +9484,8 @@ impl Iterator for GenerateWeirdPairs {
             }
             let v = v.into_boxed_slice();
 
-            let r = kvp{Key:k, Value:Blob::Boxed(v)};
+            let k = KeyForStorage::Boxed(k);
+            let r = PairForStorage {key: k, value: ValueForStorage::Boxed(v) };
             self.cur = self.cur + 1;
             Some(Ok(r))
         }

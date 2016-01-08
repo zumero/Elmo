@@ -1,4 +1,100 @@
 
+new way of dealing with overflows:
+
+global catalog.  each overflow is listed.
+
+then, a list of references, each one is a page
+num containing the reference (leaf or parent)
+and the page num of the overflow.
+
+keep track of references that get added or deleted.
+when an overflow loses all of its references, it
+can be removed.
+
+writing the header will require update of the overflow
+catalog.
+
+any chance all keys should be stored separately so we
+can know there is only one copy of each one?  crazy.
+but keys would be atoms.  a key that exists in 5
+segments would only need one copy.  still probably
+absurd.
+
+we still keep the design that a key overflow must
+be okay to read entirely into ram, but a value
+overflow does not.
+
+and an overflow does not know its length.
+
+but the reference to the overflow does.
+
+and the overflow catalog could know the length
+of each overflow.
+
+and the catalog could know whether each overflow is
+a key or a value.
+
+always store just one piece of data per overflow?
+a 4097 byte key takes 2 pages and wastes most of
+the 2nd one.
+
+a page plus offset on that page could be stored
+by shifting and then varint
+
+overflows can be cached too.
+
+overflow catalog will need to be stored in a tree of
+some kind.  don't require it to be entirely in ram at
+once.  don't require a small update to rewrite the
+entire thing.  organize them by page number.  the
+page number of the overflow is like a key.
+
+leaves don't have a full block list for overflows
+anymore.  neither do parents.  just a page num to
+identify the overflow.
+
+and depth 1 parents don't need a block list for the
+leaf child either.
+
+then why not keep everything in the leaves and parents?
+because the refcount design makes everything too complicated.
+
+does the overflow reference list need to be indexed in
+both directions?
+
+    for a given overflow, show me all the pages that reference
+    it.
+
+    for a given page, show me all the overflows it references.
+    (this one we could just get by reading the page)
+
+hey.  when a page becomes inactive, all its overflow references
+could automatically go away.
+
+any way we could change the format of overflows to avoid
+needing a header byte and/or page pointer on each page?  
+just have the overflow be the bytes of its value and nothing 
+more, with metadata stored elsewhere.  block list for an
+overflow would need to retain order.  that might be kinda
+bad.
+
+in cases where the overflow length is known (not a stream),
+we could guarantee contiguous pages.  always true for keys.
+
+finding all pages in use (at startup) could be done more
+easily.  walk every segment (without loading each leaf).
+and also walk the overflow catalog.
+
+finding overflows that are no longer used could be a
+background operation.
+
+run add_random twice in a row:  get overflow page bad
+type.  did something stomp on an overflow?
+
+an overflow owned by a parent page:  this will never
+be returned in KeyRef.  so how does it become inactive
+when that parent page gets rewritten?
+
 rustfmt issues:
     sometimes removes braces around single-statement
     match arms.  but sometimes not, or even adds them.

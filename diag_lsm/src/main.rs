@@ -264,8 +264,8 @@ fn seek_string(name: &str, key: String, sop: String) -> Result<(),lsm::Error> {
             "ge" => lsm::SeekOp::SEEK_GE,
             _ => return Err(lsm::Error::Misc(String::from("invalid sop"))),
         };
-    let k = key.into_bytes().into_boxed_slice();
-    let k = lsm::KeyRef::from_boxed_slice(k);
+    let kboxed = key.into_bytes().into_boxed_slice();
+    let k = lsm::KeyRef::Slice(&kboxed);
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let mut cursor = try!(db.open_cursor());
     let sr = try!(cursor.SeekRef(&k, sop));
@@ -289,7 +289,7 @@ fn seek_bytes(name: &str, k: Box<[u8]>, sop: String) -> Result<(),lsm::Error> {
             "ge" => lsm::SeekOp::SEEK_GE,
             _ => return Err(lsm::Error::Misc(String::from("invalid sop"))),
         };
-    let k = lsm::KeyRef::from_boxed_slice(k);
+    let k = lsm::KeyRef::Slice(&k);
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let mut cursor = try!(db.open_cursor());
     let sr = try!(cursor.SeekRef(&k, sop));
@@ -322,7 +322,7 @@ fn add_numbers(name: &str, count: u64, start: u64, step: u64) -> Result<(),lsm::
         let val = start + i * step;
         let k = format!("{:08}", val).into_bytes().into_boxed_slice();
         let v = format!("{}", val).into_bytes().into_boxed_slice();
-        pending.insert(k, lsm::Blob::Boxed(v));
+        pending.insert(k, lsm::ValueForStorage::Boxed(v));
     }
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
@@ -353,7 +353,7 @@ fn add_lines(name: &str, file: String, count_groups: usize, count_per_group: usi
         let k = line.into_bytes().into_boxed_slice();
         if k.len() > 0 {
             let v = String::from("").into_bytes().into_boxed_slice();
-            pending.insert(k, lsm::Blob::Boxed(v));
+            pending.insert(k, lsm::ValueForStorage::Boxed(v));
         }
         if num_in_group >= count_per_group {
             let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
@@ -444,7 +444,7 @@ fn add_random(name: &str, seed: usize, count_groups: usize, count_per_group: usi
         for _ in 0 .. count_per_group {
             let k = make(&mut rng, klen);
             let v = make(&mut rng, vlen);
-            pending.insert(k, lsm::Blob::Boxed(v));
+            pending.insert(k, lsm::ValueForStorage::Boxed(v));
         }
         let seg = try!(db.write_segment(pending).map_err(lsm::wrap_err));
         //println!("wrote segment: {:?}", seg);

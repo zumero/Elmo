@@ -205,7 +205,7 @@ struct MyReader {
 struct MyWriter<'a> {
     myconn: std::rc::Rc<MyConn>,
     tx: std::sync::MutexGuard<'a, lsm::WriteLock>,
-    pending: BTreeMap<Box<[u8]>, lsm::Blob>,
+    pending: BTreeMap<Box<[u8]>, lsm::ValueForStorage>,
     max_collection_id: Option<u64>,
     max_record_id: HashMap<u64, u64>,
     max_index_id: HashMap<u64, u64>,
@@ -940,7 +940,7 @@ impl<'a> MyWriter<'a> {
             },
             None => {
                 let n = {
-                    try!(self.cursor.SeekRef(&lsm::KeyRef::from_boxed_slice(box [COLLECTION_ID_BOUNDARY]), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
+                    try!(self.cursor.SeekRef(&lsm::KeyRef::Slice(&[COLLECTION_ID_BOUNDARY]), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
                     if self.cursor.IsValid() {
                         let k = try!(self.cursor.KeyRef().map_err(elmo::wrap_err));
                         if try!(k.u8_at(0).map_err(elmo::wrap_err)) == COLLECTION_ID_TO_PROPERTIES {
@@ -1062,7 +1062,7 @@ impl<'a> MyWriter<'a> {
         while cursor.IsValid() {
             {
                 let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
-                self.pending.insert(k.into_boxed_slice(), lsm::Blob::Tombstone);
+                self.pending.insert(k.into_boxed_slice(), lsm::ValueForStorage::Tombstone);
             }
 
             try!(cursor.Next().map_err(elmo::wrap_err));
@@ -1127,7 +1127,7 @@ impl<'a> MyWriter<'a> {
             },
             None => {
                 let index_id = try!(self.use_next_index_id(collection_id));
-                self.pending.insert(k.into_boxed_slice(), lsm::Blob::Boxed(u64_to_boxed_varint(index_id)));
+                self.pending.insert(k.into_boxed_slice(), lsm::ValueForStorage::Boxed(u64_to_boxed_varint(index_id)));
 
                 // now create entries for all the existing records
 
@@ -1155,7 +1155,7 @@ impl<'a> MyWriter<'a> {
                         let ba_index_id = u64_to_boxed_varint(index_id);
                         for vals in entries {
                             let index_entry = try!(Self::make_index_entry(&ba_collection_id, &ba_index_id, &ba_record_id, vals, unique));
-                            self.pending.insert(index_entry, lsm::Blob::Boxed(ba_record_id.clone()));
+                            self.pending.insert(index_entry, lsm::ValueForStorage::Boxed(ba_record_id.clone()));
                         }
                     }
 
@@ -1169,7 +1169,7 @@ impl<'a> MyWriter<'a> {
                 properties.set_string("n", info.name);
                 properties.set_document("s", info.spec);
                 properties.set_document("o", info.options);
-                self.pending.insert(k.into_boxed_slice(), lsm::Blob::Boxed(properties.to_bson_array().into_boxed_slice()));
+                self.pending.insert(k.into_boxed_slice(), lsm::ValueForStorage::Boxed(properties.to_bson_array().into_boxed_slice()));
 
                 Ok(true)
             }
@@ -1190,7 +1190,7 @@ impl<'a> MyWriter<'a> {
         match try!(get_value_for_key_as_varint(&mut self.cursor, &k)) {
             None => Ok(false),
             Some(collection_id) => {
-                self.pending.insert(k, lsm::Blob::Tombstone);
+                self.pending.insert(k, lsm::ValueForStorage::Tombstone);
  
                 // all of the following tags are followed immediately by the
                 // collection_id, so we can delete by prefix:
@@ -1242,10 +1242,10 @@ impl<'a> MyWriter<'a> {
                 Ok(created)
             },
             Some(collection_id) => {
-                self.pending.insert(k, lsm::Blob::Tombstone);
+                self.pending.insert(k, lsm::ValueForStorage::Tombstone);
 
                 let k = encode_key_name_to_collection_id(new_db, new_coll);
-                self.pending.insert(k, lsm::Blob::Boxed(u64_to_boxed_varint(collection_id)));
+                self.pending.insert(k, lsm::ValueForStorage::Boxed(u64_to_boxed_varint(collection_id)));
 
                 let k = encode_key_collection_id_to_properties(collection_id);
                 match try!(get_value_for_key_as_bson(&mut self.cursor, &k)) {
@@ -1254,7 +1254,7 @@ impl<'a> MyWriter<'a> {
                         collection_properties.set_str("c", new_coll);
                         // TODO assert that "o" (options) is already there
                         // collection_properties.set_document("o", options);
-                        self.pending.insert(k.into_boxed_slice(), lsm::Blob::Boxed(collection_properties.to_bson_array().into_boxed_slice()));
+                        self.pending.insert(k.into_boxed_slice(), lsm::ValueForStorage::Boxed(collection_properties.to_bson_array().into_boxed_slice()));
                     },
                     None => {
                         // TODO this should not be possible
@@ -1284,7 +1284,7 @@ impl<'a> MyWriter<'a> {
                 match try!(get_value_for_key_as_varint(&mut self.cursor, &k)) {
                     None => Ok(false),
                     Some(index_id) => {
-                        self.pending.insert(k.into_boxed_slice(), lsm::Blob::Tombstone);
+                        self.pending.insert(k.into_boxed_slice(), lsm::ValueForStorage::Tombstone);
 
                         try!(self.delete_by_index_id_prefix(INDEX_ID_TO_PROPERTIES, collection_id, index_id));
                         try!(self.delete_by_index_id_prefix(INDEX_ENTRY, collection_id, index_id));
@@ -1302,7 +1302,7 @@ impl<'a> MyWriter<'a> {
             Some(id) => Ok((false, id)),
             None => {
                 let collection_id = try!(self.use_next_collection_id());
-                self.pending.insert(k, lsm::Blob::Boxed(u64_to_boxed_varint(collection_id)));
+                self.pending.insert(k, lsm::ValueForStorage::Boxed(u64_to_boxed_varint(collection_id)));
 
                 // create mongo index for _id
                 match options.get("autoIndexId") {
@@ -1311,7 +1311,7 @@ impl<'a> MyWriter<'a> {
                     _ => {
                         let index_id = PRIMARY_INDEX_ID;
                         let k = encode_key_name_to_index_id(collection_id, "_id_");
-                        self.pending.insert(k.into_boxed_slice(), lsm::Blob::Boxed(u64_to_boxed_varint(index_id)));
+                        self.pending.insert(k.into_boxed_slice(), lsm::ValueForStorage::Boxed(u64_to_boxed_varint(index_id)));
 
                         let k = encode_key_index_id_to_properties(collection_id, index_id);
                         let mut properties = bson::Document::new();
@@ -1320,7 +1320,7 @@ impl<'a> MyWriter<'a> {
                         let options = bson::Document {pairs: vec![(String::from("unique"), bson::Value::BBoolean(true))]};
                         properties.set_document("s", spec);
                         properties.set_document("o", options);
-                        self.pending.insert(k.into_boxed_slice(), lsm::Blob::Boxed(properties.to_bson_array().into_boxed_slice()));
+                        self.pending.insert(k.into_boxed_slice(), lsm::ValueForStorage::Boxed(properties.to_bson_array().into_boxed_slice()));
                     },
                 }
 
@@ -1329,7 +1329,7 @@ impl<'a> MyWriter<'a> {
                 properties.set_str("d", db);
                 properties.set_str("c", coll);
                 properties.set_document("o", options);
-                self.pending.insert(k.into_boxed_slice(), lsm::Blob::Boxed(properties.to_bson_array().into_boxed_slice()));
+                self.pending.insert(k.into_boxed_slice(), lsm::ValueForStorage::Boxed(properties.to_bson_array().into_boxed_slice()));
 
                 Ok((true, collection_id))
             },
@@ -1375,7 +1375,7 @@ impl<'a> MyWriter<'a> {
     fn update_indexes_delete(&mut self, indexes: &Vec<MyIndexPrep>, ba_collection_id: &Box<[u8]>, ba_record_id: &Box<[u8]>, v: &bson::Document) -> Result<()> {
         let a = try!(Self::get_index_entries(indexes, ba_collection_id, ba_record_id, v));
         for e in a {
-            self.pending.insert(e, lsm::Blob::Tombstone);
+            self.pending.insert(e, lsm::ValueForStorage::Tombstone);
         }
         Ok(())
     }
@@ -1389,7 +1389,7 @@ impl<'a> MyWriter<'a> {
             // efficiently.
             // but how would we enforce the unique constraint on the value
             // rather than on the full key with recid appended?
-            self.pending.insert(e, lsm::Blob::Boxed(ba_record_id.clone()));
+            self.pending.insert(e, lsm::ValueForStorage::Boxed(ba_record_id.clone()));
         }
         Ok(())
     }
@@ -1416,7 +1416,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
                         k.push_all(&ba_record_id);
 
                         let old = try!(get_value_for_key_as_bson(&mut self.cursor, &k)).unwrap();
-                        self.pending.insert(k.into_boxed_slice(), lsm::Blob::Boxed(v.to_bson_array().into_boxed_slice()));
+                        self.pending.insert(k.into_boxed_slice(), lsm::ValueForStorage::Boxed(v.to_bson_array().into_boxed_slice()));
 
                         try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id, &old));
                         try!(self.update_indexes_insert(&cw.indexes, &ba_collection_id, &ba_record_id, v));
@@ -1443,7 +1443,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
                 // TODO if there are no secondary indexes, we should be able to avoid
                 // lookup of the old record.
                 let old = try!(get_value_for_key_as_bson(&mut self.cursor, &k)).unwrap();
-                self.pending.insert(k.into_boxed_slice(), lsm::Blob::Tombstone);
+                self.pending.insert(k.into_boxed_slice(), lsm::ValueForStorage::Tombstone);
 
                 try!(self.update_indexes_delete(&cw.indexes, &ba_collection_id, &ba_record_id, &old));
 
@@ -1465,7 +1465,7 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
         let record_id = try!(self.use_next_record_id(cw.collection_id));
         let ba_record_id = u64_to_boxed_varint(record_id);
         k.push_all(&ba_record_id);
-        self.pending.insert(k.into_boxed_slice(), lsm::Blob::Boxed(v.to_bson_array().into_boxed_slice()));
+        self.pending.insert(k.into_boxed_slice(), lsm::ValueForStorage::Boxed(v.to_bson_array().into_boxed_slice()));
 
         try!(self.update_indexes_insert(&cw.indexes, &ba_collection_id, &ba_record_id, v));
 

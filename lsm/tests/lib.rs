@@ -32,11 +32,11 @@ fn key_as_string(csr: &lsm::LivingCursor) -> String {
     from_utf8(key_as_boxed_slice(csr))
 }
 
-fn insert_pair_string_string(d: &mut std::collections::BTreeMap<Box<[u8]>, lsm::Blob>, k: &str, v: &str) {
-    d.insert(str_to_utf8(k), lsm::Blob::Boxed(str_to_utf8(v)));
+fn insert_pair_string_string(d: &mut std::collections::BTreeMap<Box<[u8]>, lsm::ValueForStorage>, k: &str, v: &str) {
+    d.insert(str_to_utf8(k), lsm::ValueForStorage::Boxed(str_to_utf8(v)));
 }
 
-fn insert_pair_string_blob(d: &mut std::collections::BTreeMap<Box<[u8]>, lsm::Blob>, k: &str, v: lsm::Blob) {
+fn insert_pair_string_blob(d: &mut std::collections::BTreeMap<Box<[u8]>, lsm::ValueForStorage>, k: &str, v: lsm::ValueForStorage) {
     d.insert(str_to_utf8(k), v);
 }
 
@@ -144,19 +144,19 @@ fn seek() {
         // TODO constructing the utf8 byte array seems convoluted
 
         let k = into_utf8(format!("{:08}", 42));
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(k), lsm::SeekOp::SEEK_EQ));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_EQ));
         assert!(csr.IsValid());
 
         let k = into_utf8(format!("{:08}", 105));
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(k), lsm::SeekOp::SEEK_EQ));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_EQ));
         assert!(!csr.IsValid());
 
         let k = into_utf8(format!("{:08}", 105));
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(k), lsm::SeekOp::SEEK_GE));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_GE));
         assert!(!csr.IsValid());
 
         let k = into_utf8(format!("{:08}", 105));
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(k), lsm::SeekOp::SEEK_LE));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_LE));
         assert!(csr.IsValid());
         // TODO get the key
 
@@ -239,7 +239,7 @@ fn seek_cur() {
             try!(lck.commit_segment(g2.unwrap()));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("00001")), lsm::SeekOp::SEEK_EQ));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("00001")), lsm::SeekOp::SEEK_EQ));
         assert!(csr.IsValid());
         Ok(())
     }
@@ -288,28 +288,32 @@ fn weird() {
             assert!(csr.IsValid());
         }
         for _ in 0 .. 50 {
-            let k = lsm::KeyRef::from_boxed_slice(key_as_boxed_slice(&csr));
+            let kboxed = key_as_boxed_slice(&csr);
+            let k = lsm::KeyRef::Slice(&kboxed);
             try!(csr.SeekRef(&k, lsm::SeekOp::SEEK_EQ));
             assert!(csr.IsValid());
             try!(csr.Next());
             assert!(csr.IsValid());
         }
         for _ in 0 .. 50 {
-            let k = lsm::KeyRef::from_boxed_slice(key_as_boxed_slice(&csr));
+            let kboxed = key_as_boxed_slice(&csr);
+            let k = lsm::KeyRef::Slice(&kboxed);
             try!(csr.SeekRef(&k, lsm::SeekOp::SEEK_EQ));
             assert!(csr.IsValid());
             try!(csr.Prev());
             assert!(csr.IsValid());
         }
         for _ in 0 .. 50 {
-            let k = lsm::KeyRef::from_boxed_slice(key_as_boxed_slice(&csr));
+            let kboxed = key_as_boxed_slice(&csr);
+            let k = lsm::KeyRef::Slice(&kboxed);
             try!(csr.SeekRef(&k, lsm::SeekOp::SEEK_LE));
             assert!(csr.IsValid());
             try!(csr.Prev());
             assert!(csr.IsValid());
         }
         for _ in 0 .. 50 {
-            let k = lsm::KeyRef::from_boxed_slice(key_as_boxed_slice(&csr));
+            let kboxed = key_as_boxed_slice(&csr);
+            let k = lsm::KeyRef::Slice(&kboxed);
             try!(csr.SeekRef(&k, lsm::SeekOp::SEEK_GE));
             assert!(csr.IsValid());
             try!(csr.Next());
@@ -348,16 +352,16 @@ fn no_le_ge_multicursor() {
 
         let mut csr = try!(db.open_cursor());
 
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("a")), lsm::SeekOp::SEEK_LE));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("a")), lsm::SeekOp::SEEK_LE));
         assert!(!csr.IsValid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("d")), lsm::SeekOp::SEEK_LE));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("d")), lsm::SeekOp::SEEK_LE));
         assert!(csr.IsValid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("f")), lsm::SeekOp::SEEK_GE));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("f")), lsm::SeekOp::SEEK_GE));
         assert!(csr.IsValid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("h")), lsm::SeekOp::SEEK_GE));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("h")), lsm::SeekOp::SEEK_GE));
         assert!(!csr.IsValid());
 
         Ok(())
@@ -378,7 +382,7 @@ fn empty_val() {
             try!(lck.commit_segment(g));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("_")), lsm::SeekOp::SEEK_EQ));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("_")), lsm::SeekOp::SEEK_EQ));
         assert!(csr.IsValid());
         assert_eq!(0, csr.ValueLength().unwrap().unwrap());
 
@@ -404,7 +408,7 @@ fn delete_not_there() {
         }
 
         let mut t2 = std::collections::BTreeMap::new();
-        insert_pair_string_blob(&mut t2, "e", lsm::Blob::Tombstone);
+        insert_pair_string_blob(&mut t2, "e", lsm::ValueForStorage::Tombstone);
         let g = try!(db.write_segment(t2));
         if let Some(g) = g {
             let lck = try!(db.get_write_lock());
@@ -426,7 +430,7 @@ fn delete_nothing_there() {
         let db = try!(lsm::DatabaseFile::new(tempfile("delete_nothing_there"), lsm::DEFAULT_SETTINGS));
 
         let mut t2 = std::collections::BTreeMap::new();
-        insert_pair_string_blob(&mut t2, "e", lsm::Blob::Tombstone);
+        insert_pair_string_blob(&mut t2, "e", lsm::ValueForStorage::Tombstone);
         let g = try!(db.write_segment(t2));
         if let Some(g) = g {
             let lck = try!(db.get_write_lock());
@@ -459,7 +463,7 @@ fn simple_tombstone() {
         }
 
         let mut t2 = std::collections::BTreeMap::new();
-        insert_pair_string_blob(&mut t2, del, lsm::Blob::Tombstone);
+        insert_pair_string_blob(&mut t2, del, lsm::ValueForStorage::Tombstone);
         let g = try!(db.write_segment(t2));
         if let Some(g) = g {
             let lck = try!(db.get_write_lock());
@@ -513,7 +517,7 @@ fn one_blob() {
         }
         assert_eq!(LEN, v.len());
         let mut t2 = std::collections::BTreeMap::new();
-        insert_pair_string_blob(&mut t2, "e", lsm::Blob::Boxed(v.into_boxed_slice()));
+        insert_pair_string_blob(&mut t2, "e", lsm::ValueForStorage::Boxed(v.into_boxed_slice()));
         let g = try!(db.write_segment(t2));
         if let Some(g) = g {
             let lck = try!(db.get_write_lock());
@@ -559,16 +563,16 @@ fn no_le_ge() {
             try!(lck.commit_segment(g));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("a")), lsm::SeekOp::SEEK_LE));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("a")), lsm::SeekOp::SEEK_LE));
         assert!(!csr.IsValid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("d")), lsm::SeekOp::SEEK_LE));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("d")), lsm::SeekOp::SEEK_LE));
         assert!(csr.IsValid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("f")), lsm::SeekOp::SEEK_GE));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("f")), lsm::SeekOp::SEEK_GE));
         assert!(csr.IsValid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("h")), lsm::SeekOp::SEEK_GE));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("h")), lsm::SeekOp::SEEK_GE));
         assert!(!csr.IsValid());
 
         Ok(())
@@ -592,17 +596,17 @@ fn seek_ge_le_bigger() {
             try!(lck.commit_segment(g));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("8088")), lsm::SeekOp::SEEK_EQ));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("8088")), lsm::SeekOp::SEEK_EQ));
         assert!(csr.IsValid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("8087")), lsm::SeekOp::SEEK_EQ));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("8087")), lsm::SeekOp::SEEK_EQ));
         assert!(!csr.IsValid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("8087")), lsm::SeekOp::SEEK_LE));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("8087")), lsm::SeekOp::SEEK_LE));
         assert!(csr.IsValid());
         assert_eq!("8086", key_as_string(&csr));
 
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("8087")), lsm::SeekOp::SEEK_GE));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("8087")), lsm::SeekOp::SEEK_GE));
         assert!(csr.IsValid());
         assert_eq!("8088", key_as_string(&csr));
 
@@ -638,14 +642,14 @@ fn seek_ge_le() {
         assert_eq!(13, try!(count_keys_forward(&mut csr)));
         assert_eq!(13, try!(count_keys_backward(&mut csr)));
 
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("n")), lsm::SeekOp::SEEK_EQ));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("n")), lsm::SeekOp::SEEK_EQ));
         assert!(!csr.IsValid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("n")), lsm::SeekOp::SEEK_LE));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("n")), lsm::SeekOp::SEEK_LE));
         assert!(csr.IsValid());
         assert_eq!("m", key_as_string(&csr));
 
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("n")), lsm::SeekOp::SEEK_GE));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("n")), lsm::SeekOp::SEEK_GE));
         assert!(csr.IsValid());
         assert_eq!("o", key_as_string(&csr));
 
@@ -669,7 +673,7 @@ fn tombstone() {
             try!(lck.commit_segment(g));
         }
         let mut t2 = std::collections::BTreeMap::new();
-        insert_pair_string_blob(&mut t2, "b", lsm::Blob::Tombstone);
+        insert_pair_string_blob(&mut t2, "b", lsm::ValueForStorage::Tombstone);
         let g = try!(db.write_segment(t2));
         if let Some(g) = g {
             let lck = try!(db.get_write_lock());
@@ -698,17 +702,17 @@ fn tombstone() {
         assert_eq!(3, try!(count_keys_forward(&mut csr)));
         assert_eq!(3, try!(count_keys_backward(&mut csr)));
 
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("b")), lsm::SeekOp::SEEK_EQ));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::SEEK_EQ));
         assert!(!csr.IsValid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("b")), lsm::SeekOp::SEEK_LE));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::SEEK_LE));
         assert!(csr.IsValid());
         assert_eq!("a", key_as_string(&csr));
         try!(csr.Next());
         assert!(csr.IsValid());
         assert_eq!("c", key_as_string(&csr));
 
-        try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("b")), lsm::SeekOp::SEEK_GE));
+        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::SEEK_GE));
         assert!(csr.IsValid());
         assert_eq!("c", key_as_string(&csr));
         try!(csr.Prev());
@@ -735,7 +739,7 @@ fn overwrite() {
         }
         fn getb(db: &lsm::DatabaseFile) -> lsm::Result<String> {
             let mut csr = try!(db.open_cursor());
-            try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(str_to_utf8("b")), lsm::SeekOp::SEEK_EQ));
+            try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::SEEK_EQ));
             Ok(from_utf8(read_value(csr.ValueRef().unwrap()).unwrap()))
         }
         assert_eq!("2", getb(&db).unwrap());
@@ -764,7 +768,7 @@ fn blobs_of_many_sizes() {
         let db = try!(lsm::DatabaseFile::new(tempfile("blobs_of_many_sizes"), settings));
         // TODO why doesn't Box<[u8]> support clone?
         // for now, we have a function to generate the pile we need, and we call it twice
-        fn gen() -> std::collections::BTreeMap<Box<[u8]>, lsm::Blob> {
+        fn gen() -> std::collections::BTreeMap<Box<[u8]>, lsm::ValueForStorage> {
             let mut t1 = std::collections::BTreeMap::new();
             for i in 200 .. 1500 {
                 let k = format!("{}", i);
@@ -791,9 +795,9 @@ fn blobs_of_many_sizes() {
         println!("got cursor");
         let t1 = gen(); // generate another copy
         for (k, v) in t1 {
-            if let lsm::Blob::Boxed(v) = v {
+            if let lsm::ValueForStorage::Boxed(v) = v {
                 println!("k: {:?}", k);
-                try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(k), lsm::SeekOp::SEEK_EQ));
+                try!(csr.SeekRef(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_EQ));
                 assert!(csr.IsValid());
                 println!("    valid");
                 assert_eq!(v.len() as u64, csr.ValueLength().unwrap().unwrap());
@@ -823,7 +827,7 @@ fn write_then_read() {
             try!(lck.commit_segment(g));
         }
             let mut d = std::collections::BTreeMap::new();
-            insert_pair_string_blob(&mut d, "73", lsm::Blob::Tombstone);
+            insert_pair_string_blob(&mut d, "73", lsm::ValueForStorage::Tombstone);
             let g = try!(db.write_segment(d));
         if let Some(g) = g {
             let lck = try!(db.get_write_lock());
@@ -835,13 +839,13 @@ fn write_then_read() {
         fn read(name: &str) -> lsm::Result<()> {
             let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
             let mut csr = try!(db.open_cursor());
-            try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(into_utf8(format!("{}", 42))), lsm::SeekOp::SEEK_EQ));
+            try!(csr.SeekRef(&lsm::KeyRef::Slice(&into_utf8(format!("{}", 42))), lsm::SeekOp::SEEK_EQ));
             assert!(csr.IsValid());
             try!(csr.Next());
             assert_eq!("43", key_as_string(&csr));
-            try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(into_utf8(format!("{}", 73))), lsm::SeekOp::SEEK_EQ));
+            try!(csr.SeekRef(&lsm::KeyRef::Slice(&into_utf8(format!("{}", 73))), lsm::SeekOp::SEEK_EQ));
             assert!(!csr.IsValid());
-            try!(csr.SeekRef(&lsm::KeyRef::from_boxed_slice(into_utf8(format!("{}", 73))), lsm::SeekOp::SEEK_LE));
+            try!(csr.SeekRef(&lsm::KeyRef::Slice(&into_utf8(format!("{}", 73))), lsm::SeekOp::SEEK_LE));
             assert!(csr.IsValid());
             assert_eq!("72", key_as_string(&csr));
             try!(csr.Next());
