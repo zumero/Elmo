@@ -64,7 +64,7 @@ fn read_value(b: lsm::ValueRef) -> lsm::Result<Box<[u8]>> {
     match b {
         lsm::ValueRef::Overflowed(f, len, blocks) => {
             let mut a = Vec::with_capacity(len as usize);
-            let mut strm = try!(lsm::OverflowReader::new(f, blocks.blocks[0].firstPage, len));
+            let mut strm = try!(lsm::OverflowReader::new(f, blocks, len));
             try!(strm.read_to_end(&mut a));
             Ok(a.into_boxed_slice())
         },
@@ -538,7 +538,7 @@ fn one_blob() {
             lsm::ValueRef::Slice(ref a) => assert_eq!(LEN, a.len()),
             lsm::ValueRef::Overflowed(f, len, blocks) => {
                 let mut a = Vec::with_capacity(len as usize);
-                let mut strm = try!(lsm::OverflowReader::new(f, blocks.blocks[0].firstPage, len));
+                let mut strm = try!(lsm::OverflowReader::new(f, blocks, len));
                 try!(strm.read_to_end(&mut a));
                 assert_eq!(LEN, a.len());
             },

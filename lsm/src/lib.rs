@@ -260,6 +260,18 @@ impl BlockList {
         self.blocks.iter().map(|pb| pb.count_pages()).sum()
     }
 
+    fn page_after(&self, cur: PageNum) -> PageNum {
+        for i in 0 .. self.blocks.len() {
+            let blk = &self.blocks[i];
+            if blk.lastPage == cur {
+                return self.blocks[i + 1].firstPage;
+            } else if cur >= blk.firstPage && cur < blk.lastPage {
+                return cur + 1;
+            }
+        }
+        unreachable!();
+    }
+
     fn last_page(&self) -> PageNum {
         // TODO assume it is sorted
         // TODO assuming self.blocks is not empty
@@ -953,7 +965,7 @@ impl<'a> LiveValueRef<'a> {
             },
             LiveValueRef::Overflowed(_, len, ref blocks) => {
                 let mut a = Vec::with_capacity(len);
-                let mut strm = try!(OverflowReader::new(path, pgsz, blocks.blocks[0].firstPage, len));
+                let mut strm = try!(OverflowReader::new(path, pgsz, blocks.clone(), len));
                 try!(strm.read_to_end(&mut a));
                 Ok(a.into_boxed_slice())
             },
@@ -974,7 +986,7 @@ impl<'a> LiveValueRef<'a> {
             },
             LiveValueRef::Overflowed(ref f, len, ref blocks) => {
                 let mut a = Vec::with_capacity(len as usize);
-                let mut strm = try!(OverflowReader::new(f.clone(), blocks.blocks[0].firstPage, len));
+                let mut strm = try!(OverflowReader::new(f.clone(), blocks.clone(), len));
                 try!(strm.read_to_end(&mut a));
                 assert!((len as usize) == a.len());
                 let t = try!(func(&a));
@@ -1562,14 +1574,6 @@ impl PageBuilder {
         // TODO just self.buf?  instead of making 4-byte slice.
         misc::bytes::copy_into(&endian::u32_to_bytes_be(ov), &mut self.buf[at .. at + SIZE_32]);
         self.cur = self.cur + SIZE_32;
-    }
-
-    fn SetLastInt32(&mut self, page: u32) {
-        let len = self.buf.len();
-        let at = len - 1 * SIZE_32;
-        if self.cur > at { panic!("SetLastInt32 is squashing data"); }
-        // TODO just self.buf?  instead of making 4-byte slice.
-        misc::bytes::copy_into(&endian::u32_to_bytes_be(page), &mut self.buf[at .. at + SIZE_32]);
     }
 
     fn PutInt16(&mut self, ov: u16) {
@@ -2701,8 +2705,6 @@ pub enum PageType {
     PARENT_NODE,
 }
 
-const PAGE_TYPE_OVERFLOW: u8 = 3;
-
 impl PageType {
 
     #[inline(always)]
@@ -2834,11 +2836,9 @@ impl ItemForParent {
     }
 
     fn to_owned_overflow(&mut self, pw: &mut PageWriter) -> Result<()> {
-        // TODO magic number
-        let hard_limit = 1024;
         let k = &self.last_key.key;
         let mut r = misc::ByteSliceRead::new(&k);
-        let (len, blocks) = try!(write_overflow(&mut r, Some(k.len() as u64), pw, hard_limit));
+        let (len, blocks) = try!(write_overflow(&mut r, Some(k.len() as u64), pw));
         assert!((len as usize) == k.len());
         println!("OwnedOverflow: {:?}", blocks);
         self.last_key.location = KeyLocationForParent::OwnedOverflow(blocks);
@@ -3068,34 +3068,17 @@ fn write_overflow<R: Read>(
                     ba: &mut R, 
                     len: Option<u64>,
                     pw: &mut PageWriter,
-                    limit : usize,
                    ) -> Result<(u64, BlockList)> {
 
     fn write_page<R: Read>(ba: &mut R, pb: &mut PageBuilder, pgsz: usize, pw: &mut PageWriter, group: &mut PageGroup) -> Result<(usize, bool)> {
-// TODO get rid of this metadata stuff.  keep just the bytes.
-// will need to keep an exact list of pages, in order, in
-// the overflow catalog.
         pb.Reset();
-        pb.PutByte(PAGE_TYPE_OVERFLOW);
-        let boundary = try!(pw.is_group_on_block_boundary(group));
-        let room = 
-            if boundary.is_some() {
-                pb.PutByte(PageFlag::FLAG_BOUNDARY_NODE);
-                pgsz - 2 - SIZE_32
-            } else {
-                pb.PutByte(0u8);
-                pgsz - 2
-            };
-        let put = try!(pb.PutStream2(ba, room));
+        let put = try!(pb.PutStream2(ba, pgsz));
         if put > 0 {
-            if let Some(next_page) = boundary {
-                pb.SetLastInt32(next_page);
-            }
             try!(pw.write_group_page(pb.buf(), group));
         } else {
             // there was nothing to write
         }
-        Ok((put, put < room))
+        Ok((put, put < pgsz))
     };
 
     let pgsz = pw.page_size();
@@ -3104,15 +3087,14 @@ fn write_overflow<R: Read>(
     let pages = 
         match len {
             Some(len) => {
-// TODO add one unless len % pgsz is 0
-                let pages = len / ((pgsz as u64) - 4);
+                let pages = len / (pgsz as u64) + if 0 == (len % (pgsz as u64)) {0} else {1};;
                 Some(pages as PageCount)
             },
             None => {
                 None
             },
         };
-    let mut group = try!(pw.begin_group(pages, limit));
+    let mut group = try!(pw.begin_group(pages));
     let mut sofar = 0;
     loop {
         let (put, finished) = try!(write_page(ba, &mut pb, pgsz, pw, &mut group));
@@ -3320,16 +3302,9 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                 if k.len() <= maxKeyInline {
                     (k, KeyLocationForLeaf::Inline)
                 } else {
-                    // for an overflowed key, there is probably no practical hard limit on the size
-                    // of the encoded block list.  we want things to be as contiguous as
-                    // possible, but if the block list won't fit on the usable part of a
-                    // fresh page, something is seriously wrong.
-                    // rather than calculate the actual hard limit, we provide an arbitrary
-                    // fraction of the page which would still be pathological.
-                    let hard_limit = pgsz / 4;
                     let (len, blocks) = {
                         let mut r = misc::ByteSliceRead::new(&k.as_ref());
-                        try!(write_overflow(&mut r, Some(k.len() as u64), pw, hard_limit))
+                        try!(write_overflow(&mut r, Some(k.len() as u64), pw))
                     };
                     assert!((len as usize) == k.len());
                     (k, KeyLocationForLeaf::Overflow(blocks))
@@ -3368,16 +3343,6 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
         // block list for the value.  the hard limit, basically, is:  we cannot get
         // into a state where the key and value cannot fit on the same page.
 
-        // TODO use calc_leaf_page_len
-        let hard_limit_for_value_overflow =
-            pgsz
-            - LEAF_PAGE_OVERHEAD
-            - 2 // worst case prefixlen varint
-            - kloc.need(&k, 0)
-            - 1 // value flags
-            - 9 // worst case varint for value len
-            ;
-
         match pair.value {
             ValueForStorage::Tombstone => {
                 ValueLocation::Tombstone
@@ -3398,7 +3363,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                     }
                     ValueLocation::Buffer(va.into_boxed_slice())
                 } else {
-                    let (len, blocks) = try!(write_overflow(&mut (vbuf.chain(strm)), None, pw, hard_limit_for_value_overflow));
+                    let (len, blocks) = try!(write_overflow(&mut (vbuf.chain(strm)), None, pw));
                     ValueLocation::Overflowed(len, blocks)
                 }
             },
@@ -3411,7 +3376,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                     ValueLocation::Buffer(a)
                 } else {
                     let mut r = misc::ByteSliceRead::new(&a);
-                    let (len, blocks) = try!(write_overflow(&mut r, Some(a.len() as u64), pw, hard_limit_for_value_overflow));
+                    let (len, blocks) = try!(write_overflow(&mut r, Some(a.len() as u64), pw));
                     assert!(len as usize == a.len());
                     ValueLocation::Overflowed(len, blocks)
                 }
@@ -4750,7 +4715,7 @@ fn create_segment<I>(mut pw: PageWriter,
 pub struct OverflowReader {
     fs: std::sync::Arc<PageCache>,
     len: u64,
-    firstPage: PageNum, // TODO this will be needed later for Seek trait
+    blocks: BlockList,
     buf: Box<[u8]>,
     currentPage: PageNum,
     sofarOverall: u64,
@@ -4760,16 +4725,17 @@ pub struct OverflowReader {
 }
     
 impl OverflowReader {
-    pub fn new(fs: std::sync::Arc<PageCache>, firstPage: PageNum, len: u64) -> Result<OverflowReader> {
+    pub fn new(fs: std::sync::Arc<PageCache>, blocks: BlockList, len: u64) -> Result<OverflowReader> {
         // TODO the vec new below is really slow.  use a pool?
         let buf = vec![0; fs.page_size()].into_boxed_slice();
+        let first_page = blocks.blocks[0].firstPage;
         let mut res = 
             OverflowReader {
                 fs: fs,
                 len: len,
-                firstPage: firstPage,
+                blocks: blocks,
                 buf: buf,
-                currentPage: firstPage,
+                currentPage: first_page,
                 sofarOverall: 0,
                 sofarThisPage: 0,
                 bytesOnThisPage: 0,
@@ -4783,40 +4749,21 @@ impl OverflowReader {
 
     fn ReadPage(&mut self) -> Result<()> {
         try!(self.fs.read_page(self.currentPage, &mut *self.buf));
-        if self.buf[0] != PAGE_TYPE_OVERFLOW {
-            return Err(Error::CorruptFile("first overflow page has invalid page type"));
-        }
         self.sofarThisPage = 0;
-        self.offsetOnThisPage = 2;
-        if self.CheckPageFlag(PageFlag::FLAG_BOUNDARY_NODE) {
-            self.bytesOnThisPage = self.buf.len() - 2 - SIZE_32;
-        } else {
-            self.bytesOnThisPage = self.buf.len() - 2;
-        }
+        self.offsetOnThisPage = 0;
+        self.bytesOnThisPage = self.buf.len();
         Ok(())
     }
 
-    fn GetLastInt32(&self) -> u32 {
-        let at = self.buf.len() - SIZE_32;
-        // TODO just self.buf?  instead of making 4-byte slice.
-        let a = misc::bytes::extract_4(&self.buf[at .. at + 4]);
-        endian::u32_from_bytes_be(a)
-    }
-
-    fn CheckPageFlag(&self, f: u8) -> bool {
-        0 != (self.buf[1] & f)
-    }
-
     fn Read(&mut self, ba: &mut [u8], offset: usize, wanted: usize) -> Result<usize> {
+// TODO fix this to read directly into ba when possible
         if self.sofarOverall >= self.len {
             Ok(0)
         } else {
             if self.sofarThisPage >= self.bytesOnThisPage {
-                if self.CheckPageFlag(PageFlag::FLAG_BOUNDARY_NODE) {
-                    self.currentPage = self.GetLastInt32();
-                } else {
-                    self.currentPage += 1;
-                }
+                // TODO if the overflow block list is complicated,
+                // this could be slow.
+                self.currentPage = self.blocks.page_after(self.currentPage);
                 try!(self.ReadPage());
             }
 
@@ -5453,7 +5400,7 @@ impl KeyInLeafPage {
                 }
             },
             &KeyInLeafPage::Overflow{len: klen, ref blocks} => {
-                let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.blocks[0].firstPage, klen as u64));
+                let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.clone(), klen as u64));
                 let mut x_k = Vec::with_capacity(klen);
                 try!(ostrm.read_to_end(&mut x_k));
                 let x_k = x_k.into_boxed_slice();
@@ -5508,7 +5455,7 @@ impl KeyInParentPage {
             &KeyInParentPage::BorrowedOverflow{len: klen, ref blocks}
             | &KeyInParentPage::OwnedOverflow{len: klen, ref blocks} => 
             {
-                let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.blocks[0].firstPage, klen as u64));
+                let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.clone(), klen as u64));
                 let mut x_k = Vec::with_capacity(klen);
                 try!(ostrm.read_to_end(&mut x_k));
                 let x_k = x_k.into_boxed_slice();
@@ -5551,7 +5498,7 @@ impl KeyInParentPage {
             | &KeyInParentPage::OwnedOverflow{len: klen, ref blocks} => 
             {
                 let k = {
-                    let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.blocks[0].firstPage, klen as u64));
+                    let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.clone(), klen as u64));
                     let mut x_k = Vec::with_capacity(klen);
                     try!(ostrm.read_to_end(&mut x_k));
                     let x_k = x_k.into_boxed_slice();
@@ -9169,7 +9116,6 @@ struct PageWriter {
 
 struct PageGroup {
     inventory: Vec<PageBlock>,
-    limit: usize, // TODO rm
     blocks: BlockList,
     len: Option<PageCount>,
 }
@@ -9189,20 +9135,30 @@ impl PageWriter {
         Ok(pw)
     }
 
-    fn begin_group(&mut self, len: Option<PageCount>, limit: usize) -> Result<PageGroup> {
+    fn begin_group(&mut self, len: Option<PageCount>) -> Result<PageGroup> {
         let mut group = PageGroup {
             inventory: vec![],
-            limit: limit,
             len: len,
             blocks: BlockList::new(),
         };
-        try!(self.ensure_group_inventory(&mut group));
+
+        // TODO we don't want the biggest block.  we want a block
+        // of exactly this size.  and we want the earliest block of
+        // that size.
+
+        if let Some(want) = group.len {
+            // TODO we could see if self.blocks (inventory) has something we could use
+            let blk = try!(self.request_block(BlockRequest::MinimumSize(want)));
+            group.inventory.push(blk);
+        }
+
         Ok(group)
     }
 
     fn end_group(&self, group: PageGroup) -> Result<BlockList> {
         // TODO or, consider putting the group inventory back into the main inventory
-        if !group.blocks.is_empty() {
+        // TODO there should be no inventory left if group.len.is_some() ?
+        if !group.inventory.is_empty() {
             let mut space = try!(self.inner.space.lock());
             if !group.inventory.is_empty() {
                 space.add_free_blocks(BlockList {blocks: group.inventory});
@@ -9225,6 +9181,10 @@ impl PageWriter {
             self.blocks.push(blk);
             Ok(())
         } else if self.blocks.len() == 1 {
+            // TODO remove this restriction because no more boundary stuff?
+            // TODO probably still makes sense to never deplete, so that we
+            // can request a block that starts where the current one ends,
+            // but...
             if self.blocks[0].count_pages() == 1 {
                 let want = self.blocks[0].lastPage + 1;
                 let blk2 = try!(self.request_block(BlockRequest::StartOrAny(vec![want])));
@@ -9245,7 +9205,8 @@ impl PageWriter {
     fn get_page_from(blocks: &mut Vec<PageBlock>) -> Result<PageNum> {
         assert!(!blocks.is_empty());
         if blocks[0].count_pages() == 1 {
-            assert!(blocks.len() > 1);
+            // TODO remove this restriction because no more boundary stuff?
+            //assert!(blocks.len() > 1);
             let blk = blocks.remove(0);
             assert!(blk.firstPage == blk.lastPage);
             Ok(blk.firstPage)
@@ -9263,16 +9224,18 @@ impl PageWriter {
     }
 
     fn ensure_group_inventory(&mut self, group: &mut PageGroup) -> Result<()> {
-        // TODO the limit parameter is the hard limit on the size of the
-        // encoded blocklist for the group.  We can use this information,
-        // in cases where we are getting close to the limit, to get more
-        // desperate and request a large block at the end of the file.
+        // TODO can't we just simplify this now?  no need to require multiple
+        // blocks.  no need to keep track of whether we have a boundary.
+        // just check to see if we need more pages, and get some if we do.
 
         // TODO not sure what minimum size we should request.
         // we want overflows to be contiguous, but we also want to
         // avoid putting them at the end of the file.
         // TODO config constant?
         const MINIMUM_SIZE_FIRST_BLOCK_IN_GROUP: PageCount = 16;
+
+        // TODO the need to have the first page always be the lowest numbered
+        // page in the resulting blocklist is not going to be so important.
 
         assert!(group.inventory.len() <= 2);
         if group.inventory.is_empty() {
@@ -9344,7 +9307,6 @@ impl PageWriter {
                             // first page of the group.
                             let after = group.blocks[0].firstPage;
 
-                            // TODO use the limit provided for close cases
                             // TODO tune the numbers below
                             // TODO maybe the request size should be a formula instead of match cases
 
@@ -9396,39 +9358,20 @@ impl PageWriter {
     }
 
     fn get_group_page(&mut self, group: &mut PageGroup) -> Result<PageNum> {
-        try!(self.ensure_group_inventory(group));
+        if group.len.is_none() {
+            try!(self.ensure_group_inventory(group));
+        }
         let pg = try!(Self::get_page_from(&mut group.inventory));
         if group.blocks.blocks.len() > 0 {
             let first = group.blocks[0].firstPage;
             assert!(pg > first);
         }
         let extended = group.blocks.add_page_no_reorder(pg);
-        // TODO only consol if above false?
-        // TODO this consol will end up removed when we need the blocklist to retain order
-        group.blocks.sort_and_consolidate();
-        assert!(group.blocks.encoded_len() < group.limit);
         Ok(pg)
     }
 
     fn page_size(&self) -> usize {
         self.inner.page_cache.page_size()
-    }
-
-    fn is_group_on_block_boundary(&mut self, group: &mut PageGroup) -> Result<Option<PageNum>> {
-        try!(self.ensure_group_inventory(group));
-        // at this point, the caller must be able to request 
-        // two pages without change in the group inventory
-        // don't reorder the inventory.
-        // make sure we always take from the first block in inventory.
-
-        if group.inventory[0].count_pages() > 1 {
-            Ok(None)
-        } else {
-            assert!(group.inventory[0].count_pages() == 1);
-            assert!(group.inventory.len() > 1);
-            assert!(group.inventory[0].lastPage + 1 != group.inventory[1].firstPage);
-            Ok(Some(group.inventory[1].firstPage))
-        }
     }
 
     fn do_write(&mut self, buf: &[u8], pg: PageNum) -> Result<()> {
