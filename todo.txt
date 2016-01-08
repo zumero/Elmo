@@ -1,5 +1,60 @@
 
+disallow a pagegroup from asking for more pages
+than it said it wanted
+
+if we're not going to write overflows into leaf
+or parent, we can stop worrying so much about
+long their encoded block list is.  in fact, there
+is way too much code in PageWriter that is
+concerned about keeping the encoded len of a
+group very small.
+
+overflows get tracked like segments.  they have
+their own identity at the top level of the file.
+an overflow whic has been written but not put
+in the catalog is just like a segment which has
+been writing but not added to a level.
+
+should overflow ids be a monotonically increasing
+int?  or should they be the page num of the first
+page?
+
+the notion of desperate doesn't have to be tied to
+the size of the header and whether it fits in a
+4K page.  we could go back to allowing the header
+to be of any size while still retaining the ability
+to have a level be desperate if we wanted to force
+merges to happen a certain way.
+
+add notion of multiple dbs?  each one is its own
+set of levels, like the current header.  then the
+header would simply be the list of pointers to
+db headers.
+
+could just store the entire catalog as one blob,
+as a temporary solution.
+
+are blocklists encoded with all of them offset from
+the first?  or offset from prev?  latter would be
+smaller.
+
+consider another form of tree:  all keys are varints,
+so they can compress entirely as integer deltas.
+no overflows allowed.  for overflow list, key
+is an int, value is len, page, blocklist, etc.
+for references, both key and value are ints.
+
 new way of dealing with overflows:
+
+should a leaf/parent store enough info to read
+an overflow without consulting the catalog?
+or do we assume that it stores an id, and that
+id needs to be looked up in the catalog to get
+the info necessary to read it, which would include
+the len and maybe the exact sequence of pages.
+
+shifted len flag.  when it's an overflow, the
+len could be the overflow id instead of len.
 
 global catalog.  each overflow is listed.
 
@@ -48,6 +103,10 @@ some kind.  don't require it to be entirely in ram at
 once.  don't require a small update to rewrite the
 entire thing.  organize them by page number.  the
 page number of the overflow is like a key.
+
+I suppose we could keep the overflow catalog in a
+parallel segment lsm.  as long as that one is never
+going to have overflows.
 
 leaves don't have a full block list for overflows
 anymore.  neither do parents.  just a page num to
