@@ -2763,6 +2763,7 @@ impl ChildInfo {
                 ref blocks_overflows, 
                 count_tombstones,
             } => {
+                // TODO don't store the overflow blocklist
                 blocks_overflows.encoded_len()
                 + varint::space_needed_for(count_tombstones as u64)
             },
@@ -2830,7 +2831,7 @@ impl ItemForParent {
         }
     }
 
-    fn need(&self, prefix_len: usize, depth: u8) -> usize {
+    fn need(&self, prefix_len: usize) -> usize {
         let needed = 
             varint::space_needed_for(self.page as u64) 
             + self.info.need()
@@ -4482,7 +4483,7 @@ impl ParentNodeWriter {
                 assert!(self.st.prefix_len == 0 || would_be_prefix_len < self.st.prefix_len);
                 // the prefix_len would change with the addition of this key,
                 // so we need to recalc sofar
-                let sum = self.st.items.iter().map(|lp| lp.need(would_be_prefix_len, self.my_depth) ).sum();;
+                let sum = self.st.items.iter().map(|lp| lp.need(would_be_prefix_len) ).sum();;
                 sum
             } else {
                 self.st.sofar
@@ -4494,7 +4495,7 @@ impl ParentNodeWriter {
             let would_be_len_page_before_this_key = Self::calc_page_len(would_be_prefix_len, would_be_sofar_before_this_key);
             if pgsz > would_be_len_page_before_this_key {
                 let avalable_for_this_key = pgsz - would_be_len_page_before_this_key;
-                let fits = avalable_for_this_key >= child.need(would_be_prefix_len, self.my_depth);
+                let fits = avalable_for_this_key >= child.need(would_be_prefix_len);
                 fits
             } else {
                 false
@@ -4521,10 +4522,10 @@ impl ParentNodeWriter {
                 } else {
                     0
                 };
-            self.st.sofar = child.need(self.st.prefix_len, self.my_depth);
+            self.st.sofar = child.need(self.st.prefix_len);
         } else {
             self.st.prefix_len = would_be_prefix_len;
-            self.st.sofar = would_be_sofar_before_this_key + child.need(self.st.prefix_len, self.my_depth);
+            self.st.sofar = would_be_sofar_before_this_key + child.need(self.st.prefix_len);
         }
 
         self.st.items.push(child);
@@ -4541,7 +4542,7 @@ impl ParentNodeWriter {
                             0
                         };
                     self.st.prefix_len = self.st.items[remaining_inline].last_key.key.len();
-                    let sofar = self.st.items[0].need(self.st.prefix_len, self.my_depth) + self.st.items[1].need(self.st.prefix_len, self.my_depth);
+                    let sofar = self.st.items[0].need(self.st.prefix_len) + self.st.items[1].need(self.st.prefix_len);
                     if Self::calc_page_len(self.st.prefix_len, sofar) > pgsz {
                         //println!("TWOFER");
                         try!(self.st.items[remaining_inline].to_owned_overflow(pw));
@@ -4560,7 +4561,7 @@ impl ParentNodeWriter {
                 }
             }
             //println!("sofar before: {}", self.st.sofar);
-            self.st.sofar = self.st.items[0].need(self.st.prefix_len, self.my_depth) + self.st.items[1].need(self.st.prefix_len, self.my_depth);
+            self.st.sofar = self.st.items[0].need(self.st.prefix_len) + self.st.items[1].need(self.st.prefix_len);
             //println!("sofar after: {}", self.st.sofar);
         }
         //println!("items: {}", self.st.items.len());
