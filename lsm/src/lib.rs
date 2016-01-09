@@ -1444,12 +1444,17 @@ pub mod utils {
     use super::Error;
     use super::Result;
 
-    pub fn SeekPage<S: Seek>(strm: &mut S, pgsz: usize, pageNumber: PageNum) -> Result<u64> {
+    pub fn page_offset(pgsz: usize, pageNumber: PageNum) -> Result<u64> {
         if 0 == pageNumber { 
             // TODO should this panic?
             return Err(Error::InvalidPageNumber);
         }
         let pos = ((pageNumber as u64) - 1) * (pgsz as u64);
+        Ok(pos)
+    }
+
+    pub fn SeekPage<S: Seek>(strm: &mut S, pgsz: usize, pageNumber: PageNum) -> Result<u64> {
+        let pos = try!(page_offset(pgsz, pageNumber));
         let v = try!(strm.seek(SeekFrom::Start(pos)));
         Ok(v)
     }
@@ -4716,65 +4721,56 @@ pub struct OverflowReader {
     fs: std::sync::Arc<PageCache>,
     len: u64,
     blocks: BlockList,
-    buf: Box<[u8]>,
-    currentPage: PageNum,
-    sofarOverall: u64,
-    sofarThisPage: usize,
-    bytesOnThisPage: usize,
-    offsetOnThisPage: usize,
+    current_block: usize,
+    sofar_overall: u64,
+    sofar_this_block: u64,
+    bytes_in_this_block: u64,
 }
     
 impl OverflowReader {
     pub fn new(fs: std::sync::Arc<PageCache>, blocks: BlockList, len: u64) -> Result<OverflowReader> {
-        // TODO the vec new below is really slow.  use a pool?
-        let buf = vec![0; fs.page_size()].into_boxed_slice();
-        let first_page = blocks.blocks[0].firstPage;
         let mut res = 
             OverflowReader {
                 fs: fs,
                 len: len,
                 blocks: blocks,
-                buf: buf,
-                currentPage: first_page,
-                sofarOverall: 0,
-                sofarThisPage: 0,
-                bytesOnThisPage: 0,
-                offsetOnThisPage: 0,
+                current_block: 0,
+                sofar_overall: 0,
+                sofar_this_block: 0,
+                bytes_in_this_block: 0,
             };
-        try!(res.ReadPage());
+        try!(res.set_block(0));
         Ok(res)
     }
 
     // TODO consider supporting Seek trait
 
-    fn ReadPage(&mut self) -> Result<()> {
-        try!(self.fs.read_page(self.currentPage, &mut *self.buf));
-        self.sofarThisPage = 0;
-        self.offsetOnThisPage = 0;
-        self.bytesOnThisPage = self.buf.len();
+    fn set_block(&mut self, i: usize) -> Result<()> {
+        self.current_block = i;
+        self.sofar_this_block = 0;
+        // TODO adjust for sofar_overfall?
+        self.bytes_in_this_block = (self.blocks.blocks[i].count_pages() as u64) * (self.fs.page_size() as u64);
         Ok(())
     }
 
     fn Read(&mut self, ba: &mut [u8], offset: usize, wanted: usize) -> Result<usize> {
-// TODO fix this to read directly into ba when possible
-        if self.sofarOverall >= self.len {
+        if self.sofar_overall >= self.len {
             Ok(0)
         } else {
-            if self.sofarThisPage >= self.bytesOnThisPage {
-                // TODO if the overflow block list is complicated,
-                // this could be slow.
-                self.currentPage = self.blocks.page_after(self.currentPage);
-                try!(self.ReadPage());
+            if self.sofar_this_block >= self.bytes_in_this_block {
+                // TODO what if there are no more blocks?
+                let next_block = self.current_block + 1;
+                try!(self.set_block(next_block));
             }
 
-            let available = std::cmp::min(self.bytesOnThisPage - self.sofarThisPage, (self.len - self.sofarOverall) as usize);
-            let num = std::cmp::min(available, wanted);
-            for i in 0 .. num {
-                ba[offset + i] = self.buf[self.offsetOnThisPage + self.sofarThisPage + i];
-            }
-            self.sofarOverall = self.sofarOverall + (num as u64);
-            self.sofarThisPage = self.sofarThisPage + num;
-            Ok(num)
+            let available = std::cmp::min(self.bytes_in_this_block - self.sofar_this_block, self.len - self.sofar_overall);
+            let num = std::cmp::min(available, wanted as u64) as usize;
+            let first_page = self.blocks.blocks[self.current_block].firstPage;
+            let pos = try!(utils::page_offset(self.fs.page_size(), first_page)) + self.sofar_this_block;
+            let got = try!(self.fs.seek_and_read(&mut ba[offset .. offset + num], pos));
+            self.sofar_overall += got as u64;
+            self.sofar_this_block += got as u64;
+            Ok(got)
         }
     }
 }
@@ -6972,6 +6968,14 @@ impl PageCache {
 
     fn page_size(&self) -> usize {
         self.pgsz
+    }
+
+    fn seek_and_read(&self, buf: &mut [u8], pos: u64) -> Result<usize> {
+        let mut stuff = try!(self.stuff.lock());
+        let v = try!(stuff.f.seek(SeekFrom::Start(pos)));
+        let got = try!(stuff.f.read(buf));
+        //try!(misc::io::read_fully(&mut stuff.f, buf));
+        Ok(got)
     }
 
     fn inner_read(stuff: &mut InnerPageCache, page: PageNum, buf: &mut [u8]) -> Result<()> {
