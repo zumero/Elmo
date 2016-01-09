@@ -199,6 +199,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum BlockRequest {
     Any,
     MinimumSize(PageCount),
+    EarlyExactSize(PageCount),
     StartOrAfterMinimumSize(Vec<PageNum>, PageNum, PageCount),
     StartOrAny(Vec<PageNum>),
 }
@@ -208,6 +209,7 @@ impl BlockRequest {
         match self {
             &BlockRequest::Any => false,
             &BlockRequest::MinimumSize(_) => false,
+            &BlockRequest::EarlyExactSize(_) => false,
 
             &BlockRequest::StartOrAny(ref v) => v.iter().any(|n| *n == pg),
             &BlockRequest::StartOrAfterMinimumSize(ref v, _, _) => v.iter().any(|n| *n == pg),
@@ -218,6 +220,7 @@ impl BlockRequest {
         match self {
             &BlockRequest::Any => None,
             &BlockRequest::MinimumSize(_) => None,
+            &BlockRequest::EarlyExactSize(_) => None,
 
             &BlockRequest::StartOrAny(_) => None,
             &BlockRequest::StartOrAfterMinimumSize(_, after, _) => Some(after),
@@ -6791,6 +6794,35 @@ impl Space {
             None
         }
 
+        fn find_earliest_block_minimum_size(space: &mut Space, size: PageCount) -> Option<usize> {
+            // TODO this will need to look at every block that is
+            // big enough.  is that worth it?  if it accepts a block
+            // that is larger than we need, that block will need to be
+            // split with the remainder added back to the free list.
+            // is finding the earliest block worth that?  the rationale
+            // is that since an overflow never gets moved, it's worth
+            // getting it as early in the file as possible.
+            let mut winner = None;
+            for i in 0 .. space.free_blocks.count_blocks() {
+                if space.free_blocks[i].count_pages() >= size {
+                    match winner {
+                        None => {
+                            winner = Some(i);
+                        },
+                        Some(j) => {
+                            if space.free_blocks[i].firstPage < space.free_blocks[j].firstPage {
+                                winner = Some(j);
+                            }
+                        },
+                    }
+                } else {
+                    // if this block isn't big enough, none of the ones after it will be
+                    break;
+                }
+            }
+            return winner;
+        }
+
         fn find_block_minimum_size(space: &mut Space, size: PageCount) -> Option<usize> {
             // space.free_blocks is sorted by size desc, so we only
             // need to check the first block.
@@ -6818,10 +6850,12 @@ impl Space {
             None
         }
 
+        #[derive(Debug)]
         enum FromWhere {
             End(PageCount),
             FirstFree,
             SpecificFree(usize),
+            SpecificFreeExact(usize, PageCount),
         }
 
         if let Some(after) = req.get_after() {
@@ -6834,7 +6868,14 @@ impl Space {
 
         let from =
             if self.free_blocks.is_empty() {
-                FromWhere::End(self.pages_per_block)
+                match req {
+                    BlockRequest::EarlyExactSize(size) => {
+                        FromWhere::End(size)
+                    },
+                    _ => {
+                        FromWhere::End(self.pages_per_block)
+                    },
+                }
             } else if req.start_is(self.nextPage) {
                 FromWhere::End(self.pages_per_block)
             } else {
@@ -6850,6 +6891,13 @@ impl Space {
                             FromWhere::SpecificFree(i)
                         } else {
                             FromWhere::End(std::cmp::max(size, self.pages_per_block))
+                        }
+                    },
+                    BlockRequest::EarlyExactSize(size) => {
+                        if let Some(i) = find_earliest_block_minimum_size(self, size) {
+                            FromWhere::SpecificFreeExact(i, size)
+                        } else {
+                            FromWhere::End(size)
                         }
                     },
                     BlockRequest::MinimumSize(size) => {
@@ -6876,6 +6924,17 @@ impl Space {
             },
             FromWhere::SpecificFree(i) => {
                 self.free_blocks.remove_block(i)
+            },
+            FromWhere::SpecificFreeExact(i, size) => {
+                let mut blk = self.free_blocks.remove_block(i);
+                if blk.count_pages() > size {
+                    let mut remainder = BlockList::new();
+                    remainder.add_block_no_reorder(PageBlock::new(blk.firstPage + size, blk.lastPage));
+                    blk.lastPage = blk.firstPage + size - 1;
+                    self.recent_free.push(remainder);
+                }
+                assert!(blk.count_pages() == size);
+                blk
             },
             FromWhere::End(size) => {
                 let newBlk = PageBlock::new(self.nextPage, self.nextPage + size - 1) ;
@@ -9121,7 +9180,7 @@ struct PageWriter {
 struct PageGroup {
     inventory: Vec<PageBlock>,
     blocks: BlockList,
-    len: Option<PageCount>,
+    known_size: Option<PageCount>,
 }
 
 impl PageWriter {
@@ -9139,20 +9198,17 @@ impl PageWriter {
         Ok(pw)
     }
 
-    fn begin_group(&mut self, len: Option<PageCount>) -> Result<PageGroup> {
+    fn begin_group(&mut self, known_size: Option<PageCount>) -> Result<PageGroup> {
         let mut group = PageGroup {
             inventory: vec![],
-            len: len,
+            known_size: known_size,
             blocks: BlockList::new(),
         };
 
-        // TODO we don't want the biggest block.  we want a block
-        // of exactly this size.  and we want the earliest block of
-        // that size.
-
-        if let Some(want) = group.len {
+        if let Some(want) = group.known_size {
             // TODO we could see if self.blocks (inventory) has something we could use
-            let blk = try!(self.request_block(BlockRequest::MinimumSize(want)));
+            let blk = try!(self.request_block(BlockRequest::EarlyExactSize(want)));
+            assert!(blk.count_pages() == want);
             group.inventory.push(blk);
         }
 
@@ -9160,13 +9216,12 @@ impl PageWriter {
     }
 
     fn end_group(&self, group: PageGroup) -> Result<BlockList> {
-        // TODO or, consider putting the group inventory back into the main inventory
-        // TODO there should be no inventory left if group.len.is_some() ?
         if !group.inventory.is_empty() {
+            assert!(group.known_size.is_none());
+
+            // TODO or, consider putting the group inventory back into the main inventory
             let mut space = try!(self.inner.space.lock());
-            if !group.inventory.is_empty() {
-                space.add_free_blocks(BlockList {blocks: group.inventory});
-            }
+            space.add_free_blocks(BlockList {blocks: group.inventory});
             // TODO consider calling space.truncate_if_possible() here
         }
         Ok(group.blocks)
@@ -9228,9 +9283,8 @@ impl PageWriter {
     }
 
     fn ensure_group_inventory(&mut self, group: &mut PageGroup) -> Result<()> {
-        // TODO can't we just simplify this now?  no need to require multiple
-        // blocks.  no need to keep track of whether we have a boundary.
-        // just check to see if we need more pages, and get some if we do.
+        // this is only used for groups where the size was not known
+        assert!(group.known_size.is_none());
 
         // TODO not sure what minimum size we should request.
         // we want overflows to be contiguous, but we also want to
@@ -9264,11 +9318,7 @@ impl PageWriter {
             // likely we will need another block, but more of the free block list is
             // available for choosing.
 
-            let want =
-                match group.len {
-                    Some(n) => n,
-                    None => MINIMUM_SIZE_FIRST_BLOCK_IN_GROUP,
-                };
+            let want = MINIMUM_SIZE_FIRST_BLOCK_IN_GROUP;
             let blk = try!(self.request_block(BlockRequest::MinimumSize(want)));
             group.inventory.push(blk);
             Ok(())
@@ -9362,7 +9412,7 @@ impl PageWriter {
     }
 
     fn get_group_page(&mut self, group: &mut PageGroup) -> Result<PageNum> {
-        if group.len.is_none() {
+        if group.known_size.is_none() {
             try!(self.ensure_group_inventory(group));
         }
         let pg = try!(Self::get_page_from(&mut group.inventory));

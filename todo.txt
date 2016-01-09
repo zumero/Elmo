@@ -1,4 +1,7 @@
 
+eliminate After form of page request?  still would
+make encoding easier.
+
 disallow a pagegroup from asking for more pages
 than it said it wanted
 
