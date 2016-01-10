@@ -1,4 +1,43 @@
 
+hmmm.  any chance we should keep track of free
+blocks instead of keeping track of used blocks?
+
+or we could keep track of "loaned pages" as we issue
+them with getBlock.  a page goes from loaned to
+used when it is part of something that gets
+committed in the header.  this means that any given
+time, the set of all used pages is traceable
+through the combination of the header and the
+loaned pages list, and everything else is considered
+free.
+
+hmmm.  should we insert a header at the front of
+an overflow?  so that it can be read without
+catalog lookup?  for a known_size overflow, all
+we need is the len.  an unknown size overflow
+would need a different flag at the beginning,
+followed by its eventual len, followed by its
+full block list.  this would need to be written
+AFTER the overflow itself was written.
+
+use a bigger buffer to check an unknown size
+overflow to try and get its size.
+
+or just leave room for the usual header, and if
+by chance the overflow fits in the first
+contig block, go back and fix the header to mark
+it as a known-size overflow.  and if it does
+not, see if maybe the block list by chance will
+fit in the header, and if so, put it there.
+otherwise, put something else there that points
+to where the block list is.
+
+in other words, there would be three kinds of
+overflows:
+    1 -- just the len, contig
+    2 -- len plus blocklist, right there in the hdr
+    3 -- pointer to blocklist somewhere else.
+
 note that unless we atom-ize, two overflows can
 be identical.
 

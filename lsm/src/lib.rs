@@ -2747,7 +2747,7 @@ mod PageFlag {
 #[derive(Debug, Clone)]
 enum ChildInfo {
     Leaf{
-        blocks_overflows: BlockList,
+        blocks_overflows: BlockList, // TODO rm
         count_tombstones: u64,
     },
     Parent{
@@ -2887,6 +2887,7 @@ impl ValueLocation {
                 1 + varint::space_needed_for(vlen as u64) + vlen
             },
             &ValueLocation::Overflowed(vlen, ref blocks) => {
+                // TODO just the overflow id
                 1 + varint::space_needed_for(vlen as u64) + blocks.encoded_len()
             },
         }
@@ -2916,6 +2917,7 @@ impl KeyLocationForLeaf {
                 - prefix_len
             },
             KeyLocationForLeaf::Overflow(ref blocks) => {
+                // TODO just the overflow id
                 varint::space_needed_for(self.len_with_overflow_flag(k)) 
                 + blocks.encoded_len()
             },
@@ -2965,6 +2967,7 @@ impl KeyLocationForParent {
             KeyLocationForParent::BorrowedOverflow(ref blocks) 
             | KeyLocationForParent::OwnedOverflow(ref blocks) => 
             {
+                // TODO just the overflow id
                 varint::space_needed_for(self.len_with_overflow_flag(k)) 
                 + blocks.encoded_len()
             },
@@ -3129,10 +3132,11 @@ fn calc_leaf_page_len(prefix_len: usize, sofar: usize) -> usize {
 
 struct BuildLeafReturnValue {
     last_key: KeyWithLocationForLeaf,
-    blocks: BlockList,
+    blocks: BlockList, // TODO rm
     len_page: usize,
     count_pairs: usize,
     count_tombstones: u64,
+    // TODO overflows_referenced: Vec<PageNum>,
 }
 
 fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> BuildLeafReturnValue {
@@ -3162,13 +3166,15 @@ fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> BuildLeaf
     // either way, overflow-check this cast.
     pb.PutInt16(count_keys_in_this_leaf as u16);
 
-    fn f(pb: &mut PageBuilder, prefix_len: usize, lp: &ItemForLeaf, list: &mut BlockList, count_tombstones: &mut u64) {
+    fn put_item(pb: &mut PageBuilder, prefix_len: usize, lp: &ItemForLeaf, list: &mut BlockList, count_tombstones: &mut u64) {
         match lp.key.location {
             KeyLocationForLeaf::Inline => {
                 pb.PutVarint(lp.key.len_with_overflow_flag());
                 pb.PutArray(&lp.key.key[prefix_len .. ]);
             },
             KeyLocationForLeaf::Overflow(ref blocks) => {
+                // TODO instead, encode the overflow id.
+                // and add to overflows list.
                 pb.PutVarint(lp.key.len_with_overflow_flag());
                 blocks.encode(pb);
                 list.add_blocklist_no_reorder(blocks);
@@ -3185,6 +3191,8 @@ fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> BuildLeaf
                 pb.PutArray(&vbuf);
             },
             ValueLocation::Overflowed(vlen, ref blocks) => {
+                // TODO instead, encode the overflow id.
+                // and add to overflows list.
                 pb.PutByte(ValueFlag::FLAG_OVERFLOW);
                 pb.PutVarint(vlen as u64);
                 blocks.encode(pb);
@@ -3198,7 +3206,7 @@ fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> BuildLeaf
 
     // deal with all the keys except the last one
     for lp in st.items.drain(0 .. count_keys_in_this_leaf - 1) {
-        f(pb, st.prefix_len, &lp, &mut blocks, &mut count_tombstones);
+        put_item(pb, st.prefix_len, &lp, &mut blocks, &mut count_tombstones);
     }
 
     // now the last key
@@ -3206,7 +3214,7 @@ fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> BuildLeaf
     let last_key = {
         let lp = st.items.remove(0); 
         assert!(st.items.is_empty());
-        f(pb, st.prefix_len, &lp, &mut blocks, &mut count_tombstones);
+        put_item(pb, st.prefix_len, &lp, &mut blocks, &mut count_tombstones);
         lp.key
     };
     blocks.sort_and_consolidate();
@@ -4241,6 +4249,9 @@ struct ParentNodeWriter {
     results_chain: Option<Box<ParentNodeWriter>>,
 
     count_emit: usize,
+
+    // TODO need a way to keep track of newly-created overflows
+    // and new overflow references
 }
 
 impl ParentNodeWriter {
@@ -4320,6 +4331,7 @@ impl ParentNodeWriter {
         self.put_key(&item.last_key, prefix_len);
     }
 
+    // TODO return tuple is too large
     fn build_parent_page(&mut self,
                       ) -> (KeyWithLocationForParent, PageCount, u64, usize, usize) {
         // TODO? assert!(st.items.len() > 1);
@@ -4373,6 +4385,7 @@ impl ParentNodeWriter {
         };
         assert!(self.st.items.is_empty());
 
+        // TODO need to return list of overflows referenced
         (last_key, count_leaves, count_tombstones, count_items, self.pb.sofar())
     }
 
