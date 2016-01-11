@@ -568,6 +568,31 @@ impl<'a> std::io::Read for ByteSliceRead<'a> {
 
 }
 
+pub struct ByteBufRead {
+    buf: Box<[u8]>,
+    cur: usize,
+}
+
+impl ByteBufRead {
+    pub fn new(buf: Box<[u8]>) -> Self {
+        ByteBufRead {
+            buf: buf,
+            cur: 0,
+        }
+    }
+}
+
+impl std::io::Read for ByteBufRead {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let amt = std::cmp::min(buf.len(), self.buf.len() - self.cur);
+        buf.clone_from_slice(&self.buf[self.cur .. self.cur + amt]);
+        self.cur += amt;
+        Ok(amt)
+    }
+
+}
+
 pub mod io {
     use std::io;
     use std::io::Read;

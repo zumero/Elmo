@@ -47,6 +47,8 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+const MIN_OVERFLOW_HEADER_LEN: usize = 32;
+
 const SIZE_32: usize = 4; // like std::mem::size_of::<u32>()
 const SIZE_16: usize = 2; // like std::mem::size_of::<u16>()
 
@@ -68,7 +70,7 @@ pub type PageCount = u32;
 pub enum KeyForStorage {
 // TODO maybe just a struct, with the box, and optional/private blocklist?
     Boxed(Box<[u8]>),
-    SameFileOverflow(Box<[u8]>, BlockList),
+    SameFileOverflow(Box<[u8]>, BlockList), // TODO just the first page
 }
 
 impl KeyForStorage {
@@ -82,11 +84,11 @@ impl KeyForStorage {
 }
 
 pub enum ValueForStorage {
-    Stream(Box<Read>), // TODO rename, unknown len
-    // TODO add a way to provide a Read which also has a known len
+    UnknownLen(Box<Read>),
+    Read(Box<Read>, u64),
     Boxed(Box<[u8]>),
     Tombstone,
-    SameFileOverflow(u64, BlockList),
+    SameFileOverflow(u64, BlockList), // TODO just the first page
 }
 
 impl std::fmt::Debug for ValueForStorage {
@@ -95,8 +97,11 @@ impl std::fmt::Debug for ValueForStorage {
             &ValueForStorage::Tombstone => {
                 write!(f, "Tombstone")
             },
-            &ValueForStorage::Stream(_) => {
-                write!(f, "Stream")
+            &ValueForStorage::UnknownLen(_) => {
+                write!(f, "UnknownLen")
+            },
+            &ValueForStorage::Read(_, len) => {
+                write!(f, "Read ({})", len)
             },
             &ValueForStorage::Boxed(ref a) => {
                 write!(f, "{:?}", a)
@@ -112,7 +117,8 @@ impl ValueForStorage {
     fn is_tombstone(&self) -> bool {
         match self {
             &ValueForStorage::Tombstone => true,
-            &ValueForStorage::Stream(_) => false,
+            &ValueForStorage::UnknownLen(_) => false,
+            &ValueForStorage::Read(_,_) => false,
             &ValueForStorage::Boxed(_) => false,
             &ValueForStorage::SameFileOverflow(_, _) => false,
         }
@@ -281,7 +287,7 @@ impl BlockList {
         self.blocks[self.blocks.len() - 1].lastPage
     }
 
-    fn first_page(&self) -> PageNum {
+    pub fn first_page(&self) -> PageNum {
         // TODO assume it is sorted
         // TODO assuming self.blocks is not empty
         self.blocks[0].firstPage
@@ -482,46 +488,52 @@ impl BlockList {
                 );
     }
 
-    fn encode(&self, pb: &mut PageBuilder) {
+    fn encode_base(&self, a: &mut Vec<u64>) {
         // we store each PageBlock as first/offset instead of first/last, since the
         // offset will always compress better as a varint.
         
         // if there are multiple blocks, we store the firstPage field
-        // of all blocks after the first one as offsets from th first one.
-        // this requires that the list was sorted before this func was called.
+        // of all blocks after the first one as offsets from the first one.
+        // this requires that the first block has a firstPage field which is
+        // lower than all the others.
 
-        let len_before = pb.sofar();
-        pb.PutVarint( self.blocks.len() as u64);
+        a.push( self.blocks.len() as u64);
         if self.blocks.len() > 0 {
             let first_page = self.blocks[0].firstPage;
-            pb.PutVarint( self.blocks[0].firstPage as u64);
-            pb.PutVarint( (self.blocks[0].lastPage - self.blocks[0].firstPage) as u64);
+            a.push( self.blocks[0].firstPage as u64);
+            a.push( (self.blocks[0].lastPage - self.blocks[0].firstPage) as u64);
             if self.blocks.len() > 1 {
                 for i in 1 .. self.blocks.len() {
                     assert!(self.blocks[i].firstPage > first_page);
-                    pb.PutVarint( (self.blocks[i].firstPage - first_page) as u64);
-                    pb.PutVarint( (self.blocks[i].lastPage - self.blocks[i].firstPage) as u64);
+                    a.push( (self.blocks[i].firstPage - first_page) as u64);
+                    a.push( (self.blocks[i].lastPage - self.blocks[i].firstPage) as u64);
                 }
             }
         }
-        let len_after = pb.sofar();
-        assert!(len_after - len_before == self.encoded_len());
+    }
+
+    fn encode(&self, pb: &mut PageBuilder) {
+        let mut a = Vec::with_capacity(1 + self.blocks.len() * 2);
+        self.encode_base(&mut a);
+        for n in a {
+            pb.PutVarint(n);
+        }
+    }
+
+    fn encode_into_vec(&self, v: &mut Vec<u8>) {
+        let mut a = Vec::with_capacity(1 + self.blocks.len() * 2);
+        self.encode_base(&mut a);
+        for n in a {
+            misc::push_varint(v, n);
+        }
     }
 
     fn encoded_len(&self) -> usize {
         let mut len = 0;
-        len += varint::space_needed_for(self.blocks.len() as u64);
-        if self.blocks.len() > 0 {
-            let first_page = self.blocks[0].firstPage;
-            len += varint::space_needed_for(self.blocks[0].firstPage as u64);
-            len += varint::space_needed_for((self.blocks[0].lastPage - self.blocks[0].firstPage) as u64);
-            if self.blocks.len() > 1 {
-                for i in 1 .. self.blocks.len() {
-                    assert!(self.blocks[i].firstPage > first_page);
-                    len += varint::space_needed_for((self.blocks[i].firstPage - first_page) as u64);
-                    len += varint::space_needed_for((self.blocks[i].lastPage - self.blocks[i].firstPage) as u64);
-                }
-            }
+        let mut a = Vec::with_capacity(1 + self.blocks.len() * 2);
+        self.encode_base(&mut a);
+        for v in a {
+            len += varint::space_needed_for(v);
         }
         len
     }
@@ -578,7 +590,7 @@ fn split3<T>(a: &mut [T], i: usize) -> (&mut [T], &mut [T], &mut [T]) {
 }
 
 pub enum KeyRef<'a> {
-    Overflowed(Box<[u8]>, std::sync::Arc<PageCache>, BlockList),
+    Overflowed(Box<[u8]>, std::sync::Arc<PageCache>, BlockList), // TODO just first page
 
     // the other two are references into the page
     Prefixed(&'a [u8],&'a [u8]),
@@ -893,7 +905,7 @@ impl<'a> KeyRef<'a> {
 
 pub enum ValueRef<'a> {
     Slice(&'a [u8]),
-    Overflowed(std::sync::Arc<PageCache>, u64, BlockList),
+    Overflowed(std::sync::Arc<PageCache>, u64, BlockList), // TODO just first page
     Tombstone,
 }
 
@@ -901,7 +913,7 @@ pub enum ValueRef<'a> {
 /// only from a LivingCursor.
 pub enum LiveValueRef<'a> {
     Slice(&'a [u8]),
-    Overflowed(std::sync::Arc<PageCache>, u64, BlockList),
+    Overflowed(std::sync::Arc<PageCache>, u64, BlockList), // TODO just first page
 }
 
 impl<'a> ValueRef<'a> {
@@ -989,7 +1001,7 @@ impl<'a> LiveValueRef<'a> {
             },
             LiveValueRef::Overflowed(ref f, len, ref blocks) => {
                 let mut a = Vec::with_capacity(len as usize);
-                let mut strm = try!(OverflowReader::new(f.clone(), blocks.clone(), len));
+                let mut strm = try!(OverflowReader::new(f.clone(), blocks.first_page()));
                 try!(strm.read_to_end(&mut a));
                 assert!((len as usize) == a.len());
                 let t = try!(func(&a));
@@ -1560,6 +1572,10 @@ impl PageBuilder {
         self.buf.len() - self.cur
     }
 
+    fn put_u8_at(&mut self, x: u8, at: usize) {
+        self.buf[at] = x;
+    }
+
     fn PutByte(&mut self, x: u8) {
         self.buf[self.cur] = x;
         self.cur = self.cur + 1;
@@ -1593,6 +1609,15 @@ impl PageBuilder {
 
     fn PutVarint(&mut self, ov: u64) {
         varint::write(&mut *self.buf, &mut self.cur, ov);
+    }
+
+    fn put_varint_at(&mut self, ov: u64, at: usize) {
+        let mut cur = at;
+        varint::write(&mut *self.buf, &mut cur, ov);
+    }
+
+    fn put_array_at(&mut self, ba: &[u8], at: usize) {
+        self.buf[at .. at + ba.len()].clone_from_slice(ba);
     }
 
 }
@@ -2847,7 +2872,7 @@ impl ItemForParent {
     fn to_owned_overflow(&mut self, pw: &mut PageWriter) -> Result<()> {
         let k = &self.last_key.key;
         let mut r = misc::ByteSliceRead::new(&k);
-        let (len, blocks) = try!(write_overflow(&mut r, Some(k.len() as u64), pw));
+        let (len, blocks) = try!(write_overflow_known_len(&mut r, k.len() as u64, pw));
         assert!((len as usize) == k.len());
         println!("OwnedOverflow: {:?}", blocks);
         self.last_key.location = KeyLocationForParent::OwnedOverflow(blocks);
@@ -3076,48 +3101,120 @@ struct LeafUnderConstruction {
 
 }
 
-fn write_overflow<R: Read>(
+fn calc_overflow_pages(len: u64, header_len: u64, pgsz: u64) -> PageCount {
+    let total_len = header_len + len;
+    let pages = total_len / pgsz + if 0 == (total_len % pgsz) {0} else {1};
+    pages as PageCount
+}
+
+fn write_overflow_known_len<R: Read>(
                     ba: &mut R, 
-                    len: Option<u64>,
+                    len: u64,
                     pw: &mut PageWriter,
                    ) -> Result<(u64, BlockList)> {
-
-    fn write_page<R: Read>(ba: &mut R, pb: &mut PageBuilder, pgsz: usize, pw: &mut PageWriter, group: &mut PageGroup) -> Result<(usize, bool)> {
-        pb.Reset();
-        let put = try!(pb.PutStream2(ba, pgsz));
-        if put > 0 {
-            try!(pw.write_group_page(pb.buf(), group));
-        } else {
-            // there was nothing to write
-        }
-        Ok((put, put < pgsz))
-    };
 
     let pgsz = pw.page_size();
     let mut pb = PageBuilder::new(pgsz);
 
-    let pages = 
-        match len {
-            Some(len) => {
-                let pages = len / (pgsz as u64) + if 0 == (len % (pgsz as u64)) {0} else {1};;
-                Some(pages as PageCount)
-            },
-            None => {
-                None
-            },
-        };
-    let mut group = try!(pw.begin_group(pages));
+    let pages = calc_overflow_pages(len, MIN_OVERFLOW_HEADER_LEN as u64, pgsz as u64);
+
+    let mut group = try!(pw.begin_group(Some(pages)));
     let mut sofar = 0;
-    loop {
-        let (put, finished) = try!(write_page(ba, &mut pb, pgsz, pw, &mut group));
-        sofar += put as u64;
-        if finished {
-            break;
+    while sofar < len {
+        pb.Reset();
+        let want =
+            if sofar == 0 {
+                // first page
+                assert!(1 + varint::space_needed_for(len) <= MIN_OVERFLOW_HEADER_LEN);
+                let mut hdr = [0; MIN_OVERFLOW_HEADER_LEN];
+                hdr[0] = 1; // defines the format of the header
+                let mut cur = 1;
+                varint::write(&mut hdr, &mut cur, len);
+                pb.PutArray(&hdr);
+                pgsz - MIN_OVERFLOW_HEADER_LEN
+            } else {
+                pgsz
+            };
+        let put = try!(pb.PutStream2(ba, want));
+        if put > 0 {
+            try!(pw.write_group_page(pb.buf(), &mut group));
+        } else {
+            // there was nothing to write
+            assert!(sofar > 0);
         }
+        sofar += put as u64;
     }
+    assert!(sofar == len);
     //println!("overflow: len = {}  blocks.len = {}  encoded_len: {}", sofar, blocks.len(), blocks.encoded_len());
     let blocks = try!(pw.end_group(group));
     Ok((sofar, blocks))
+}
+
+fn write_overflow_unknown_len<R: Read>(
+                    ba: &mut R, 
+                    pw: &mut PageWriter,
+                   ) -> Result<(u64, BlockList)> {
+
+    let pgsz = pw.page_size();
+    let mut pb_first = PageBuilder::new(pgsz);
+    let mut pb = PageBuilder::new(pgsz);
+
+    let mut group = try!(pw.begin_group(None));
+
+    pb_first.Reset();
+    let mut hdr = [0; MIN_OVERFLOW_HEADER_LEN];
+    // the header will need to get filled in later
+    pb_first.PutArray(&hdr);
+    let put = try!(pb_first.PutStream2(ba, pgsz - MIN_OVERFLOW_HEADER_LEN));
+    assert!(put > 0);
+    try!(pw.write_group_page(pb_first.buf(), &mut group));
+    let mut sofar = put as u64;
+
+    loop {
+        pb.Reset();
+        let put = try!(pb.PutStream2(ba, pgsz));
+        if put > 0 {
+            try!(pw.write_group_page(pb.buf(), &mut group));
+        } else {
+            // there was nothing to write
+            assert!(sofar > 0);
+        }
+        sofar += put as u64;
+        if put < pgsz {
+            break;
+        }
+    }
+
+    //println!("overflow: len = {}  blocks.len = {}  encoded_len: {}", sofar, blocks.len(), blocks.encoded_len());
+    let blocks = try!(pw.end_group(group));
+    let len = sofar;
+    println!("overflow unknown size: {:?}", blocks);
+
+    // go back and fix the header on the first page
+    let first_page = blocks.first_page();
+    if blocks.count_blocks() == 1 {
+        // the overflow ended up contiguous.
+        // this can be format 1, no block list needed.
+        let pages_should_be = calc_overflow_pages(len, MIN_OVERFLOW_HEADER_LEN as u64, pgsz as u64);
+        assert!(pages_should_be == blocks.count_pages());
+        pb_first.put_u8_at(1, 0);
+        pb_first.put_varint_at(len, 1);
+        try!(pw.write_page_at(pb_first.buf(), first_page));
+    } else {
+        let mut hdr = vec![];
+        hdr.push(2u8);
+        misc::push_varint(&mut hdr, len);
+        blocks.encode_into_vec(&mut hdr);
+        if hdr.len() <= MIN_OVERFLOW_HEADER_LEN {
+            pb_first.put_array_at(&hdr, 0);
+            try!(pw.write_page_at(pb_first.buf(), first_page));
+        } else {
+            // TODO format 3
+            unimplemented!();
+        }
+    }
+
+    Ok((len, blocks))
 }
 
 // TODO begin mod leaf
@@ -3321,7 +3418,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                 } else {
                     let (len, blocks) = {
                         let mut r = misc::ByteSliceRead::new(&k.as_ref());
-                        try!(write_overflow(&mut r, Some(k.len() as u64), pw))
+                        try!(write_overflow_known_len(&mut r, k.len() as u64, pw))
                     };
                     assert!((len as usize) == k.len());
                     (k, KeyLocationForLeaf::Overflow(blocks))
@@ -3364,7 +3461,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
             ValueForStorage::Tombstone => {
                 ValueLocation::Tombstone
             },
-            ValueForStorage::Stream(ref mut strm) => {
+            ValueForStorage::UnknownLen(ref mut strm) => {
                 // TODO
                 // not sure reusing vbuf is worth it.  maybe we should just
                 // alloc here.  ownership will get passed into the
@@ -3380,7 +3477,19 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                     }
                     ValueLocation::Buffer(va.into_boxed_slice())
                 } else {
-                    let (len, blocks) = try!(write_overflow(&mut (vbuf.chain(strm)), None, pw));
+                    let (len, blocks) = try!(write_overflow_unknown_len(&mut (vbuf.chain(strm)), pw));
+                    ValueLocation::Overflowed(len, blocks)
+                }
+            },
+            ValueForStorage::Read(ref mut strm, len) => {
+                // TODO should be <= ?
+                if (len as usize) < maxValueInline {
+                    let mut va = Vec::with_capacity(len as usize);
+                    let vread = try!(misc::io::read_fully(&mut *strm, &mut va));
+                    assert!(len as usize == vread);
+                    ValueLocation::Buffer(va.into_boxed_slice())
+                } else {
+                    let (len, blocks) = try!(write_overflow_known_len(&mut (vbuf.chain(strm)), len, pw));
                     ValueLocation::Overflowed(len, blocks)
                 }
             },
@@ -3393,7 +3502,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                     ValueLocation::Buffer(a)
                 } else {
                     let mut r = misc::ByteSliceRead::new(&a);
-                    let (len, blocks) = try!(write_overflow(&mut r, Some(a.len() as u64), pw));
+                    let (len, blocks) = try!(write_overflow_known_len(&mut r, a.len() as u64, pw));
                     assert!(len as usize == a.len());
                     ValueLocation::Overflowed(len, blocks)
                 }
@@ -4737,6 +4846,7 @@ fn create_segment<I>(mut pw: PageWriter,
 pub struct OverflowReader {
     fs: std::sync::Arc<PageCache>,
     len: u64,
+    header_len: usize,
     blocks: BlockList,
     current_block: usize,
     sofar_overall: u64,
@@ -4745,27 +4855,60 @@ pub struct OverflowReader {
 }
     
 impl OverflowReader {
-    pub fn new(fs: std::sync::Arc<PageCache>, blocks: BlockList, len: u64) -> Result<OverflowReader> {
+    pub fn new(fs: std::sync::Arc<PageCache>, first_page: PageNum) -> Result<OverflowReader> {
+        let mut hdr = [0; MIN_OVERFLOW_HEADER_LEN];
+        let pos = try!(utils::page_offset(fs.page_size(), first_page));
+        let got = try!(fs.seek_and_read_fully(&mut hdr, pos));
+        assert!(got == MIN_OVERFLOW_HEADER_LEN);
+        let (len, blocks, actual_header_len) =
+            match hdr[0] {
+                1 => {
+                    let actual_header_len = MIN_OVERFLOW_HEADER_LEN;
+                    let mut cur = 1;
+                    let len = varint::read(&hdr, &mut cur);
+                    let pages = calc_overflow_pages(len, actual_header_len as u64, fs.page_size() as u64);
+                    let blk = PageBlock::new(first_page, first_page + pages - 1);
+                    let mut blocks = BlockList::new();
+                    blocks.add_block_no_reorder(blk);
+                    (len, blocks, actual_header_len)
+                },
+                2 => {
+                    let actual_header_len = MIN_OVERFLOW_HEADER_LEN;
+                    let mut cur = 1;
+                    let len = varint::read(&hdr, &mut cur);
+                    let pages = calc_overflow_pages(len, actual_header_len as u64, fs.page_size() as u64);
+                    let blocks = BlockList::read(&hdr, &mut cur);
+                    assert!(blocks.first_page() == first_page);
+                    (len, blocks, actual_header_len)
+                },
+                _ => {
+                    panic!(); // TODO
+                },
+            };
+        let bytes_in_this_block = (blocks.blocks[0].count_pages() as u64) * (fs.page_size() as u64) - (actual_header_len as u64);
         let mut res = 
             OverflowReader {
                 fs: fs,
                 len: len,
+                header_len: actual_header_len,
                 blocks: blocks,
                 current_block: 0,
                 sofar_overall: 0,
                 sofar_this_block: 0,
-                bytes_in_this_block: 0,
+                bytes_in_this_block: bytes_in_this_block,
             };
-        try!(res.set_block(0));
         Ok(res)
     }
 
     // TODO consider supporting Seek trait
 
     fn set_block(&mut self, i: usize) -> Result<()> {
+        // TODO for seek, we would need to support set_block(0)
+        assert!(i != 0);
+
         self.current_block = i;
         self.sofar_this_block = 0;
-        // TODO adjust for sofar_overfall?
+        // TODO adjust for sofar_overfall on the last block?
         self.bytes_in_this_block = (self.blocks.blocks[i].count_pages() as u64) * (self.fs.page_size() as u64);
         Ok(())
     }
@@ -4783,8 +4926,13 @@ impl OverflowReader {
             let available = std::cmp::min(self.bytes_in_this_block - self.sofar_this_block, self.len - self.sofar_overall);
             let num = std::cmp::min(available, wanted as u64) as usize;
             let first_page = self.blocks.blocks[self.current_block].firstPage;
-            let pos = try!(utils::page_offset(self.fs.page_size(), first_page)) + self.sofar_this_block;
-            let got = try!(self.fs.seek_and_read(&mut ba[offset .. offset + num], pos));
+            let offset_this_block = if self.current_block == 0 {
+                self.header_len as u64
+            } else {
+                0
+            };
+            let pos = try!(utils::page_offset(self.fs.page_size(), first_page)) + self.sofar_this_block + offset_this_block;
+            let got = try!(self.fs.seek_and_read_fully(&mut ba[offset .. offset + num], pos));
             self.sofar_overall += got as u64;
             self.sofar_this_block += got as u64;
             Ok(got)
@@ -5413,7 +5561,7 @@ impl KeyInLeafPage {
                 }
             },
             &KeyInLeafPage::Overflow{len: klen, ref blocks} => {
-                let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.clone(), klen as u64));
+                let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.first_page()));
                 let mut x_k = Vec::with_capacity(klen);
                 try!(ostrm.read_to_end(&mut x_k));
                 let x_k = x_k.into_boxed_slice();
@@ -5468,7 +5616,7 @@ impl KeyInParentPage {
             &KeyInParentPage::BorrowedOverflow{len: klen, ref blocks}
             | &KeyInParentPage::OwnedOverflow{len: klen, ref blocks} => 
             {
-                let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.clone(), klen as u64));
+                let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.first_page()));
                 let mut x_k = Vec::with_capacity(klen);
                 try!(ostrm.read_to_end(&mut x_k));
                 let x_k = x_k.into_boxed_slice();
@@ -5511,7 +5659,7 @@ impl KeyInParentPage {
             | &KeyInParentPage::OwnedOverflow{len: klen, ref blocks} => 
             {
                 let k = {
-                    let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.clone(), klen as u64));
+                    let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.first_page()));
                     let mut x_k = Vec::with_capacity(klen);
                     try!(ostrm.read_to_end(&mut x_k));
                     let x_k = x_k.into_boxed_slice();
@@ -7043,12 +7191,11 @@ impl PageCache {
         self.pgsz
     }
 
-    fn seek_and_read(&self, buf: &mut [u8], pos: u64) -> Result<usize> {
+    fn seek_and_read_fully(&self, buf: &mut [u8], pos: u64) -> Result<usize> {
         let mut stuff = try!(self.stuff.lock());
         let v = try!(stuff.f.seek(SeekFrom::Start(pos)));
-        let got = try!(stuff.f.read(buf));
-        //try!(misc::io::read_fully(&mut stuff.f, buf));
-        Ok(got)
+        try!(misc::io::read_fully(&mut stuff.f, buf));
+        Ok(buf.len())
     }
 
     fn inner_read(stuff: &mut InnerPageCache, page: PageNum, buf: &mut [u8]) -> Result<()> {
@@ -9442,7 +9589,7 @@ impl PageWriter {
         self.inner.page_cache.page_size()
     }
 
-    fn do_write(&mut self, buf: &[u8], pg: PageNum) -> Result<()> {
+    fn write_page_at(&mut self, buf: &[u8], pg: PageNum) -> Result<()> {
         if pg != self.last_page + 1 {
             try!(utils::SeekPage(&mut self.f, self.inner.page_cache.page_size(), pg));
         }
@@ -9453,13 +9600,13 @@ impl PageWriter {
 
     fn write_group_page(&mut self, buf: &[u8], group: &mut PageGroup) -> Result<()> {
         let pg = try!(self.get_group_page(group));
-        try!(self.do_write(buf, pg));
+        try!(self.write_page_at(buf, pg));
         Ok(())
     }
 
     fn write_page(&mut self, buf: &[u8]) -> Result<PageNum> {
         let pg = try!(self.get_page());
-        try!(self.do_write(buf, pg));
+        try!(self.write_page_at(buf, pg));
         //println!("wrote page {}", pg);
         Ok(pg)
     }

@@ -1,4 +1,6 @@
 
+need test cases with unknown size overflows
+
 hmmm.  any chance we should keep track of free
 blocks instead of keeping track of used blocks?
 
