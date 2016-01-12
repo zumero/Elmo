@@ -13,40 +13,28 @@ through the combination of the header and the
 loaned pages list, and everything else is considered
 free.
 
-hmmm.  should we insert a header at the front of
-an overflow?  so that it can be read without
-catalog lookup?  for a known_size overflow, all
-we need is the len.  an unknown size overflow
-would need a different flag at the beginning,
-followed by its eventual len, followed by its
-full block list.  this would need to be written
-AFTER the overflow itself was written.
-
 use a bigger buffer to check an unknown size
-overflow to try and get its size.
+overflow to try and get its size.  this would
+catch cases where the overflow is actually < 32K ish
+and avoid the need to write the first page twice.
 
-or just leave room for the usual header, and if
-by chance the overflow fits in the first
-contig block, go back and fix the header to mark
-it as a known-size overflow.  and if it does
-not, see if maybe the block list by chance will
-fit in the header, and if so, put it there.
-otherwise, put something else there that points
-to where the block list is.
-
-in other words, there would be three kinds of
-overflows:
-    1 -- just the len, contig
-    2 -- len plus blocklist, right there in the hdr
-    3 -- pointer to blocklist somewhere else.
+implement format 3 overflows
 
 note that unless we atom-ize, two overflows can
 be identical.
 
 special code to compare two overflows?
 
-eliminate After form of page request?  still would
-make encoding easier.
+still need After form of page request, because we
+still want the blocklist to encode as small as
+possible.
+
+the blocklist in the format 2 overflow should have
+its very first u64 removed, since it will be the
+same as the page nuim on which it sits.
+
+consider searching the first block of an unknown len
+overflow with Earliest.
 
 if we're not going to write overflows into leaf
 or parent, we can stop worrying so much about
@@ -61,9 +49,7 @@ an overflow which has been written but not put
 in the catalog is just like a segment which has
 been writing but not added to a level.
 
-should overflow ids be a monotonically increasing
-int?  or should they be the page num of the first
-page?  use pagenum.
+first page of the overflow is its id.
 
 the notion of desperate doesn't have to be tied to
 the size of the header and whether it fits in a
@@ -80,10 +66,6 @@ db headers.
 could just store the entire catalog as one blob,
 as a temporary solution.
 
-are blocklists encoded with all of them offset from
-the first?  or offset from prev?  latter would be
-smaller.
-
 consider another form of tree:  all keys are varints,
 so they can compress entirely as integer deltas.
 no overflows allowed.  for overflow list, key
@@ -94,9 +76,6 @@ new way of dealing with overflows:
 
 leaf/parent stores an overflow id, which is
 actually the first page of the overflow.
-need to look up the rest of the info for that
-id in the overflow catalog.
-the len and maybe the exact sequence of pages.
 
 shifted len flag.  when it's an overflow, the
 len could be the overflow id instead of len.
@@ -114,20 +93,13 @@ can be removed.
 writing the header will require update of the overflow
 catalog.
 
-any chance all keys should be stored separately so we
-can know there is only one copy of each one?  crazy.
-but keys would be atoms.  a key that exists in 5
-segments would only need one copy.  still probably
-absurd.
+still makes sense that keys should always be inlined
+when possible.  but values?  maybe overflowing a value
+isn't so bad?
 
 we still keep the design that a key overflow must
 be okay to read entirely into ram, but a value
 overflow does not.
-
-an overflow does not know its length.  or its
-blocklist.  only the catalog knows this.  and
-the reference (in the leaf or parent page) only
-has the id into the catalog.
 
 and the catalog could know whether each overflow is
 a key or a value.
