@@ -70,7 +70,7 @@ pub type PageCount = u32;
 pub enum KeyForStorage {
 // TODO maybe just a struct, with the box, and optional/private blocklist?
     Boxed(Box<[u8]>),
-    SameFileOverflow(Box<[u8]>, BlockList), // TODO just the first page
+    SameFileOverflow(Box<[u8]>, PageNum),
 }
 
 impl KeyForStorage {
@@ -88,7 +88,7 @@ pub enum ValueForStorage {
     Read(Box<Read>, u64),
     Boxed(Box<[u8]>),
     Tombstone,
-    SameFileOverflow(u64, BlockList), // TODO just the first page
+    SameFileOverflow(u64, PageNum),
 }
 
 impl std::fmt::Debug for ValueForStorage {
@@ -590,7 +590,7 @@ fn split3<T>(a: &mut [T], i: usize) -> (&mut [T], &mut [T], &mut [T]) {
 }
 
 pub enum KeyRef<'a> {
-    Overflowed(Box<[u8]>, std::sync::Arc<PageCache>, BlockList), // TODO just first page
+    Overflowed(Box<[u8]>, std::sync::Arc<PageCache>, PageNum),
 
     // the other two are references into the page
     Prefixed(&'a [u8],&'a [u8]),
@@ -600,7 +600,7 @@ pub enum KeyRef<'a> {
 impl<'a> std::fmt::Debug for KeyRef<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         match *self {
-            KeyRef::Overflowed(ref a, _, _) => write!(f, "Overflowed, a={:?}", a),
+            KeyRef::Overflowed(ref a, _, page) => write!(f, "Overflowed, page={}, a={:?}", page, a),
             KeyRef::Prefixed(front,back) => write!(f, "Prefixed, front={:?}, back={:?}", front, back),
             KeyRef::Slice(a) => write!(f, "Array, val={:?}", a),
         }
@@ -610,8 +610,8 @@ impl<'a> std::fmt::Debug for KeyRef<'a> {
 impl<'a> KeyRef<'a> {
     fn into_key_for_merge(self) -> KeyForStorage {
         match self {
-            KeyRef::Overflowed(a, _, blocks) => {
-                KeyForStorage::SameFileOverflow(a, blocks)
+            KeyRef::Overflowed(a, _, page) => {
+                KeyForStorage::SameFileOverflow(a, page)
             },
             KeyRef::Slice(a) => {
                 let mut k = Vec::with_capacity(a.len());
@@ -905,7 +905,8 @@ impl<'a> KeyRef<'a> {
 
 pub enum ValueRef<'a> {
     Slice(&'a [u8]),
-    Overflowed(std::sync::Arc<PageCache>, u64, BlockList), // TODO just first page
+// TODO need len?
+    Overflowed(std::sync::Arc<PageCache>, u64, PageNum),
     Tombstone,
 }
 
@@ -913,10 +914,12 @@ pub enum ValueRef<'a> {
 /// only from a LivingCursor.
 pub enum LiveValueRef<'a> {
     Slice(&'a [u8]),
-    Overflowed(std::sync::Arc<PageCache>, u64, BlockList), // TODO just first page
+// TODO need len?
+    Overflowed(std::sync::Arc<PageCache>, u64, PageNum),
 }
 
 impl<'a> ValueRef<'a> {
+// TODO is this method needed?
     pub fn len(&self) -> Option<u64> {
         match *self {
             ValueRef::Slice(a) => Some(a.len() as u64),
@@ -932,7 +935,7 @@ impl<'a> ValueRef<'a> {
                 k.extend_from_slice(a);
                 ValueForStorage::Boxed(k.into_boxed_slice())
             },
-            ValueRef::Overflowed(_, len, blocks) => ValueForStorage::SameFileOverflow(len, blocks),
+            ValueRef::Overflowed(_, len, page) => ValueForStorage::SameFileOverflow(len, page),
             ValueRef::Tombstone => ValueForStorage::Tombstone,
         }
     }
@@ -943,13 +946,14 @@ impl<'a> std::fmt::Debug for ValueRef<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         match *self {
             ValueRef::Slice(a) => write!(f, "Array, len={:?}", a),
-            ValueRef::Overflowed(_, len, _) => write!(f, "Overflowed, len={}", len),
+            ValueRef::Overflowed(_, len, page) => write!(f, "Overflowed, len={}, page={}", len, page),
             ValueRef::Tombstone => write!(f, "Tombstone"),
         }
     }
 }
 
 impl<'a> LiveValueRef<'a> {
+// TODO is this method needed?
     pub fn len(&self) -> u64 {
         match *self {
             LiveValueRef::Slice(a) => a.len() as u64,
@@ -964,26 +968,7 @@ impl<'a> LiveValueRef<'a> {
                 k.extend_from_slice(a);
                 ValueForStorage::Boxed(k.into_boxed_slice())
             },
-            LiveValueRef::Overflowed(_, len, blocks) => ValueForStorage::SameFileOverflow(len, blocks),
-        }
-    }
-
-    // TODO dangerous function if len() is big
-    // TODO change this to return a stream, and require file/pgsz?
-    #[cfg(remove_me)]
-    pub fn _into_boxed_slice(self) -> Result<Box<[u8]>> {
-        match self {
-            LiveValueRef::Slice(a) => {
-                let mut v = Vec::with_capacity(a.len());
-                v.extend_from_slice(a);
-                Ok(v.into_boxed_slice())
-            },
-            LiveValueRef::Overflowed(_, len, ref blocks) => {
-                let mut a = Vec::with_capacity(len);
-                let mut strm = try!(OverflowReader::new(path, pgsz, blocks.clone(), len));
-                try!(strm.read_to_end(&mut a));
-                Ok(a.into_boxed_slice())
-            },
+            LiveValueRef::Overflowed(_, len, page) => ValueForStorage::SameFileOverflow(len, page),
         }
     }
 
@@ -999,9 +984,9 @@ impl<'a> LiveValueRef<'a> {
                 let t = try!(func(a));
                 Ok(t)
             },
-            LiveValueRef::Overflowed(ref f, len, ref blocks) => {
+            LiveValueRef::Overflowed(ref f, len, page) => {
                 let mut a = Vec::with_capacity(len as usize);
-                let mut strm = try!(OverflowReader::new(f.clone(), blocks.first_page()));
+                let mut strm = try!(OverflowReader::new(f.clone(), page));
                 try!(strm.read_to_end(&mut a));
                 assert!((len as usize) == a.len());
                 let t = try!(func(&a));
@@ -1182,7 +1167,7 @@ impl CursorIterator {
         self.csr.count_keys_yielded()
     }
 
-    fn overflows_eaten(self) -> Vec<(PageNum, BlockList)> {
+    fn overflows_eaten(self) -> Vec<(PageNum, PageNum)> {
         self.csr.overflows_eaten()
     }
 
@@ -1394,7 +1379,7 @@ impl SegmentHeaderInfo {
             match pt {
                 PageType::LEAF_NODE => {
                     let page = try!(LeafPage::new(f.clone(), self.root_page));
-                    page.blocklist_unsorted()
+                    try!(page.blocklist_unsorted())
                 },
                 PageType::PARENT_NODE => {
                     let parent = try!(ParentPage::new(f.clone(), self.root_page));
@@ -1402,6 +1387,31 @@ impl SegmentHeaderInfo {
                 },
             };
         Ok(blocks)
+    }
+
+    fn iter_nodes(&self, 
+                          f: &std::sync::Arc<PageCache>,
+                          ) -> Result<Box<Iterator<Item=Result<Node>>>> {
+        let pt = try!(PageType::from_u8(self.buf[0]));
+        let it: Box<Iterator<Item=Result<Node>>> =
+            match pt {
+                PageType::LEAF_NODE => {
+                    let page = try!(LeafPage::new(f.clone(), self.root_page));
+                    let node = Node {
+                        depth: 0,
+                        page: self.root_page,
+                        parent: None,
+                    };
+                    let it = std::iter::once(Ok(node));
+                    box it
+                },
+                PageType::PARENT_NODE => {
+                    let parent = try!(ParentPage::new(f.clone(), self.root_page));
+                    let it = parent.into_node_iter(0);
+                    box it
+                },
+            };
+        Ok(it)
     }
 
     // TODO this is only used for diag purposes
@@ -2107,7 +2117,8 @@ struct MergeCursor {
     sorted: Box<[(usize, Option<Ordering>)]>,
     cur: Option<usize>, 
 
-    overflows_eaten: Vec<(PageNum, BlockList)>,
+    // fst of the following tuple is segment num
+    overflows_eaten: Vec<(PageNum, PageNum)>,
     count_keys_yielded: usize,
     count_keys_shadowed: usize,
 }
@@ -2121,7 +2132,8 @@ impl MergeCursor {
         self.count_keys_shadowed
     }
 
-    fn overflows_eaten(self) -> Vec<(PageNum, BlockList)> {
+    // overflows owned by leaves but shadowed by something earlier
+    fn overflows_eaten(self) -> Vec<(PageNum, PageNum)> {
         self.overflows_eaten
     }
 
@@ -2367,8 +2379,8 @@ impl IForwardCursor for MergeCursor {
                                             },
                                             KeyRef::Slice(_) => {
                                             },
-                                            KeyRef::Overflowed(_, _, blocks) => {
-                                                self.overflows_eaten.push((try!(self.subcursors[n].current_pagenum()), blocks));
+                                            KeyRef::Overflowed(_, _, page) => {
+                                                self.overflows_eaten.push((try!(self.subcursors[n].current_pagenum()), page));
                                             },
                                         }
 
@@ -2377,8 +2389,8 @@ impl IForwardCursor for MergeCursor {
                                             },
                                             ValueRef::Tombstone => {
                                             },
-                                            ValueRef::Overflowed(_, len, blocks) => {
-                                                self.overflows_eaten.push((try!(self.subcursors[n].current_pagenum()), blocks));
+                                            ValueRef::Overflowed(_, _, page) => {
+                                                self.overflows_eaten.push((try!(self.subcursors[n].current_pagenum()), page));
                                             },
                                         }
                                     }
@@ -2772,7 +2784,6 @@ mod PageFlag {
 #[derive(Debug, Clone)]
 enum ChildInfo {
     Leaf{
-        blocks_overflows: BlockList, // TODO rm
         count_tombstones: u64,
     },
     Parent{
@@ -2785,12 +2796,9 @@ impl ChildInfo {
     fn need(&self) -> usize {
         match self {
             &ChildInfo::Leaf{
-                ref blocks_overflows, 
                 count_tombstones,
             } => {
-                // TODO don't store the overflow blocklist
-                blocks_overflows.encoded_len()
-                + varint::space_needed_for(count_tombstones as u64)
+                varint::space_needed_for(count_tombstones as u64)
             },
             &ChildInfo::Parent{
                 count_leaves, 
@@ -2875,9 +2883,10 @@ impl ItemForParent {
         let (len, blocks) = try!(write_overflow_known_len(&mut r, k.len() as u64, pw));
         assert!((len as usize) == k.len());
         println!("OwnedOverflow: {:?}", blocks);
-        self.last_key.location = KeyLocationForParent::OwnedOverflow(blocks);
+        self.last_key.location = KeyLocationForParent::OwnedOverflow(blocks.first_page());
         Ok(())
     }
+
 }
 
 struct ParentUnderConstruction {
@@ -2890,15 +2899,15 @@ struct ParentUnderConstruction {
 #[derive(Debug, Clone)]
 enum KeyLocationForLeaf {
     Inline,
-    Overflow(BlockList),
+    Overflow(PageNum),
 }
 
 // this type is used during construction of a page
 #[derive(Debug, Clone)]
 enum KeyLocationForParent {
     Inline,
-    BorrowedOverflow(BlockList),
-    OwnedOverflow(BlockList),
+    BorrowedOverflow(PageNum),
+    OwnedOverflow(PageNum),
 }
 
 impl ValueLocation {
@@ -2909,11 +2918,14 @@ impl ValueLocation {
             },
             &ValueLocation::Buffer(ref vbuf) => {
                 let vlen = vbuf.len();
-                1 + varint::space_needed_for(vlen as u64) + vlen
+                1 
+                + varint::space_needed_for(vlen as u64) 
+                + vlen
             },
-            &ValueLocation::Overflowed(vlen, ref blocks) => {
-                // TODO just the overflow id
-                1 + varint::space_needed_for(vlen as u64) + blocks.encoded_len()
+            &ValueLocation::Overflowed(vlen, page) => {
+                1 
+                + varint::space_needed_for(vlen as u64) 
+                + varint::space_needed_for(page as u64)
             },
         }
     }
@@ -2922,6 +2934,7 @@ impl ValueLocation {
 
 impl KeyLocationForLeaf {
     fn len_with_overflow_flag(&self, k: &[u8]) -> u64 {
+        assert!(k.len() > 0);
         let klen = (k.len() as u64) << 1;
         match *self {
             KeyLocationForLeaf::Inline => {
@@ -2941,10 +2954,9 @@ impl KeyLocationForLeaf {
                 + k.len() 
                 - prefix_len
             },
-            KeyLocationForLeaf::Overflow(ref blocks) => {
-                // TODO just the overflow id
+            KeyLocationForLeaf::Overflow(page) => {
                 varint::space_needed_for(self.len_with_overflow_flag(k)) 
-                + blocks.encoded_len()
+                + varint::space_needed_for(page as u64)
             },
         }
     }
@@ -2967,6 +2979,7 @@ impl KeyLocationForLeaf {
 
 impl KeyLocationForParent {
     fn len_with_overflow_flag(&self, k: &[u8]) -> u64 {
+        assert!(k.len() > 0);
         let klen = (k.len() as u64) << 2;
         match *self {
             KeyLocationForParent::Inline => {
@@ -2989,12 +3002,11 @@ impl KeyLocationForParent {
                 + k.len() 
                 - prefix_len
             },
-            KeyLocationForParent::BorrowedOverflow(ref blocks) 
-            | KeyLocationForParent::OwnedOverflow(ref blocks) => 
+            KeyLocationForParent::BorrowedOverflow(page) 
+            | KeyLocationForParent::OwnedOverflow(page) => 
             {
-                // TODO just the overflow id
                 varint::space_needed_for(self.len_with_overflow_flag(k)) 
-                + blocks.encoded_len()
+                + varint::space_needed_for(page as u64)
             },
         }
     }
@@ -3006,6 +3018,15 @@ impl KeyLocationForParent {
             KeyLocationForParent::OwnedOverflow(_) => false,
         }
     }
+
+    fn is_owned_overflow(&self) -> bool {
+        match *self {
+            KeyLocationForParent::Inline => false,
+            KeyLocationForParent::BorrowedOverflow(_) => false,
+            KeyLocationForParent::OwnedOverflow(_) => true,
+        }
+    }
+
 }
 
 impl KeyWithLocationForLeaf {
@@ -3049,6 +3070,15 @@ impl KeyWithLocationForParent {
     fn is_inline(&self) -> bool {
         self.location.is_inline()
     }
+
+    // back to Inline
+    fn fix_owned_overflow(&mut self) {
+        assert!(self.key.len() > 0);
+        if self.location.is_owned_overflow() {
+            //println!("fixing owned overflow: {:?}", self.location);
+            self.location = KeyLocationForParent::Inline;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3072,7 +3102,7 @@ enum ValueLocation {
     Tombstone,
     // when this is a Buffer, this gets ownership of PairForStorage.value
     Buffer(Box<[u8]>),
-    Overflowed(u64, BlockList),
+    Overflowed(u64, PageNum),
 }
 
 // this type is used during construction of a page
@@ -3229,11 +3259,10 @@ fn calc_leaf_page_len(prefix_len: usize, sofar: usize) -> usize {
 
 struct BuildLeafReturnValue {
     last_key: KeyWithLocationForLeaf,
-    blocks: BlockList, // TODO rm
+    overflows: Vec<PageNum>,
     len_page: usize,
     count_pairs: usize,
     count_tombstones: u64,
-    // TODO overflows_referenced: Vec<PageNum>,
 }
 
 fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> BuildLeafReturnValue {
@@ -3263,18 +3292,16 @@ fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> BuildLeaf
     // either way, overflow-check this cast.
     pb.PutInt16(count_keys_in_this_leaf as u16);
 
-    fn put_item(pb: &mut PageBuilder, prefix_len: usize, lp: &ItemForLeaf, list: &mut BlockList, count_tombstones: &mut u64) {
+    fn put_item(pb: &mut PageBuilder, prefix_len: usize, lp: &ItemForLeaf, list: &mut Vec<PageNum>, count_tombstones: &mut u64) {
         match lp.key.location {
             KeyLocationForLeaf::Inline => {
                 pb.PutVarint(lp.key.len_with_overflow_flag());
                 pb.PutArray(&lp.key.key[prefix_len .. ]);
             },
-            KeyLocationForLeaf::Overflow(ref blocks) => {
-                // TODO instead, encode the overflow id.
-                // and add to overflows list.
+            KeyLocationForLeaf::Overflow(page) => {
                 pb.PutVarint(lp.key.len_with_overflow_flag());
-                blocks.encode(pb);
-                list.add_blocklist_no_reorder(blocks);
+                pb.PutVarint(page as u64);
+                list.push(page);
             },
         }
         match lp.value {
@@ -3287,23 +3314,22 @@ fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> BuildLeaf
                 pb.PutVarint(vbuf.len() as u64);
                 pb.PutArray(&vbuf);
             },
-            ValueLocation::Overflowed(vlen, ref blocks) => {
-                // TODO instead, encode the overflow id.
+            ValueLocation::Overflowed(vlen, page) => {
                 // and add to overflows list.
                 pb.PutByte(ValueFlag::FLAG_OVERFLOW);
                 pb.PutVarint(vlen as u64);
-                blocks.encode(pb);
-                list.add_blocklist_no_reorder(blocks);
+                pb.PutVarint(page as u64);
+                list.push(page);
             },
         }
     }
 
-    let mut blocks = BlockList::new();
+    let mut overflows = vec![];
     let mut count_tombstones = 0;
 
     // deal with all the keys except the last one
     for lp in st.items.drain(0 .. count_keys_in_this_leaf - 1) {
-        put_item(pb, st.prefix_len, &lp, &mut blocks, &mut count_tombstones);
+        put_item(pb, st.prefix_len, &lp, &mut overflows, &mut count_tombstones);
     }
 
     // now the last key
@@ -3311,13 +3337,12 @@ fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> BuildLeaf
     let last_key = {
         let lp = st.items.remove(0); 
         assert!(st.items.is_empty());
-        put_item(pb, st.prefix_len, &lp, &mut blocks, &mut count_tombstones);
+        put_item(pb, st.prefix_len, &lp, &mut overflows, &mut count_tombstones);
         lp.key
     };
-    blocks.sort_and_consolidate();
     BuildLeafReturnValue {
         last_key: last_key,
-        blocks: blocks,
+        overflows: overflows,
         len_page: pb.sofar(),
         count_pairs: count_keys_in_this_leaf,
         count_tombstones: count_tombstones,
@@ -3328,18 +3353,17 @@ fn write_leaf(st: &mut LeafUnderConstruction,
                 pb: &mut PageBuilder, 
                 pw: &mut PageWriter,
                ) -> Result<(usize, ItemForParent)> {
-    let BuildLeafReturnValue {last_key, blocks, len_page, count_pairs, count_tombstones} = build_leaf(st, pb);
+    let BuildLeafReturnValue {last_key, overflows, len_page, count_pairs, count_tombstones} = build_leaf(st, pb);
+    // TODO we should do something with the overflows. it used to go into ChildInfo::Leaf
     let last_key = last_key.for_parent();
     //println!("leaf blocklist: {:?}", blocks);
     //println!("leaf blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
     assert!(st.items.is_empty());
     try!(pb.write_page(pw));
-    assert!(!blocks.contains_page(pb.last_page_written));
     // TODO ItemForParent::new
     let pg = ItemForParent {
         page: pb.last_page_written, 
         info: ChildInfo::Leaf{
-            blocks_overflows: blocks, 
             count_tombstones: count_tombstones,
         },
         last_key: last_key
@@ -3421,11 +3445,11 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                         try!(write_overflow_known_len(&mut r, k.len() as u64, pw))
                     };
                     assert!((len as usize) == k.len());
-                    (k, KeyLocationForLeaf::Overflow(blocks))
+                    (k, KeyLocationForLeaf::Overflow(blocks.first_page()))
                 }
             },
-            KeyForStorage::SameFileOverflow(k, blocks) => {
-                (k, KeyLocationForLeaf::Overflow(blocks))
+            KeyForStorage::SameFileOverflow(k, page) => {
+                (k, KeyLocationForLeaf::Overflow(page))
             },
         };
 
@@ -3478,7 +3502,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                     ValueLocation::Buffer(va.into_boxed_slice())
                 } else {
                     let (len, blocks) = try!(write_overflow_unknown_len(&mut (vbuf.chain(strm)), pw));
-                    ValueLocation::Overflowed(len, blocks)
+                    ValueLocation::Overflowed(len, blocks.first_page())
                 }
             },
             ValueForStorage::Read(ref mut strm, len) => {
@@ -3490,11 +3514,11 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                     ValueLocation::Buffer(va.into_boxed_slice())
                 } else {
                     let (len, blocks) = try!(write_overflow_known_len(&mut (vbuf.chain(strm)), len, pw));
-                    ValueLocation::Overflowed(len, blocks)
+                    ValueLocation::Overflowed(len, blocks.first_page())
                 }
             },
-            ValueForStorage::SameFileOverflow(len, blocks) => {
-                ValueLocation::Overflowed(len, blocks)
+            ValueForStorage::SameFileOverflow(len, page) => {
+                ValueLocation::Overflowed(len, page)
             },
             ValueForStorage::Boxed(a) => {
                 // TODO should be <= ?
@@ -3504,7 +3528,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                     let mut r = misc::ByteSliceRead::new(&a);
                     let (len, blocks) = try!(write_overflow_known_len(&mut r, a.len() as u64, pw));
                     assert!(len as usize == a.len());
-                    ValueLocation::Overflowed(len, blocks)
+                    ValueLocation::Overflowed(len, blocks.first_page())
                 }
             },
         }
@@ -3691,7 +3715,7 @@ struct WroteMerge {
     segment: Option<SegmentHeaderInfo>,
     nodes_rewritten: Box<[Vec<PageNum>]>,
     nodes_recycled: Box<[usize]>,
-    overflows_freed: Vec<BlockList>, // TODO in rewritten leaves
+    overflows_freed: Vec<PageNum>, // TODO in rewritten leaves
     keys_promoted: usize,
     keys_rewritten: usize,
     keys_shadowed: usize,
@@ -3701,8 +3725,9 @@ struct WroteMerge {
 
 struct WroteSurvivors {
     segment: Option<SegmentHeaderInfo>,
-    nodes_rewritten: Box<[Vec<PageNum>]>,
+    nodes_rewritten: Box<[Vec<PageNum>]>, // TODO why is this in a box?
     nodes_recycled: Box<[usize]>,
+    owned_overflows: Vec<PageNum>,
     elapsed_ms: i64,
 }
 
@@ -3788,7 +3813,7 @@ fn merge_rewrite_leaf(
                     leafreader: &LeafPage,
                     behind: &mut Option<Vec<PageCursor>>,
                     chain: &mut ParentNodeWriter,
-                    overflows_freed: &mut Vec<BlockList>,
+                    overflows_freed: &mut Vec<PageNum>,
                     dest_level: DestLevel,
                     ) -> Result<MergeRewriteReturnValue> {
 
@@ -3830,17 +3855,19 @@ fn merge_rewrite_leaf(
                         },
                         Ordering::Equal => {
                             // whatever value is coming from the rewritten leaf, it is shadowed
+// TODO explain how we know that this overflow is not
+// borrowed by a parent.
                             let pair = try!(leafreader.pair_for_merge(i));
                             match &pair.key {
-                                &KeyForStorage::SameFileOverflow(_, ref blocks) => {
-                                    overflows_freed.push(blocks.clone());
+                                &KeyForStorage::SameFileOverflow(_, page) => {
+                                    overflows_freed.push(page);
                                 },
                                 _ => {
                                 },
                             }
                             match &pair.value {
-                                &ValueForStorage::SameFileOverflow(_, ref blocks) => {
-                                    overflows_freed.push(blocks.clone());
+                                &ValueForStorage::SameFileOverflow(_, page) => {
+                                    overflows_freed.push(page);
                                 },
                                 _ => {
                                 },
@@ -3894,7 +3921,7 @@ fn merge_rewrite_parent(
                     parent: &ParentPage,
                     behind: &mut Option<Vec<PageCursor>>,
                     chain: &mut ParentNodeWriter,
-                    overflows_freed: &mut Vec<BlockList>,
+                    overflows_freed: &mut Vec<PageNum>,
                     nodes_rewritten: &mut Box<[Vec<PageNum>]>,
                     nodes_recycled: &mut Box<[usize]>,
                     dest_level: DestLevel,
@@ -4016,8 +4043,7 @@ fn merge_rewrite_parent(
             },
         }
     }
-    // TODO this will fail if an owned overflow gets re-borrowed by a
-    // another parent page, right?
+
     parent.get_owned_overflows(overflows_freed);
 
     Ok(ret)
@@ -4100,13 +4126,15 @@ fn write_merge(
             let mut sub = ParentPage::new_empty(f.clone());
             for r in it {
                 let nd = try!(r);
+                try!(sub.move_to_page(nd.page));
                 if nd.depth == rewrite_level {
-                    try!(sub.move_to_page(nd.page));
-                    let sub = try!(merge_rewrite_parent(&mut st, &mut pb, pw, &mut vbuf, pairs, &mut leaf, &sub, &mut behind, &mut chain, &mut overflows_freed, &mut nodes_rewritten, &mut nodes_recycled, dest_level));
-                    keys_promoted += sub.keys_promoted;
-                    keys_rewritten += sub.keys_rewritten;
-                    keys_shadowed += sub.keys_shadowed;
-                    tombstones_removed += sub.tombstones_removed;
+                    let res = try!(merge_rewrite_parent(&mut st, &mut pb, pw, &mut vbuf, pairs, &mut leaf, &sub, &mut behind, &mut chain, &mut overflows_freed, &mut nodes_rewritten, &mut nodes_recycled, dest_level));
+                    keys_promoted += res.keys_promoted;
+                    keys_rewritten += res.keys_rewritten;
+                    keys_shadowed += res.keys_shadowed;
+                    tombstones_removed += res.tombstones_removed;
+                } else {
+                    sub.get_owned_overflows(&mut overflows_freed);
                 }
                 nodes_rewritten[nd.depth as usize].push(nd.page);
             }
@@ -4247,6 +4275,7 @@ fn survivors_rewrite_ancestor(
                     chain: &mut ParentNodeWriter,
                     nodes_rewritten: &mut Box<[Vec<PageNum>]>,
                     nodes_recycled: &mut Box<[usize]>,
+                    owned_overflows: &mut Vec<PageNum>,
                     ) -> Result<()> {
 
     assert!(parent.depth() > skip_depth + 1);
@@ -4259,7 +4288,7 @@ fn survivors_rewrite_ancestor(
         if this_pagenum == this_skip {
             nodes_rewritten[parent.depth() as usize - 1].push(this_pagenum);
             let sub = try!(parent.fetch_item_parent(i));
-            try!(survivors_rewrite_node(pw, skip_pages, skip_depth, skip_lineage, &sub, chain, nodes_rewritten, nodes_recycled,));
+            try!(survivors_rewrite_node(pw, skip_pages, skip_depth, skip_lineage, &sub, chain, nodes_rewritten, nodes_recycled, owned_overflows, ));
         } else {
             let pg = try!(parent.child_as_item_for_parent(i));
             try!(chain.add_child(pw, pg, parent.depth() - 1));
@@ -4277,16 +4306,29 @@ fn survivors_rewrite_node(
                     skip_lineage: &Vec<PageNum>,
                     parent: &ParentPage,
                     chain: &mut ParentNodeWriter,
-                    nodes_rewritten: &mut Box<[Vec<PageNum>]>,
+                    nodes_rewritten: &mut Box<[Vec<PageNum>]>, // TODO why is this in a box?
                     nodes_recycled: &mut Box<[usize]>,
+                    owned_overflows: &mut Vec<PageNum>,
                     ) -> Result<()> {
     if parent.depth() - 1 == skip_depth {
         let num_recycled = try!(survivors_rewrite_immediate_parent_of_skip(pw, skip_pages, skip_depth, parent, chain));
         nodes_recycled[skip_depth as usize] += num_recycled;
     } else if parent.depth() - 1 > skip_depth {
-        try!(survivors_rewrite_ancestor(pw, skip_pages, skip_depth, skip_lineage, parent, chain, nodes_rewritten, nodes_recycled, ));
+        try!(survivors_rewrite_ancestor(pw, skip_pages, skip_depth, skip_lineage, parent, chain, nodes_rewritten, nodes_recycled, owned_overflows, ));
     } else {
         panic!();
+    }
+    let len = parent.count_items();
+    for i in 0 .. len {
+        match &parent.children[i].last_key {
+            &KeyInParentPage::Inline{..} => {
+            },
+            &KeyInParentPage::BorrowedOverflow{..} => {
+            },
+            &KeyInParentPage::OwnedOverflow{page, ..} => {
+                owned_overflows.push(page);
+            },
+        }
     }
     Ok(())
 }
@@ -4310,8 +4352,9 @@ fn write_survivors(
     let mut chain = ParentNodeWriter::new(pw.page_size(), 1);
     let mut nodes_rewritten = vec![vec![]; parent.depth() as usize + 1].into_boxed_slice();
     let mut nodes_recycled = vec![0; parent.depth() as usize + 1].into_boxed_slice();
+    let mut owned_overflows = vec![];
 
-    try!(survivors_rewrite_node(pw, skip_pages, skip_depth, skip_lineage, parent, &mut chain, &mut nodes_rewritten, &mut nodes_recycled, ));
+    try!(survivors_rewrite_node(pw, skip_pages, skip_depth, skip_lineage, parent, &mut chain, &mut nodes_rewritten, &mut nodes_recycled, &mut owned_overflows));
     nodes_rewritten[parent.depth() as usize].push(parent.pagenum);
 
     let (count_parent_nodes, seg) = try!(chain.done(pw));
@@ -4343,6 +4386,7 @@ fn write_survivors(
         segment: seg,
         nodes_rewritten: nodes_rewritten,
         nodes_recycled: nodes_recycled,
+        owned_overflows: owned_overflows,
         elapsed_ms: elapsed.num_milliseconds(),
     };
     Ok(wrote)
@@ -4399,10 +4443,10 @@ impl ParentNodeWriter {
             KeyLocationForParent::Inline => {
                 self.pb.PutArray(&k.key[prefix_len .. ]);
             },
-            KeyLocationForParent::BorrowedOverflow(ref blocks)
-            | KeyLocationForParent::OwnedOverflow(ref blocks) => 
+            KeyLocationForParent::BorrowedOverflow(page)
+            | KeyLocationForParent::OwnedOverflow(page) => 
             {
-                blocks.encode(&mut self.pb);
+                self.pb.PutVarint(page as u64);
             },
         }
     }
@@ -4411,11 +4455,9 @@ impl ParentNodeWriter {
         self.pb.PutVarint(item.page as u64);
         match &item.info {
             &ChildInfo::Leaf{
-                ref blocks_overflows,
                 count_tombstones,
             } => {
                 assert!(self.my_depth == 1);
-                blocks_overflows.encode(&mut self.pb);
                 self.pb.PutVarint(count_tombstones as u64);
                 *total_count_leaves += 1;
                 *total_count_tombstones += count_tombstones;
@@ -4502,11 +4544,13 @@ impl ParentNodeWriter {
                           pw: &mut PageWriter,
                          ) -> Result<(usize, ItemForParent)> {
         // assert st.sofar > 0
-        let (last_key, count_leaves, count_tombstones, count_items, count_bytes) = self.build_parent_page();
+        let (mut last_key, count_leaves, count_tombstones, count_items, count_bytes) = self.build_parent_page();
         assert!(self.st.items.is_empty());
         //println!("parent blocklist: {:?}", blocks);
         //println!("parent blocklist, len: {}   encoded_len: {:?}", blocks.len(), blocks.encoded_len());
         try!(self.pb.write_page(pw));
+        //println!("wrote parent page: {}", self.pb.last_page_written);
+        last_key.fix_owned_overflow();
         // TODO ItemForParent::new
         let pg = ItemForParent {
             page: self.pb.last_page_written, 
@@ -4855,7 +4899,13 @@ pub struct OverflowReader {
 }
     
 impl OverflowReader {
+    pub fn get_len_and_blocklist(fs: std::sync::Arc<PageCache>, first_page: PageNum) -> Result<(u64, BlockList)> {
+        let rdr = try!(Self::new(fs, first_page));
+        Ok((rdr.len, rdr.blocks))
+    }
+
     pub fn new(fs: std::sync::Arc<PageCache>, first_page: PageNum) -> Result<OverflowReader> {
+        //println!("reading overflow: {}", first_page);
         let mut hdr = [0; MIN_OVERFLOW_HEADER_LEN];
         let pos = try!(utils::page_offset(fs.page_size(), first_page));
         let got = try!(fs.seek_and_read_fully(&mut hdr, pos));
@@ -5016,14 +5066,14 @@ impl LeafPage {
 
     // TODO not sure if we need to provide funcs: key_overflows() and value_overflows()
 
-    pub fn overflows(&self) -> Vec<&BlockList> {
+    pub fn overflows(&self) -> Vec<PageNum> {
         let mut list = vec![];
         for i in 0 .. self.pairs.len() {
             match &self.pairs[i].key {
                 &KeyInLeafPage::Inline{..} => {
                 },
-                &KeyInLeafPage::Overflow{ref blocks, ..} => {
-                    list.push(blocks);
+                &KeyInLeafPage::Overflow{page, ..} => {
+                    list.push(page);
                 },
             }
             match &self.pairs[i].value {
@@ -5031,20 +5081,21 @@ impl LeafPage {
                 },
                 &ValueInLeaf::Inline(_,_) => {
                 },
-                &ValueInLeaf::Overflowed(_, ref blocks) => {
-                    list.push(blocks);
+                &ValueInLeaf::Overflowed(_, page) => {
+                    list.push(page);
                 },
             }
         }
         list
     }
 
-    pub fn blocklist_unsorted(&self) -> BlockList {
+    pub fn blocklist_unsorted(&self) -> Result<BlockList> {
         let mut list = BlockList::new();
-        for blist in self.overflows() {
-            list.add_blocklist_no_reorder(blist);
+        for page in self.overflows() {
+            let (_, blist) = try!(OverflowReader::get_len_and_blocklist(self.f.clone(), page));
+            list.add_blocklist_no_reorder(&blist);
         }
-        list
+        Ok(list)
     }
 
     fn parse_page(pgnum: PageNum, pr: &[u8], pairs: &mut Vec<ItemInLeafPage>) -> Result<(Option<Box<[u8]>>, usize)> {
@@ -5158,8 +5209,8 @@ impl LeafPage {
             &ValueInLeaf::Inline(vlen, pos) => {
                 Ok(ValueRef::Slice(&self.pr[pos .. pos + vlen]))
             },
-            &ValueInLeaf::Overflowed(vlen, ref blocks) => {
-                Ok(ValueRef::Overflowed(self.f.clone(), vlen, blocks.clone()))
+            &ValueInLeaf::Overflowed(vlen, page) => {
+                Ok(ValueRef::Overflowed(self.f.clone(), vlen, page))
             },
         }
     }
@@ -5246,10 +5297,6 @@ impl LeafCursor {
 
     fn move_to_page(&mut self, pgnum: PageNum) -> Result<()> {
         self.page.move_to_page(pgnum)
-    }
-
-    pub fn blocklist_unsorted(&self) -> BlockList {
-        self.page.blocklist_unsorted()
     }
 
 }
@@ -5404,17 +5451,6 @@ impl PageCursor {
         }
     }
 
-    pub fn blocklist_unsorted(&self) -> Result<BlockList> {
-        match self {
-            &PageCursor::Leaf(ref c) => {
-                Ok(c.blocklist_unsorted())
-            },
-            &PageCursor::Parent(ref c) => {
-                c.blocklist_unsorted()
-            },
-        }
-    }
-
     fn move_to_page(&mut self, pg: PageNum) -> Result<()> {
         match self {
             &mut PageCursor::Leaf(ref mut c) => {
@@ -5515,14 +5551,14 @@ pub enum Overlap {
 #[derive(Debug)]
 pub enum KeyInLeafPage {
     Inline{len: usize, offset: usize},
-    Overflow{len: usize, blocks: BlockList},
+    Overflow{len: usize, page: PageNum},
 }
 
 #[derive(Debug)]
 pub enum KeyInParentPage {
     Inline{len: usize, offset: usize},
-    BorrowedOverflow{len: usize, blocks: BlockList},
-    OwnedOverflow{len: usize, blocks: BlockList},
+    BorrowedOverflow{len: usize, page: PageNum},
+    OwnedOverflow{len: usize, page: PageNum},
 }
 
 impl KeyInLeafPage {
@@ -5532,7 +5568,7 @@ impl KeyInLeafPage {
         let inline = 0 == (klen & 1);
         let klen = klen >> 1;
         if klen == 0 {
-            return Err(Error::CorruptFile("key cannot be zero length"));
+            return Err(Error::CorruptFile("leaf: key cannot be zero length"));
         }
         let k = 
             if inline {
@@ -5540,8 +5576,8 @@ impl KeyInLeafPage {
                 *cur += klen - prefix_len;
                 k
             } else {
-                let blocks = BlockList::read(&pr, cur);
-                let k = KeyInLeafPage::Overflow{len: klen, blocks: blocks};
+                let page = varint::read(pr, cur) as PageNum;
+                let k = KeyInLeafPage::Overflow{len: klen, page: page};
                 k
             };
         Ok(k)
@@ -5560,12 +5596,12 @@ impl KeyInLeafPage {
                     },
                 }
             },
-            &KeyInLeafPage::Overflow{len: klen, ref blocks} => {
-                let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.first_page()));
+            &KeyInLeafPage::Overflow{len: klen, page} => {
+                let mut ostrm = try!(OverflowReader::new(f.clone(), page));
                 let mut x_k = Vec::with_capacity(klen);
                 try!(ostrm.read_to_end(&mut x_k));
                 let x_k = x_k.into_boxed_slice();
-                Ok(KeyRef::Overflowed(x_k, f.clone(), blocks.clone()))
+                Ok(KeyRef::Overflowed(x_k, f.clone(), page))
             },
         }
     }
@@ -5580,7 +5616,7 @@ impl KeyInParentPage {
         let borrowed = 0 == (klen & 2);
         let klen = klen >> 2;
         if klen == 0 {
-            return Err(Error::CorruptFile("key cannot be zero length"));
+            return Err(Error::CorruptFile("parent: key cannot be zero length"));
         }
         let k = 
             if inline {
@@ -5588,12 +5624,12 @@ impl KeyInParentPage {
                 *cur += klen - prefix_len;
                 k
             } else {
-                let blocks = BlockList::read(&pr, cur);
+                let page = varint::read(pr, cur) as PageNum;
                 if borrowed {
-                    let k = KeyInParentPage::BorrowedOverflow{len: klen, blocks: blocks};
+                    let k = KeyInParentPage::BorrowedOverflow{len: klen, page: page};
                     k
                 } else {
-                    let k = KeyInParentPage::OwnedOverflow{len: klen, blocks: blocks};
+                    let k = KeyInParentPage::OwnedOverflow{len: klen, page: page};
                     k
                 }
             };
@@ -5613,20 +5649,20 @@ impl KeyInParentPage {
                     },
                 }
             },
-            &KeyInParentPage::BorrowedOverflow{len: klen, ref blocks}
-            | &KeyInParentPage::OwnedOverflow{len: klen, ref blocks} => 
+            &KeyInParentPage::BorrowedOverflow{len: klen, page: page}
+            | &KeyInParentPage::OwnedOverflow{len: klen, page: page} => 
             {
-                let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.first_page()));
+                let mut ostrm = try!(OverflowReader::new(f.clone(), page));
                 let mut x_k = Vec::with_capacity(klen);
                 try!(ostrm.read_to_end(&mut x_k));
                 let x_k = x_k.into_boxed_slice();
-                Ok(KeyRef::Overflowed(x_k, f.clone(), blocks.clone()))
+                Ok(KeyRef::Overflowed(x_k, f.clone(), page))
             },
         }
     }
 
     #[inline]
-    fn key_with_location_for_parent(&self, pr: &[u8], prefix: Option<&[u8]>, f: &std::sync::Arc<PageCache>) -> Result<KeyWithLocationForParent> { 
+    fn to_boxed_slice(&self, pr: &[u8], prefix: Option<&[u8]>, f: &std::sync::Arc<PageCache>) -> Result<Box<[u8]>> { 
         match self {
             &KeyInParentPage::Inline{len: klen, offset} => {
                 let k = 
@@ -5649,25 +5685,44 @@ impl KeyInParentPage {
                             k
                         },
                     };
+                Ok(k)
+            },
+            &KeyInParentPage::BorrowedOverflow{len: klen, page} |
+            &KeyInParentPage::OwnedOverflow{len: klen, page} => {
+                let k = {
+                    let mut ostrm = try!(OverflowReader::new(f.clone(), page));
+                    let mut x_k = Vec::with_capacity(klen);
+                    try!(ostrm.read_to_end(&mut x_k));
+                    let x_k = x_k.into_boxed_slice();
+                    x_k
+                };
+                Ok(k)
+            },
+        }
+    }
+
+    #[inline]
+    fn key_with_location_for_parent(&self, pr: &[u8], prefix: Option<&[u8]>, f: &std::sync::Arc<PageCache>) -> Result<KeyWithLocationForParent> { 
+        let k = try!(self.to_boxed_slice(pr, prefix, f));
+        match self {
+            &KeyInParentPage::Inline{len: klen, offset} => {
                 let kw = KeyWithLocationForParent {
                     key: k,
                     location: KeyLocationForParent::Inline,
                 };
                 Ok(kw)
             },
-            &KeyInParentPage::BorrowedOverflow{len: klen, ref blocks}
-            | &KeyInParentPage::OwnedOverflow{len: klen, ref blocks} => 
-            {
-                let k = {
-                    let mut ostrm = try!(OverflowReader::new(f.clone(), blocks.first_page()));
-                    let mut x_k = Vec::with_capacity(klen);
-                    try!(ostrm.read_to_end(&mut x_k));
-                    let x_k = x_k.into_boxed_slice();
-                    x_k
-                };
+            &KeyInParentPage::BorrowedOverflow{len: klen, page} => {
                 let kw = KeyWithLocationForParent {
                     key: k,
-                    location: KeyLocationForParent::BorrowedOverflow(blocks.clone()),
+                    location: KeyLocationForParent::BorrowedOverflow(page),
+                };
+                Ok(kw)
+            },
+            &KeyInParentPage::OwnedOverflow{len: klen, page} => {
+                let kw = KeyWithLocationForParent {
+                    key: k,
+                    location: KeyLocationForParent::Inline,
                 };
                 Ok(kw)
             },
@@ -5680,7 +5735,7 @@ impl KeyInParentPage {
 enum ValueInLeaf {
     Tombstone,
     Inline(usize, usize),
-    Overflowed(u64, BlockList),
+    Overflowed(u64, PageNum),
 }
 
 impl ValueInLeaf {
@@ -5692,8 +5747,8 @@ impl ValueInLeaf {
             } else {
                 let vlen = varint::read(pr, cur);
                 if 0 != (vflag & ValueFlag::FLAG_OVERFLOW) {
-                    let blocks = BlockList::read(&pr, cur);
-                    ValueInLeaf::Overflowed(vlen as u64, blocks)
+                    let page = varint::read(&pr, cur) as PageNum;
+                    ValueInLeaf::Overflowed(vlen as u64, page)
                 } else {
                     let v = ValueInLeaf::Inline(vlen as usize, *cur);
                     *cur = *cur + (vlen as usize);
@@ -5889,11 +5944,12 @@ impl ParentPage {
     fn child_blocklist(&self, i: usize) -> Result<BlockList> {
         match self.children[i].info {
             ChildInfo::Leaf{
-                ref blocks_overflows,
                 ..
             } => {
                 assert!(self.depth() == 1);
-                Ok(blocks_overflows.clone())
+                let pagenum = self.children[i].page;
+                let page = try!(LeafPage::new(self.f.clone(), pagenum));
+                page.blocklist_unsorted()
             },
             ChildInfo::Parent{..} => {
                 assert!(self.depth() > 1);
@@ -5914,6 +5970,7 @@ impl ParentPage {
     fn child_as_item_for_parent(&self, i: usize) -> Result<ItemForParent> {
         // TODO this func shows up as a common offender of malloc calls
         let last_key = try!(self.key_with_location_for_parent(&self.children[i].last_key));
+        assert!( ! last_key.location.is_owned_overflow() );
         // TODO ItemForParent::new
         let pg = ItemForParent {
             page: self.children[i].page,
@@ -5956,15 +6013,15 @@ impl ParentPage {
             .sum()
     }
 
-    fn get_owned_overflows(&self, list: &mut Vec<BlockList>) {
+    fn get_owned_overflows(&self, list: &mut Vec<PageNum>) {
         for i in 0 .. self.children.len() {
             match &self.children[i].last_key {
                 &KeyInParentPage::Inline{..} => {
                 },
                 &KeyInParentPage::BorrowedOverflow{..} => {
                 },
-                &KeyInParentPage::OwnedOverflow{len: klen, ref blocks} => {
-                    list.push(blocks.clone());
+                &KeyInParentPage::OwnedOverflow{len: klen, page} => {
+                    list.push(page);
                 },
             }
         }
@@ -5979,7 +6036,8 @@ impl ParentPage {
         }
         let mut a = vec![];
         self.get_owned_overflows(&mut a);
-        for blocks in a {
+        for page in a {
+            let (_, blocks) = try!(OverflowReader::get_len_and_blocklist(self.f.clone(), page));
             list.add_blocklist_no_reorder(&blocks);
         }
         Ok(list)
@@ -6045,10 +6103,8 @@ impl ParentPage {
 
             let info = 
                 if depth == 1 {
-                    let blocks_overflows = BlockList::read(pr, &mut cur);
                     let count_tombstones = varint::read(pr, &mut cur) as u64;
                     ChildInfo::Leaf{
-                        blocks_overflows: blocks_overflows,
                         count_tombstones: count_tombstones,
                     }
                 } else {
@@ -6293,10 +6349,6 @@ impl ParentCursor {
         try!(self.sub.move_to_page(pagenum));
         self.cur = Some(0);
         Ok(())
-    }
-
-    pub fn blocklist_unsorted(&self) -> Result<BlockList> {
-        self.page.blocklist_unsorted()
     }
 
     fn seek(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
@@ -7218,6 +7270,7 @@ impl PageCache {
                 e.insert(weak);
             },
             std::collections::hash_map::Entry::Occupied(mut e) => {
+                // TODO the following assert failed once.  why?
                 assert!(e.get().upgrade().is_none());
                 e.insert(weak);
             },
@@ -8619,6 +8672,8 @@ impl InnerPart {
                 let mut source = CursorIterator::new(cursor);
                 let wrote = try!(write_merge(&mut pw, &mut source, &into, behind_cursors, &inner.path, f.clone(), from_level.get_dest_level()));
 
+                //println!("write_merge, nodes_rewritten: {:?}", wrote.nodes_rewritten);
+
                 let count_keys_yielded_by_merge_cursor = source.count_keys_yielded();
                 //println!("count_keys_yielded_by_merge_cursor: {}", count_keys_yielded_by_merge_cursor);
 
@@ -8734,9 +8789,10 @@ impl InnerPart {
                         let mut blocks = BlockList::new();
                         blocks.add_page_no_reorder(seg);
                         // TODO overflows_eaten should be a hashmap
-                        for &(s,ref b) in overflows_eaten.iter() {
+                        for &(s, page) in overflows_eaten.iter() {
                             if s == seg {
-                                blocks.add_blocklist_no_reorder(b);
+                                let (_, blist) = try!(OverflowReader::get_len_and_blocklist(f.clone(), page));
+                                blocks.add_blocklist_no_reorder(&blist);
                             }
                         }
                         assert!(!now_inactive.contains_key(&seg));
@@ -8772,8 +8828,9 @@ impl InnerPart {
                             blocks.add_page_no_reorder(*pgnum);
                         }
                     }
-                    for b in overflows_freed {
-                        blocks.add_blocklist_no_reorder(&b);
+                    for page in overflows_freed {
+                        let (_, blist) = try!(OverflowReader::get_len_and_blocklist(f.clone(), page));
+                        blocks.add_blocklist_no_reorder(&blist);
                     }
                     assert!(!now_inactive.contains_key(&old_segment));
                     now_inactive.insert(old_segment, blocks);
@@ -8800,7 +8857,7 @@ impl InnerPart {
                 MergingFrom::WaitingPartial{old_segment, promote_pages, promote_depth, promote_lineage, promote_blocks, ..} => {
                     // TODO this code is very similar to the MergingFrom::RegularPartial case below
                     //println!("promote_lineage: {:?}", promote_lineage);
-                    //println!("promote_blocks: {:?}", promote_blocks);
+                    //println!("promote_pages: {:?}", promote_pages);
                     // TODO this seems to be the place where overflowed keys are getting lost
                     // instead of becoming inactive
                     let wrote = try!(write_survivors(&mut pw, &promote_pages, promote_depth, &promote_lineage, &old_segment, &inner.path, &f, from_level.get_dest_level()));
@@ -8813,6 +8870,7 @@ impl InnerPart {
                              if wrote.nodes_recycled.len() > 1 { wrote.nodes_recycled[1] } else { 0 },
                              wrote.elapsed_ms,
                             );
+                    //println!("node_rewritten: {:?}", wrote.nodes_rewritten);
 
                     let from = 
                         MergeFrom::Waiting{
@@ -8828,6 +8886,10 @@ impl InnerPart {
                         for pgnum in wrote.nodes_rewritten[depth].iter() {
                             blocks.add_page_no_reorder(*pgnum);
                         }
+                    }
+                    for page in wrote.owned_overflows {
+                        let (_, blist) = try!(OverflowReader::get_len_and_blocklist(f.clone(), page));
+                        blocks.add_blocklist_no_reorder(&blist);
                     }
                     //println!("blocks becoming inactive on survivors: {:?}", blocks);
                     assert!(!now_inactive.contains_key(&old_segment.pagenum));
@@ -8870,6 +8932,10 @@ impl InnerPart {
                             blocks.add_page_no_reorder(*pgnum);
                         }
                     }
+                    for page in wrote.owned_overflows {
+                        let (_, blist) = try!(OverflowReader::get_len_and_blocklist(f.clone(), page));
+                        blocks.add_blocklist_no_reorder(&blist);
+                    }
                     //println!("blocks becoming inactive on survivors: {:?}", blocks);
                     assert!(!now_inactive.contains_key(&old_segment.pagenum));
                     now_inactive.insert(old_segment.pagenum, blocks);
@@ -8896,7 +8962,7 @@ impl InnerPart {
                     match pt {
                         PageType::LEAF_NODE => {
                             let page = try!(LeafPage::new(f.clone(), page));
-                            page.blocklist_unsorted()
+                            try!(page.blocklist_unsorted())
                         },
                         PageType::PARENT_NODE => {
                             let parent = try!(ParentPage::new(f.clone(), page));
@@ -8921,6 +8987,7 @@ impl InnerPart {
                     },
                     MergeFrom::Waiting{old_segment, ..} => {
                         let blocks = try!(get_blocklist_for_segment_including_root(old_segment, f));
+                        println!("old_segment {} was {:?}", old_segment, blocks);
                         assert!(!now_inactive.contains_key(&old_segment));
                         now_inactive.insert(old_segment, blocks);
                     },
@@ -8933,6 +9000,7 @@ impl InnerPart {
                 match old_dest_segment {
                     Some(seg) => {
                         let blocks = try!(get_blocklist_for_segment_including_root(seg, f));
+                        println!("old_dest_segment {} is {:?}", seg, blocks);
                         assert!(!now_inactive.contains_key(&seg));
                         now_inactive.insert(seg, blocks);
                     },
@@ -8948,6 +9016,7 @@ impl InnerPart {
                     Some(ref seg) => {
                         let mut blocks = try!(seg.blocklist_unsorted(f));
                         blocks.add_page_no_reorder(seg.root_page);
+                        println!("new_dest_segment {} is {:?}", seg.root_page, blocks);
                         for (k,b) in old_now_inactive.iter_mut() {
                             b.remove_anything_in(&blocks);
                         }
@@ -8960,6 +9029,7 @@ impl InnerPart {
                         if let &Some(ref new_segment) = new_segment {
                             let mut blocks = try!(new_segment.blocklist_unsorted(f));
                             blocks.add_page_no_reorder(new_segment.root_page);
+                            println!("new_segment {} is {:?}", new_segment.root_page, blocks);
                             for (k, b) in old_now_inactive.iter_mut() {
                                 b.remove_anything_in(&blocks);
                             }

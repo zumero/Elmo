@@ -1,8 +1,75 @@
 
+maybe the comments need a more concise list of the
+various cases where a page becomes inactive during
+a merge.  it's confusing.
+
+I *think* it is true that blocklist_unsorted() is never
+called except for list_all_blocks at startup.
+
+in parent depth 1, we used to store the blocklist for
+the overflows in that leaf.  now we have to read
+the leaf to get its list of overflows, AND we have
+to reach the hdr of each overflow to get its blocklist.
+should we at least store the leaf's overflow list
+in the depth 1 parent?
+
+worry about how expensive it is to read the header of
+an overflow just to get its len and blocklist.
+it certainly makes the 'bizarre' check a LOT slower.
+
+note that a leaf cannot reference an overflow without
+owning it.  either the overflow was written as the
+leaf was created, or the overflow is moved to the leaf
+from a leaf that is being rewritten.
+
+a parent can have an overflowed key in two ways.
+
+a borrowed overflow must be owned by a leaf.  it is
+a bug to free an overflow from a leaf but retain
+references to it in a parent.  are we checking for
+this?
+
+an owned overflow is owned by that parent, and
+cannot be shared by anything else.
+
+OverflowReader::blocklist should return len as well
+
+test with bizarre
+
+ValueRef probably needs a method that returns a Read
+
+maybe a parent page should only be allowed to borrow
+from a leaf, not from another parent page.  in other
+words, when a parent makes an owned overflow, it
+needs to keep it private.  the thing that gets
+passed up to the next parent is still the inline
+overflow it got from below.
+
+consider removing the len stored with the overflow.
+it's really only there for Vec::with_capacity()
+and for ValueRef::len().  right?
+
+actually, value_len is used to implement tombstone
+checks.  might want a simpler is_tombstone()
+method, because we always know that.
+
+would need to limit values to 62/63 bits in
+order to combine flag and avoid the len.
+
+pack flags all together (for all keys in the
+page) instead of shifting on each len?
+
 need test cases with unknown size overflows
 
 hmmm.  any chance we should keep track of free
-blocks instead of keeping track of used blocks?
+blocks instead of just keeping track of used blocks?
+sqlite has a freelist.  but it seems like it would
+be really expensive to rewrite the freelist every
+time a block is handed out.  maybe we keep the
+freelist current in memory (like now) but only
+write it out to disk when the header is written?
+it's not like we're going to read the freelist
+from disk unless we are starting up.
 
 or we could keep track of "loaned pages" as we issue
 them with getBlock.  a page goes from loaned to
@@ -31,17 +98,10 @@ possible.
 
 the blocklist in the format 2 overflow should have
 its very first u64 removed, since it will be the
-same as the page nuim on which it sits.
+same as the page num on which it sits.
 
 consider searching the first block of an unknown len
 overflow with Earliest.
-
-if we're not going to write overflows into leaf
-or parent, we can stop worrying so much about
-long their encoded block list is.  in fact, there
-is way too much code in PageWriter that is
-concerned about keeping the encoded len of a
-group very small.
 
 overflows get tracked like segments.  they have
 their own identity at the top level of the file.

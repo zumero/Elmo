@@ -63,9 +63,9 @@ fn count_keys_backward(csr: &mut lsm::LivingCursor) -> lsm::Result<usize> {
 
 fn read_value(b: lsm::ValueRef) -> lsm::Result<Box<[u8]>> {
     match b {
-        lsm::ValueRef::Overflowed(f, len, blocks) => {
+        lsm::ValueRef::Overflowed(f, len, page) => {
             let mut a = Vec::with_capacity(len as usize);
-            let mut strm = try!(lsm::OverflowReader::new(f, blocks.first_page()));
+            let mut strm = try!(lsm::OverflowReader::new(f, page));
             try!(strm.read_to_end(&mut a));
             Ok(a.into_boxed_slice())
         },
@@ -537,9 +537,9 @@ fn one_blob() {
         match q {
             lsm::ValueRef::Tombstone => assert!(false),
             lsm::ValueRef::Slice(ref a) => assert_eq!(LEN, a.len()),
-            lsm::ValueRef::Overflowed(f, len, blocks) => {
+            lsm::ValueRef::Overflowed(f, len, page) => {
                 let mut a = Vec::with_capacity(len as usize);
-                let mut strm = try!(lsm::OverflowReader::new(f, blocks.first_page()));
+                let mut strm = try!(lsm::OverflowReader::new(f, page));
                 try!(strm.read_to_end(&mut a));
                 assert_eq!(LEN, a.len());
                 // TODO compare the actual bytes
@@ -584,9 +584,9 @@ fn one_blob_unknown_len() {
         match q {
             lsm::ValueRef::Tombstone => assert!(false),
             lsm::ValueRef::Slice(ref a) => assert_eq!(LEN, a.len()),
-            lsm::ValueRef::Overflowed(f, len, blocks) => {
+            lsm::ValueRef::Overflowed(f, len, page) => {
                 let mut a = Vec::with_capacity(len as usize);
-                let mut strm = try!(lsm::OverflowReader::new(f, blocks.first_page()));
+                let mut strm = try!(lsm::OverflowReader::new(f, page));
                 try!(strm.read_to_end(&mut a));
                 assert_eq!(LEN, a.len());
                 // TODO compare the actual bytes
