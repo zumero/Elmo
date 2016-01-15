@@ -1,4 +1,6 @@
 
+switch pagenum to u64 ?
+
 maybe the comments need a more concise list of the
 various cases where a page becomes inactive during
 a merge.  it's confusing.
@@ -17,8 +19,6 @@ a parent can have an overflowed key in two ways:
 
     an owned overflow is owned by that parent, and
     cannot be shared by anything else.
-
-remove the len that is stored with a key overflow as well?
 
 pack flags all together (for all keys in the
 page) instead of shifting on each len?
