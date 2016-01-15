@@ -547,17 +547,15 @@ fn one_blob() {
 
 #[test]
 fn one_blob_unknown_len() {
-    fn f() -> lsm::Result<()> {
+    fn f(given_len: usize) -> lsm::Result<()> {
         let db = try!(lsm::DatabaseFile::new(tempfile("one_blob_unknown_len"), lsm::DEFAULT_SETTINGS));
 
-        const LEN: usize = 100000;
-
         let mut v = Vec::new();
-        for i in 0 .. LEN {
+        for i in 0 .. given_len {
             v.push(i as u8);
         }
         let v = v.into_boxed_slice();
-        assert_eq!(LEN, v.len());
+        assert_eq!(given_len, v.len());
         let mut t2 = std::collections::BTreeMap::new();
         insert_pair_string_blob(&mut t2, "e", lsm::ValueForStorage::UnknownLen(box misc::ByteBufRead::new(v)));
         let g = try!(db.write_segment(t2));
@@ -574,14 +572,16 @@ fn one_blob_unknown_len() {
         assert!(csr.IsValid());
         let q = try!(csr.ValueRef());
         let (len, mut strm) = try!(q.read());
-        assert_eq!(LEN as u64, len);
+        assert_eq!(given_len as u64, len);
         let mut a = vec![];
         try!(strm.read_to_end(&mut a));
         // TODO compare the actual bytes
 
         Ok(())
     }
-    assert!(f().is_ok());
+    assert!(f(100_000).is_ok());
+    assert!(f(40_000).is_ok());
+    assert!(f(20_000).is_ok());
 }
 
 #[test]

@@ -3371,7 +3371,6 @@ fn write_leaf(st: &mut LeafUnderConstruction,
 fn process_pair_into_leaf(st: &mut LeafUnderConstruction, 
                 pb: &mut PageBuilder, 
                 pw: &mut PageWriter,
-                vbuf: &mut [u8],
                 mut pair: PairForStorage,
                ) -> Result<Option<ItemForParent>> {
     let pgsz = pw.page_size();
@@ -3481,20 +3480,24 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                 ValueLocation::Tombstone
             },
             ValueForStorage::UnknownLen(ref mut strm) => {
-                // TODO
-                // not sure reusing vbuf is worth it.  maybe we should just
-                // alloc here.  ownership will get passed into the
-                // ValueLocation when it fits.
-                let vread = try!(misc::io::read_fully(&mut *strm, &mut vbuf[0 .. maxValueInline + 1]));
-                let vbuf = &vbuf[0 .. vread];
-                // TODO should be <= ?
-                if vread < maxValueInline {
-                    // TODO this alloc+copy is unfortunate
-                    let mut va = Vec::with_capacity(vbuf.len());
-                    for i in 0 .. vbuf.len() {
-                        va.push(vbuf[i]);
+                // TODO config constant?
+                let mut vbuf = vec![0; 32768].into_boxed_slice();
+                let vread = try!(misc::io::read_fully(&mut *strm, &mut vbuf));
+                if vread < vbuf.len() {
+                    // known len
+                    let vbuf = &vbuf[0 .. vread];
+                    // TODO should be <= ?
+                    if vread < maxValueInline {
+                        // TODO this alloc+copy is unfortunate
+                        let mut va = Vec::with_capacity(vbuf.len());
+                        for i in 0 .. vbuf.len() {
+                            va.push(vbuf[i]);
+                        }
+                        ValueLocation::Buffer(va.into_boxed_slice())
+                    } else {
+                        let (len, blocks) = try!(write_overflow_known_len(&mut (vbuf.chain(strm)), vread as u64, pw));
+                        ValueLocation::Overflowed(blocks.first_page())
                     }
-                    ValueLocation::Buffer(va.into_boxed_slice())
                 } else {
                     let (len, blocks) = try!(write_overflow_unknown_len(&mut (vbuf.chain(strm)), pw));
                     ValueLocation::Overflowed(blocks.first_page())
@@ -3508,7 +3511,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                     assert!(len as usize == vread);
                     ValueLocation::Buffer(va.into_boxed_slice())
                 } else {
-                    let (len, blocks) = try!(write_overflow_known_len(&mut (vbuf.chain(strm)), len, pw));
+                    let (len, blocks) = try!(write_overflow_known_len(strm, len, pw));
                     ValueLocation::Overflowed(blocks.first_page())
                 }
             },
@@ -3651,12 +3654,6 @@ fn write_leaves<I: Iterator<Item=Result<PairForStorage>>, >(
 
     let mut pb = PageBuilder::new(pw.page_size());
 
-    // TODO this is a buffer just for the purpose of being reused
-    // in cases where the blob is provided as a stream, and we need
-    // read a bit of it to figure out if it might fit inline rather
-    // than overflow.
-    let mut vbuf = vec![0; pw.page_size()].into_boxed_slice(); 
-
     let mut st = LeafUnderConstruction {
         sofar: 0,
         items: Vec::new(),
@@ -3668,7 +3665,7 @@ fn write_leaves<I: Iterator<Item=Result<PairForStorage>>, >(
 
     for result_pair in pairs {
         let pair = try!(result_pair);
-        if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, &mut vbuf, pair)) {
+        if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, pair)) {
             try!(chain.add_child(pw, pg, 0));
         }
     }
@@ -3731,7 +3728,6 @@ fn merge_process_pair(
     st: &mut LeafUnderConstruction,
     pb: &mut PageBuilder,
     pw: &mut PageWriter,
-    vbuf: &mut [u8],
     behind: &mut Option<Vec<PageCursor>>,
     chain: &mut ParentNodeWriter,
     dest_level: DestLevel,
@@ -3784,7 +3780,7 @@ fn merge_process_pair(
         };
 
     if keep {
-        if let Some(pg) = try!(process_pair_into_leaf(st, pb, pw, vbuf, pair)) {
+        if let Some(pg) = try!(process_pair_into_leaf(st, pb, pw, pair)) {
             try!(chain.add_child(pw, pg, 0));
         }
     }
@@ -3803,7 +3799,6 @@ fn merge_rewrite_leaf(
                     st: &mut LeafUnderConstruction,
                     pb: &mut PageBuilder,
                     pw: &mut PageWriter,
-                    vbuf: &mut [u8],
                     pairs: &mut CursorIterator,
                     leafreader: &LeafPage,
                     behind: &mut Option<Vec<PageCursor>>,
@@ -3884,7 +3879,7 @@ fn merge_rewrite_leaf(
         match action {
             Action::Pairs => {
                 let pair = try!(misc::inside_out(pairs.next())).unwrap();
-                if try!(merge_process_pair(pair, st, pb, pw, vbuf, behind, chain, dest_level)) {
+                if try!(merge_process_pair(pair, st, pb, pw, behind, chain, dest_level)) {
                     ret.keys_promoted += 1;
                 } else {
                     ret.tombstones_removed += 1;
@@ -3894,7 +3889,7 @@ fn merge_rewrite_leaf(
                 let pair = try!(leafreader.pair_for_merge(i));
                 // TODO it is interesting to note that (in not-very-thorough testing), if we
                 // put a tombstone check here, it never skips a tombstone.
-                if let Some(pg) = try!(process_pair_into_leaf(st, pb, pw, vbuf, pair)) {
+                if let Some(pg) = try!(process_pair_into_leaf(st, pb, pw, pair)) {
                     try!(chain.add_child(pw, pg, 0));
                 }
                 ret.keys_rewritten += 1;
@@ -3910,7 +3905,6 @@ fn merge_rewrite_parent(
                     st: &mut LeafUnderConstruction,
                     pb: &mut PageBuilder,
                     pw: &mut PageWriter,
-                    vbuf: &mut [u8],
                     pairs: &mut CursorIterator,
                     leaf: &mut LeafPage,
                     parent: &ParentPage,
@@ -4014,7 +4008,7 @@ fn merge_rewrite_parent(
                 if parent.depth() == 1 {
                     let pg = try!(parent.child_as_item_for_parent(i));
                     try!(leaf.move_to_page(pg.page));
-                    let sub = try!(merge_rewrite_leaf(st, pb, pw, vbuf, pairs, leaf, behind, chain, overflows_freed, dest_level));
+                    let sub = try!(merge_rewrite_leaf(st, pb, pw, pairs, leaf, behind, chain, overflows_freed, dest_level));
 
                     // in the case where we rewrote a page that didn't really NEED to be,
                     // the following assert is not true
@@ -4028,7 +4022,7 @@ fn merge_rewrite_parent(
                     ret.tombstones_removed += sub.tombstones_removed;
                 } else {
                     let sub = try!(parent.fetch_item_parent(i));
-                    let sub = try!(merge_rewrite_parent(st, pb, pw, vbuf, pairs, leaf, &sub, behind, chain, overflows_freed, nodes_rewritten, nodes_recycled, dest_level));
+                    let sub = try!(merge_rewrite_parent(st, pb, pw, pairs, leaf, &sub, behind, chain, overflows_freed, nodes_rewritten, nodes_recycled, dest_level));
                     ret.keys_promoted += sub.keys_promoted;
                     ret.keys_rewritten += sub.keys_rewritten;
                     ret.keys_shadowed += sub.keys_shadowed;
@@ -4056,13 +4050,8 @@ fn write_merge(
 
     let t1 = time::PreciseTime::now();
 
-    // TODO could/should pb and vbuf move into LeafUnderConstruction?
+    // TODO could/should pb move into LeafUnderConstruction?
 
-    // TODO this is a buffer just for the purpose of being reused
-    // in cases where the blob is provided as a stream, and we need
-    // read a bit of it to figure out if it might fit inline rather
-    // than overflow.
-    let mut vbuf = vec![0; pw.page_size()].into_boxed_slice(); 
     let mut pb = PageBuilder::new(pw.page_size());
     let mut st = LeafUnderConstruction {
         sofar: 0,
@@ -4097,7 +4086,7 @@ fn write_merge(
             // nothing to do here
         },
         MergingInto::Leaf(ref leaf) => {
-            let sub = try!(merge_rewrite_leaf(&mut st, &mut pb, pw, &mut vbuf, pairs, leaf, &mut behind, &mut chain, &mut overflows_freed, dest_level));
+            let sub = try!(merge_rewrite_leaf(&mut st, &mut pb, pw, pairs, leaf, &mut behind, &mut chain, &mut overflows_freed, dest_level));
             keys_promoted = sub.keys_promoted;
             keys_rewritten = sub.keys_rewritten;
             keys_shadowed = sub.keys_shadowed;
@@ -4123,7 +4112,7 @@ fn write_merge(
                 let nd = try!(r);
                 try!(sub.move_to_page(nd.page));
                 if nd.depth == rewrite_level {
-                    let res = try!(merge_rewrite_parent(&mut st, &mut pb, pw, &mut vbuf, pairs, &mut leaf, &sub, &mut behind, &mut chain, &mut overflows_freed, &mut nodes_rewritten, &mut nodes_recycled, dest_level));
+                    let res = try!(merge_rewrite_parent(&mut st, &mut pb, pw, pairs, &mut leaf, &sub, &mut behind, &mut chain, &mut overflows_freed, &mut nodes_rewritten, &mut nodes_recycled, dest_level));
                     keys_promoted += res.keys_promoted;
                     keys_rewritten += res.keys_rewritten;
                     keys_shadowed += res.keys_shadowed;
@@ -4139,7 +4128,7 @@ fn write_merge(
     // any pairs left need to get processed
     for pair in pairs {
         let pair = try!(pair);
-        if try!(merge_process_pair(pair, &mut st, &mut pb, pw, &mut vbuf, &mut behind, &mut chain, dest_level)) {
+        if try!(merge_process_pair(pair, &mut st, &mut pb, pw, &mut behind, &mut chain, dest_level)) {
             keys_promoted += 1;
         } else {
             tombstones_removed += 1;

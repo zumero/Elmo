@@ -3,17 +3,6 @@ maybe the comments need a more concise list of the
 various cases where a page becomes inactive during
 a merge.  it's confusing.
 
-in parent depth 1, we used to store the blocklist for
-the overflows in that leaf.  now we have to read
-the leaf to get its list of overflows, AND we have
-to reach the hdr of each overflow to get its blocklist.
-should we at least store the leaf's overflow list
-in the depth 1 parent?
-
-worry about how expensive it is to read the header of
-an overflow just to get its len and blocklist.
-it certainly makes the 'bizarre' check a LOT slower.
-
 note that a leaf cannot reference an overflow without
 owning it.  either the overflow was written as the
 leaf was created, or the overflow is moved to the leaf
@@ -41,7 +30,19 @@ and the bigger the db, the slower this will get.
 can we do it in a bg thread?
 
 I *think* it is true that blocklist_unsorted() is never
-called except for list_all_blocks at startup.
+called except for list_all_blocks at startup.  and the
+"bizarre" check.
+
+worry about how expensive it is to read the header of
+an overflow just to get its len and blocklist.
+it certainly makes the 'bizarre' check a LOT slower.
+
+in parent depth 1, we used to store the blocklist for
+the overflows in that leaf.  now we have to read
+the leaf to get its list of overflows, AND we have
+to reach the hdr of each overflow to get its blocklist.
+should we at least store the leaf's overflow list
+in the depth 1 parent?
 
 hmmm.  any chance we should keep track of free
 blocks instead of just keeping track of used blocks?
@@ -61,11 +62,6 @@ time, the set of all used pages is traceable
 through the combination of the header and the
 loaned pages list, and everything else is considered
 free.
-
-use a bigger buffer to check an unknown size
-overflow to try and get its size.  this would
-catch cases where the overflow is actually < 32K ish
-and avoid the need to write the first page twice.
 
 implement format 3 overflows
 
@@ -87,6 +83,10 @@ overflow with Earliest.
 
 alternatively, for an unknown len overflow, consider
 just grabbing a really big block at the end of the file.
+on the assumption that unknown_len overflows will
+hopefully be uncommon, and the penalty for using them
+is that your overflows get written at the end of the
+file.
 
 maybe we should have a background thread that looks
 for overflows that could be moved earlier in the file.
