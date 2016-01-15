@@ -2779,17 +2779,6 @@ impl PageType {
     }
 }
 
-mod ValueFlag {
-    // TODO remove FLAG_ prefix
-    pub const FLAG_OVERFLOW: u8 = 1;
-    pub const FLAG_TOMBSTONE: u8 = 2;
-}
-
-mod PageFlag {
-    // TODO remove FLAG_ prefix
-    pub const FLAG_BOUNDARY_NODE: u8 = 2;
-}
-
 #[derive(Debug, Clone)]
 enum ChildInfo {
     Leaf{
@@ -2923,19 +2912,16 @@ impl ValueLocation {
     fn need(&self) -> usize {
         match self {
             &ValueLocation::Tombstone => {
-                1
+                varint::space_needed_for(1 as u64) 
             },
             &ValueLocation::Buffer(ref vbuf) => {
-                let vlen = vbuf.len();
-                // TODO shift the flag
-                1 
-                + varint::space_needed_for(vlen as u64) 
-                + vlen
+                let val_with_flag = (vbuf.len() as u64) << 1;
+                varint::space_needed_for(val_with_flag as u64) 
+                + vbuf.len()
             },
             &ValueLocation::Overflowed(page) => {
-                // TODO shift the flag
-                1 
-                + varint::space_needed_for(page as u64)
+                let val_with_flag = ((page as u64) << 1) | 1;
+                varint::space_needed_for(val_with_flag as u64)
             },
         }
     }
@@ -3317,17 +3303,17 @@ fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> BuildLeaf
         match lp.value {
             ValueLocation::Tombstone => {
                 *count_tombstones += 1;
-                pb.PutByte(ValueFlag::FLAG_TOMBSTONE);
+                pb.PutByte(1);
             },
             ValueLocation::Buffer(ref vbuf) => {
-                pb.PutByte(0u8);
-                pb.PutVarint(vbuf.len() as u64);
+                let val_with_flag = (vbuf.len() as u64) << 1;
+                pb.PutVarint(val_with_flag);
                 pb.PutArray(&vbuf);
             },
             ValueLocation::Overflowed(page) => {
+                let val_with_flag = ((page as u64) << 1) | 1;
+                pb.PutVarint(val_with_flag);
                 // and add to overflows list.
-                pb.PutByte(ValueFlag::FLAG_OVERFLOW);
-                pb.PutVarint(page as u64);
                 list.push(page);
             },
         }
@@ -5754,20 +5740,22 @@ enum ValueInLeaf {
 
 impl ValueInLeaf {
     fn read(pr: &[u8], cur: &mut usize) -> Result<Self> {
-        let vflag = misc::buf_advance::get_byte(pr, cur);
+        let val_with_flag = varint::read(&pr, cur) as PageNum;
+        let flag = 0 != (val_with_flag & 1);
+        let val = val_with_flag >> 1;
         let v = 
-            if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) { 
-                ValueInLeaf::Tombstone
-            } else {
-                if 0 != (vflag & ValueFlag::FLAG_OVERFLOW) {
-                    let page = varint::read(&pr, cur) as PageNum;
-                    ValueInLeaf::Overflowed(page)
+            if flag {
+                if val == 0 {
+                    ValueInLeaf::Tombstone
                 } else {
-                    let vlen = varint::read(pr, cur);
-                    let v = ValueInLeaf::Inline(vlen as usize, *cur);
-                    *cur = *cur + (vlen as usize);
-                    v
+                    let page = val;
+                    ValueInLeaf::Overflowed(page)
                 }
+            } else {
+                let vlen = val;
+                let v = ValueInLeaf::Inline(vlen as usize, *cur);
+                *cur = *cur + (vlen as usize);
+                v
             };
         Ok(v)
     }
