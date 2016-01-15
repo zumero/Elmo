@@ -49,22 +49,13 @@ use std::collections::HashSet;
 
 const MIN_OVERFLOW_HEADER_LEN: usize = 32;
 
-const SIZE_32: usize = 4; // like std::mem::size_of::<u32>()
-const SIZE_16: usize = 2; // like std::mem::size_of::<u16>()
-
 // TODO does this need to be a constant?  maybe we should just allow it
 // to grow as needed?  but then we would need to start up new threads
 // and channels.
 const NUM_REGULAR_LEVELS: usize = 8;
 
-pub type PageNum = u32;
-pub type PageCount = u32;
-// type PageSize = u32;
-
-// TODO there is code which assumes that PageNum is u32.
-// but that's the nature of the file format.  the type alias
-// isn't so much so that we can change it, but rather, to make
-// reading the code easier.
+pub type PageNum = u64;
+pub type PageCount = u64;
 
 #[derive(Debug)]
 pub enum KeyForStorage {
@@ -1599,20 +1590,6 @@ impl PageBuilder {
         self.cur = self.cur + ba.len();
     }
 
-    fn PutInt32(&mut self, ov: u32) {
-        let at = self.cur;
-        // TODO just self.buf?  instead of making 4-byte slice.
-        misc::bytes::copy_into(&endian::u32_to_bytes_be(ov), &mut self.buf[at .. at + SIZE_32]);
-        self.cur = self.cur + SIZE_32;
-    }
-
-    fn PutInt16(&mut self, ov: u16) {
-        let at = self.cur;
-        // TODO just self.buf?  instead of making 2-byte slice.
-        misc::bytes::copy_into(&endian::u16_to_bytes_be(ov), &mut self.buf[at .. at + SIZE_16]);
-        self.cur = self.cur + SIZE_16;
-    }
-
     fn PutVarint(&mut self, ov: u64) {
         varint::write(&mut *self.buf, &mut self.cur, ov);
     }
@@ -2909,14 +2886,19 @@ enum KeyLocationForParent {
 }
 
 impl ValueLocation {
+    #[inline]
+    fn val_with_flag_for_len_inline(vlen: usize) -> u64 {
+        (vlen as u64) << 1
+    }
+
     fn need(&self) -> usize {
         match self {
             &ValueLocation::Tombstone => {
                 varint::space_needed_for(1 as u64) 
             },
             &ValueLocation::Buffer(ref vbuf) => {
-                let val_with_flag = (vbuf.len() as u64) << 1;
-                varint::space_needed_for(val_with_flag as u64) 
+                let val = Self::val_with_flag_for_len_inline(vbuf.len());
+                varint::space_needed_for(val) 
                 + vbuf.len()
             },
             &ValueLocation::Overflowed(page) => {
@@ -3244,11 +3226,11 @@ fn write_overflow_unknown_len<R: Read>(
 
 // TODO begin mod leaf
 
-fn calc_leaf_page_len(prefix_len: usize, sofar: usize) -> usize {
+fn calc_leaf_page_len(prefix_len: usize, sofar: usize, count_items: usize) -> usize {
     2 // page type and flags
-    + 2 // stored count
     + varint::space_needed_for(prefix_len as u64)
     + prefix_len
+    + varint::space_needed_for(count_items as u64)
     + sofar // sum of size of all the actual items
 }
 
@@ -3283,9 +3265,7 @@ fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> BuildLeaf
         }
     }
     let count_keys_in_this_leaf = st.items.len();
-    // TODO should we support more than 64k keys in a leaf?
-    // either way, overflow-check this cast.
-    pb.PutInt16(count_keys_in_this_leaf as u16);
+    pb.PutVarint(count_keys_in_this_leaf as u64);
 
     fn put_item(pb: &mut PageBuilder, prefix_len: usize, lp: &ItemForLeaf, list: &mut Vec<PageNum>, count_tombstones: &mut u64) {
         pb.PutVarint(lp.key.val_with_overflow_flag());
@@ -3448,19 +3428,11 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
     // we have NOT yet decided which page the key is going on.  will it fit on the
     // current page or does it have to bump to the next one?  we don't know yet.
 
-    // 2 for the page type and flags
-    // 2 for the stored count
-    const LEAF_PAGE_OVERHEAD: usize = 2 + 2;
-
     let vloc = {
         let maxValueInline = {
-            // TODO use calc_leaf_page_len
-            let fixed_costs_on_new_page =
-                LEAF_PAGE_OVERHEAD
-                + 2 // worst case prefixlen varint
+            let fixed_costs_on_new_page = calc_leaf_page_len(0, 0, 1)
                 + kloc.need(&k, 0)
-                + 1 // value flags
-                + varint::space_needed_for(pgsz as u64) // vlen can't be larger than this for inline
+                + varint::space_needed_for(ValueLocation::val_with_flag_for_len_inline(pgsz)) 
                 ;
             assert!(fixed_costs_on_new_page < pgsz); // TODO lte?
             let available_for_inline_value_on_new_page = pgsz - fixed_costs_on_new_page;
@@ -3595,7 +3567,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
             st.sofar
         };
     let fits = {
-        let would_be_len_page_before_this_pair = calc_leaf_page_len(would_be_prefix_len, would_be_sofar_before_this_pair);
+        let would_be_len_page_before_this_pair = calc_leaf_page_len(would_be_prefix_len, would_be_sofar_before_this_pair, st.items.len() + 1);
         if pgsz > would_be_len_page_before_this_pair {
             let available_for_this_pair = pgsz - would_be_len_page_before_this_pair;
             let needed_for_this_pair = lp.need(would_be_prefix_len);
@@ -3607,7 +3579,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
     let wrote =
         if !fits {
             assert!(st.items.len() > 0);
-            let should_be = calc_leaf_page_len(st.prefix_len, st.sofar);
+            let should_be = calc_leaf_page_len(st.prefix_len, st.sofar, st.items.len());
             let (len_page, pg) = try!(write_leaf(st, pb, pw));
             //println!("should_be = {}   len_page = {}", should_be, len_page);
             assert!(should_be == len_page);
@@ -3633,7 +3605,7 @@ fn flush_leaf(st: &mut LeafUnderConstruction,
                ) -> Result<Option<ItemForParent>> {
     if !st.items.is_empty() {
         assert!(st.items.len() > 0);
-        let should_be = calc_leaf_page_len(st.prefix_len, st.sofar);
+        let should_be = calc_leaf_page_len(st.prefix_len, st.sofar, st.items.len());
         let (len_page, pg) = try!(write_leaf(st, pb, pw));
         //println!("should_be = {}   len_page = {}", should_be, len_page);
         assert!(should_be == len_page);
@@ -4410,12 +4382,12 @@ impl ParentNodeWriter {
         }
     }
 
-    fn calc_page_len(prefix_len: usize, sofar: usize) -> usize {
+    fn calc_page_len(prefix_len: usize, sofar: usize, count_items: usize) -> usize {
         2 // page type and flags
         + 1 // stored depth
-        + 2 // stored count
         + varint::space_needed_for(prefix_len as u64) 
         + prefix_len 
+        + varint::space_needed_for(count_items as u64)
         + sofar // sum of size of all the actual items
     }
 
@@ -4491,7 +4463,7 @@ impl ParentNodeWriter {
             }
         }
         let count_items = self.st.items.len();
-        self.pb.PutInt16(count_items as u16);
+        self.pb.PutVarint(count_items as u64);
         //println!("self.st.items.len(): {}", self.st.items.len());
 
         let mut count_leaves = 0;
@@ -4638,7 +4610,7 @@ impl ParentNodeWriter {
             // a parent page is required to accept at least 2 items
             true
         } else {
-            let would_be_len_page_before_this_key = Self::calc_page_len(would_be_prefix_len, would_be_sofar_before_this_key);
+            let would_be_len_page_before_this_key = Self::calc_page_len(would_be_prefix_len, would_be_sofar_before_this_key, self.st.items.len() + 1);
             if pgsz > would_be_len_page_before_this_key {
                 let avalable_for_this_key = pgsz - would_be_len_page_before_this_key;
                 let fits = avalable_for_this_key >= child.need(would_be_prefix_len);
@@ -4653,7 +4625,7 @@ impl ParentNodeWriter {
             // then one of them should have been overflowed.
             assert!(self.st.items.len() > 1);
             
-            let should_be = Self::calc_page_len(self.st.prefix_len, self.st.sofar);
+            let should_be = Self::calc_page_len(self.st.prefix_len, self.st.sofar, self.st.items.len());
             let (count_bytes, pg) = try!(self.write_parent_page(pw));
             self.count_emit += 1;
             assert!(should_be == count_bytes);
@@ -4676,7 +4648,7 @@ impl ParentNodeWriter {
 
         self.st.items.push(child);
 
-        if self.st.items.len() == 2 && Self::calc_page_len(self.st.prefix_len, self.st.sofar) > pgsz {
+        if self.st.items.len() == 2 && Self::calc_page_len(self.st.prefix_len, self.st.sofar, self.st.items.len()) > pgsz {
             if self.st.items[0].is_inline() {
                 if self.st.items[1].is_inline() {
                     let remaining_inline =
@@ -4689,7 +4661,7 @@ impl ParentNodeWriter {
                         };
                     self.st.prefix_len = self.st.items[remaining_inline].last_key.key.len();
                     let sofar = self.st.items[0].need(self.st.prefix_len) + self.st.items[1].need(self.st.prefix_len);
-                    if Self::calc_page_len(self.st.prefix_len, sofar) > pgsz {
+                    if Self::calc_page_len(self.st.prefix_len, sofar, self.st.items.len()) > pgsz {
                         //println!("TWOFER");
                         try!(self.st.items[remaining_inline].to_owned_overflow(pw));
                         self.st.prefix_len = 0;
@@ -4713,7 +4685,7 @@ impl ParentNodeWriter {
         //println!("items: {}", self.st.items.len());
         //println!("prefix_len: {}", self.st.prefix_len);
         //println!("sofar: {}", self.st.sofar);
-        assert!(Self::calc_page_len(self.st.prefix_len, self.st.sofar) <= pgsz);
+        assert!(Self::calc_page_len(self.st.prefix_len, self.st.sofar, self.st.items.len()) <= pgsz);
 
         Ok(())
     }
@@ -4767,7 +4739,7 @@ impl ParentNodeWriter {
 
     fn flush_page(&mut self, pw: &mut PageWriter) -> Result<()> {
         if !self.st.items.is_empty() {
-            let should_be = Self::calc_page_len(self.st.prefix_len, self.st.sofar);
+            let should_be = Self::calc_page_len(self.st.prefix_len, self.st.sofar, self.st.items.len());
             let (count_bytes, pg) = try!(self.write_parent_page(pw));
             // TODO try!(pg.verify(pw.page_size(), path, f.clone()));
             self.count_emit += 1;
@@ -5100,7 +5072,7 @@ impl LeafPage {
         } else {
             prefix = None;
         }
-        let count_keys = misc::buf_advance::get_u16(pr, &mut cur) as usize;
+        let count_keys = varint::read(pr, &mut cur) as usize;
         // assert count_keys>0
 
         match pairs.len().cmp(&count_keys) {
@@ -6081,8 +6053,7 @@ impl ParentPage {
                 None
             }
         };
-        let count_items = misc::buf_advance::get_u16(pr, &mut cur) as usize;
-        // TODO count_items has gotta be > 1, right?  or does it?
+        let count_items = varint::read(pr, &mut cur) as usize;
         //println!("count_items: {}", count_items);
         let mut children = Vec::with_capacity(count_items);
 
@@ -6168,7 +6139,7 @@ impl ParentPage {
             // threads, which should be fine if the key ranges do not overlap
             // the same stuff, and if we can fix up the parent node at the end.
 
-            let i = ((self.pagenum as u32) % (self.children.len() as u32)) as usize;
+            let i = ((self.pagenum as PageNum) % (self.children.len() as PageNum)) as usize;
             i
         } else {
             result
@@ -6211,7 +6182,7 @@ impl ParentPage {
             // the same stuff, and if we can fix up the parent node at the end.
 
             let count = self.children.len() - want + 1;
-            let i = ((self.pagenum as u32) % (count as u32)) as usize;
+            let i = ((self.pagenum as PageNum) % (count as PageNum)) as usize;
             assert!(i + want - 1 < self.children.len());
             i
         } else {
@@ -6685,7 +6656,10 @@ fn read_header(path: &str) -> Result<(HeaderData, PageCache, PageNum)> {
 
         let mut cur = 0;
 
-        let pgsz = misc::buf_advance::get_u32(&pr, &mut cur) as usize;
+        let file_format = pr[0];
+        cur += 1;
+
+        let pgsz = varint::read(&pr, &mut cur) as usize;
         let changeCounter = varint::read(&pr, &mut cur);
         let mergeCounter = varint::read(&pr, &mut cur);
 
@@ -6975,7 +6949,7 @@ impl Space {
 
         let file_length = try!(std::fs::metadata(&self.path)).len();
         let page_size = self.page_size as u64;
-        let first_page_beyond = (file_length / page_size + 1) as u32;
+        let first_page_beyond = (file_length / page_size + 1) as PageNum;
         if first_page_beyond > self.nextPage {
             let fs = try!(OpenOptions::new()
                     .read(true)
@@ -7826,9 +7800,10 @@ impl HeaderStuff {
         //println!("header, incoming,{}, waiting,{}, regular,{}", hdr.incoming.len(), hdr.waiting.len(), hdr.regular.len());
 
         let mut pb = PageBuilder::new(HEADER_SIZE_IN_BYTES);
-        // TODO format version number
+        pb.PutByte(0); // file format
+        pb.PutVarint(pgsz as u64);
+
         // TODO aren't there some settings that should go in here?
-        pb.PutInt32(pgsz as u32);
 
         pb.PutVarint(hdr.changeCounter);
         pb.PutVarint(hdr.mergeCounter);

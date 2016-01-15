@@ -30,14 +30,14 @@ extern crate rand;
 use rand::Rng;
 use rand::SeedableRng;
 
-fn dump_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
+fn dump_page(name: &str, pgnum: lsm::PageNum) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let page = try!(db.get_page(pgnum));
     println!("{:?}", page);
     Ok(())
 }
 
-fn show_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
+fn show_page(name: &str, pgnum: lsm::PageNum) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let cursor = try!(db.open_cursor_on_page(pgnum));
     let pt = cursor.page_type();
@@ -46,7 +46,7 @@ fn show_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     Ok(())
 }
 
-fn show_leaf_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
+fn show_leaf_page(name: &str, pgnum: lsm::PageNum) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let mut cursor = try!(db.open_cursor_on_leaf_page(pgnum));
     try!(cursor.First());
@@ -63,7 +63,7 @@ fn show_leaf_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
     Ok(())
 }
 
-fn graph_parent_page(name: &str, pgnum: u32, depth: u8) -> Result<(),lsm::Error> {
+fn graph_parent_page(name: &str, pgnum: lsm::PageNum, depth: u8) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let page = try!(db.read_parent_page(pgnum));
     {
@@ -85,7 +85,7 @@ fn graph_parent_page(name: &str, pgnum: u32, depth: u8) -> Result<(),lsm::Error>
     Ok(())
 }
 
-fn show_parent_page(name: &str, pgnum: u32) -> Result<(),lsm::Error> {
+fn show_parent_page(name: &str, pgnum: lsm::PageNum) -> Result<(),lsm::Error> {
     let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
     let page = try!(db.read_parent_page(pgnum));
     println!("depth: {}", page.depth());
@@ -532,7 +532,7 @@ fn result_main() -> Result<(),lsm::Error> {
             if args.len() < 4 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
-            let pgnum = args[3].parse::<u32>().unwrap();
+            let pgnum = args[3].parse::<lsm::PageNum>().unwrap();
             show_page(name, pgnum)
         },
         "show_leaf_page" => {
@@ -540,7 +540,7 @@ fn result_main() -> Result<(),lsm::Error> {
             if args.len() < 4 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
-            let pgnum = args[3].parse::<u32>().unwrap();
+            let pgnum = args[3].parse::<lsm::PageNum>().unwrap();
             show_leaf_page(name, pgnum)
         },
         "list_page_keys" => {
@@ -548,7 +548,7 @@ fn result_main() -> Result<(),lsm::Error> {
             if args.len() < 4 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
-            let pgnum = args[3].parse::<u32>().unwrap();
+            let pgnum = args[3].parse::<lsm::PageNum>().unwrap();
             list_page_keys(name, pgnum)
         },
         "show_parent_page" => {
@@ -556,7 +556,7 @@ fn result_main() -> Result<(),lsm::Error> {
             if args.len() < 4 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
-            let pgnum = args[3].parse::<u32>().unwrap();
+            let pgnum = args[3].parse::<lsm::PageNum>().unwrap();
             show_parent_page(name, pgnum)
         },
         "graph_parent_page" => {
@@ -564,7 +564,7 @@ fn result_main() -> Result<(),lsm::Error> {
             if args.len() < 5 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
-            let pgnum = args[3].parse::<u32>().unwrap();
+            let pgnum = args[3].parse::<lsm::PageNum>().unwrap();
             let depth = args[4].parse::<u8>().unwrap();
             graph_parent_page(name, pgnum, depth)
         },
@@ -601,7 +601,7 @@ fn result_main() -> Result<(),lsm::Error> {
             if args.len() < 4 {
                 return Err(lsm::Error::Misc(String::from("too few args")));
             }
-            let pgnum = args[3].parse::<u32>().unwrap();
+            let pgnum = args[3].parse::<lsm::PageNum>().unwrap();
             dump_page(name, pgnum)
         },
         "list_keys" => {
