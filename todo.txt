@@ -1,5 +1,9 @@
 
-switch pagenum to u64 ?
+the blocklist in the format 2 overflow should have
+its very first u64 removed, since it will be the
+same as the page num on which it sits.
+
+is BlockList::encode() used anywhere else?
 
 maybe the comments need a more concise list of the
 various cases where a page becomes inactive during
@@ -73,10 +77,6 @@ special code to compare two overflows?
 still need After form of page request, because we
 still want the blocklist to encode as small as
 possible.
-
-the blocklist in the format 2 overflow should have
-its very first u64 removed, since it will be the
-same as the page num on which it sits.
 
 consider searching the first block of an unknown len
 overflow with Earliest.
