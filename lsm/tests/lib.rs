@@ -64,8 +64,8 @@ fn count_keys_backward(csr: &mut lsm::LivingCursor) -> lsm::Result<usize> {
 
 fn read_value(b: lsm::LiveValueRef) -> lsm::Result<Box<[u8]>> {
     match b {
-        lsm::LiveValueRef::Overflowed(f, len, page) => {
-            let mut a = Vec::with_capacity(len as usize);
+        lsm::LiveValueRef::Overflowed(f, page) => {
+            let mut a = vec![];
             let mut strm = try!(lsm::OverflowReader::new(f, page));
             try!(strm.read_to_end(&mut a));
             Ok(a.into_boxed_slice())
@@ -385,7 +385,9 @@ fn empty_val() {
         let mut csr = try!(db.open_cursor());
         try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("_")), lsm::SeekOp::SEEK_EQ));
         assert!(csr.IsValid());
-        assert_eq!(0, csr.ValueRef().unwrap().len());
+        let q = try!(csr.ValueRef());
+        let (len, _) = try!(q.read());
+        assert_eq!(0, len);
 
         Ok(())
     }
@@ -531,19 +533,12 @@ fn one_blob() {
 
         try!(csr.First());
         assert!(csr.IsValid());
-        assert_eq!(LEN as u64, csr.ValueRef().unwrap().len());
-        let mut q = csr.ValueRef().unwrap();
-
-        match q {
-            lsm::LiveValueRef::Slice(ref a) => assert_eq!(LEN, a.len()),
-            lsm::LiveValueRef::Overflowed(f, len, page) => {
-                let mut a = Vec::with_capacity(len as usize);
-                let mut strm = try!(lsm::OverflowReader::new(f, page));
-                try!(strm.read_to_end(&mut a));
-                assert_eq!(LEN, a.len());
-                // TODO compare the actual bytes
-            },
-        }
+        let v = try!(csr.ValueRef());
+        let (len, mut strm) = try!(v.read());
+        assert_eq!(LEN as u64, len);
+        let mut a = vec![];
+        try!(strm.read_to_end(&mut a));
+        // TODO compare the actual bytes
 
         Ok(())
     }
@@ -577,19 +572,12 @@ fn one_blob_unknown_len() {
 
         try!(csr.First());
         assert!(csr.IsValid());
-        assert_eq!(LEN as u64, csr.ValueRef().unwrap().len());
-        let mut q = csr.ValueRef().unwrap();
-
-        match q {
-            lsm::LiveValueRef::Slice(ref a) => assert_eq!(LEN, a.len()),
-            lsm::LiveValueRef::Overflowed(f, len, page) => {
-                let mut a = Vec::with_capacity(len as usize);
-                let mut strm = try!(lsm::OverflowReader::new(f, page));
-                try!(strm.read_to_end(&mut a));
-                assert_eq!(LEN, a.len());
-                // TODO compare the actual bytes
-            },
-        }
+        let q = try!(csr.ValueRef());
+        let (len, mut strm) = try!(q.read());
+        assert_eq!(LEN as u64, len);
+        let mut a = vec![];
+        try!(strm.read_to_end(&mut a));
+        // TODO compare the actual bytes
 
         Ok(())
     }
@@ -847,8 +835,13 @@ fn blobs_of_many_sizes() {
                 try!(csr.SeekRef(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_EQ));
                 assert!(csr.IsValid());
                 println!("    valid");
-                assert_eq!(v.len() as u64, csr.ValueRef().unwrap().len());
-                assert_eq!(v, read_value(csr.ValueRef().unwrap()).unwrap());
+                let q = try!(csr.ValueRef());
+                let (len, mut strm) = try!(q.read());
+                assert_eq!(v.len() as u64, len);
+                let mut a = vec![];
+                try!(strm.read_to_end(&mut a));
+                let a = a.into_boxed_slice();
+                assert_eq!(v, a);
             } else {
                 unreachable!();
             }

@@ -88,7 +88,7 @@ pub enum ValueForStorage {
     Read(Box<Read>, u64),
     Boxed(Box<[u8]>),
     Tombstone,
-    SameFileOverflow(u64, PageNum),
+    SameFileOverflow(PageNum),
 }
 
 impl std::fmt::Debug for ValueForStorage {
@@ -106,7 +106,7 @@ impl std::fmt::Debug for ValueForStorage {
             &ValueForStorage::Boxed(ref a) => {
                 write!(f, "{:?}", a)
             },
-            &ValueForStorage::SameFileOverflow(_, _) => {
+            &ValueForStorage::SameFileOverflow(_) => {
                 write!(f, "SameFileOverflow")
             },
         }
@@ -120,7 +120,7 @@ impl ValueForStorage {
             &ValueForStorage::UnknownLen(_) => false,
             &ValueForStorage::Read(_,_) => false,
             &ValueForStorage::Boxed(_) => false,
-            &ValueForStorage::SameFileOverflow(_, _) => false,
+            &ValueForStorage::SameFileOverflow(_) => false,
         }
     }
 }
@@ -905,8 +905,7 @@ impl<'a> KeyRef<'a> {
 
 pub enum ValueRef<'a> {
     Slice(&'a [u8]),
-// TODO need len?
-    Overflowed(std::sync::Arc<PageCache>, u64, PageNum),
+    Overflowed(std::sync::Arc<PageCache>, PageNum),
     Tombstone,
 }
 
@@ -914,28 +913,18 @@ pub enum ValueRef<'a> {
 /// only from a LivingCursor.
 pub enum LiveValueRef<'a> {
     Slice(&'a [u8]),
-// TODO need len?
-    Overflowed(std::sync::Arc<PageCache>, u64, PageNum),
+    Overflowed(std::sync::Arc<PageCache>, PageNum),
 }
 
 impl<'a> ValueRef<'a> {
-// TODO is this method needed?
-    pub fn len(&self) -> Option<u64> {
-        match *self {
-            ValueRef::Slice(a) => Some(a.len() as u64),
-            ValueRef::Overflowed(_, len, _) => Some(len),
-            ValueRef::Tombstone => None,
-        }
-    }
-
-    pub fn into_value_for_merge(self) -> ValueForStorage {
+    fn into_value_for_merge(self) -> ValueForStorage {
         match self {
             ValueRef::Slice(a) => {
                 let mut k = Vec::with_capacity(a.len());
                 k.extend_from_slice(a);
                 ValueForStorage::Boxed(k.into_boxed_slice())
             },
-            ValueRef::Overflowed(_, len, page) => ValueForStorage::SameFileOverflow(len, page),
+            ValueRef::Overflowed(_, page) => ValueForStorage::SameFileOverflow(page),
             ValueRef::Tombstone => ValueForStorage::Tombstone,
         }
     }
@@ -946,29 +935,34 @@ impl<'a> std::fmt::Debug for ValueRef<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         match *self {
             ValueRef::Slice(a) => write!(f, "Array, len={:?}", a),
-            ValueRef::Overflowed(_, len, page) => write!(f, "Overflowed, len={}, page={}", len, page),
+            ValueRef::Overflowed(_, page) => write!(f, "Overflowed, page={}", page),
             ValueRef::Tombstone => write!(f, "Tombstone"),
         }
     }
 }
 
 impl<'a> LiveValueRef<'a> {
-// TODO is this method needed?
-    pub fn len(&self) -> u64 {
-        match *self {
-            LiveValueRef::Slice(a) => a.len() as u64,
-            LiveValueRef::Overflowed(_, len, _) => len,
+    pub fn read(&'a self) -> Result<(u64, Box<Read + 'a>)> {
+        match self {
+            &LiveValueRef::Slice(a) => {
+                let r = misc::ByteSliceRead::new(a);
+                Ok((a.len() as u64, box r))
+            },
+            &LiveValueRef::Overflowed(ref f, page) => {
+                let strm = try!(OverflowReader::new(f.clone(), page));
+                Ok((strm.len, box strm))
+            },
         }
     }
 
-    pub fn into_value_for_merge(self) -> ValueForStorage {
+    pub fn _into_value_for_merge(self) -> ValueForStorage {
         match self {
             LiveValueRef::Slice(a) => {
                 let mut k = Vec::with_capacity(a.len());
                 k.extend_from_slice(a);
                 ValueForStorage::Boxed(k.into_boxed_slice())
             },
-            LiveValueRef::Overflowed(_, len, page) => ValueForStorage::SameFileOverflow(len, page),
+            LiveValueRef::Overflowed(_, page) => ValueForStorage::SameFileOverflow(page),
         }
     }
 
@@ -984,11 +978,10 @@ impl<'a> LiveValueRef<'a> {
                 let t = try!(func(a));
                 Ok(t)
             },
-            LiveValueRef::Overflowed(ref f, len, page) => {
-                let mut a = Vec::with_capacity(len as usize);
+            LiveValueRef::Overflowed(ref f, page) => {
+                let mut a = vec![];
                 let mut strm = try!(OverflowReader::new(f.clone(), page));
                 try!(strm.read_to_end(&mut a));
-                assert!((len as usize) == a.len());
                 let t = try!(func(&a));
                 Ok(t)
             },
@@ -1000,7 +993,7 @@ impl<'a> std::fmt::Debug for LiveValueRef<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         match *self {
             LiveValueRef::Slice(a) => write!(f, "Array, len={:?}", a),
-            LiveValueRef::Overflowed(_, len, _) => write!(f, "Overflowed, len={}", len),
+            LiveValueRef::Overflowed(_, page) => write!(f, "Overflowed, page={}", page),
         }
     }
 }
@@ -2398,7 +2391,7 @@ impl IForwardCursor for MergeCursor {
                                             },
                                             ValueRef::Tombstone => {
                                             },
-                                            ValueRef::Overflowed(_, _, page) => {
+                                            ValueRef::Overflowed(_, page) => {
                                                 self.overflows_eaten.push((try!(self.subcursors[n].current_pagenum()), page));
                                             },
                                         }
@@ -2474,7 +2467,7 @@ impl ILiveValue for LivingCursor {
     fn ValueRef<'a>(&'a self) -> Result<LiveValueRef<'a>> {
         match try!(self.chain.ValueRef()) {
             ValueRef::Slice(a) => Ok(LiveValueRef::Slice(a)),
-            ValueRef::Overflowed(f, len, blocks) => Ok(LiveValueRef::Overflowed(f, len, blocks)),
+            ValueRef::Overflowed(f, blocks) => Ok(LiveValueRef::Overflowed(f, blocks)),
             ValueRef::Tombstone => Err(Error::Misc(String::from("LiveValueRef tombstone TODO unreachable"))),
         }
     }
@@ -2934,13 +2927,14 @@ impl ValueLocation {
             },
             &ValueLocation::Buffer(ref vbuf) => {
                 let vlen = vbuf.len();
+                // TODO shift the flag
                 1 
                 + varint::space_needed_for(vlen as u64) 
                 + vlen
             },
-            &ValueLocation::Overflowed(vlen, page) => {
+            &ValueLocation::Overflowed(page) => {
+                // TODO shift the flag
                 1 
-                + varint::space_needed_for(vlen as u64) 
                 + varint::space_needed_for(page as u64)
             },
         }
@@ -3118,7 +3112,7 @@ enum ValueLocation {
     Tombstone,
     // when this is a Buffer, this gets ownership of PairForStorage.value
     Buffer(Box<[u8]>),
-    Overflowed(u64, PageNum),
+    Overflowed(PageNum),
 }
 
 // this type is used during construction of a page
@@ -3330,10 +3324,9 @@ fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> BuildLeaf
                 pb.PutVarint(vbuf.len() as u64);
                 pb.PutArray(&vbuf);
             },
-            ValueLocation::Overflowed(vlen, page) => {
+            ValueLocation::Overflowed(page) => {
                 // and add to overflows list.
                 pb.PutByte(ValueFlag::FLAG_OVERFLOW);
-                pb.PutVarint(vlen as u64);
                 pb.PutVarint(page as u64);
                 list.push(page);
             },
@@ -3518,7 +3511,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                     ValueLocation::Buffer(va.into_boxed_slice())
                 } else {
                     let (len, blocks) = try!(write_overflow_unknown_len(&mut (vbuf.chain(strm)), pw));
-                    ValueLocation::Overflowed(len, blocks.first_page())
+                    ValueLocation::Overflowed(blocks.first_page())
                 }
             },
             ValueForStorage::Read(ref mut strm, len) => {
@@ -3530,11 +3523,11 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                     ValueLocation::Buffer(va.into_boxed_slice())
                 } else {
                     let (len, blocks) = try!(write_overflow_known_len(&mut (vbuf.chain(strm)), len, pw));
-                    ValueLocation::Overflowed(len, blocks.first_page())
+                    ValueLocation::Overflowed(blocks.first_page())
                 }
             },
-            ValueForStorage::SameFileOverflow(len, page) => {
-                ValueLocation::Overflowed(len, page)
+            ValueForStorage::SameFileOverflow(page) => {
+                ValueLocation::Overflowed(page)
             },
             ValueForStorage::Boxed(a) => {
                 // TODO should be <= ?
@@ -3544,7 +3537,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                     let mut r = misc::ByteSliceRead::new(&a);
                     let (len, blocks) = try!(write_overflow_known_len(&mut r, a.len() as u64, pw));
                     assert!(len as usize == a.len());
-                    ValueLocation::Overflowed(len, blocks.first_page())
+                    ValueLocation::Overflowed(blocks.first_page())
                 }
             },
         }
@@ -3882,7 +3875,7 @@ fn merge_rewrite_leaf(
                                 },
                             }
                             match &pair.value {
-                                &ValueForStorage::SameFileOverflow(_, page) => {
+                                &ValueForStorage::SameFileOverflow(page) => {
                                     overflows_freed.push(page);
                                 },
                                 _ => {
@@ -5097,7 +5090,7 @@ impl LeafPage {
                 },
                 &ValueInLeaf::Inline(_,_) => {
                 },
-                &ValueInLeaf::Overflowed(_, page) => {
+                &ValueInLeaf::Overflowed(page) => {
                     list.push(page);
                 },
             }
@@ -5225,8 +5218,8 @@ impl LeafPage {
             &ValueInLeaf::Inline(vlen, pos) => {
                 Ok(ValueRef::Slice(&self.pr[pos .. pos + vlen]))
             },
-            &ValueInLeaf::Overflowed(vlen, page) => {
-                Ok(ValueRef::Overflowed(self.f.clone(), vlen, page))
+            &ValueInLeaf::Overflowed(page) => {
+                Ok(ValueRef::Overflowed(self.f.clone(), page))
             },
         }
     }
@@ -5239,7 +5232,7 @@ impl LeafPage {
             &ValueInLeaf::Inline(vlen, _) => {
                 Ok(false)
             },
-            &ValueInLeaf::Overflowed(vlen, _) => {
+            &ValueInLeaf::Overflowed(_) => {
                 Ok(false)
             },
         }
@@ -5756,7 +5749,7 @@ impl KeyInParentPage {
 enum ValueInLeaf {
     Tombstone,
     Inline(usize, usize),
-    Overflowed(u64, PageNum),
+    Overflowed(PageNum),
 }
 
 impl ValueInLeaf {
@@ -5766,11 +5759,11 @@ impl ValueInLeaf {
             if 0 != (vflag & ValueFlag::FLAG_TOMBSTONE) { 
                 ValueInLeaf::Tombstone
             } else {
-                let vlen = varint::read(pr, cur);
                 if 0 != (vflag & ValueFlag::FLAG_OVERFLOW) {
                     let page = varint::read(&pr, cur) as PageNum;
-                    ValueInLeaf::Overflowed(vlen as u64, page)
+                    ValueInLeaf::Overflowed(page)
                 } else {
+                    let vlen = varint::read(pr, cur);
                     let v = ValueInLeaf::Inline(vlen as usize, *cur);
                     *cur = *cur + (vlen as usize);
                     v
@@ -5783,7 +5776,7 @@ impl ValueInLeaf {
         match self {
             &ValueInLeaf::Tombstone => true,
             &ValueInLeaf::Inline(_,_) => false,
-            &ValueInLeaf::Overflowed(_,_) => false,
+            &ValueInLeaf::Overflowed(_) => false,
         }
     }
 
