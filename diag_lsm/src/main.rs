@@ -21,8 +21,10 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 extern crate lsm;
-use lsm::ICursor;
 use lsm::IForwardCursor;
+use lsm::ISeekableCursor;
+use lsm::ILiveValue;
+use lsm::IValue;
 
 extern crate rand;
 use rand::Rng;
@@ -231,7 +233,7 @@ fn list_keys(name: &str) -> Result<(),lsm::Error> {
         {
             let k = try!(cursor.KeyRef());
             println!("k: {:?}", k);
-            let v = try!(cursor.LiveValueRef());
+            let v = try!(cursor.ValueRef());
             //println!("v: {:?}", v);
             //let q = try!(v.into_boxed_slice());
         }
@@ -274,7 +276,7 @@ fn seek_string(name: &str, key: String, sop: String) -> Result<(),lsm::Error> {
         {
             let k = try!(cursor.KeyRef());
             println!("k: {:?}", k);
-            let v = try!(cursor.LiveValueRef());
+            let v = try!(cursor.ValueRef());
             println!("v: {:?}", v);
         }
     }
@@ -298,7 +300,7 @@ fn seek_bytes(name: &str, k: Box<[u8]>, sop: String) -> Result<(),lsm::Error> {
         {
             let k = try!(cursor.KeyRef());
             println!("k: {:?}", k);
-            let v = try!(cursor.LiveValueRef());
+            let v = try!(cursor.ValueRef());
             println!("v: {:?}", v);
         }
         for x in 0 .. 20 {
@@ -306,7 +308,7 @@ fn seek_bytes(name: &str, k: Box<[u8]>, sop: String) -> Result<(),lsm::Error> {
             if cursor.IsValid() {
                 let k = try!(cursor.KeyRef());
                 println!("    k: {:?}", k);
-                let v = try!(cursor.LiveValueRef());
+                let v = try!(cursor.ValueRef());
                 println!("    v: {:?}", v);
             } else {
                 break;

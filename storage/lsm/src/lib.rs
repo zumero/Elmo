@@ -28,8 +28,9 @@ extern crate misc;
 extern crate elmo;
 extern crate lsm;
 
-use lsm::ICursor;
 use lsm::IForwardCursor;
+use lsm::ISeekableCursor;
+use lsm::ILiveValue;
 
 pub type Result<T> = elmo::Result<T>;
 
@@ -112,7 +113,7 @@ impl RangeCursorBsonValueIterator {
     fn iter_next(&mut self) -> Result<Option<elmo::Row>> {
         if self.cursor.IsValid() {
             let row = {
-                let v = try!(self.cursor.LiveValueRef().map_err(elmo::wrap_err));
+                let v = try!(self.cursor.ValueRef().map_err(elmo::wrap_err));
                 let v = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
                 let v = v.into_value();
                 let row = elmo::Row {
@@ -162,7 +163,7 @@ impl RangeCursorVarintIterator {
     fn iter_next(&mut self) -> Result<Option<u64>> {
         if self.cursor.IsValid() {
             let v = {
-                let v = try!(self.cursor.LiveValueRef().map_err(elmo::wrap_err));
+                let v = try!(self.cursor.ValueRef().map_err(elmo::wrap_err));
                 //println!("got {:?}", v);
                 let v = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
                 v
@@ -464,7 +465,7 @@ fn find_record(cursor: &mut lsm::LivingCursor, collection_id: u64, id: &bson::Va
 fn get_value_for_key_as_varint(cursor: &mut lsm::LivingCursor, k: &[u8]) -> Result<Option<u64>> {
     try!(cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
     if cursor.IsValid() {
-        let v = try!(cursor.LiveValueRef().map_err(elmo::wrap_err));
+        let v = try!(cursor.ValueRef().map_err(elmo::wrap_err));
         let id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
         Ok(Some(id))
     } else {
@@ -475,7 +476,7 @@ fn get_value_for_key_as_varint(cursor: &mut lsm::LivingCursor, k: &[u8]) -> Resu
 fn get_value_for_key_as_bson(cursor: &mut lsm::LivingCursor, k: &[u8]) -> Result<Option<bson::Document>> {
     try!(cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
     if cursor.IsValid() {
-        let v = try!(cursor.LiveValueRef().map_err(elmo::wrap_err));
+        let v = try!(cursor.ValueRef().map_err(elmo::wrap_err));
         let id = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
         Ok(Some(id))
     } else {
@@ -685,7 +686,7 @@ impl MyConn {
                         misc::push_varint(&mut k, record_id);
                         try!(cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
                         if cursor.IsValid() {
-                            let v = try!(cursor.LiveValueRef().map_err(elmo::wrap_err));
+                            let v = try!(cursor.ValueRef().map_err(elmo::wrap_err));
                             let v = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
                             let v = v.into_value();
                             let row = elmo::Row {
@@ -738,7 +739,7 @@ impl MyConn {
                 let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
                 let (collection_id, index_id) = try!(decode_key_index_id_to_properties(&k));
 
-                let v = try!(cursor.LiveValueRef().map_err(elmo::wrap_err));
+                let v = try!(cursor.ValueRef().map_err(elmo::wrap_err));
                 let props = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
 
                 (collection_id, index_id, props)
@@ -824,7 +825,7 @@ impl MyConn {
                 let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
                 let (db, coll) = try!(decode_key_name_to_collection_id(&k));
 
-                let v = try!(cursor.LiveValueRef().map_err(elmo::wrap_err));
+                let v = try!(cursor.ValueRef().map_err(elmo::wrap_err));
                 let collection_id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
 
                 a.push((collection_id, db, coll));
@@ -1148,7 +1149,7 @@ impl<'a> MyWriter<'a> {
                         let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
                         let (_, record_id) = try!(decode_key_record(&k));
                         let ba_record_id = u64_to_boxed_varint(record_id);
-                        let v = try!(cursor.LiveValueRef().map_err(elmo::wrap_err));
+                        let v = try!(cursor.ValueRef().map_err(elmo::wrap_err));
                         let v = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
                         let entries = try!(elmo::get_index_entries(&v, &normspec, &weights, &info.options));
                         let ba_collection_id = u64_to_boxed_varint(collection_id);

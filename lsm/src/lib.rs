@@ -1230,7 +1230,7 @@ pub enum SeekResult {
 }
 
 impl SeekResult {
-    fn verify(&self, k: &KeyRef, sop: SeekOp, csr: &ICursor) -> Result<()> {
+    fn verify(&self, k: &KeyRef, sop: SeekOp, csr: &IForwardCursor) -> Result<()> {
         match self {
             &SeekResult::Invalid => {
                 assert!(!csr.IsValid());
@@ -1254,7 +1254,7 @@ impl SeekResult {
         Ok(())
     }
 
-    fn from_cursor(csr: &ICursor, k: &KeyRef) -> Result<SeekResult> {
+    fn from_cursor(csr: &IForwardCursor, k: &KeyRef) -> Result<SeekResult> {
         if csr.IsValid() {
             let kc = try!(csr.KeyRef());
             if Ordering::Equal == KeyRef::cmp(&kc, k) {
@@ -1292,15 +1292,18 @@ pub trait IForwardCursor {
     fn IsValid(&self) -> bool;
 
     fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>>;
-    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>>;
-
-    // TODO maybe rm ValueLength.  but LivingCursor uses it as a fast
-    // way to detect whether a value is a tombstone or not.
-    fn ValueLength(&self) -> Result<Option<u64>>; // tombstone is None
-
 }
 
-pub trait ICursor : IForwardCursor {
+pub trait IValue {
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>>;
+    fn value_is_tombstone(&self) -> Result<bool>;
+}
+
+pub trait ILiveValue {
+    fn ValueRef<'a>(&'a self) -> Result<LiveValueRef<'a>>;
+}
+
+pub trait ISeekableCursor {
     fn SeekRef(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult>;
     fn Last(&mut self) -> Result<()>;
     fn Prev(&mut self) -> Result<()>;
@@ -1841,6 +1844,31 @@ impl MultiCursor {
 
 }
 
+impl IValue for MultiCursor {
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(icur) => {
+                self.subcursors[icur].ValueRef()
+            },
+        }
+    }
+
+    fn value_is_tombstone(&self) -> Result<bool> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(icur) => {
+                self.subcursors[icur].value_is_tombstone()
+            },
+        }
+    }
+
+}
+
 impl IForwardCursor for MultiCursor {
     fn IsValid(&self) -> bool {
         match self.cur {
@@ -1864,28 +1892,6 @@ impl IForwardCursor for MultiCursor {
             },
             Some(icur) => {
                 self.subcursors[icur].KeyRef()
-            },
-        }
-    }
-
-    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
-        match self.cur {
-            None => {
-                Err(Error::CursorNotValid)
-            },
-            Some(icur) => {
-                self.subcursors[icur].ValueRef()
-            },
-        }
-    }
-
-    fn ValueLength(&self) -> Result<Option<u64>> {
-        match self.cur {
-            None => {
-                Err(Error::CursorNotValid)
-            },
-            Some(icur) => {
-                self.subcursors[icur].ValueLength()
             },
         }
     }
@@ -2053,7 +2059,7 @@ impl IForwardCursor for MultiCursor {
 
 }
 
-impl ICursor for MultiCursor {
+impl ISeekableCursor for MultiCursor {
     fn Last(&mut self) -> Result<()> {
         for i in 0 .. self.subcursors.len() {
             try!(self.subcursors[i].Last());
@@ -2281,6 +2287,31 @@ impl MergeCursor {
 
 }
 
+impl IValue for MergeCursor {
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(icur) => {
+                self.subcursors[icur].ValueRef()
+            },
+        }
+    }
+
+    fn value_is_tombstone(&self) -> Result<bool> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(icur) => {
+                self.subcursors[icur].value_is_tombstone()
+            },
+        }
+    }
+
+}
+
 impl IForwardCursor for MergeCursor {
     fn IsValid(&self) -> bool {
         match self.cur {
@@ -2308,28 +2339,6 @@ impl IForwardCursor for MergeCursor {
             },
             Some(icur) => {
                 self.subcursors[icur].KeyRef()
-            },
-        }
-    }
-
-    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
-        match self.cur {
-            None => {
-                Err(Error::CursorNotValid)
-            },
-            Some(icur) => {
-                self.subcursors[icur].ValueRef()
-            },
-        }
-    }
-
-    fn ValueLength(&self) -> Result<Option<u64>> {
-        match self.cur {
-            None => {
-                Err(Error::CursorNotValid)
-            },
-            Some(icur) => {
-                self.subcursors[icur].ValueLength()
             },
         }
     }
@@ -2435,16 +2444,8 @@ impl Drop for LivingCursor {
 }
 
 impl LivingCursor {
-    pub fn LiveValueRef<'a>(&'a self) -> Result<LiveValueRef<'a>> {
-        match try!(self.chain.ValueRef()) {
-            ValueRef::Slice(a) => Ok(LiveValueRef::Slice(a)),
-            ValueRef::Overflowed(f, len, blocks) => Ok(LiveValueRef::Overflowed(f, len, blocks)),
-            ValueRef::Tombstone => Err(Error::Misc(String::from("LiveValueRef tombstone TODO unreachable"))),
-        }
-    }
-
     fn skip_tombstones_forward(&mut self) -> Result<()> {
-        while self.chain.IsValid() && try!(self.chain.ValueLength()).is_none() {
+        while self.chain.IsValid() && try!(self.chain.value_is_tombstone()) {
             self.skipped += 1;
             try!(self.chain.Next());
         }
@@ -2452,7 +2453,7 @@ impl LivingCursor {
     }
 
     fn skip_tombstones_backward(&mut self) -> Result<()> {
-        while self.chain.IsValid() && try!(self.chain.ValueLength()).is_none() {
+        while self.chain.IsValid() && try!(self.chain.value_is_tombstone()) {
             self.skipped += 1;
             try!(self.chain.Prev());
         }
@@ -2466,6 +2467,18 @@ impl LivingCursor {
             skipped: 0,
         }
     }
+
+}
+
+impl ILiveValue for LivingCursor {
+    fn ValueRef<'a>(&'a self) -> Result<LiveValueRef<'a>> {
+        match try!(self.chain.ValueRef()) {
+            ValueRef::Slice(a) => Ok(LiveValueRef::Slice(a)),
+            ValueRef::Overflowed(f, len, blocks) => Ok(LiveValueRef::Overflowed(f, len, blocks)),
+            ValueRef::Tombstone => Err(Error::Misc(String::from("LiveValueRef tombstone TODO unreachable"))),
+        }
+    }
+
 }
 
 impl IForwardCursor for LivingCursor {
@@ -2479,20 +2492,12 @@ impl IForwardCursor for LivingCursor {
         self.chain.KeyRef()
     }
 
-    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
-        self.chain.ValueRef()
-    }
-
-    fn ValueLength(&self) -> Result<Option<u64>> {
-        self.chain.ValueLength()
-    }
-
     fn IsValid(&self) -> bool {
         self.chain.IsValid() 
             && {
-                let r = self.chain.ValueLength();
+                let r = self.chain.value_is_tombstone();
                 if r.is_ok() {
-                    r.unwrap().is_some()
+                    !r.unwrap()
                 } else {
                     false
                 }
@@ -2508,7 +2513,7 @@ impl IForwardCursor for LivingCursor {
 
 }
 
-impl ICursor for LivingCursor {
+impl ISeekableCursor for LivingCursor {
     fn Last(&mut self) -> Result<()> {
         try!(self.chain.Last());
         try!(self.skip_tombstones_backward());
@@ -2530,7 +2535,7 @@ impl ICursor for LivingCursor {
         }
         match sop {
             SeekOp::SEEK_GE => {
-                if sr.is_valid() && self.chain.ValueLength().unwrap().is_none() {
+                if sr.is_valid() && self.chain.value_is_tombstone().unwrap() {
                     try!(self.skip_tombstones_forward());
                     SeekResult::from_cursor(&*self.chain, k)
                 } else {
@@ -2538,7 +2543,7 @@ impl ICursor for LivingCursor {
                 }
             },
             SeekOp::SEEK_LE => {
-                if sr.is_valid() && self.chain.ValueLength().unwrap().is_none() {
+                if sr.is_valid() && self.chain.value_is_tombstone().unwrap() {
                     try!(self.skip_tombstones_backward());
                     SeekResult::from_cursor(&*self.chain, k)
                 } else {
@@ -2634,7 +2639,10 @@ impl RangeCursor {
         }
     }
 
-    pub fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
+}
+
+impl IForwardCursor for RangeCursor {
+    fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
         if self.IsValid() {
             self.chain.KeyRef()
         } else {
@@ -2642,15 +2650,7 @@ impl RangeCursor {
         }
     }
 
-    pub fn LiveValueRef<'a>(&'a self) -> Result<LiveValueRef<'a>> {
-        if self.IsValid() {
-            self.chain.LiveValueRef()
-        } else {
-            Err(Error::CursorNotValid)
-        }
-    }
-
-    pub fn IsValid(&self) -> bool {
+    fn IsValid(&self) -> bool {
         self.chain.IsValid() 
             && {
                 let k = self.chain.KeyRef().unwrap();
@@ -2659,7 +2659,7 @@ impl RangeCursor {
             }
     }
 
-    pub fn First(&mut self) -> Result<()> {
+    fn First(&mut self) -> Result<()> {
         let sr = try!(self.chain.SeekRef(&KeyRef::for_slice(&self.min.k), SeekOp::SEEK_GE));
         match (sr, self.min.cmp) {
             (SeekResult::Equal, OpGt::GT) => {
@@ -2671,7 +2671,7 @@ impl RangeCursor {
         Ok(())
     }
 
-    pub fn Next(&mut self) -> Result<()> {
+    fn Next(&mut self) -> Result<()> {
         if self.IsValid() {
             self.chain.Next()
         } else {
@@ -2679,7 +2679,17 @@ impl RangeCursor {
         }
     }
 
-    // TODO this one could support Last/Prev I suppose
+}
+
+impl ILiveValue for RangeCursor {
+    fn ValueRef<'a>(&'a self) -> Result<LiveValueRef<'a>> {
+        if self.IsValid() {
+            self.chain.ValueRef()
+        } else {
+            Err(Error::CursorNotValid)
+        }
+    }
+
 }
 
 pub struct PrefixCursor<'c> { 
@@ -2696,8 +2706,11 @@ impl<'c> PrefixCursor<'c> {
         }
     }
 
+}
+
+impl<'c> IForwardCursor for PrefixCursor<'c> {
     // TODO lifetimes below should be 'c ?
-    pub fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
+    fn KeyRef<'a>(&'a self) -> Result<KeyRef<'a>> {
         if self.IsValid() {
             let k = try!(self.chain.KeyRef());
             //println!("PrefixCursor yielding: {:?}", k);
@@ -2708,16 +2721,7 @@ impl<'c> PrefixCursor<'c> {
         }
     }
 
-    // TODO lifetimes below should be 'c ?
-    pub fn LiveValueRef<'a>(&'a self) -> Result<LiveValueRef<'a>> {
-        if self.IsValid() {
-            self.chain.LiveValueRef()
-        } else {
-            Err(Error::CursorNotValid)
-        }
-    }
-
-    pub fn IsValid(&self) -> bool {
+    fn IsValid(&self) -> bool {
         self.chain.IsValid() 
             && 
             {
@@ -2727,15 +2731,27 @@ impl<'c> PrefixCursor<'c> {
             }
     }
 
-    pub fn First(&mut self) -> Result<SeekResult> {
+    fn First(&mut self) -> Result<()> {
         let sr = try!(self.chain.SeekRef(&KeyRef::for_slice(&self.prefix), SeekOp::SEEK_GE));
-        Ok(sr)
+        Ok(())
     }
 
-    pub fn Next(&mut self) -> Result<()> {
+    fn Next(&mut self) -> Result<()> {
         if self.IsValid() {
             try!(self.chain.Next());
             Ok(())
+        } else {
+            Err(Error::CursorNotValid)
+        }
+    }
+
+}
+
+impl<'c> ILiveValue for PrefixCursor<'c> {
+    // TODO lifetimes below should be 'c ?
+    fn ValueRef<'a>(&'a self) -> Result<LiveValueRef<'a>> {
+        if self.IsValid() {
+            self.chain.ValueRef()
         } else {
             Err(Error::CursorNotValid)
         }
@@ -5215,17 +5231,16 @@ impl LeafPage {
         }
     }
 
-    // TODO shouldn't we have a method that returns the ValueInLeaf?
-    fn value_len<'a>(&'a self, n: usize) -> Result<Option<u64>> {
+    fn value_is_tombstone(&self, n: usize) -> Result<bool> {
         match &self.pairs[n].value {
             &ValueInLeaf::Tombstone => {
-                Ok(None)
+                Ok(true)
             },
             &ValueInLeaf::Inline(vlen, _) => {
-                Ok(Some(vlen as u64))
+                Ok(false)
             },
             &ValueInLeaf::Overflowed(vlen, _) => {
-                Ok(Some(vlen))
+                Ok(false)
             },
         }
     }
@@ -5301,6 +5316,31 @@ impl LeafCursor {
 
 }
 
+impl IValue for LeafCursor {
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(cur) => {
+                self.page.value(cur)
+            }
+        }
+    }
+
+    fn value_is_tombstone(&self) -> Result<bool> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(cur) => {
+                self.page.value_is_tombstone(cur)
+            }
+        }
+    }
+
+}
+
 impl IForwardCursor for LeafCursor {
     fn IsValid(&self) -> bool {
         if let Some(i) = self.cur {
@@ -5319,28 +5359,6 @@ impl IForwardCursor for LeafCursor {
             Some(cur) => {
                 self.page.key(cur)
             },
-        }
-    }
-
-    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
-        match self.cur {
-            None => {
-                Err(Error::CursorNotValid)
-            },
-            Some(cur) => {
-                self.page.value(cur)
-            }
-        }
-    }
-
-    fn ValueLength(&self) -> Result<Option<u64>> {
-        match self.cur {
-            None => {
-                Err(Error::CursorNotValid)
-            },
-            Some(cur) => {
-                self.page.value_len(cur)
-            }
         }
     }
 
@@ -5366,7 +5384,7 @@ impl IForwardCursor for LeafCursor {
 
 }
 
-impl ICursor for LeafCursor {
+impl ISeekableCursor for LeafCursor {
     fn Last(&mut self) -> Result<()> {
         self.cur = Some(self.page.count_keys() - 1);
         Ok(())
@@ -5464,6 +5482,23 @@ impl PageCursor {
     }
 }
 
+impl IValue for PageCursor {
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
+        match self {
+            &PageCursor::Leaf(ref c) => c.ValueRef(),
+            &PageCursor::Parent(ref c) => c.ValueRef(),
+        }
+    }
+
+    fn value_is_tombstone(&self) -> Result<bool> {
+        match self {
+            &PageCursor::Leaf(ref c) => c.value_is_tombstone(),
+            &PageCursor::Parent(ref c) => c.value_is_tombstone(),
+        }
+    }
+
+}
+
 impl IForwardCursor for PageCursor {
     fn IsValid(&self) -> bool {
         match self {
@@ -5476,20 +5511,6 @@ impl IForwardCursor for PageCursor {
         match self {
             &PageCursor::Leaf(ref c) => c.KeyRef(),
             &PageCursor::Parent(ref c) => c.KeyRef(),
-        }
-    }
-
-    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
-        match self {
-            &PageCursor::Leaf(ref c) => c.ValueRef(),
-            &PageCursor::Parent(ref c) => c.ValueRef(),
-        }
-    }
-
-    fn ValueLength(&self) -> Result<Option<u64>> {
-        match self {
-            &PageCursor::Leaf(ref c) => c.ValueLength(),
-            &PageCursor::Parent(ref c) => c.ValueLength(),
         }
     }
 
@@ -5509,7 +5530,7 @@ impl IForwardCursor for PageCursor {
 
 }
 
-impl ICursor for PageCursor {
+impl ISeekableCursor for PageCursor {
     fn Last(&mut self) -> Result<()> {
         match self {
             &mut PageCursor::Leaf(ref mut c) => c.Last(),
@@ -6395,6 +6416,31 @@ impl ParentCursor {
 
 }
 
+impl IValue for ParentCursor {
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(_) => {
+                self.sub.ValueRef()
+            },
+        }
+    }
+
+    fn value_is_tombstone(&self) -> Result<bool> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(_) => {
+                self.sub.value_is_tombstone()
+            },
+        }
+    }
+
+}
+
 impl IForwardCursor for ParentCursor {
     fn IsValid(&self) -> bool {
         match self.cur {
@@ -6412,28 +6458,6 @@ impl IForwardCursor for ParentCursor {
             },
             Some(_) => {
                 self.sub.KeyRef()
-            },
-        }
-    }
-
-    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
-        match self.cur {
-            None => {
-                Err(Error::CursorNotValid)
-            },
-            Some(_) => {
-                self.sub.ValueRef()
-            },
-        }
-    }
-
-    fn ValueLength(&self) -> Result<Option<u64>> {
-        match self.cur {
-            None => {
-                Err(Error::CursorNotValid)
-            },
-            Some(_) => {
-                self.sub.ValueLength()
             },
         }
     }
@@ -6462,7 +6486,7 @@ impl IForwardCursor for ParentCursor {
 
 }
 
-impl ICursor for ParentCursor {
+impl ISeekableCursor for ParentCursor {
     fn Last(&mut self) -> Result<()> {
         let last_child = self.page.count_items() - 1;
         try!(self.set_child(last_child));
@@ -6553,6 +6577,31 @@ impl MultiPageCursor {
 
 }
 
+impl IValue for MultiPageCursor {
+    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(_) => {
+                self.sub.ValueRef()
+            },
+        }
+    }
+
+    fn value_is_tombstone(&self) -> Result<bool> {
+        match self.cur {
+            None => {
+                Err(Error::CursorNotValid)
+            },
+            Some(_) => {
+                self.sub.value_is_tombstone()
+            },
+        }
+    }
+
+}
+
 impl IForwardCursor for MultiPageCursor {
     fn IsValid(&self) -> bool {
         match self.cur {
@@ -6570,28 +6619,6 @@ impl IForwardCursor for MultiPageCursor {
             },
             Some(_) => {
                 self.sub.KeyRef()
-            },
-        }
-    }
-
-    fn ValueRef<'a>(&'a self) -> Result<ValueRef<'a>> {
-        match self.cur {
-            None => {
-                Err(Error::CursorNotValid)
-            },
-            Some(_) => {
-                self.sub.ValueRef()
-            },
-        }
-    }
-
-    fn ValueLength(&self) -> Result<Option<u64>> {
-        match self.cur {
-            None => {
-                Err(Error::CursorNotValid)
-            },
-            Some(_) => {
-                self.sub.ValueLength()
             },
         }
     }
