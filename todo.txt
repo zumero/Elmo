@@ -3,9 +3,6 @@ maybe the comments need a more concise list of the
 various cases where a page becomes inactive during
 a merge.  it's confusing.
 
-I *think* it is true that blocklist_unsorted() is never
-called except for list_all_blocks at startup.
-
 in parent depth 1, we used to store the blocklist for
 the overflows in that leaf.  now we have to read
 the leaf to get its list of overflows, AND we have
@@ -22,44 +19,29 @@ owning it.  either the overflow was written as the
 leaf was created, or the overflow is moved to the leaf
 from a leaf that is being rewritten.
 
-a parent can have an overflowed key in two ways.
+a parent can have an overflowed key in two ways:
 
-a borrowed overflow must be owned by a leaf.  it is
-a bug to free an overflow from a leaf but retain
-references to it in a parent.  are we checking for
-this?
+    a borrowed overflow must be owned by a leaf.  it is
+    a bug to free an overflow from a leaf but retain
+    references to it in a parent.  are we checking for
+    this?
 
-an owned overflow is owned by that parent, and
-cannot be shared by anything else.
+    an owned overflow is owned by that parent, and
+    cannot be shared by anything else.
 
-OverflowReader::blocklist should return len as well
-
-test with bizarre
-
-ValueRef probably needs a method that returns a Read
-
-maybe a parent page should only be allowed to borrow
-from a leaf, not from another parent page.  in other
-words, when a parent makes an owned overflow, it
-needs to keep it private.  the thing that gets
-passed up to the next parent is still the inline
-overflow it got from below.
-
-consider removing the len stored with the overflow.
-it's really only there for Vec::with_capacity()
-and for ValueRef::len().  right?
-
-actually, value_len is used to implement tombstone
-checks.  might want a simpler is_tombstone()
-method, because we always know that.
-
-would need to limit values to 62/63 bits in
-order to combine flag and avoid the len.
+remove the len that is stored with a key overflow as well?
 
 pack flags all together (for all keys in the
 page) instead of shifting on each len?
 
-need test cases with unknown size overflows
+need more test cases with unknown size overflows
+
+finding every used page at startup is really slow.
+and the bigger the db, the slower this will get.
+can we do it in a bg thread?
+
+I *think* it is true that blocklist_unsorted() is never
+called except for list_all_blocks at startup.
 
 hmmm.  any chance we should keep track of free
 blocks instead of just keeping track of used blocks?
@@ -87,7 +69,7 @@ and avoid the need to write the first page twice.
 
 implement format 3 overflows
 
-note that unless we atom-ize, two overflows can
+note that unless we atom-ize, two overflows *can*
 be identical.
 
 special code to compare two overflows?
@@ -103,45 +85,24 @@ same as the page num on which it sits.
 consider searching the first block of an unknown len
 overflow with Earliest.
 
+alternatively, for an unknown len overflow, consider
+just grabbing a really big block at the end of the file.
+
+maybe we should have a background thread that looks
+for overflows that could be moved earlier in the file.
+
+--
+
+still consider the idea of eliminating ownership
+of overflows and using refcounting:
+
 overflows get tracked like segments.  they have
 their own identity at the top level of the file.
 an overflow which has been written but not put
 in the catalog is just like a segment which has
-been writing but not added to a level.
+been written but not added to a level.
 
-first page of the overflow is its id.
-
-the notion of desperate doesn't have to be tied to
-the size of the header and whether it fits in a
-4K page.  we could go back to allowing the header
-to be of any size while still retaining the ability
-to have a level be desperate if we wanted to force
-merges to happen a certain way.
-
-add notion of multiple dbs?  each one is its own
-set of levels, like the current header.  then the
-header would simply be the list of pointers to
-db headers.
-
-could just store the entire catalog as one blob,
-as a temporary solution.
-
-consider another form of tree:  all keys are varints,
-so they can compress entirely as integer deltas.
-no overflows allowed.  for overflow list, key
-is an int, value is len, page, blocklist, etc.
-for references, both key and value are ints.
-
-new way of dealing with overflows:
-
-leaf/parent stores an overflow id, which is
-actually the first page of the overflow.
-
-shifted len flag.  when it's an overflow, the
-len could be the overflow id instead of len.
-
-global catalog.  each overflow is listed.
-
+global catalog of overflows.
 then, a list of references, each one is a page
 num containing the reference (leaf or parent)
 and the page num of the overflow.
@@ -150,28 +111,11 @@ keep track of references that get added or deleted.
 when an overflow loses all of its references, it
 can be removed.
 
+could just store the entire catalog as one blob,
+as a temporary solution.
+
 writing the header will require update of the overflow
-catalog.
-
-still makes sense that keys should always be inlined
-when possible.  but values?  maybe overflowing a value
-isn't so bad?
-
-we still keep the design that a key overflow must
-be okay to read entirely into ram, but a value
-overflow does not.
-
-and the catalog could know whether each overflow is
-a key or a value.
-
-always store just one piece of data per overflow?
-a 4097 byte key takes 2 pages and wastes most of
-the 2nd one.
-
-a page plus offset on that page could be stored
-by shifting and then varint
-
-overflows can be cached too?
+catalog and ref list.
 
 overflow catalog will need to be stored in a tree of
 some kind.  don't require it to be entirely in ram at
@@ -182,12 +126,6 @@ page number of the overflow is like a key.
 I suppose we could keep the overflow catalog in a
 parallel segment lsm.  as long as that one is never
 going to have overflows.
-
-and depth 1 parents don't need a block list for the
-leaf child either.
-
-then why not keep everything in the leaves and parents?
-because the refcount design makes everything too complicated.
 
 does the overflow reference list need to be indexed in
 both directions?
@@ -208,12 +146,35 @@ and also walk the overflow catalog.
 finding overflows that are no longer used could be a
 background operation.
 
-run add_random twice in a row:  get overflow page bad
-type.  did something stomp on an overflow?
+--
 
-an overflow owned by a parent page:  this will never
-be returned in KeyRef.  so how does it become inactive
-when that parent page gets rewritten?
+the notion of desperate doesn't have to be tied to
+the size of the header and whether it fits in a
+4K page.  we could go back to allowing the header
+to be of any size while still retaining the ability
+to have a level be desperate if we wanted to force
+merges to happen a certain way.
+
+add notion of multiple dbs?  each one is its own
+set of levels, like the current header.  then the
+header would simply be the list of pointers to
+db headers.
+
+consider another form of tree:  all keys are varints,
+so they can compress entirely as integer deltas.
+no overflows allowed.  for overflow list, key
+is an int, value is len, page, blocklist, etc.
+for references, both key and value are ints.
+
+still makes sense that keys should always be inlined
+when possible.  but values?  maybe overflowing a value
+isn't so bad?
+
+always store just one piece of data per overflow?
+a 4097 byte key takes 2 pages and wastes most of
+the 2nd one.
+a page plus offset on that page could be stored
+by shifting and then varint
 
 rustfmt issues:
     sometimes removes braces around single-statement
@@ -251,30 +212,10 @@ rustfmt issues:
 when promoting into a Regular level that is empty,
 just move without rewrite?
 
-parent node writer gets in trouble, overflows its stack,
-when it has to deal with lots of pages that only hold one
-key.  problem is that if only one key fits in the leaf,
-then only one key fits in its parent, so the generation
-of parent nodes is the same size, so depth increases
-forever.  maybe we need to overflow keys unless two of
-them can fit in a parent page.  or maybe a parent page
-needs the ability to overflow a key even if the leaf
-did not, just to ensure that at least two keys fit in
-every parent.
-
-reuse key overflows.
-
 can varint::read be made faster using transmute for
 some of the cases?
 
 child_as_item_for_parent clone
-
-so yeah, it would seem that the blocklist stored for
-the leaf children of a depth 1 parent is only used at
-startup to identify all the pages in use.  is that
-right?  if so, how feasible would it be to remove these
-and calculate them?  any way to do this in a background
-thread?
 
 too many open/close of the file for PageWriter as well.
 
