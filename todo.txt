@@ -1,4 +1,29 @@
 
+headless blocklist in format 2 overflow
+
+format 3 overflow
+
+need more test cases with unknown size overflows
+
+list_all_blocks slow on startup
+
+header overflow
+
+child_as_item_for_parent clone
+
+fine-grained locks for merge
+
+ability to have pages be different sizes
+
+separate lsm code into multiple files (modules) so we can get 
+better privacy on struct fields
+
+pending tx manager
+
+change trait methods to Rust naming convention
+
+--
+
 the blocklist in the format 2 overflow should have
 its very first u64 removed, since it will be the
 same as the page num on which it sits.
@@ -26,8 +51,6 @@ a parent can have an overflowed key in two ways:
 
 pack flags all together (for all keys in the
 page) instead of shifting on each len?
-
-need more test cases with unknown size overflows
 
 finding every used page at startup is really slow.
 and the bigger the db, the slower this will get.
@@ -215,8 +238,6 @@ just move without rewrite?
 can varint::read be made faster using transmute for
 some of the cases?
 
-child_as_item_for_parent clone
-
 too many open/close of the file for PageWriter as well.
 
 should the level multiplier be stored in the file header?
@@ -382,7 +403,7 @@ recycled, based on its fullness?
 it is possible for the depth of a segment to decrease
 when it is the target of a merge, right?
 
-dependencies can chain.  maybe long chains.
+free-block-list dependencies can chain.  maybe long chains.
 
 looping over all the children in a parent node to get
 max tombstones, but when there are no tombstones, this
@@ -428,8 +449,6 @@ unless it needs to pass along an Arc clone, methods should
 be &self not &Arc<InnerPart>
 
 where should I be using AsRef?  From/Into ?
-
-get rid of pagepool?
 
 so a new leaf can't squeeze between two parents anymore.
 what does this mean for the merge problem where we had
@@ -568,23 +587,9 @@ shrink much, and ends up with a lot of empty blocks in it.
 
 allow block allocation policy that always selects the earliest block?
 
-maybe everywhere we read a page (cursors), instead of a file,
-we should provide an object which abstracts the reading of page.
-allows a cache.  or a non-file.
-
 lsm_diag should just have show_page
 
-consider fiddling with the depth at which parent nodes
-store child block lists.  more than just one?  do we
-need them at all?  would need parent nodes fit calculations 
-to account for the size of the encoded block lists.  
-do we need this anyway?
-
 look for ways to make elmo index entry encoding more compact
-
-at some point, review all decisions about what actually gets stored
-in the parent page and make sure it's worth it.  full
-block list?  should we store the number of descendant leaves?
 
 header can get really small.  so small that we no longer want to 
 waste 4096 bytes or an entire page on it?  it would need to live on
@@ -601,8 +606,6 @@ code for calc/build/write leaf and parent has gotten awfully similar
 multiple prefixes, so we can have better compression of keys in
 parent page?
 
-any way to represent/store keys as deltas?  vcdiff?
-
 need more tests of large overflows, especially with block allocation
 issues, fragmentation, etc.
 
@@ -617,9 +620,6 @@ factor as low as 2.  lower multipler means faster writes and
 slower reads.
 
 update rust nightly?
-
-separate lsm code into multiple files (modules) so we can get 
-better privacy on struct fields
 
 ability to merge entire file
 
@@ -651,11 +651,6 @@ we're using usize all over the place for cases size and index into a page.
 this is sad, because a page will never exceed 32 bits, and probably will
 not exceed 16 bits.
 
-make pgnum a u64?
-same for pgnum but then storage is wasteful,
-want to store as a varint, but then space in the page calculations are
-more complicated.
-
 reduce malloc
 
 are we using Arc too much now?  are there places we could sweep back
@@ -665,14 +660,9 @@ https://github.com/zslayton/lifeguard
 
 cleanup bcmp and friends
 
-vbuf reuse write leaves
-
 keyInLeafs should share code.
 
 same for Value and ValueRef code
-
-perhaps, when reading stuff from a buffer, instead of using a cur variable,
-we should use the Read impl of slice
 
 the benefit of getting a reference to the key or value bytes directly
 in the page will be diminished when the bytes are compressed or encrypted.
