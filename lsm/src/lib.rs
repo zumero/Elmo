@@ -1,5 +1,5 @@
 ﻿/*
-    Copyright 2014-2015 Zumero, LLC
+    Copyright 2014-2016 Zumero, LLC
 
     Licensed under the Apache License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License.
@@ -255,18 +255,6 @@ impl BlockList {
         self.blocks.iter().map(|pb| pb.count_pages()).sum()
     }
 
-    fn page_after(&self, cur: PageNum) -> PageNum {
-        for i in 0 .. self.blocks.len() {
-            let blk = &self.blocks[i];
-            if blk.lastPage == cur {
-                return self.blocks[i + 1].firstPage;
-            } else if cur >= blk.firstPage && cur < blk.lastPage {
-                return cur + 1;
-            }
-        }
-        unreachable!();
-    }
-
     fn last_page(&self) -> PageNum {
         // TODO assume it is sorted
         // TODO assuming self.blocks is not empty
@@ -474,7 +462,7 @@ impl BlockList {
                 );
     }
 
-    fn encode_base(&self, a: &mut Vec<u64>) {
+    fn encode_as_u64_list(&self, a: &mut Vec<u64>) {
         // we store each PageBlock as first/offset instead of first/last, since the
         // offset will always compress better as a varint.
         
@@ -498,30 +486,12 @@ impl BlockList {
         }
     }
 
-    fn encode(&self, pb: &mut PageBuilder) {
-        let mut a = Vec::with_capacity(1 + self.blocks.len() * 2);
-        self.encode_base(&mut a);
-        for n in a {
-            pb.put_varint(n);
-        }
-    }
-
     fn encode_into_vec(&self, v: &mut Vec<u8>) {
         let mut a = Vec::with_capacity(1 + self.blocks.len() * 2);
-        self.encode_base(&mut a);
+        self.encode_as_u64_list(&mut a);
         for n in a {
             misc::push_varint(v, n);
         }
-    }
-
-    fn encoded_len(&self) -> usize {
-        let mut len = 0;
-        let mut a = Vec::with_capacity(1 + self.blocks.len() * 2);
-        self.encode_base(&mut a);
-        for v in a {
-            len += varint::space_needed_for(v);
-        }
-        len
     }
 
     fn read(pr: &[u8], cur: &mut usize) -> Self {
@@ -1339,10 +1309,10 @@ impl SegmentHeaderInfo {
     fn count_leaves_for_list_segments(&self) -> Result<PageCount> {
         let pt = try!(PageType::from_u8(self.buf[0]));
         match pt {
-            PageType::LEAF_NODE => {
+            PageType::Leaf => {
                 Ok(1)
             },
-            PageType::PARENT_NODE => {
+            PageType::Parent => {
                 let (count_leaves, count_tombstones) = try!(ParentPage::count_stuff_for_needs_merge(self.root_page, &self.buf));
                 Ok(count_leaves)
             },
@@ -1356,41 +1326,16 @@ impl SegmentHeaderInfo {
         let pt = try!(PageType::from_u8(self.buf[0]));
         let blocks =
             match pt {
-                PageType::LEAF_NODE => {
+                PageType::Leaf => {
                     let page = try!(LeafPage::new(f.clone(), self.root_page));
                     try!(page.blocklist_unsorted())
                 },
-                PageType::PARENT_NODE => {
+                PageType::Parent => {
                     let parent = try!(ParentPage::new(f.clone(), self.root_page));
                     try!(parent.blocklist_unsorted())
                 },
             };
         Ok(blocks)
-    }
-
-    fn iter_nodes(&self, 
-                          f: &std::sync::Arc<PageCache>,
-                          ) -> Result<Box<Iterator<Item=Result<Node>>>> {
-        let pt = try!(PageType::from_u8(self.buf[0]));
-        let it: Box<Iterator<Item=Result<Node>>> =
-            match pt {
-                PageType::LEAF_NODE => {
-                    let page = try!(LeafPage::new(f.clone(), self.root_page));
-                    let node = Node {
-                        depth: 0,
-                        page: self.root_page,
-                        parent: None,
-                    };
-                    let it = std::iter::once(Ok(node));
-                    box it
-                },
-                PageType::PARENT_NODE => {
-                    let parent = try!(ParentPage::new(f.clone(), self.root_page));
-                    let it = parent.into_node_iter(0);
-                    box it
-                },
-            };
-        Ok(it)
     }
 
     // TODO this is only used for diag purposes
@@ -1401,11 +1346,11 @@ impl SegmentHeaderInfo {
         let pt = try!(PageType::from_u8(self.buf[0]));
         let count =
             match pt {
-                PageType::LEAF_NODE => {
+                PageType::Leaf => {
                     let page = try!(LeafPage::new(f.clone(), self.root_page));
                     page.count_keys()
                 },
-                PageType::PARENT_NODE => {
+                PageType::Parent => {
                     let parent = try!(ParentPage::new(f.clone(), self.root_page));
                     let mut cursor = try!(ParentCursor::new(parent));
                     let mut count = 0;
@@ -1448,17 +1393,17 @@ pub mod utils {
     use super::Error;
     use super::Result;
 
-    pub fn page_offset(pgsz: usize, pageNumber: PageNum) -> Result<u64> {
-        if 0 == pageNumber { 
+    pub fn page_offset(pgsz: usize, pgnum: PageNum) -> Result<u64> {
+        if 0 == pgnum { 
             // TODO should this panic?
             return Err(Error::InvalidPageNumber);
         }
-        let pos = ((pageNumber as u64) - 1) * (pgsz as u64);
+        let pos = ((pgnum as u64) - 1) * (pgsz as u64);
         Ok(pos)
     }
 
-    pub fn seek_page<S: Seek>(strm: &mut S, pgsz: usize, pageNumber: PageNum) -> Result<u64> {
-        let pos = try!(page_offset(pgsz, pageNumber));
+    pub fn seek_page<S: Seek>(strm: &mut S, pgsz: usize, pgnum: PageNum) -> Result<u64> {
+        let pos = try!(page_offset(pgsz, pgnum));
         let v = try!(strm.seek(SeekFrom::Start(pos)));
         Ok(v)
     }
@@ -1479,7 +1424,7 @@ mod bcmp {
         x.cmp(y)
     }
 
-    pub fn PrefixMatch(x: &[u8], y: &[u8], max: usize) -> usize {
+    pub fn prefix_match(x: &[u8], y: &[u8], max: usize) -> usize {
         let len = min(x.len(), y.len());
         let lim = min(len, max);
         let mut i = 0;
@@ -2724,8 +2669,8 @@ impl<'c> ILiveValue for PrefixCursor<'c> {
 #[derive(Hash,PartialEq,Eq,Copy,Clone,Debug)]
 #[repr(u8)]
 pub enum PageType {
-    LEAF_NODE,
-    PARENT_NODE,
+    Leaf,
+    Parent,
 }
 
 impl PageType {
@@ -2733,16 +2678,16 @@ impl PageType {
     #[inline(always)]
     fn to_u8(self) -> u8 {
         match self {
-            PageType::LEAF_NODE => 1,
-            PageType::PARENT_NODE => 2,
+            PageType::Leaf => 1,
+            PageType::Parent => 2,
         }
     }
 
     #[inline(always)]
     fn from_u8(v: u8) -> Result<PageType> {
         match v {
-            1 => Ok(PageType::LEAF_NODE),
-            2 => Ok(PageType::PARENT_NODE),
+            1 => Ok(PageType::Leaf),
+            2 => Ok(PageType::Parent),
             _ => panic!("invalid page type"), // TODO Err(Error::InvalidPageType(v)),
         }
     }
@@ -3236,7 +3181,7 @@ struct BuildLeafReturnValue {
 
 fn build_leaf(st: &mut LeafUnderConstruction, pb: &mut PageBuilder) -> BuildLeafReturnValue {
     pb.reset();
-    pb.put_u8(PageType::LEAF_NODE.to_u8());
+    pb.put_u8(PageType::Leaf.to_u8());
     pb.put_u8(0u8); // flags
     pb.put_varint(st.prefix_len as u64);
     if st.prefix_len > 0 {
@@ -3390,7 +3335,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                     * 8 // crazy case
                     ;
 
-                let maxKeyInline = 
+                let max_key_inline = 
                     pgsz 
                     - 2 // page type and flags
                     - 2 // count keys
@@ -3400,7 +3345,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                     - 9 // worst case varint value len
                     - PESSIMISTIC_OVERFLOW_INFO_SIZE; // overflowed value page
 
-                if k.len() <= maxKeyInline {
+                if k.len() <= max_key_inline {
                     (k, KeyLocationForLeaf::Inline)
                 } else {
                     let (len, blocks) = {
@@ -3421,7 +3366,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
     // current page or does it have to bump to the next one?  we don't know yet.
 
     let vloc = {
-        let maxValueInline = {
+        let max_value_inline = {
             let fixed_costs_on_new_page = calc_leaf_page_len(0, 0, 1)
                 + kloc.need(&k, 0)
                 + varint::space_needed_for(ValueLocation::val_with_flag_for_len_inline(pgsz)) 
@@ -3448,7 +3393,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                     // known len
                     let vbuf = &vbuf[0 .. vread];
                     // TODO should be <= ?
-                    if vread < maxValueInline {
+                    if vread < max_value_inline {
                         // TODO this alloc+copy is unfortunate
                         let mut va = Vec::with_capacity(vbuf.len());
                         for i in 0 .. vbuf.len() {
@@ -3466,7 +3411,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
             },
             ValueForStorage::Read(ref mut strm, len) => {
                 // TODO should be <= ?
-                if (len as usize) < maxValueInline {
+                if (len as usize) < max_value_inline {
                     let mut va = Vec::with_capacity(len as usize);
                     let vread = try!(misc::io::read_fully(&mut *strm, &mut va));
                     assert!(len as usize == vread);
@@ -3481,7 +3426,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
             },
             ValueForStorage::Boxed(a) => {
                 // TODO should be <= ?
-                if a.len() < maxValueInline {
+                if a.len() < max_value_inline {
                     ValueLocation::Buffer(a)
                 } else {
                     let mut r = misc::ByteSliceRead::new(&a);
@@ -3519,7 +3464,7 @@ fn process_pair_into_leaf(st: &mut LeafUnderConstruction,
                     }
                     match other {
                         Some(i) => {
-                            bcmp::PrefixMatch(&*st.items[i].key.key, &k, max_prefix)
+                            bcmp::prefix_match(&*st.items[i].key.key, &k, max_prefix)
                         },
                         None => {
                             // in a leaf, with only one inline item, the prefix_len is 0
@@ -4433,7 +4378,7 @@ impl ParentNodeWriter {
         //println!("build_parent_page, prefix_len: {:?}", st.prefix_len);
         //println!("build_parent_page, items: {:?}", st.items);
         self.pb.reset();
-        self.pb.put_u8(PageType::PARENT_NODE.to_u8());
+        self.pb.put_u8(PageType::Parent.to_u8());
         self.pb.put_u8(0u8);
         self.pb.put_u8(self.my_depth);
         self.pb.put_varint(self.st.prefix_len as u64);
@@ -4523,7 +4468,7 @@ impl ParentNodeWriter {
                 }
                 match other {
                     Some(i) => {
-                        bcmp::PrefixMatch(&*self.st.items[i].last_key.key, &item.last_key.key, self.st.prefix_len)
+                        bcmp::prefix_match(&*self.st.items[i].last_key.key, &item.last_key.key, self.st.prefix_len)
                     },
                     None => {
                         item.last_key.key.len()
@@ -4907,7 +4852,7 @@ impl OverflowReader {
         Ok(())
     }
 
-    fn Read(&mut self, ba: &mut [u8], offset: usize, wanted: usize) -> Result<usize> {
+    fn read_some(&mut self, ba: &mut [u8], offset: usize, wanted: usize) -> Result<usize> {
         if self.sofar_overall >= self.len {
             Ok(0)
         } else {
@@ -4937,7 +4882,7 @@ impl OverflowReader {
 impl Read for OverflowReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let len = buf.len();
-        match self.Read(buf, 0, len) {
+        match self.read_some(buf, 0, len) {
             Ok(v) => Ok(v),
             Err(e) => {
                 // this interface requires io::Result, so we shoehorn the others into it
@@ -5047,7 +4992,7 @@ impl LeafPage {
 
         let mut cur = 0;
         let pt = try!(PageType::from_u8(misc::buf_advance::get_byte(pr, &mut cur)));
-        if pt != PageType::LEAF_NODE {
+        if pt != PageType::Leaf {
             panic!(format!("bad leaf page num: {}", pgnum));
             return Err(Error::CorruptFile("leaf has invalid page type"));
         }
@@ -5223,9 +5168,9 @@ impl LeafCursor {
 
     fn seek(&mut self, k: &KeyRef, sop: SeekOp) -> Result<SeekResult> {
         //println!("leaf cursor page: {}  search: kq = {:?},  sop = {:?}", self.page.pagenum, k, sop);
-        let tmp_countLeafKeys = self.page.count_keys();
-        let (newCur, equal) = try!(self.page.search(k, 0, (tmp_countLeafKeys - 1), sop, None, None));
-        self.cur = newCur;
+        let tmp_count_leaf_keys = self.page.count_keys();
+        let (new_cur, equal) = try!(self.page.search(k, 0, (tmp_count_leaf_keys - 1), sop, None, None));
+        self.cur = new_cur;
         if self.cur.is_none() {
             //println!("    Invalid");
             Ok(SeekResult::Invalid)
@@ -5360,12 +5305,12 @@ impl PageCursor {
         let pt = try!(PageType::from_u8(buf[0]));
         let sub = 
             match pt {
-                PageType::LEAF_NODE => {
+                PageType::Leaf => {
                     let page = try!(LeafPage::new(f, pagenum));
                     let sub = LeafCursor::new(page);
                     PageCursor::Leaf(sub)
                 },
-                PageType::PARENT_NODE => {
+                PageType::Parent => {
                     let page = try!(ParentPage::new(f, pagenum));
                     let sub = try!(ParentCursor::new(page));
                     PageCursor::Parent(sub)
@@ -5389,10 +5334,10 @@ impl PageCursor {
     pub fn page_type(&self) -> PageType {
         match self {
             &PageCursor::Leaf(_) => {
-                PageType::LEAF_NODE
+                PageType::Leaf
             },
             &PageCursor::Parent(_) => {
-                PageType::PARENT_NODE
+                PageType::Parent
             },
         }
     }
@@ -5656,7 +5601,7 @@ impl KeyInParentPage {
     fn key_with_location_for_parent(&self, pr: &[u8], prefix: Option<&[u8]>, f: &std::sync::Arc<PageCache>) -> Result<KeyWithLocationForParent> { 
         let k = try!(self.to_boxed_slice(pr, prefix, f));
         match self {
-            &KeyInParentPage::Inline{len: klen, offset} => {
+            &KeyInParentPage::Inline{..} => {
                 let kw = KeyWithLocationForParent {
                     key: k,
                     location: KeyLocationForParent::Inline,
@@ -5670,7 +5615,7 @@ impl KeyInParentPage {
                 };
                 Ok(kw)
             },
-            &KeyInParentPage::OwnedOverflow{page} => {
+            &KeyInParentPage::OwnedOverflow{..} => {
                 let kw = KeyWithLocationForParent {
                     key: k,
                     location: KeyLocationForParent::Inline,
@@ -6026,7 +5971,7 @@ impl ParentPage {
         // it, like the leaf version does.
         let mut cur = 0;
         let pt = try!(PageType::from_u8(misc::buf_advance::get_byte(pr, &mut cur)));
-        if  pt != PageType::PARENT_NODE {
+        if  pt != PageType::Parent {
             panic!(format!("bad parent pagenum is {}", pgnum));
             return Err(Error::CorruptFile("parent page has invalid page type"));
         }
@@ -6720,8 +6665,8 @@ fn list_all_blocks(
     ) -> Result<BlockList> {
     let mut blocks = BlockList::new();
 
-    let headerBlock = PageBlock::new(1, (HEADER_SIZE_IN_BYTES / f.page_size()) as PageNum);
-    blocks.add_block_no_reorder(headerBlock);
+    let header_block = PageBlock::new(1, (HEADER_SIZE_IN_BYTES / f.page_size()) as PageNum);
+    blocks.add_block_no_reorder(header_block);
 
     fn do_seglist<'a, I: Iterator<Item=&'a SegmentHeaderInfo>>(f: &std::sync::Arc<PageCache>, segments: I, blocks: &mut BlockList) -> Result<()> {
         for seg in segments {
@@ -7217,13 +7162,6 @@ impl PageCache {
         Ok(())
     }
 
-    fn read_page(&self, page: PageNum, buf: &mut [u8]) -> Result<()> {
-        let mut stuff = try!(self.stuff.lock());
-        // TODO assert pgsz?
-        try!(Self::inner_read(&mut stuff, page, buf));
-        Ok(())
-    }
-
     fn inner_put(stuff: &mut InnerPageCache, pgnum: PageNum, strong: &std::sync::Arc<Box<[u8]>>) {
         let weak = std::sync::Arc::downgrade(strong);
         match stuff.pages.entry(pgnum) {
@@ -7569,7 +7507,7 @@ impl DatabaseFile {
         for i in 0 .. NUM_REGULAR_LEVELS {
             println!("---------------- Stopping regular {}", i);
             {
-                let mut senders = try!(self.inner.senders.lock());
+                let senders = try!(self.inner.senders.lock());
                 let tx = &senders.notify_regular[i];
                 try!(tx.send(MergeMessage::Terminate).map_err(wrap_err));
             }
@@ -8137,11 +8075,11 @@ impl InnerPart {
                 let i = header.incoming.len() - 1;
                 let pt = try!(PageType::from_u8(header.incoming[i].buf[0]));
                 match pt {
-                    PageType::PARENT_NODE => {
+                    PageType::Parent => {
                         // a parent node is promoted from Incoming without a rewrite
                         return Ok(NeedsMerge::Yes);
                     },
-                    PageType::LEAF_NODE => {
+                    PageType::Leaf => {
                         if header.incoming.len() > 1 {
                             return Ok(NeedsMerge::Yes);
                         } else {
@@ -8171,7 +8109,7 @@ impl InnerPart {
                 match &header.regular[i] {
                     &Some(ref seg) => {
                         match try!(PageType::from_u8(seg.buf[0])) {
-                            PageType::LEAF_NODE => {
+                            PageType::Leaf => {
                                 // TODO this is a fairly expensive way to count the stuff.
                                 // it parses the page out of the buffer.
                                 let count_tombstones = try!(LeafPage::count_tombstones(seg.root_page, &seg.buf));
@@ -8186,7 +8124,7 @@ impl InnerPart {
                                 */
                                 return Ok(NeedsMerge::No);
                             },
-                            PageType::PARENT_NODE => {
+                            PageType::Parent => {
                                 // TODO this is a fairly expensive way to count the stuff.
                                 // it parses the page out of the buffer.
                                 // store the count in SegmentHeaderInfo ?
@@ -8295,7 +8233,7 @@ impl InnerPart {
                     FromLevel::Incoming => {
                         let i = header.incoming.len() - 1;
                         match try!(PageType::from_u8(header.incoming[i].buf[0])) {
-                            PageType::LEAF_NODE => {
+                            PageType::Leaf => {
                                 let mut i = i;
                                 // TODO should there be a limit to how many leaves we will take at one time?
 
@@ -8303,7 +8241,7 @@ impl InnerPart {
                                 // otherwise, we could get stuck with the last segment being a leaf
                                 // and the second-to-last segment being a parent.
                                 while i > 0 {
-                                    if PageType::LEAF_NODE == try!(PageType::from_u8(header.incoming[i - 1].buf[0])) {
+                                    if PageType::Leaf == try!(PageType::from_u8(header.incoming[i - 1].buf[0])) {
                                         i -= 1;
                                     } else {
                                         break;
@@ -8322,10 +8260,10 @@ impl InnerPart {
 
                                 (cursors, MergingFrom::IncomingLeaves{segments: merge_segments})
                             },
-                            PageType::PARENT_NODE => {
+                            PageType::Parent => {
                                 let mut i = i;
                                 while i > 0 {
-                                    if PageType::PARENT_NODE == try!(PageType::from_u8(header.incoming[i - 1].buf[0])) {
+                                    if PageType::Parent == try!(PageType::from_u8(header.incoming[i - 1].buf[0])) {
                                         i -= 1;
                                     } else {
                                         break;
@@ -8360,7 +8298,7 @@ impl InnerPart {
                         let i = header.waiting.len() - 1;
                         let segment = &header.waiting[i];
                         match try!(PageType::from_u8(header.waiting[i].buf[0])) {
-                            PageType::LEAF_NODE => {
+                            PageType::Leaf => {
                                 let count_tombstones = try!(LeafPage::count_tombstones(segment.root_page, &segment.buf));
 
                                 // TODO sad that this will re-read the leaf page
@@ -8373,7 +8311,7 @@ impl InnerPart {
 
                                 (vec![cursor], from)
                             },
-                            PageType::PARENT_NODE => {
+                            PageType::Parent => {
                                 let promote_depth = 0;
 
                                 let parent = try!(ParentPage::new(f.clone(), segment.root_page));
@@ -8402,7 +8340,7 @@ impl InnerPart {
                         // TODO unwrap here is ugly.  but needs_merge happpened first
                         let old_from_segment = header.regular[level].as_ref().unwrap();
                         match try!(PageType::from_u8(old_from_segment.buf[0])) {
-                            PageType::LEAF_NODE => {
+                            PageType::Leaf => {
                                 let count_tombstones = try!(LeafPage::count_tombstones(old_from_segment.root_page, &old_from_segment.buf));
 
                                 // TODO sad that this will re-read the leaf page
@@ -8416,7 +8354,7 @@ impl InnerPart {
 
                                 (vec![cursor], from)
                             },
-                            PageType::PARENT_NODE => {
+                            PageType::Parent => {
                                 let depth_root = old_from_segment.buf[2];
                                 //println!("old_from_segment: {}, depth: {}", old_from_segment.root_page, depth_root);
                                 assert!(depth_root >= 1);
@@ -8474,12 +8412,12 @@ impl InnerPart {
                                     let pt = try!(PageType::from_u8(dest_segment.buf[0]));
 
                                     match pt {
-                                        PageType::LEAF_NODE => {
+                                        PageType::Leaf => {
                                             //println!("root of the dest segment is a leaf");
                                             let leaf = try!(LeafPage::new(f.clone(), dest_segment.root_page));
                                             MergingInto::Leaf(leaf)
                                         },
-                                        PageType::PARENT_NODE => {
+                                        PageType::Parent => {
                                             let parent = try!(ParentPage::new(f.clone(), dest_segment.root_page));
                                             MergingInto::Parent(parent)
                                         },
@@ -8922,11 +8860,11 @@ impl InnerPart {
                 let pt = try!(PageType::from_u8(buf[0]));
                 let mut blocks =
                     match pt {
-                        PageType::LEAF_NODE => {
+                        PageType::Leaf => {
                             let page = try!(LeafPage::new(f.clone(), page));
                             try!(page.blocklist_unsorted())
                         },
-                        PageType::PARENT_NODE => {
+                        PageType::Parent => {
                             let parent = try!(ParentPage::new(f.clone(), page));
                             try!(parent.blocklist_unsorted())
                         },
