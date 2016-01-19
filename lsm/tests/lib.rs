@@ -1,7 +1,5 @@
 
 #![feature(box_syntax)]
-#![feature(collections)]
-#![feature(vec_push_all)]
 
 extern crate misc;
 extern crate lsm;
@@ -72,7 +70,7 @@ fn read_value(b: lsm::LiveValueRef) -> lsm::Result<Box<[u8]>> {
         },
         lsm::LiveValueRef::Slice(a) => {
             let mut k = Vec::with_capacity(a.len());
-            k.push_all(a);
+            k.extend_from_slice(a);
             Ok(k.into_boxed_slice())
         },
     }
@@ -145,19 +143,19 @@ fn seek() {
         // TODO constructing the utf8 byte array seems convoluted
 
         let k = into_utf8(format!("{:08}", 42));
-        try!(csr.seek(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_EQ));
+        try!(csr.seek(&lsm::KeyRef::Slice(&k), lsm::SeekOp::Equal));
         assert!(csr.is_valid());
 
         let k = into_utf8(format!("{:08}", 105));
-        try!(csr.seek(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_EQ));
+        try!(csr.seek(&lsm::KeyRef::Slice(&k), lsm::SeekOp::Equal));
         assert!(!csr.is_valid());
 
         let k = into_utf8(format!("{:08}", 105));
-        try!(csr.seek(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_GE));
+        try!(csr.seek(&lsm::KeyRef::Slice(&k), lsm::SeekOp::GreaterOrEqual));
         assert!(!csr.is_valid());
 
         let k = into_utf8(format!("{:08}", 105));
-        try!(csr.seek(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_LE));
+        try!(csr.seek(&lsm::KeyRef::Slice(&k), lsm::SeekOp::LessOrEqual));
         assert!(csr.is_valid());
         // TODO get the key
 
@@ -240,7 +238,7 @@ fn seek_cur() {
             try!(lck.commit_segment(g2.unwrap()));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("00001")), lsm::SeekOp::SEEK_EQ));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("00001")), lsm::SeekOp::Equal));
         assert!(csr.is_valid());
         Ok(())
     }
@@ -291,7 +289,7 @@ fn weird() {
         for _ in 0 .. 50 {
             let kboxed = key_as_boxed_slice(&csr);
             let k = lsm::KeyRef::Slice(&kboxed);
-            try!(csr.seek(&k, lsm::SeekOp::SEEK_EQ));
+            try!(csr.seek(&k, lsm::SeekOp::Equal));
             assert!(csr.is_valid());
             try!(csr.next());
             assert!(csr.is_valid());
@@ -299,7 +297,7 @@ fn weird() {
         for _ in 0 .. 50 {
             let kboxed = key_as_boxed_slice(&csr);
             let k = lsm::KeyRef::Slice(&kboxed);
-            try!(csr.seek(&k, lsm::SeekOp::SEEK_EQ));
+            try!(csr.seek(&k, lsm::SeekOp::Equal));
             assert!(csr.is_valid());
             try!(csr.prev());
             assert!(csr.is_valid());
@@ -307,7 +305,7 @@ fn weird() {
         for _ in 0 .. 50 {
             let kboxed = key_as_boxed_slice(&csr);
             let k = lsm::KeyRef::Slice(&kboxed);
-            try!(csr.seek(&k, lsm::SeekOp::SEEK_LE));
+            try!(csr.seek(&k, lsm::SeekOp::LessOrEqual));
             assert!(csr.is_valid());
             try!(csr.prev());
             assert!(csr.is_valid());
@@ -315,7 +313,7 @@ fn weird() {
         for _ in 0 .. 50 {
             let kboxed = key_as_boxed_slice(&csr);
             let k = lsm::KeyRef::Slice(&kboxed);
-            try!(csr.seek(&k, lsm::SeekOp::SEEK_GE));
+            try!(csr.seek(&k, lsm::SeekOp::GreaterOrEqual));
             assert!(csr.is_valid());
             try!(csr.next());
             assert!(csr.is_valid());
@@ -353,16 +351,16 @@ fn no_le_ge_multicursor() {
 
         let mut csr = try!(db.open_cursor());
 
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("a")), lsm::SeekOp::SEEK_LE));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("a")), lsm::SeekOp::LessOrEqual));
         assert!(!csr.is_valid());
 
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("d")), lsm::SeekOp::SEEK_LE));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("d")), lsm::SeekOp::LessOrEqual));
         assert!(csr.is_valid());
 
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("f")), lsm::SeekOp::SEEK_GE));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("f")), lsm::SeekOp::GreaterOrEqual));
         assert!(csr.is_valid());
 
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("h")), lsm::SeekOp::SEEK_GE));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("h")), lsm::SeekOp::GreaterOrEqual));
         assert!(!csr.is_valid());
 
         Ok(())
@@ -383,7 +381,7 @@ fn empty_val() {
             try!(lck.commit_segment(g));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("_")), lsm::SeekOp::SEEK_EQ));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("_")), lsm::SeekOp::Equal));
         assert!(csr.is_valid());
         let q = try!(csr.value());
         let (len, _) = try!(q.read());
@@ -598,16 +596,16 @@ fn no_le_ge() {
             try!(lck.commit_segment(g));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("a")), lsm::SeekOp::SEEK_LE));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("a")), lsm::SeekOp::LessOrEqual));
         assert!(!csr.is_valid());
 
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("d")), lsm::SeekOp::SEEK_LE));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("d")), lsm::SeekOp::LessOrEqual));
         assert!(csr.is_valid());
 
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("f")), lsm::SeekOp::SEEK_GE));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("f")), lsm::SeekOp::GreaterOrEqual));
         assert!(csr.is_valid());
 
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("h")), lsm::SeekOp::SEEK_GE));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("h")), lsm::SeekOp::GreaterOrEqual));
         assert!(!csr.is_valid());
 
         Ok(())
@@ -631,17 +629,17 @@ fn seek_ge_le_bigger() {
             try!(lck.commit_segment(g));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("8088")), lsm::SeekOp::SEEK_EQ));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("8088")), lsm::SeekOp::Equal));
         assert!(csr.is_valid());
 
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("8087")), lsm::SeekOp::SEEK_EQ));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("8087")), lsm::SeekOp::Equal));
         assert!(!csr.is_valid());
 
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("8087")), lsm::SeekOp::SEEK_LE));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("8087")), lsm::SeekOp::LessOrEqual));
         assert!(csr.is_valid());
         assert_eq!("8086", key_as_string(&csr));
 
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("8087")), lsm::SeekOp::SEEK_GE));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("8087")), lsm::SeekOp::GreaterOrEqual));
         assert!(csr.is_valid());
         assert_eq!("8088", key_as_string(&csr));
 
@@ -677,14 +675,14 @@ fn seek_ge_le() {
         assert_eq!(13, try!(count_keys_forward(&mut csr)));
         assert_eq!(13, try!(count_keys_backward(&mut csr)));
 
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("n")), lsm::SeekOp::SEEK_EQ));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("n")), lsm::SeekOp::Equal));
         assert!(!csr.is_valid());
 
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("n")), lsm::SeekOp::SEEK_LE));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("n")), lsm::SeekOp::LessOrEqual));
         assert!(csr.is_valid());
         assert_eq!("m", key_as_string(&csr));
 
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("n")), lsm::SeekOp::SEEK_GE));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("n")), lsm::SeekOp::GreaterOrEqual));
         assert!(csr.is_valid());
         assert_eq!("o", key_as_string(&csr));
 
@@ -737,17 +735,17 @@ fn tombstone() {
         assert_eq!(3, try!(count_keys_forward(&mut csr)));
         assert_eq!(3, try!(count_keys_backward(&mut csr)));
 
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::SEEK_EQ));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::Equal));
         assert!(!csr.is_valid());
 
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::SEEK_LE));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::LessOrEqual));
         assert!(csr.is_valid());
         assert_eq!("a", key_as_string(&csr));
         try!(csr.next());
         assert!(csr.is_valid());
         assert_eq!("c", key_as_string(&csr));
 
-        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::SEEK_GE));
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::GreaterOrEqual));
         assert!(csr.is_valid());
         assert_eq!("c", key_as_string(&csr));
         try!(csr.prev());
@@ -774,7 +772,7 @@ fn overwrite() {
         }
         fn getb(db: &lsm::DatabaseFile) -> lsm::Result<String> {
             let mut csr = try!(db.open_cursor());
-            try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::SEEK_EQ));
+            try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::Equal));
             Ok(from_utf8(read_value(csr.value().unwrap()).unwrap()))
         }
         assert_eq!("2", getb(&db).unwrap());
@@ -832,7 +830,7 @@ fn blobs_of_many_sizes() {
         for (k, v) in t1 {
             if let lsm::ValueForStorage::Boxed(v) = v {
                 println!("k: {:?}", k);
-                try!(csr.seek(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_EQ));
+                try!(csr.seek(&lsm::KeyRef::Slice(&k), lsm::SeekOp::Equal));
                 assert!(csr.is_valid());
                 println!("    valid");
                 let q = try!(csr.value());
@@ -879,13 +877,13 @@ fn write_then_read() {
         fn read(name: &str) -> lsm::Result<()> {
             let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
             let mut csr = try!(db.open_cursor());
-            try!(csr.seek(&lsm::KeyRef::Slice(&into_utf8(format!("{}", 42))), lsm::SeekOp::SEEK_EQ));
+            try!(csr.seek(&lsm::KeyRef::Slice(&into_utf8(format!("{}", 42))), lsm::SeekOp::Equal));
             assert!(csr.is_valid());
             try!(csr.next());
             assert_eq!("43", key_as_string(&csr));
-            try!(csr.seek(&lsm::KeyRef::Slice(&into_utf8(format!("{}", 73))), lsm::SeekOp::SEEK_EQ));
+            try!(csr.seek(&lsm::KeyRef::Slice(&into_utf8(format!("{}", 73))), lsm::SeekOp::Equal));
             assert!(!csr.is_valid());
-            try!(csr.seek(&lsm::KeyRef::Slice(&into_utf8(format!("{}", 73))), lsm::SeekOp::SEEK_LE));
+            try!(csr.seek(&lsm::KeyRef::Slice(&into_utf8(format!("{}", 73))), lsm::SeekOp::LessOrEqual));
             assert!(csr.is_valid());
             assert_eq!("72", key_as_string(&csr));
             try!(csr.next());

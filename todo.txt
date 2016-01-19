@@ -24,6 +24,10 @@ change to Rust naming convention
 
 eliminate warnings
 
+should the level multiplier be stored in the file header?
+
+grow number of levels as needed
+
 --
 
 the blocklist in the format 2 overflow should have
@@ -241,8 +245,6 @@ can varint::read be made faster using transmute for
 some of the cases?
 
 too many open/close of the file for PageWriter as well.
-
-should the level multiplier be stored in the file header?
 
 need to make merges more parallelizable.  two merges in
 the same level but different key range.

@@ -261,9 +261,9 @@ fn list_keys_as_strings(name: &str) -> Result<(),lsm::Error> {
 fn seek_string(name: &str, key: String, sop: String) -> Result<(),lsm::Error> {
     let sop = 
         match sop.as_str() {
-            "eq" => lsm::SeekOp::SEEK_EQ,
-            "le" => lsm::SeekOp::SEEK_LE,
-            "ge" => lsm::SeekOp::SEEK_GE,
+            "eq" => lsm::SeekOp::Equal,
+            "le" => lsm::SeekOp::LessOrEqual,
+            "ge" => lsm::SeekOp::GreaterOrEqual,
             _ => return Err(lsm::Error::Misc(String::from("invalid sop"))),
         };
     let kboxed = key.into_bytes().into_boxed_slice();
@@ -286,9 +286,9 @@ fn seek_string(name: &str, key: String, sop: String) -> Result<(),lsm::Error> {
 fn seek_bytes(name: &str, k: Box<[u8]>, sop: String) -> Result<(),lsm::Error> {
     let sop = 
         match sop.as_str() {
-            "eq" => lsm::SeekOp::SEEK_EQ,
-            "le" => lsm::SeekOp::SEEK_LE,
-            "ge" => lsm::SeekOp::SEEK_GE,
+            "eq" => lsm::SeekOp::Equal,
+            "le" => lsm::SeekOp::LessOrEqual,
+            "ge" => lsm::SeekOp::GreaterOrEqual,
             _ => return Err(lsm::Error::Misc(String::from("invalid sop"))),
         };
     let k = lsm::KeyRef::Slice(&k);

@@ -16,7 +16,6 @@
 
 #![feature(box_syntax)]
 #![feature(associated_consts)]
-#![feature(vec_push_all)]
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -310,11 +309,11 @@ fn encode_key_name_to_collection_id(db: &str, coll: &str) -> Box<[u8]> {
 
     let b = db.as_bytes();
     k.push(b.len() as u8);
-    k.push_all(b);
+    k.extend_from_slice(b);
 
     let b = coll.as_bytes();
     k.push(b.len() as u8);
-    k.push_all(b);
+    k.extend_from_slice(b);
 
     k.into_boxed_slice()
 }
@@ -408,11 +407,11 @@ fn encode_key_name_to_index_id(collection_id: u64, name: &str) -> Vec<u8> {
     // (.) separator, and the collection name (i.e. <database>.<collection>), is 120 bytes.
 
     let ba = u64_to_boxed_varint(collection_id);
-    k.push_all(&ba);
+    k.extend_from_slice(&ba);
 
     let b = name.as_bytes();
     k.push(b.len() as u8);
-    k.push_all(b);
+    k.extend_from_slice(b);
 
     k
 }
@@ -432,7 +431,7 @@ fn lsm_map_to_varint(ba: &[u8]) -> lsm::Result<u64> {
 fn lsm_map_to_box(ba: &[u8]) -> lsm::Result<Box<[u8]>> {
     // TODO capacity
     let mut k = vec![];
-    k.push_all(ba);
+    k.extend_from_slice(ba);
     let k = k.into_boxed_slice();
     Ok(k)
 }
@@ -442,7 +441,7 @@ fn u64_to_boxed_varint(n: u64) -> Box<[u8]> {
     let mut cur = 0;
     misc::varint::write(&mut buf, &mut cur, n);
     let mut v = Vec::with_capacity(cur);
-    v.push_all(&buf[0 .. cur]);
+    v.extend_from_slice(&buf[0 .. cur]);
     let v = v.into_boxed_slice();
     v
 }
@@ -459,11 +458,11 @@ fn find_record(cursor: &mut lsm::LivingCursor, collection_id: u64, id: &bson::Va
     misc::push_varint(&mut k, collection_id);
     misc::push_varint(&mut k, PRIMARY_INDEX_ID);
     let ba = bson::Value::encode_one_for_index(id, false);
-    k.push_all(&ba);
+    k.extend_from_slice(&ba);
     get_value_for_key_as_varint(cursor, &k)
 }
 fn get_value_for_key_as_varint(cursor: &mut lsm::LivingCursor, k: &[u8]) -> Result<Option<u64>> {
-    try!(cursor.seek(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
+    try!(cursor.seek(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::Equal).map_err(elmo::wrap_err));
     if cursor.is_valid() {
         let v = try!(cursor.value().map_err(elmo::wrap_err));
         let id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
@@ -474,7 +473,7 @@ fn get_value_for_key_as_varint(cursor: &mut lsm::LivingCursor, k: &[u8]) -> Resu
 }
 
 fn get_value_for_key_as_bson(cursor: &mut lsm::LivingCursor, k: &[u8]) -> Result<Option<bson::Document>> {
-    try!(cursor.seek(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
+    try!(cursor.seek(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::Equal).map_err(elmo::wrap_err));
     if cursor.is_valid() {
         let v = try!(cursor.value().map_err(elmo::wrap_err));
         let id = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
@@ -638,7 +637,7 @@ impl MyConn {
                 elmo::QueryBounds::GTE_LTE(eqvals, minvals, maxvals) => f_two(has_recid, key_preface, cursor, eqvals, minvals, maxvals, lsm::OpGt::GTE, lsm::OpLt::LTE),
                 elmo::QueryBounds::EQ(vals) => {
                     // TODO if this is a unique index (which does not have the recid on the end of
-                    // the key), we should maybe do this seek as SEEK_EQ so the bloom filter
+                    // the key), we should maybe do this seek as Equal so the bloom filter
                     // can be used.
                     let mut kmin = key_preface.clone();
                     bson::Value::push_encode_multi_for_index(&mut kmin, &vals, None);
@@ -684,7 +683,7 @@ impl MyConn {
                         k.push(RECORD);
                         misc::push_varint(&mut k, collection_id);
                         misc::push_varint(&mut k, record_id);
-                        try!(cursor.seek(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
+                        try!(cursor.seek(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::Equal).map_err(elmo::wrap_err));
                         if cursor.is_valid() {
                             let v = try!(cursor.value().map_err(elmo::wrap_err));
                             let v = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
@@ -873,7 +872,7 @@ impl<'a> MyWriter<'a> {
                     let mut k = vec![];
                     k.push(INDEX_ID_TO_PROPERTIES);
                     misc::push_varint(&mut k, collection_id + 1);
-                    try!(self.cursor.seek(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
+                    try!(self.cursor.seek(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::LessOrEqual).map_err(elmo::wrap_err));
                     if self.cursor.is_valid() {
                         let k = try!(self.cursor.key().map_err(elmo::wrap_err));
                         if try!(k.u8_at(0).map_err(elmo::wrap_err)) == INDEX_ID_TO_PROPERTIES {
@@ -909,7 +908,7 @@ impl<'a> MyWriter<'a> {
                     let mut k = vec![];
                     k.push(RECORD);
                     misc::push_varint(&mut k, collection_id + 1);
-                    try!(self.cursor.seek(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
+                    try!(self.cursor.seek(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::LessOrEqual).map_err(elmo::wrap_err));
                     if self.cursor.is_valid() {
                         let k = try!(self.cursor.key().map_err(elmo::wrap_err));
                         if try!(k.u8_at(0).map_err(elmo::wrap_err)) == RECORD {
@@ -941,7 +940,7 @@ impl<'a> MyWriter<'a> {
             },
             None => {
                 let n = {
-                    try!(self.cursor.seek(&lsm::KeyRef::Slice(&[COLLECTION_ID_BOUNDARY]), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
+                    try!(self.cursor.seek(&lsm::KeyRef::Slice(&[COLLECTION_ID_BOUNDARY]), lsm::SeekOp::LessOrEqual).map_err(elmo::wrap_err));
                     if self.cursor.is_valid() {
                         let k = try!(self.cursor.key().map_err(elmo::wrap_err));
                         if try!(k.u8_at(0).map_err(elmo::wrap_err)) == COLLECTION_ID_TO_PROPERTIES {
@@ -1343,11 +1342,11 @@ impl<'a> MyWriter<'a> {
         // TODO capacity
         let mut index_entry = vec![];
         index_entry.push(INDEX_ENTRY);
-        index_entry.push_all(ba_collection_id);
-        index_entry.push_all(ba_index_id);
-        index_entry.push_all(&k);
+        index_entry.extend_from_slice(ba_collection_id);
+        index_entry.extend_from_slice(ba_index_id);
+        index_entry.extend_from_slice(&k);
         if !unique {
-            index_entry.push_all(&ba_record_id);
+            index_entry.extend_from_slice(&ba_record_id);
         }
 
         Ok(index_entry.into_boxed_slice())
@@ -1412,9 +1411,9 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
                         let mut k = vec![];
                         k.push(RECORD);
                         let ba_collection_id = u64_to_boxed_varint(cw.collection_id);
-                        k.push_all(&ba_collection_id);
+                        k.extend_from_slice(&ba_collection_id);
                         let ba_record_id = u64_to_boxed_varint(record_id);
-                        k.push_all(&ba_record_id);
+                        k.extend_from_slice(&ba_record_id);
 
                         let old = try!(get_value_for_key_as_bson(&mut self.cursor, &k)).unwrap();
                         self.pending.insert(k.into_boxed_slice(), lsm::ValueForStorage::Boxed(v.to_bson_array().into_boxed_slice()));
@@ -1437,9 +1436,9 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
                 let mut k = vec![];
                 k.push(RECORD);
                 let ba_collection_id = u64_to_boxed_varint(cw.collection_id);
-                k.push_all(&ba_collection_id);
+                k.extend_from_slice(&ba_collection_id);
                 let ba_record_id = u64_to_boxed_varint(record_id);
-                k.push_all(&ba_record_id);
+                k.extend_from_slice(&ba_record_id);
 
                 // TODO if there are no secondary indexes, we should be able to avoid
                 // lookup of the old record.
@@ -1462,10 +1461,10 @@ impl<'a> elmo::StorageWriter for MyWriter<'a> {
         let mut k = vec![];
         k.push(RECORD);
         let ba_collection_id = u64_to_boxed_varint(cw.collection_id);
-        k.push_all(&ba_collection_id);
+        k.extend_from_slice(&ba_collection_id);
         let record_id = try!(self.use_next_record_id(cw.collection_id));
         let ba_record_id = u64_to_boxed_varint(record_id);
-        k.push_all(&ba_record_id);
+        k.extend_from_slice(&ba_record_id);
         self.pending.insert(k.into_boxed_slice(), lsm::ValueForStorage::Boxed(v.to_bson_array().into_boxed_slice()));
 
         try!(self.update_indexes_insert(&cw.indexes, &ba_collection_id, &ba_record_id, v));

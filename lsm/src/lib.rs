@@ -258,13 +258,13 @@ impl BlockList {
     fn last_page(&self) -> PageNum {
         // TODO assume it is sorted
         // TODO assuming self.blocks is not empty
-        self.blocks[self.blocks.len() - 1].lastPage
+        self.blocks[self.blocks.len() - 1].last_page
     }
 
     pub fn first_page(&self) -> PageNum {
         // TODO assume it is sorted
         // TODO assuming self.blocks is not empty
-        self.blocks[0].firstPage
+        self.blocks[0].first_page
     }
 
     fn remove_block(&mut self, i: usize) -> PageBlock {
@@ -283,7 +283,7 @@ impl BlockList {
 
     fn would_extend_an_existing_block(&self, pg: PageNum) -> bool {
         for i in 0 .. self.blocks.len() {
-            if self.blocks[i].lastPage + 1 == pg {
+            if self.blocks[i].last_page + 1 == pg {
                 return true;
             }
         }
@@ -292,8 +292,8 @@ impl BlockList {
 
     fn add_page_no_reorder(&mut self, pg: PageNum) -> bool {
         for i in 0 .. self.blocks.len() {
-            if self.blocks[i].lastPage + 1 == pg {
-                self.blocks[i].lastPage = pg;
+            if self.blocks[i].last_page + 1 == pg {
+                self.blocks[i].last_page = pg;
                 return true;
             }
         }
@@ -305,8 +305,8 @@ impl BlockList {
 
     fn add_block_no_reorder(&mut self, blk: PageBlock) -> bool {
         for i in 0 .. self.blocks.len() {
-            if self.blocks[i].lastPage + 1 == blk.firstPage {
-                self.blocks[i].lastPage = blk.lastPage;
+            if self.blocks[i].last_page + 1 == blk.first_page {
+                self.blocks[i].last_page = blk.last_page;
                 return true;
             }
         }
@@ -387,7 +387,7 @@ impl BlockList {
         {
             assert!(self.count_pages() == new_self.count_pages() + removed.count_pages());
             for i in 0 .. self.blocks.len() {
-                for pg in self.blocks[i].firstPage .. self.blocks[i].lastPage + 1 {
+                for pg in self.blocks[i].first_page .. self.blocks[i].last_page + 1 {
                     if new_self.contains_page(pg) {
                         assert!(!removed.contains_page(pg));
                         assert!(!other.contains_page(pg));
@@ -405,11 +405,11 @@ impl BlockList {
 
     fn invert(&mut self) {
         let len = self.blocks.len();
-        self.blocks.sort_by(|a,b| a.firstPage.cmp(&b.firstPage));
+        self.blocks.sort_by(|a,b| a.first_page.cmp(&b.first_page));
         for i in 0 .. len - 1 {
-            self.blocks[i].firstPage = self.blocks[i].lastPage + 1;
-            self.blocks[i].lastPage = self.blocks[i + 1].firstPage - 1;
-            assert!(self.blocks[i].firstPage <= self.blocks[i].lastPage);
+            self.blocks[i].first_page = self.blocks[i].last_page + 1;
+            self.blocks[i].last_page = self.blocks[i + 1].first_page - 1;
+            assert!(self.blocks[i].first_page <= self.blocks[i].last_page);
         }
         // this function finds the space between the blocks.
         // the last block didn't get touched, and is still a block in use.
@@ -429,11 +429,11 @@ impl BlockList {
             return;
         }
 
-        self.blocks.sort_by(|a,b| a.firstPage.cmp(&b.firstPage));
+        self.blocks.sort_by(|a,b| a.first_page.cmp(&b.first_page));
         if cfg!(expensive_check) 
         {
             for i in 1 .. self.blocks.len() {
-                assert!(self.blocks[i].firstPage > self.blocks[i - 1].lastPage);
+                assert!(self.blocks[i].first_page > self.blocks[i - 1].last_page);
             }
         }
         let mut i = 0;
@@ -441,8 +441,8 @@ impl BlockList {
             if i + 1 == self.blocks.len() {
                 break;
             }
-            if self.blocks[i].lastPage + 1 == self.blocks[i + 1].firstPage {
-                self.blocks[i].lastPage = self.blocks[i + 1].lastPage;
+            if self.blocks[i].last_page + 1 == self.blocks[i + 1].first_page {
+                self.blocks[i].last_page = self.blocks[i + 1].last_page;
                 self.blocks.remove(i + 1);
                 // leave i here
             } else {
@@ -456,7 +456,7 @@ impl BlockList {
         self.blocks.sort_by(
             |a,b| 
                 match b.count_pages().cmp(&a.count_pages()) {
-                    Ordering::Equal => a.firstPage.cmp(&b.firstPage),
+                    Ordering::Equal => a.first_page.cmp(&b.first_page),
                     c => c,
                 }
                 );
@@ -473,14 +473,14 @@ impl BlockList {
 
         a.push( self.blocks.len() as u64);
         if self.blocks.len() > 0 {
-            let first_page = self.blocks[0].firstPage;
-            a.push( self.blocks[0].firstPage as u64);
-            a.push( (self.blocks[0].lastPage - self.blocks[0].firstPage) as u64);
+            let first_page = self.blocks[0].first_page;
+            a.push( self.blocks[0].first_page as u64);
+            a.push( (self.blocks[0].last_page - self.blocks[0].first_page) as u64);
             if self.blocks.len() > 1 {
                 for i in 1 .. self.blocks.len() {
-                    assert!(self.blocks[i].firstPage > first_page);
-                    a.push( (self.blocks[i].firstPage - first_page) as u64);
-                    a.push( (self.blocks[i].lastPage - self.blocks[i].firstPage) as u64);
+                    assert!(self.blocks[i].first_page > first_page);
+                    a.push( (self.blocks[i].first_page - first_page) as u64);
+                    a.push( (self.blocks[i].last_page - self.blocks[i].first_page) as u64);
                 }
             }
         }
@@ -503,7 +503,7 @@ impl BlockList {
             let first_page = varint::read(pr, cur) as PageNum
                 +
                 if i > 0 {
-                    list.blocks[0].firstPage
+                    list.blocks[0].first_page
                 } else {
                     0
                 };
@@ -529,12 +529,10 @@ impl std::ops::Index<usize> for BlockList {
     }
 }
 
-fn get_level_size(i: usize) -> u64 {
+fn get_level_size_in_bytes(i: usize, multiplier: u64) -> u64 {
     let mut n = 1;
     for _ in 0 .. i + 1 {
-        // TODO tune this factor.
-        // for leveldb, it is 10.
-        n *= 10;
+        n *= multiplier;
     }
     n * 1024 * 1024
 }
@@ -641,10 +639,10 @@ impl<'a> KeyRef<'a> {
     pub fn compare_with(&self, k: &[u8]) -> Ordering {
         match self {
             &KeyRef::Overflowed(ref a, _, _) => {
-                bcmp::Compare(&a, &k)
+                bcmp::compare(&a, &k)
             },
             &KeyRef::Slice(a) => {
-                bcmp::Compare(&a, &k)
+                bcmp::compare(&a, &k)
             },
             &KeyRef::Prefixed(front, back) => {
                 Self::compare_px_y(front, back, k)
@@ -828,19 +826,19 @@ impl<'a> KeyRef<'a> {
     pub fn cmp(x: &KeyRef, y: &KeyRef) -> Ordering {
         match (x,y) {
             (&KeyRef::Overflowed(ref x_k, _, _), &KeyRef::Overflowed(ref y_k, _, _)) => {
-                bcmp::Compare(&x_k, &y_k)
+                bcmp::compare(&x_k, &y_k)
             },
             (&KeyRef::Overflowed(ref x_k, _, _), &KeyRef::Prefixed(ref y_p, ref y_k)) => {
                 Self::compare_x_py(&x_k, y_p, y_k)
             },
             (&KeyRef::Overflowed(ref x_k, _, _), &KeyRef::Slice(ref y_k)) => {
-                bcmp::Compare(&x_k, &y_k)
+                bcmp::compare(&x_k, &y_k)
             },
             (&KeyRef::Prefixed(ref x_p, ref x_k), &KeyRef::Overflowed(ref y_k, _, _)) => {
                 Self::compare_px_y(x_p, x_k, &y_k)
             },
             (&KeyRef::Slice(ref x_k), &KeyRef::Overflowed(ref y_k, _, _)) => {
-                bcmp::Compare(&x_k, &y_k)
+                bcmp::compare(&x_k, &y_k)
             },
             (&KeyRef::Prefixed(ref x_p, ref x_k), &KeyRef::Prefixed(ref y_p, ref y_k)) => {
                 Self::compare_px_py(x_p, x_k, y_p, y_k)
@@ -852,7 +850,7 @@ impl<'a> KeyRef<'a> {
                 Self::compare_x_py(x_k, y_p, y_k)
             },
             (&KeyRef::Slice(ref x_k), &KeyRef::Slice(ref y_k)) => {
-                bcmp::Compare(&x_k, &y_k)
+                bcmp::compare(&x_k, &y_k)
             },
         }
     }
@@ -959,8 +957,8 @@ impl<'a> std::fmt::Debug for LiveValueRef<'a> {
 
 #[derive(Hash,PartialEq,Eq,Copy,Clone,Debug)]
 pub struct PageBlock {
-    pub firstPage: PageNum,
-    pub lastPage: PageNum,
+    pub first_page: PageNum,
+    pub last_page: PageNum,
 }
 
 #[derive(Debug)]
@@ -975,24 +973,24 @@ struct IntersectPageBlocks {
 impl PageBlock {
     pub fn new(first: PageNum, last: PageNum) -> PageBlock {
         assert!(first <= last);
-        PageBlock { firstPage: first, lastPage: last }
+        PageBlock { first_page: first, last_page: last }
     }
 
     pub fn count_pages(&self) -> PageNum {
-        self.lastPage - self.firstPage + 1
+        self.last_page - self.first_page + 1
     }
 
     fn contains_page(&self, pgnum: PageNum) -> bool {
-        (pgnum >= self.firstPage) && (pgnum <= self.lastPage)
+        (pgnum >= self.first_page) && (pgnum <= self.last_page)
     }
 
     fn intersect(a: PageBlock, b: PageBlock) -> IntersectPageBlocks {
         //println!("intersecting: {:?} with {:?}", a, b);
         let a_left = 
-            if a.firstPage < b.firstPage {
-                let last = std::cmp::min(a.lastPage, b.firstPage - 1);
-                if last >= a.firstPage {
-                    Some(PageBlock::new(a.firstPage, last))
+            if a.first_page < b.first_page {
+                let last = std::cmp::min(a.last_page, b.first_page - 1);
+                if last >= a.first_page {
+                    Some(PageBlock::new(a.first_page, last))
                 } else {
                     None
                 }
@@ -1000,10 +998,10 @@ impl PageBlock {
                 None
             };
         let b_left = 
-            if b.firstPage < a.firstPage {
-                let last = std::cmp::min(b.lastPage, a.firstPage - 1);
-                if last >= b.firstPage {
-                    Some(PageBlock::new(b.firstPage, last))
+            if b.first_page < a.first_page {
+                let last = std::cmp::min(b.last_page, a.first_page - 1);
+                if last >= b.first_page {
+                    Some(PageBlock::new(b.first_page, last))
                 } else {
                     None
                 }
@@ -1011,10 +1009,10 @@ impl PageBlock {
                 None
             };
         let a_right = 
-            if a.lastPage > b.lastPage {
-                let first = std::cmp::max(a.firstPage, b.lastPage + 1);
-                if first <= a.lastPage {
-                    Some(PageBlock::new(first, a.lastPage))
+            if a.last_page > b.last_page {
+                let first = std::cmp::max(a.first_page, b.last_page + 1);
+                if first <= a.last_page {
+                    Some(PageBlock::new(first, a.last_page))
                 } else {
                     None
                 }
@@ -1022,10 +1020,10 @@ impl PageBlock {
                 None
             };
         let b_right = 
-            if b.lastPage > a.lastPage {
-                let first = std::cmp::max(b.firstPage, a.lastPage + 1);
-                if first <= b.lastPage {
-                    Some(PageBlock::new(first, b.lastPage))
+            if b.last_page > a.last_page {
+                let first = std::cmp::max(b.first_page, a.last_page + 1);
+                if first <= b.last_page {
+                    Some(PageBlock::new(first, b.last_page))
                 } else {
                     None
                 }
@@ -1033,8 +1031,8 @@ impl PageBlock {
                 None
             };
         let overlap = {
-            let first = std::cmp::max(a.firstPage, b.firstPage);
-            let last = std::cmp::min(a.lastPage, b.lastPage);
+            let first = std::cmp::max(a.first_page, b.first_page);
+            let last = std::cmp::min(a.last_page, b.last_page);
             if last >= first {
                 Some(PageBlock::new(first, last))
             } else {
@@ -1053,18 +1051,18 @@ impl PageBlock {
                 assert!(a.count_pages() == left.count_pages());
             },
             (Some(left), Some(overlap), None) => {
-                assert!(left.lastPage < overlap.firstPage);
+                assert!(left.last_page < overlap.first_page);
             },
             (Some(left), Some(overlap), Some(right)) => {
                 assert!(a.count_pages() == left.count_pages() + overlap.count_pages() + right.count_pages());
-                assert!(left.lastPage < overlap.firstPage);
-                assert!(overlap.lastPage < right.firstPage);
+                assert!(left.last_page < overlap.first_page);
+                assert!(overlap.last_page < right.first_page);
             },
             (Some(left), None, Some(right)) => {
                 unreachable!();
             },
             (None, Some(overlap), Some(right)) => {
-                assert!(overlap.lastPage < right.firstPage);
+                assert!(overlap.last_page < right.first_page);
             },
             (None, Some(overlap), None) => {
             },
@@ -1088,9 +1086,9 @@ impl PageBlock {
 
 #[derive(PartialEq,Copy,Clone,Debug)]
 pub enum SeekOp {
-    SEEK_EQ = 0,
-    SEEK_LE = 1,
-    SEEK_GE = 2,
+    Equal = 0,
+    LessOrEqual = 1,
+    GreaterOrEqual = 2,
 }
 
 // TODO consider changing the name of this to make it clear that is only for merge,
@@ -1188,13 +1186,13 @@ impl SeekResult {
                 let q = try!(csr.key());
                 let cmp = KeyRef::cmp(&q, k);
                 match sop {
-                    SeekOp::SEEK_LE => {
+                    SeekOp::LessOrEqual => {
                         assert!(cmp == Ordering::Less || cmp == Ordering::Equal);
                     },
-                    SeekOp::SEEK_GE => {
+                    SeekOp::GreaterOrEqual => {
                         assert!(cmp == Ordering::Greater || cmp == Ordering::Equal);
                     },
-                    SeekOp::SEEK_EQ => {
+                    SeekOp::Equal => {
                         assert!(cmp == Ordering::Equal || cmp == Ordering::Equal);
                     },
                 }
@@ -1340,7 +1338,6 @@ impl SegmentHeaderInfo {
 
     // TODO this is only used for diag purposes
     fn count_keys(&self, 
-                          path: &str,
                           f: &std::sync::Arc<PageCache>,
                           ) -> Result<usize> {
         let pt = try!(PageType::from_u8(self.buf[0]));
@@ -1420,7 +1417,7 @@ mod bcmp {
     // type but which do not match &[u8].  this function makes the type
     // checking more explicit.
     #[inline(always)]
-    pub fn Compare(x: &[u8], y: &[u8]) -> Ordering {
+    pub fn compare(x: &[u8], y: &[u8]) -> Ordering {
         x.cmp(y)
     }
 
@@ -1496,10 +1493,6 @@ impl PageBuilder {
     fn write_page(&mut self, pw: &mut PageWriter) -> Result<()> {
         self.last_page_written = try!(pw.write_page(self.buf()));
         Ok(())
-    }
-
-    fn Write<W: Write>(&self, strm: &mut W) -> io::Result<()> {
-        strm.write_all(&*self.buf)
     }
 
     fn available(&self) -> usize {
@@ -1721,7 +1714,7 @@ impl MultiCursor {
             }
         }
         match sop {
-            SeekOp::SEEK_GE => {
+            SeekOp::GreaterOrEqual => {
                 self.cur = try!(self.find_min());
                 match self.cur {
                     Some(i) => {
@@ -1732,7 +1725,7 @@ impl MultiCursor {
                     },
                 }
             },
-            SeekOp::SEEK_LE => {
+            SeekOp::LessOrEqual => {
                 self.cur = try!(self.find_max());
                 match self.cur {
                     Some(i) => {
@@ -1743,7 +1736,7 @@ impl MultiCursor {
                     },
                 }
             },
-            SeekOp::SEEK_EQ => {
+            SeekOp::Equal => {
                 Ok(SeekResult::Invalid)
             },
         }
@@ -1920,7 +1913,7 @@ impl IForwardCursor for MultiCursor {
                                             },
                                         }
                                     } else {
-                                        let sr = try!(csr.seek(&ki, SeekOp::SEEK_GE));
+                                        let sr = try!(csr.seek(&ki, SeekOp::GreaterOrEqual));
                                         if sr.is_valid_and_equal() {
                                             try!(csr.next());
                                         }
@@ -1935,7 +1928,7 @@ impl IForwardCursor for MultiCursor {
 
                                 for j in 0 .. subs.len() {
                                     let csr = &mut subs[j];
-                                    let sr = try!(csr.seek(&ki, SeekOp::SEEK_GE));
+                                    let sr = try!(csr.seek(&ki, SeekOp::GreaterOrEqual));
                                     if sr.is_valid_and_equal() {
                                         try!(csr.next());
                                     }
@@ -1991,7 +1984,7 @@ impl ISeekableCursor for MultiCursor {
                 for j in 0 .. self.subcursors.len() {
                     let csr = &mut self.subcursors[j];
                     if (self.dir != Direction::Backward) && (icur != j) { 
-                        try!(csr.seek(&k, SeekOp::SEEK_LE));
+                        try!(csr.seek(&k, SeekOp::LessOrEqual));
                     }
                     if csr.is_valid() {
                         let eq = {
@@ -2441,7 +2434,7 @@ impl ISeekableCursor for LivingCursor {
             try!(sr.verify(k, sop, self));
         }
         match sop {
-            SeekOp::SEEK_GE => {
+            SeekOp::GreaterOrEqual => {
                 if sr.is_valid() && self.chain.value_is_tombstone().unwrap() {
                     try!(self.skip_tombstones_forward());
                     SeekResult::from_cursor(&*self.chain, k)
@@ -2449,7 +2442,7 @@ impl ISeekableCursor for LivingCursor {
                     Ok(sr)
                 }
             },
-            SeekOp::SEEK_LE => {
+            SeekOp::LessOrEqual => {
                 if sr.is_valid() && self.chain.value_is_tombstone().unwrap() {
                     try!(self.skip_tombstones_backward());
                     SeekResult::from_cursor(&*self.chain, k)
@@ -2457,7 +2450,7 @@ impl ISeekableCursor for LivingCursor {
                     Ok(sr)
                 }
             },
-            SeekOp::SEEK_EQ => Ok(sr),
+            SeekOp::Equal => Ok(sr),
         }
     }
 
@@ -2567,7 +2560,7 @@ impl IForwardCursor for RangeCursor {
     }
 
     fn first(&mut self) -> Result<()> {
-        let sr = try!(self.chain.seek(&KeyRef::for_slice(&self.min.k), SeekOp::SEEK_GE));
+        let sr = try!(self.chain.seek(&KeyRef::for_slice(&self.min.k), SeekOp::GreaterOrEqual));
         match (sr, self.min.cmp) {
             (SeekResult::Equal, OpGt::GT) => {
                 try!(self.chain.next());
@@ -2639,7 +2632,7 @@ impl<'c> IForwardCursor for PrefixCursor<'c> {
     }
 
     fn first(&mut self) -> Result<()> {
-        let sr = try!(self.chain.seek(&KeyRef::for_slice(&self.prefix), SeekOp::SEEK_GE));
+        let sr = try!(self.chain.seek(&KeyRef::for_slice(&self.prefix), SeekOp::GreaterOrEqual));
         Ok(())
     }
 
@@ -3106,7 +3099,7 @@ fn write_overflow_unknown_len<R: Read>(
     let mut group = try!(pw.begin_group(None));
 
     pb_first.reset();
-    let mut hdr = [0; MIN_OVERFLOW_HEADER_LEN];
+    let hdr = [0; MIN_OVERFLOW_HEADER_LEN];
     // the header will need to get filled in later
     pb_first.put_from_slice(&hdr);
     let put = try!(pb_first.put_from_stream(ba, pgsz - MIN_OVERFLOW_HEADER_LEN));
@@ -3658,7 +3651,7 @@ fn merge_process_pair(
         let k = KeyRef::Slice(k);
 
         for mut cursor in behind.iter_mut() {
-            if SeekResult::Equal == try!(cursor.seek(&k, SeekOp::SEEK_EQ)) {
+            if SeekResult::Equal == try!(cursor.seek(&k, SeekOp::Equal)) {
                 // TODO if the value was found but it is another tombstone...
                 return Ok(true);
             }
@@ -4864,7 +4857,7 @@ impl OverflowReader {
 
             let available = std::cmp::min(self.bytes_in_this_block - self.sofar_this_block, self.len - self.sofar_overall);
             let num = std::cmp::min(available, wanted as u64) as usize;
-            let first_page = self.blocks.blocks[self.current_block].firstPage;
+            let first_page = self.blocks.blocks[self.current_block].first_page;
             let offset_this_block = if self.current_block == 0 {
                 self.header_len as u64
             } else {
@@ -4990,8 +4983,8 @@ impl LeafPage {
     fn parse_page(pgnum: PageNum, pr: &[u8], pairs: &mut Vec<ItemInLeafPage>) -> Result<(Option<Box<[u8]>>, usize)> {
         let mut prefix = None;
 
-        let mut cur = 0;
-        let pt = try!(PageType::from_u8(misc::buf_advance::get_byte(pr, &mut cur)));
+        let pt = try!(PageType::from_u8(pr[0]));
+        let mut cur = 1;
         if pt != PageType::Leaf {
             panic!(format!("bad leaf page num: {}", pgnum));
             return Err(Error::CorruptFile("leaf has invalid page type"));
@@ -5121,9 +5114,9 @@ impl LeafPage {
     fn search(&self, k: &KeyRef, min: usize, max: usize, sop: SeekOp, le: Option<usize>, ge: Option<usize>) -> Result<(Option<usize>, bool)> {
         if max < min {
             match sop {
-                SeekOp::SEEK_EQ => Ok((None, false)),
-                SeekOp::SEEK_LE => Ok((le, false)),
-                SeekOp::SEEK_GE => Ok((ge, false)),
+                SeekOp::Equal => Ok((None, false)),
+                SeekOp::LessOrEqual => Ok((le, false)),
+                SeekOp::GreaterOrEqual => Ok((ge, false)),
             }
         } else {
             let mid = (max + min) / 2;
@@ -5140,9 +5133,9 @@ impl LeafPage {
                     // mod is 0, so we catch that case here.
                     if mid == 0 { 
                         match sop {
-                            SeekOp::SEEK_EQ => Ok((None, false)),
-                            SeekOp::SEEK_LE => Ok((le, false)),
-                            SeekOp::SEEK_GE => Ok((Some(mid), false)),
+                            SeekOp::Equal => Ok((None, false)),
+                            SeekOp::LessOrEqual => Ok((le, false)),
+                            SeekOp::GreaterOrEqual => Ok((Some(mid), false)),
                         }
                     } else { 
                         self.search(k, min, (mid-1), sop, le, Some(mid))
@@ -5969,15 +5962,15 @@ impl ParentPage {
     fn parse_page(pgnum: PageNum, pr: &[u8]) -> Result<(Option<Box<[u8]>>, Vec<ItemInParentPage>, usize)> {
         // TODO it would be nice if this could accept a vec and reuse
         // it, like the leaf version does.
-        let mut cur = 0;
-        let pt = try!(PageType::from_u8(misc::buf_advance::get_byte(pr, &mut cur)));
+        let pt = try!(PageType::from_u8(pr[0]));
         if  pt != PageType::Parent {
             panic!(format!("bad parent pagenum is {}", pgnum));
             return Err(Error::CorruptFile("parent page has invalid page type"));
         }
-        let flags = misc::buf_advance::get_byte(pr, &mut cur);
-        let depth = misc::buf_advance::get_byte(pr, &mut cur);
+        let flags = pr[1];
+        let depth = pr[2];
         assert!(depth > 0);
+        let mut cur = 3;
         let prefix_len = varint::read(pr, &mut cur) as usize;
         let prefix = {
             if prefix_len > 0 {
@@ -6256,7 +6249,7 @@ impl ParentCursor {
                 Ordering::Less | Ordering::Equal => {
                     try!(self.set_child(i));
                     let sr = try!(self.sub.seek(k, sop));
-                    if i > 0 && sop == SeekOp::SEEK_LE && sr == SeekResult::Invalid {
+                    if i > 0 && sop == SeekOp::LessOrEqual && sr == SeekResult::Invalid {
                         try!(self.set_child(i - 1));
                         try!(self.sub.last());
                         return Ok(SeekResult::Unequal);
@@ -6273,17 +6266,17 @@ impl ParentCursor {
         // the only way to exit the loop to here is for the key to be
         // greater than the last item.
         match sop {
-            SeekOp::SEEK_LE => {
+            SeekOp::LessOrEqual => {
                 let last_child = self.page.count_items() - 1;
                 try!(self.set_child(last_child));
                 try!(self.sub.last());
                 return Ok(SeekResult::Unequal);
             },
-            SeekOp::SEEK_GE => {
+            SeekOp::GreaterOrEqual => {
                 self.cur = None;
                 return Ok(SeekResult::Invalid);
             },
-            SeekOp::SEEK_EQ => {
+            SeekOp::Equal => {
                 self.cur = None;
                 return Ok(SeekResult::Invalid);
             },
@@ -6860,7 +6853,7 @@ impl Space {
             let i_last_block = self.free_blocks.count_blocks() - 1;
             let blk = self.free_blocks.remove_block(i_last_block);
             //println!("    killing free_at_end: {:?}", blk);
-            self.next_page = blk.firstPage;
+            self.next_page = blk.first_page;
         }
 
     }
@@ -6906,7 +6899,7 @@ impl Space {
             // TODO which way should we nest these two loops?
             for i in 0 .. space.free_blocks.count_blocks() {
                 for j in 0 .. start.len() {
-                    if space.free_blocks[i].firstPage == start[j] {
+                    if space.free_blocks[i].first_page == start[j] {
                         return Some(i);
                     }
                 }
@@ -6930,7 +6923,7 @@ impl Space {
                             winner = Some(i);
                         },
                         Some(j) => {
-                            if space.free_blocks[i].firstPage < space.free_blocks[j].firstPage {
+                            if space.free_blocks[i].first_page < space.free_blocks[j].first_page {
                                 winner = Some(j);
                             }
                         },
@@ -6957,7 +6950,7 @@ impl Space {
         fn find_block_after_minimum_size(space: &mut Space, after: PageNum, size: PageCount) -> Option<usize> {
             for i in 0 .. space.free_blocks.count_blocks() {
                 if space.free_blocks[i].count_pages() >= size {
-                    if space.free_blocks[i].firstPage > after {
+                    if space.free_blocks[i].first_page > after {
                         return Some(i);
                     } else {
                         // big enough, but not "after".  keep looking.
@@ -7049,8 +7042,8 @@ impl Space {
                 let mut blk = self.free_blocks.remove_block(i);
                 if blk.count_pages() > size {
                     let mut remainder = BlockList::new();
-                    remainder.add_block_no_reorder(PageBlock::new(blk.firstPage + size, blk.lastPage));
-                    blk.lastPage = blk.firstPage + size - 1;
+                    remainder.add_block_no_reorder(PageBlock::new(blk.first_page + size, blk.last_page));
+                    blk.last_page = blk.first_page + size - 1;
                     self.recent_free.push(remainder);
                 }
                 assert!(blk.count_pages() == size);
@@ -7749,7 +7742,7 @@ impl HeaderStuff {
         }
 
         try!(self.f.seek(SeekFrom::Start(0)));
-        try!(pb.Write(&mut self.f));
+        try!(self.f.write_all(pb.buf()));
         try!(self.f.flush());
         self.data = hdr;
         Ok(())
@@ -7796,7 +7789,7 @@ impl InnerPart {
                 .write(true)
                 .open(&self.path));
         for b in blocks {
-            for x in b.firstPage .. b.lastPage+1 {
+            for x in b.first_page .. b.last_page+1 {
                 try!(utils::seek_page(&mut fs, self.pgsz, x));
                 try!(fs.write(&bad));
             }
@@ -8134,11 +8127,13 @@ impl InnerPart {
                                     return Ok(NeedsMerge::Yes);
                                 }
                                 let size = (count_leaves as u64) * (inner.page_cache.page_size() as u64);
-                                if size < get_level_size(i) {
+                                // TODO should be config setting
+                                let level_multiplier = 10;
+                                if size < get_level_size_in_bytes(i, level_multiplier) {
                                     // this level doesn't need a merge because it is doesn't have enough data in it
                                     return Ok(NeedsMerge::No);
                                 }
-                                if size > inner.settings.desperate_level_factor * get_level_size(i) {
+                                if size > inner.settings.desperate_level_factor * get_level_size_in_bytes(i, level_multiplier) {
                                     // TODO not sure we need this.  but without it,
                                     // Regular(0) gets out of control on 5M urls.
                                     // maybe a locking and starvation issue.
@@ -8616,7 +8611,7 @@ impl InnerPart {
                     let count_dest_keys_after =
                         match wrote.segment {
                             Some(ref seg) => {
-                                try!(seg.count_keys(&inner.path, f))
+                                try!(seg.count_keys(f))
                             },
                             None => {
                                 0
@@ -9376,10 +9371,10 @@ impl PageWriter {
             // can request a block that starts where the current one ends,
             // but...
             if self.blocks[0].count_pages() == 1 {
-                let want = self.blocks[0].lastPage + 1;
+                let want = self.blocks[0].last_page + 1;
                 let blk2 = try!(self.request_block(BlockRequest::StartOrAny(vec![want])));
-                if blk2.firstPage == want {
-                    self.blocks[0].lastPage = blk2.lastPage;
+                if blk2.first_page == want {
+                    self.blocks[0].last_page = blk2.last_page;
                 } else {
                     self.blocks.push(blk2);
                 }
@@ -9398,11 +9393,11 @@ impl PageWriter {
             // TODO remove this restriction because no more boundary stuff?
             //assert!(blocks.len() > 1);
             let blk = blocks.remove(0);
-            assert!(blk.firstPage == blk.lastPage);
-            Ok(blk.firstPage)
+            assert!(blk.first_page == blk.last_page);
+            Ok(blk.first_page)
         } else {
-            let pg = blocks[0].firstPage;
-            blocks[0].firstPage += 1;
+            let pg = blocks[0].first_page;
+            blocks[0].first_page += 1;
             Ok(pg)
         }
     }
@@ -9455,11 +9450,11 @@ impl PageWriter {
             Ok(())
         } else if group.inventory.len() == 1 {
             if !group.blocks.is_empty() {
-                assert!(group.inventory[0].firstPage > group.blocks[0].firstPage);
+                assert!(group.inventory[0].first_page > group.blocks[0].first_page);
             }
             if group.inventory[0].count_pages() == 1 {
                 // we always prefer a block which extends the one we've got in inventory
-                let want = group.inventory[0].lastPage + 1;
+                let want = group.inventory[0].last_page + 1;
 
                 let req =
                     match group.blocks.count_blocks() {
@@ -9467,21 +9462,21 @@ impl PageWriter {
                             // group hasn't started yet.  so it doesn't care where the block is,
                             // but it soon will, because it will be given the currently available
                             // page, so we need to make sure we get something after that one.
-                            let after = group.inventory[0].firstPage;
+                            let after = group.inventory[0].first_page;
 
                             BlockRequest::StartOrAfterMinimumSize(vec![want], after, MINIMUM_SIZE_FIRST_BLOCK_IN_GROUP)
                         },
                         _ => {
                             // the one available page must fit on one of the blocks already
                             // in the group
-                            assert!(group.blocks.would_extend_an_existing_block(group.inventory[0].firstPage));
+                            assert!(group.blocks.would_extend_an_existing_block(group.inventory[0].first_page));
 
                             // we would also prefer any block which would extend any of the
                             // blocks already in the group
 
                             let mut wants = Vec::with_capacity(4);
                             for i in 0 .. group.blocks.count_blocks() {
-                                let pg = group.blocks[i].lastPage + 1;
+                                let pg = group.blocks[i].last_page + 1;
                                 if want != pg {
                                     wants.push(pg);
                                 }
@@ -9490,7 +9485,7 @@ impl PageWriter {
 
                             // the group is running, so we cannnot accept any block before the
                             // first page of the group.
-                            let after = group.blocks[0].firstPage;
+                            let after = group.blocks[0].first_page;
 
                             // TODO tune the numbers below
                             // TODO maybe the request size should be a formula instead of match cases
@@ -9523,10 +9518,10 @@ impl PageWriter {
                     };
                 let blk2 = try!(self.request_block(req));
                 if !group.blocks.is_empty() {
-                    assert!(blk2.firstPage > group.blocks[0].firstPage);
+                    assert!(blk2.first_page > group.blocks[0].first_page);
                 }
-                if blk2.firstPage == group.inventory[0].lastPage + 1 {
-                    group.inventory[0].lastPage = blk2.lastPage;
+                if blk2.first_page == group.inventory[0].last_page + 1 {
+                    group.inventory[0].last_page = blk2.last_page;
                 } else {
                     group.inventory.push(blk2);
                 }
@@ -9534,7 +9529,7 @@ impl PageWriter {
             Ok(())
         } else if group.inventory.len() == 2 {
             if !group.blocks.is_empty() {
-                assert!(group.inventory[0].firstPage > group.blocks[0].firstPage);
+                assert!(group.inventory[0].first_page > group.blocks[0].first_page);
             }
             Ok(())
         } else {
@@ -9548,7 +9543,7 @@ impl PageWriter {
         }
         let pg = try!(Self::get_page_from(&mut group.inventory));
         if group.blocks.blocks.len() > 0 {
-            let first = group.blocks[0].firstPage;
+            let first = group.blocks[0].first_page;
             assert!(pg > first);
         }
         let extended = group.blocks.add_page_no_reorder(pg);
