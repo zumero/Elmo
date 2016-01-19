@@ -190,6 +190,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub enum BlockRequest {
     Any,
+    ExactSize(PageCount),
     MinimumSize(PageCount),
     EarlyExactSize(PageCount),
     StartOrAfterMinimumSize(Vec<PageNum>, PageNum, PageCount),
@@ -200,6 +201,7 @@ impl BlockRequest {
     fn start_is(&self, pg: PageNum) -> bool {
         match self {
             &BlockRequest::Any => false,
+            &BlockRequest::ExactSize(_) => false,
             &BlockRequest::MinimumSize(_) => false,
             &BlockRequest::EarlyExactSize(_) => false,
 
@@ -211,6 +213,7 @@ impl BlockRequest {
     fn get_after(&self) -> Option<PageNum> {
         match self {
             &BlockRequest::Any => None,
+            &BlockRequest::ExactSize(_) => None,
             &BlockRequest::MinimumSize(_) => None,
             &BlockRequest::EarlyExactSize(_) => None,
 
@@ -3038,10 +3041,14 @@ struct LeafUnderConstruction {
 
 }
 
+fn pages_needed_for(len: u64, pgsz: u64) -> PageCount {
+    let pages = len / pgsz + if 0 == (len % pgsz) {0} else {1};
+    pages as PageCount
+}
+
 fn calc_overflow_pages(len: u64, header_len: u64, pgsz: u64) -> PageCount {
     let total_len = header_len + len;
-    let pages = total_len / pgsz + if 0 == (total_len % pgsz) {0} else {1};
-    pages as PageCount
+    pages_needed_for(total_len, pgsz)
 }
 
 fn write_overflow_known_len<R: Read>(
@@ -6521,6 +6528,7 @@ struct HeaderData {
     incoming: Vec<SegmentHeaderInfo>,
     waiting: Vec<SegmentHeaderInfo>,
     regular: Vec<Option<SegmentHeaderInfo>>,
+    overflow: Option<PageBlock>,
 
     change_counter: u64,
     merge_counter: u64,
@@ -6547,7 +6555,7 @@ fn read_header(path: &str) -> Result<(HeaderData, PageCache, PageNum)> {
     }
 
     fn parse(pr: &Box<[u8]>, f: File) -> Result<(HeaderData, PageCache)> {
-        fn read_segment_list(pr: &Box<[u8]>, cur: &mut usize) -> Result<Vec<PageNum>> {
+        fn read_segment_list(pr: &[u8], cur: &mut usize) -> Result<Vec<PageNum>> {
             let count = varint::read(&pr, cur) as usize;
             let mut a = Vec::with_capacity(count);
             for _ in 0 .. count {
@@ -6595,9 +6603,35 @@ fn read_header(path: &str) -> Result<(HeaderData, PageCache, PageNum)> {
 
         let f = PageCache::new(f, pgsz);
 
-        let incoming = try!(read_segment_list(pr, &mut cur));
-        let waiting = try!(read_segment_list(pr, &mut cur));
-        let regular = try!(read_segment_list(pr, &mut cur));
+        let has_header_overflow = pr[cur] != 0;
+        cur += 1;
+
+        let (incoming, waiting, regular, header_overflow_block) =
+            if has_header_overflow {
+                let total_len = varint::read(&pr, &mut cur) as usize;
+                let first_page = varint::read(&pr, &mut cur);
+                let offset_to_last_page = varint::read(&pr, &mut cur);
+                let len_front = varint::read(&pr, &mut cur) as usize;
+                let len_back = total_len - len_front;
+                let block = PageBlock::new(first_page, first_page + offset_to_last_page);
+                let pos_back = try!(utils::page_offset(pgsz, first_page));
+                let mut seglist = vec![0; total_len].into_boxed_slice();
+                seglist[0 .. len_front].clone_from_slice(&pr[cur ..]);
+                let got = try!(f.seek_and_read_fully(&mut seglist[len_front ..], pos_back));
+                if got != len_back {
+                    return Err(Error::Misc(format!("failed reading header overflow")));
+                }
+                let mut cur = 0;
+                let incoming = try!(read_segment_list(&seglist, &mut cur));
+                let waiting = try!(read_segment_list(&seglist, &mut cur));
+                let regular = try!(read_segment_list(&seglist, &mut cur));
+                (incoming, waiting, regular, Some(block))
+            } else {
+                let incoming = try!(read_segment_list(pr, &mut cur));
+                let waiting = try!(read_segment_list(pr, &mut cur));
+                let regular = try!(read_segment_list(pr, &mut cur));
+                (incoming, waiting, regular, None)
+            };
 
         let incoming = try!(fix_segment_list(incoming, &f));
         let waiting = try!(fix_segment_list(waiting, &f));
@@ -6610,6 +6644,7 @@ fn read_header(path: &str) -> Result<(HeaderData, PageCache, PageNum)> {
                 regular: regular,
                 change_counter: change_counter,
                 merge_counter: merge_counter,
+                overflow: header_overflow_block,
             };
 
         Ok((hd, f))
@@ -6643,6 +6678,7 @@ fn read_header(path: &str) -> Result<(HeaderData, PageCache, PageNum)> {
                 regular: vec![],
                 change_counter: 0,
                 merge_counter: 0,
+                overflow: None,
             }
         };
         let next_available_page = calc_next_page(default_page_size, HEADER_SIZE_IN_BYTES);
@@ -6660,6 +6696,13 @@ fn list_all_blocks(
 
     let header_block = PageBlock::new(1, (HEADER_SIZE_IN_BYTES / f.page_size()) as PageNum);
     blocks.add_block_no_reorder(header_block);
+    match h.overflow {
+        Some(header_overflow_block) => {
+            blocks.add_block_no_reorder(header_overflow_block.clone());
+        },
+        None => {
+        },
+    }
 
     fn do_seglist<'a, I: Iterator<Item=&'a SegmentHeaderInfo>>(f: &std::sync::Arc<PageCache>, segments: I, blocks: &mut BlockList) -> Result<()> {
         for seg in segments {
@@ -7011,6 +7054,13 @@ impl Space {
                             FromWhere::SpecificFreeExact(i, size)
                         } else {
                             FromWhere::End(size)
+                        }
+                    },
+                    BlockRequest::ExactSize(size) => {
+                        if let Some(i) = find_block_minimum_size(self, size) {
+                            FromWhere::SpecificFreeExact(i, size)
+                        } else {
+                            FromWhere::End(std::cmp::max(size, self.pages_per_block))
                         }
                     },
                     BlockRequest::MinimumSize(size) => {
@@ -7687,7 +7737,7 @@ impl DatabaseFile {
 }
 
 impl HeaderStuff {
-    fn write_header(&mut self, hdr: HeaderData, pgsz: usize) -> Result<()> {
+    fn write_header(&mut self, space: &mut Space, hdr: HeaderData, pgsz: usize) -> Result<()> {
 
         fn build_segment_list(h: &HeaderData) -> Vec<u8> {
             let mut pb = vec![];
@@ -7713,6 +7763,8 @@ impl HeaderStuff {
                 }
             }
 
+            // TODO put the level multipler in here
+
             add_list(&mut pb, &h.incoming);
             add_list(&mut pb, &h.waiting);
             add_regular_list(&mut pb, &h.regular);
@@ -7720,12 +7772,10 @@ impl HeaderStuff {
             pb
         }
 
-        //println!("header, incoming,{}, waiting,{}, regular,{}", hdr.incoming.len(), hdr.waiting.len(), hdr.regular.len());
-
         let mut pb = PageBuilder::new(HEADER_SIZE_IN_BYTES);
-        pb.put_u8(0); // file format
+        let file_format = 0;
+        pb.put_u8(file_format);
         pb.put_varint(pgsz as u64);
-
         // TODO aren't there some settings that should go in here?
 
         pb.put_varint(hdr.change_counter);
@@ -7733,18 +7783,48 @@ impl HeaderStuff {
 
         let seglist = build_segment_list(&hdr);
 
-        // TODO the + 1 in the following line is probably no longer needed.
-        // I think it used to be the flag indicating header overflow.
-        if pb.available() >= (seglist.len() + 1) {
-            pb.put_from_slice(&seglist);
-        } else {
-            return Err(Error::Misc(String::from("header too big")));
-        }
+        let header_overflow =
+            if pb.available() >= (seglist.len() + 1) {
+                pb.put_u8(0u8);
+                pb.put_from_slice(&seglist);
+                None
+            } else {
+                println!("HEADER_OVERFLOW");
+                pb.put_u8(1u8);
+                pb.put_varint(seglist.len() as u64);
+                let needed_for_overhead = 
+                    9 // max varint for a page number
+                    + 2 // pathological varint for offset from first_page to last_page
+                    + 2 // pathological varint for num bytes that fit here
+                    ;
+                let fits = pb.available() - needed_for_overhead;
+                let extra_bytes = (seglist.len() - fits) as u64;
+                let extra_pages = pages_needed_for(extra_bytes, pgsz as u64);
+                let block = space.get_block(BlockRequest::ExactSize(extra_pages));
+                try!(utils::seek_page(&mut self.f, pgsz, block.first_page));
+                try!(self.f.write_all(&seglist[fits ..]));
+                pb.put_varint(block.first_page as u64);
+                pb.put_varint((block.last_page - block.first_page) as u64);
+                pb.put_varint(fits as u64);
+                pb.put_from_slice(&seglist[0 .. fits]);
+                Some(block)
+            };
 
         try!(self.f.seek(SeekFrom::Start(0)));
         try!(self.f.write_all(pb.buf()));
         try!(self.f.flush());
-        self.data = hdr;
+
+        let old_header_overflow = hdr.overflow;
+        let mut new_hdr = hdr;
+        new_hdr.overflow = header_overflow;
+        //println!("header, incoming,{}, waiting,{}, regular,{}", hdr.incoming.len(), hdr.waiting.len(), hdr.regular.len());
+        self.data = new_hdr;
+
+        if let Some(header_overflow_block) = old_header_overflow {
+            let mut blist = BlockList::new();
+            blist.add_block_no_reorder(header_overflow_block);
+            space.add_free_blocks(blist);
+        }
         Ok(())
     }
 }
@@ -7974,9 +8054,10 @@ impl InnerPart {
 
             new_header.incoming.insert(0, seg);
 
-            new_header.change_counter = new_header.change_counter + 1;
+            new_header.change_counter += 1;
 
-            try!(headerstuff.write_header(new_header, self.page_cache.page_size()));
+            let mut space = try!(self.space.lock());
+            try!(headerstuff.write_header(&mut space, new_header, self.page_cache.page_size()));
         }
 
         // note that we intentionally do not release the writeLock here.
@@ -9270,12 +9351,12 @@ impl InnerPart {
                 },
             }
 
-            new_header.merge_counter = new_header.merge_counter + 1;
-
-            try!(headerstuff.write_header(new_header, self.page_cache.page_size()));
-            //println!("merge committed");
+            new_header.merge_counter += 1;
 
             let mut space = try!(self.space.lock());
+            try!(headerstuff.write_header(&mut space, new_header, self.page_cache.page_size()));
+            //println!("merge committed");
+
             for (seg, depends_on) in deps {
                 space.add_dependencies(seg, depends_on);
             }

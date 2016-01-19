@@ -1,4 +1,6 @@
 
+need tests that read_header
+
 headless blocklist in format 2 overflow
 
 format 3 overflow
@@ -7,11 +9,9 @@ need more test cases with unknown size overflows
 
 list_all_blocks slow on startup
 
-header overflow
-
 child_as_item_for_parent clone
 
-fine-grained locks for merge
+finer-grained locks for merge
 
 ability to have pages be different sizes
 
@@ -27,6 +27,9 @@ eliminate warnings
 should the level multiplier be stored in the file header?
 
 grow number of levels as needed
+
+experiment with triggering desperate less often or never,
+now that header overflow is back.
 
 --
 
@@ -176,13 +179,6 @@ finding overflows that are no longer used could be a
 background operation.
 
 --
-
-the notion of desperate doesn't have to be tied to
-the size of the header and whether it fits in a
-4K page.  we could go back to allowing the header
-to be of any size while still retaining the ability
-to have a level be desperate if we wanted to force
-merges to happen a certain way.
 
 add notion of multiple dbs?  each one is its own
 set of levels, like the current header.  then the
@@ -340,9 +336,6 @@ note that switching varint::read to use a Read trait did
 seem to cause a perf loss.
 
 vec capacities
-
-why did we get rid of header overflow?  if we brought
-it back, maybe we would never need levels to be "desperate".
 
 at startup, we find all pages in use by a segment, and
 then assume that all other pages are free.  this is the only
