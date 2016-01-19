@@ -111,9 +111,9 @@ struct RangeCursorBsonValueIterator {
 
 impl RangeCursorBsonValueIterator {
     fn iter_next(&mut self) -> Result<Option<elmo::Row>> {
-        if self.cursor.IsValid() {
+        if self.cursor.is_valid() {
             let row = {
-                let v = try!(self.cursor.ValueRef().map_err(elmo::wrap_err));
+                let v = try!(self.cursor.value().map_err(elmo::wrap_err));
                 let v = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
                 let v = v.into_value();
                 let row = elmo::Row {
@@ -123,7 +123,7 @@ impl RangeCursorBsonValueIterator {
                 };
                 row
             };
-            try!(self.cursor.Next().map_err(elmo::wrap_err));
+            try!(self.cursor.next().map_err(elmo::wrap_err));
             Ok(Some(row))
         } else {
             Ok(None)
@@ -161,14 +161,14 @@ struct RangeCursorVarintIterator {
 
 impl RangeCursorVarintIterator {
     fn iter_next(&mut self) -> Result<Option<u64>> {
-        if self.cursor.IsValid() {
+        if self.cursor.is_valid() {
             let v = {
-                let v = try!(self.cursor.ValueRef().map_err(elmo::wrap_err));
+                let v = try!(self.cursor.value().map_err(elmo::wrap_err));
                 //println!("got {:?}", v);
                 let v = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
                 v
             };
-            try!(self.cursor.Next().map_err(elmo::wrap_err));
+            try!(self.cursor.next().map_err(elmo::wrap_err));
             Ok(Some(v))
         } else {
             Ok(None)
@@ -463,9 +463,9 @@ fn find_record(cursor: &mut lsm::LivingCursor, collection_id: u64, id: &bson::Va
     get_value_for_key_as_varint(cursor, &k)
 }
 fn get_value_for_key_as_varint(cursor: &mut lsm::LivingCursor, k: &[u8]) -> Result<Option<u64>> {
-    try!(cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
-    if cursor.IsValid() {
-        let v = try!(cursor.ValueRef().map_err(elmo::wrap_err));
+    try!(cursor.seek(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
+    if cursor.is_valid() {
+        let v = try!(cursor.value().map_err(elmo::wrap_err));
         let id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
         Ok(Some(id))
     } else {
@@ -474,9 +474,9 @@ fn get_value_for_key_as_varint(cursor: &mut lsm::LivingCursor, k: &[u8]) -> Resu
 }
 
 fn get_value_for_key_as_bson(cursor: &mut lsm::LivingCursor, k: &[u8]) -> Result<Option<bson::Document>> {
-    try!(cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
-    if cursor.IsValid() {
-        let v = try!(cursor.ValueRef().map_err(elmo::wrap_err));
+    try!(cursor.seek(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
+    if cursor.is_valid() {
+        let v = try!(cursor.value().map_err(elmo::wrap_err));
         let id = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
         Ok(Some(id))
     } else {
@@ -513,7 +513,7 @@ impl MyConn {
                 let max = lsm::Max::new(kmax, lsm::OpLt::LT);
 
                 let mut cursor = lsm::RangeCursor::new(cursor, min, max);
-                try!(cursor.First().map_err(elmo::wrap_err));
+                try!(cursor.first().map_err(elmo::wrap_err));
                 let seq = 
                     RangeCursorBsonValueIterator {
                         cursor: cursor,
@@ -638,7 +638,7 @@ impl MyConn {
                 elmo::QueryBounds::GTE_LTE(eqvals, minvals, maxvals) => f_two(has_recid, key_preface, cursor, eqvals, minvals, maxvals, lsm::OpGt::GTE, lsm::OpLt::LTE),
                 elmo::QueryBounds::EQ(vals) => {
                     // TODO if this is a unique index (which does not have the recid on the end of
-                    // the key), we should maybe do this SeekRef as SEEK_EQ so the bloom filter
+                    // the key), we should maybe do this seek as SEEK_EQ so the bloom filter
                     // can be used.
                     let mut kmin = key_preface.clone();
                     bson::Value::push_encode_multi_for_index(&mut kmin, &vals, None);
@@ -650,7 +650,7 @@ impl MyConn {
                 },
             };
 
-        try!(cursor.First().map_err(elmo::wrap_err));
+        try!(cursor.first().map_err(elmo::wrap_err));
         let seq = 
             RangeCursorVarintIterator {
                 cursor: cursor,
@@ -684,9 +684,9 @@ impl MyConn {
                         k.push(RECORD);
                         misc::push_varint(&mut k, collection_id);
                         misc::push_varint(&mut k, record_id);
-                        try!(cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
-                        if cursor.IsValid() {
-                            let v = try!(cursor.ValueRef().map_err(elmo::wrap_err));
+                        try!(cursor.seek(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_EQ).map_err(elmo::wrap_err));
+                        if cursor.is_valid() {
+                            let v = try!(cursor.value().map_err(elmo::wrap_err));
                             let v = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
                             let v = v.into_value();
                             let row = elmo::Row {
@@ -733,13 +733,13 @@ impl MyConn {
         let mut cursor = lsm::PrefixCursor::new(cursor, q);
         let mut a = vec![];
 
-        try!(cursor.First().map_err(elmo::wrap_err));
-        while cursor.IsValid() {
+        try!(cursor.first().map_err(elmo::wrap_err));
+        while cursor.is_valid() {
             let (collection_id, index_id, props) = {
-                let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
+                let k = try!(cursor.key().map_err(elmo::wrap_err));
                 let (collection_id, index_id) = try!(decode_key_index_id_to_properties(&k));
 
-                let v = try!(cursor.ValueRef().map_err(elmo::wrap_err));
+                let v = try!(cursor.value().map_err(elmo::wrap_err));
                 let props = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
 
                 (collection_id, index_id, props)
@@ -747,7 +747,7 @@ impl MyConn {
 
             a.push((collection_id, index_id, props));
 
-            try!(cursor.Next().map_err(elmo::wrap_err));
+            try!(cursor.next().map_err(elmo::wrap_err));
         }
         //println!("base_list_indexes,{:?},{}", collection_id, a.len());
         Ok(a)
@@ -819,18 +819,18 @@ impl MyConn {
         let mut cursor = lsm::PrefixCursor::new(cursor, box [NAME_TO_COLLECTION_ID]);
         let mut a = vec![];
         // TODO might need to sort by the coll name?  the sqlite version does.
-        try!(cursor.First().map_err(elmo::wrap_err));
-        while cursor.IsValid() {
+        try!(cursor.first().map_err(elmo::wrap_err));
+        while cursor.is_valid() {
             {
-                let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
+                let k = try!(cursor.key().map_err(elmo::wrap_err));
                 let (db, coll) = try!(decode_key_name_to_collection_id(&k));
 
-                let v = try!(cursor.ValueRef().map_err(elmo::wrap_err));
+                let v = try!(cursor.value().map_err(elmo::wrap_err));
                 let collection_id = try!(v.map(lsm_map_to_varint).map_err(elmo::wrap_err));
 
                 a.push((collection_id, db, coll));
             }
-            try!(cursor.Next().map_err(elmo::wrap_err));
+            try!(cursor.next().map_err(elmo::wrap_err));
         }
         Ok(a)
     }
@@ -873,9 +873,9 @@ impl<'a> MyWriter<'a> {
                     let mut k = vec![];
                     k.push(INDEX_ID_TO_PROPERTIES);
                     misc::push_varint(&mut k, collection_id + 1);
-                    try!(self.cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
-                    if self.cursor.IsValid() {
-                        let k = try!(self.cursor.KeyRef().map_err(elmo::wrap_err));
+                    try!(self.cursor.seek(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
+                    if self.cursor.is_valid() {
+                        let k = try!(self.cursor.key().map_err(elmo::wrap_err));
                         if try!(k.u8_at(0).map_err(elmo::wrap_err)) == INDEX_ID_TO_PROPERTIES {
                             let (k_collection_id, index_id) = try!(decode_key_index_id_to_properties(&k));
                             if collection_id == k_collection_id {
@@ -909,9 +909,9 @@ impl<'a> MyWriter<'a> {
                     let mut k = vec![];
                     k.push(RECORD);
                     misc::push_varint(&mut k, collection_id + 1);
-                    try!(self.cursor.SeekRef(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
-                    if self.cursor.IsValid() {
-                        let k = try!(self.cursor.KeyRef().map_err(elmo::wrap_err));
+                    try!(self.cursor.seek(&lsm::KeyRef::for_slice(&k), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
+                    if self.cursor.is_valid() {
+                        let k = try!(self.cursor.key().map_err(elmo::wrap_err));
                         if try!(k.u8_at(0).map_err(elmo::wrap_err)) == RECORD {
                             let (k_collection_id, record_id) = try!(decode_key_record(&k));
                             if collection_id == k_collection_id {
@@ -941,9 +941,9 @@ impl<'a> MyWriter<'a> {
             },
             None => {
                 let n = {
-                    try!(self.cursor.SeekRef(&lsm::KeyRef::Slice(&[COLLECTION_ID_BOUNDARY]), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
-                    if self.cursor.IsValid() {
-                        let k = try!(self.cursor.KeyRef().map_err(elmo::wrap_err));
+                    try!(self.cursor.seek(&lsm::KeyRef::Slice(&[COLLECTION_ID_BOUNDARY]), lsm::SeekOp::SEEK_LE).map_err(elmo::wrap_err));
+                    if self.cursor.is_valid() {
+                        let k = try!(self.cursor.key().map_err(elmo::wrap_err));
                         if try!(k.u8_at(0).map_err(elmo::wrap_err)) == COLLECTION_ID_TO_PROPERTIES {
                             let collection_id = try!(decode_key_collection_id_to_properties(&k));
                             1 + collection_id
@@ -1059,14 +1059,14 @@ impl<'a> MyWriter<'a> {
         // blind delete by prefix.
 
         let mut cursor = lsm::PrefixCursor::new(&mut self.cursor, prefix);
-        try!(cursor.First().map_err(elmo::wrap_err));
-        while cursor.IsValid() {
+        try!(cursor.first().map_err(elmo::wrap_err));
+        while cursor.is_valid() {
             {
-                let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
+                let k = try!(cursor.key().map_err(elmo::wrap_err));
                 self.pending.insert(k.into_boxed_slice(), lsm::ValueForStorage::Tombstone);
             }
 
-            try!(cursor.Next().map_err(elmo::wrap_err));
+            try!(cursor.next().map_err(elmo::wrap_err));
         }
 
         Ok(())
@@ -1143,13 +1143,13 @@ impl<'a> MyWriter<'a> {
                 k.push(RECORD);
                 misc::push_varint(&mut k, collection_id);
                 let mut cursor = lsm::PrefixCursor::new(&mut self.cursor, k.into_boxed_slice());
-                try!(cursor.First().map_err(elmo::wrap_err));
-                while cursor.IsValid() {
+                try!(cursor.first().map_err(elmo::wrap_err));
+                while cursor.is_valid() {
                     {
-                        let k = try!(cursor.KeyRef().map_err(elmo::wrap_err));
+                        let k = try!(cursor.key().map_err(elmo::wrap_err));
                         let (_, record_id) = try!(decode_key_record(&k));
                         let ba_record_id = u64_to_boxed_varint(record_id);
-                        let v = try!(cursor.ValueRef().map_err(elmo::wrap_err));
+                        let v = try!(cursor.value().map_err(elmo::wrap_err));
                         let v = try!(v.map(lsm_map_to_bson).map_err(elmo::wrap_err));
                         let entries = try!(elmo::get_index_entries(&v, &normspec, &weights, &info.options));
                         let ba_collection_id = u64_to_boxed_varint(collection_id);
@@ -1160,7 +1160,7 @@ impl<'a> MyWriter<'a> {
                         }
                     }
 
-                    try!(cursor.Next().map_err(elmo::wrap_err));
+                    try!(cursor.next().map_err(elmo::wrap_err));
                 }
 
                 // now store the index id to properties

@@ -20,7 +20,9 @@ better privacy on struct fields
 
 pending tx manager
 
-change trait methods to Rust naming convention
+change to Rust naming convention
+
+eliminate warnings
 
 --
 

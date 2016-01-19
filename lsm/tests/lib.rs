@@ -27,7 +27,7 @@ fn from_utf8(a: Box<[u8]>) -> String {
 }
 
 fn key_as_boxed_slice(csr: &lsm::LivingCursor) -> Box<[u8]> {
-    csr.KeyRef().unwrap().into_boxed_slice()
+    csr.key().unwrap().into_boxed_slice()
 }
 
 fn key_as_string(csr: &lsm::LivingCursor) -> String {
@@ -44,20 +44,20 @@ fn insert_pair_string_blob(d: &mut std::collections::BTreeMap<Box<[u8]>, lsm::Va
 
 fn count_keys_forward(csr: &mut lsm::LivingCursor) -> lsm::Result<usize> {
     let mut r = 0;
-    try!(csr.First());
-    while csr.IsValid() {
+    try!(csr.first());
+    while csr.is_valid() {
         r = r + 1;
-        try!(csr.Next());
+        try!(csr.next());
     }
     Ok(r)
 }
 
 fn count_keys_backward(csr: &mut lsm::LivingCursor) -> lsm::Result<usize> {
     let mut r = 0;
-    try!(csr.Last());
-    while csr.IsValid() {
+    try!(csr.last());
+    while csr.is_valid() {
         r = r + 1;
-        try!(csr.Prev());
+        try!(csr.prev());
     }
     Ok(r)
 }
@@ -83,10 +83,10 @@ fn empty_cursor() {
     fn f() -> lsm::Result<()> {
         let db = try!(lsm::DatabaseFile::new(tempfile("empty_cursor"), lsm::DEFAULT_SETTINGS));
         let mut csr = try!(db.open_cursor());
-        try!(csr.First());
-        assert!(!csr.IsValid());
-        try!(csr.Last());
-        assert!(!csr.IsValid());
+        try!(csr.first());
+        assert!(!csr.is_valid());
+        try!(csr.last());
+        assert!(!csr.is_valid());
         Ok(())
     }
     assert!(f().is_ok());
@@ -102,10 +102,10 @@ fn first_prev() {
             try!(lck.commit_segment(g));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.First());
-        assert!(csr.IsValid());
-        try!(csr.Prev());
-        assert!(!csr.IsValid());
+        try!(csr.first());
+        assert!(csr.is_valid());
+        try!(csr.prev());
+        assert!(!csr.is_valid());
         Ok(())
     }
     assert!(f().is_ok());
@@ -121,10 +121,10 @@ fn last_next() {
             try!(lck.commit_segment(g));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.Last());
-        assert!(csr.IsValid());
-        try!(csr.Next());
-        assert!(!csr.IsValid());
+        try!(csr.last());
+        assert!(csr.is_valid());
+        try!(csr.next());
+        assert!(!csr.is_valid());
         Ok(())
     }
     assert!(f().is_ok());
@@ -140,25 +140,25 @@ fn seek() {
             try!(lck.commit_segment(g));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.First());
-        assert!(csr.IsValid());
+        try!(csr.first());
+        assert!(csr.is_valid());
         // TODO constructing the utf8 byte array seems convoluted
 
         let k = into_utf8(format!("{:08}", 42));
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_EQ));
-        assert!(csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_EQ));
+        assert!(csr.is_valid());
 
         let k = into_utf8(format!("{:08}", 105));
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_EQ));
-        assert!(!csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_EQ));
+        assert!(!csr.is_valid());
 
         let k = into_utf8(format!("{:08}", 105));
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_GE));
-        assert!(!csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_GE));
+        assert!(!csr.is_valid());
 
         let k = into_utf8(format!("{:08}", 105));
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_LE));
-        assert!(csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_LE));
+        assert!(csr.is_valid());
         // TODO get the key
 
         Ok(())
@@ -180,36 +180,36 @@ fn lexographic() {
             try!(lck.commit_segment(g));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.First());
-        assert!(csr.IsValid());
+        try!(csr.first());
+        assert!(csr.is_valid());
         assert_eq!(key_as_string(&csr), "10");
 
-        try!(csr.Next());
-        assert!(csr.IsValid());
+        try!(csr.next());
+        assert!(csr.is_valid());
         assert_eq!(key_as_string(&csr), "20");
 
-        try!(csr.Next());
-        assert!(csr.IsValid());
+        try!(csr.next());
+        assert!(csr.is_valid());
         assert_eq!(key_as_string(&csr), "8");
 
-        try!(csr.Next());
-        assert!(!csr.IsValid());
+        try!(csr.next());
+        assert!(!csr.is_valid());
 
         // --------
-        try!(csr.Last());
-        assert!(csr.IsValid());
+        try!(csr.last());
+        assert!(csr.is_valid());
         assert_eq!(key_as_string(&csr), "8");
 
-        try!(csr.Prev());
-        assert!(csr.IsValid());
+        try!(csr.prev());
+        assert!(csr.is_valid());
         assert_eq!(key_as_string(&csr), "20");
 
-        try!(csr.Prev());
-        assert!(csr.IsValid());
+        try!(csr.prev());
+        assert!(csr.is_valid());
         assert_eq!(key_as_string(&csr), "10");
 
-        try!(csr.Prev());
-        assert!(!csr.IsValid());
+        try!(csr.prev());
+        assert!(!csr.is_valid());
 
         Ok(())
     }
@@ -240,8 +240,8 @@ fn seek_cur() {
             try!(lck.commit_segment(g2.unwrap()));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("00001")), lsm::SeekOp::SEEK_EQ));
-        assert!(csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("00001")), lsm::SeekOp::SEEK_EQ));
+        assert!(csr.is_valid());
         Ok(())
     }
     assert!(f().is_ok());
@@ -271,54 +271,54 @@ fn weird() {
             try!(lck.commit_segment(g2.unwrap()));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.First());
+        try!(csr.first());
         for _ in 0 .. 100 {
-            try!(csr.Next());
-            assert!(csr.IsValid());
+            try!(csr.next());
+            assert!(csr.is_valid());
         }
         for _ in 0 .. 50 {
-            try!(csr.Prev());
-            assert!(csr.IsValid());
+            try!(csr.prev());
+            assert!(csr.is_valid());
         }
         for _ in 0 .. 100 {
-            try!(csr.Next());
-            assert!(csr.IsValid());
-            try!(csr.Next());
-            assert!(csr.IsValid());
-            try!(csr.Prev());
-            assert!(csr.IsValid());
+            try!(csr.next());
+            assert!(csr.is_valid());
+            try!(csr.next());
+            assert!(csr.is_valid());
+            try!(csr.prev());
+            assert!(csr.is_valid());
         }
         for _ in 0 .. 50 {
             let kboxed = key_as_boxed_slice(&csr);
             let k = lsm::KeyRef::Slice(&kboxed);
-            try!(csr.SeekRef(&k, lsm::SeekOp::SEEK_EQ));
-            assert!(csr.IsValid());
-            try!(csr.Next());
-            assert!(csr.IsValid());
+            try!(csr.seek(&k, lsm::SeekOp::SEEK_EQ));
+            assert!(csr.is_valid());
+            try!(csr.next());
+            assert!(csr.is_valid());
         }
         for _ in 0 .. 50 {
             let kboxed = key_as_boxed_slice(&csr);
             let k = lsm::KeyRef::Slice(&kboxed);
-            try!(csr.SeekRef(&k, lsm::SeekOp::SEEK_EQ));
-            assert!(csr.IsValid());
-            try!(csr.Prev());
-            assert!(csr.IsValid());
+            try!(csr.seek(&k, lsm::SeekOp::SEEK_EQ));
+            assert!(csr.is_valid());
+            try!(csr.prev());
+            assert!(csr.is_valid());
         }
         for _ in 0 .. 50 {
             let kboxed = key_as_boxed_slice(&csr);
             let k = lsm::KeyRef::Slice(&kboxed);
-            try!(csr.SeekRef(&k, lsm::SeekOp::SEEK_LE));
-            assert!(csr.IsValid());
-            try!(csr.Prev());
-            assert!(csr.IsValid());
+            try!(csr.seek(&k, lsm::SeekOp::SEEK_LE));
+            assert!(csr.is_valid());
+            try!(csr.prev());
+            assert!(csr.is_valid());
         }
         for _ in 0 .. 50 {
             let kboxed = key_as_boxed_slice(&csr);
             let k = lsm::KeyRef::Slice(&kboxed);
-            try!(csr.SeekRef(&k, lsm::SeekOp::SEEK_GE));
-            assert!(csr.IsValid());
-            try!(csr.Next());
-            assert!(csr.IsValid());
+            try!(csr.seek(&k, lsm::SeekOp::SEEK_GE));
+            assert!(csr.is_valid());
+            try!(csr.next());
+            assert!(csr.is_valid());
         }
         // got the following value from the debugger.
         // just want to make sure that it doesn't change
@@ -353,17 +353,17 @@ fn no_le_ge_multicursor() {
 
         let mut csr = try!(db.open_cursor());
 
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("a")), lsm::SeekOp::SEEK_LE));
-        assert!(!csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("a")), lsm::SeekOp::SEEK_LE));
+        assert!(!csr.is_valid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("d")), lsm::SeekOp::SEEK_LE));
-        assert!(csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("d")), lsm::SeekOp::SEEK_LE));
+        assert!(csr.is_valid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("f")), lsm::SeekOp::SEEK_GE));
-        assert!(csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("f")), lsm::SeekOp::SEEK_GE));
+        assert!(csr.is_valid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("h")), lsm::SeekOp::SEEK_GE));
-        assert!(!csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("h")), lsm::SeekOp::SEEK_GE));
+        assert!(!csr.is_valid());
 
         Ok(())
     }
@@ -383,9 +383,9 @@ fn empty_val() {
             try!(lck.commit_segment(g));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("_")), lsm::SeekOp::SEEK_EQ));
-        assert!(csr.IsValid());
-        let q = try!(csr.ValueRef());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("_")), lsm::SeekOp::SEEK_EQ));
+        assert!(csr.is_valid());
+        let q = try!(csr.value());
         let (len, _) = try!(q.read());
         assert_eq!(0, len);
 
@@ -531,9 +531,9 @@ fn one_blob() {
         assert_eq!(1, try!(count_keys_forward(&mut csr)));
         assert_eq!(1, try!(count_keys_backward(&mut csr)));
 
-        try!(csr.First());
-        assert!(csr.IsValid());
-        let v = try!(csr.ValueRef());
+        try!(csr.first());
+        assert!(csr.is_valid());
+        let v = try!(csr.value());
         let (len, mut strm) = try!(v.read());
         assert_eq!(LEN as u64, len);
         let mut a = vec![];
@@ -568,9 +568,9 @@ fn one_blob_unknown_len() {
         assert_eq!(1, try!(count_keys_forward(&mut csr)));
         assert_eq!(1, try!(count_keys_backward(&mut csr)));
 
-        try!(csr.First());
-        assert!(csr.IsValid());
-        let q = try!(csr.ValueRef());
+        try!(csr.first());
+        assert!(csr.is_valid());
+        let q = try!(csr.value());
         let (len, mut strm) = try!(q.read());
         assert_eq!(given_len as u64, len);
         let mut a = vec![];
@@ -598,17 +598,17 @@ fn no_le_ge() {
             try!(lck.commit_segment(g));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("a")), lsm::SeekOp::SEEK_LE));
-        assert!(!csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("a")), lsm::SeekOp::SEEK_LE));
+        assert!(!csr.is_valid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("d")), lsm::SeekOp::SEEK_LE));
-        assert!(csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("d")), lsm::SeekOp::SEEK_LE));
+        assert!(csr.is_valid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("f")), lsm::SeekOp::SEEK_GE));
-        assert!(csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("f")), lsm::SeekOp::SEEK_GE));
+        assert!(csr.is_valid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("h")), lsm::SeekOp::SEEK_GE));
-        assert!(!csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("h")), lsm::SeekOp::SEEK_GE));
+        assert!(!csr.is_valid());
 
         Ok(())
     }
@@ -631,18 +631,18 @@ fn seek_ge_le_bigger() {
             try!(lck.commit_segment(g));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("8088")), lsm::SeekOp::SEEK_EQ));
-        assert!(csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("8088")), lsm::SeekOp::SEEK_EQ));
+        assert!(csr.is_valid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("8087")), lsm::SeekOp::SEEK_EQ));
-        assert!(!csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("8087")), lsm::SeekOp::SEEK_EQ));
+        assert!(!csr.is_valid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("8087")), lsm::SeekOp::SEEK_LE));
-        assert!(csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("8087")), lsm::SeekOp::SEEK_LE));
+        assert!(csr.is_valid());
         assert_eq!("8086", key_as_string(&csr));
 
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("8087")), lsm::SeekOp::SEEK_GE));
-        assert!(csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("8087")), lsm::SeekOp::SEEK_GE));
+        assert!(csr.is_valid());
         assert_eq!("8088", key_as_string(&csr));
 
         Ok(())
@@ -677,15 +677,15 @@ fn seek_ge_le() {
         assert_eq!(13, try!(count_keys_forward(&mut csr)));
         assert_eq!(13, try!(count_keys_backward(&mut csr)));
 
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("n")), lsm::SeekOp::SEEK_EQ));
-        assert!(!csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("n")), lsm::SeekOp::SEEK_EQ));
+        assert!(!csr.is_valid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("n")), lsm::SeekOp::SEEK_LE));
-        assert!(csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("n")), lsm::SeekOp::SEEK_LE));
+        assert!(csr.is_valid());
         assert_eq!("m", key_as_string(&csr));
 
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("n")), lsm::SeekOp::SEEK_GE));
-        assert!(csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("n")), lsm::SeekOp::SEEK_GE));
+        assert!(csr.is_valid());
         assert_eq!("o", key_as_string(&csr));
 
         Ok(())
@@ -716,41 +716,41 @@ fn tombstone() {
         }
         // TODO it would be nice to check the multicursor without the living wrapper
         let mut csr = try!(db.open_cursor());
-        try!(csr.First());
-        assert!(csr.IsValid());
+        try!(csr.first());
+        assert!(csr.is_valid());
         assert_eq!("a", key_as_string(&csr));
-        assert_eq!("1", from_utf8(read_value(csr.ValueRef().unwrap()).unwrap()));
+        assert_eq!("1", from_utf8(read_value(csr.value().unwrap()).unwrap()));
 
-        try!(csr.Next());
-        assert!(csr.IsValid());
+        try!(csr.next());
+        assert!(csr.is_valid());
         assert_eq!("c", key_as_string(&csr));
-        assert_eq!("3", from_utf8(read_value(csr.ValueRef().unwrap()).unwrap()));
+        assert_eq!("3", from_utf8(read_value(csr.value().unwrap()).unwrap()));
 
-        try!(csr.Next());
-        assert!(csr.IsValid());
+        try!(csr.next());
+        assert!(csr.is_valid());
         assert_eq!("d", key_as_string(&csr));
-        assert_eq!("4", from_utf8(read_value(csr.ValueRef().unwrap()).unwrap()));
+        assert_eq!("4", from_utf8(read_value(csr.value().unwrap()).unwrap()));
 
-        try!(csr.Next());
-        assert!(!csr.IsValid());
+        try!(csr.next());
+        assert!(!csr.is_valid());
 
         assert_eq!(3, try!(count_keys_forward(&mut csr)));
         assert_eq!(3, try!(count_keys_backward(&mut csr)));
 
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::SEEK_EQ));
-        assert!(!csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::SEEK_EQ));
+        assert!(!csr.is_valid());
 
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::SEEK_LE));
-        assert!(csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::SEEK_LE));
+        assert!(csr.is_valid());
         assert_eq!("a", key_as_string(&csr));
-        try!(csr.Next());
-        assert!(csr.IsValid());
+        try!(csr.next());
+        assert!(csr.is_valid());
         assert_eq!("c", key_as_string(&csr));
 
-        try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::SEEK_GE));
-        assert!(csr.IsValid());
+        try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::SEEK_GE));
+        assert!(csr.is_valid());
         assert_eq!("c", key_as_string(&csr));
-        try!(csr.Prev());
+        try!(csr.prev());
         assert_eq!("a", key_as_string(&csr));
 
         Ok(())
@@ -774,8 +774,8 @@ fn overwrite() {
         }
         fn getb(db: &lsm::DatabaseFile) -> lsm::Result<String> {
             let mut csr = try!(db.open_cursor());
-            try!(csr.SeekRef(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::SEEK_EQ));
-            Ok(from_utf8(read_value(csr.ValueRef().unwrap()).unwrap()))
+            try!(csr.seek(&lsm::KeyRef::Slice(&str_to_utf8("b")), lsm::SeekOp::SEEK_EQ));
+            Ok(from_utf8(read_value(csr.value().unwrap()).unwrap()))
         }
         assert_eq!("2", getb(&db).unwrap());
         let mut t2 = std::collections::BTreeMap::new();
@@ -832,10 +832,10 @@ fn blobs_of_many_sizes() {
         for (k, v) in t1 {
             if let lsm::ValueForStorage::Boxed(v) = v {
                 println!("k: {:?}", k);
-                try!(csr.SeekRef(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_EQ));
-                assert!(csr.IsValid());
+                try!(csr.seek(&lsm::KeyRef::Slice(&k), lsm::SeekOp::SEEK_EQ));
+                assert!(csr.is_valid());
                 println!("    valid");
-                let q = try!(csr.ValueRef());
+                let q = try!(csr.value());
                 let (len, mut strm) = try!(q.read());
                 assert_eq!(v.len() as u64, len);
                 let mut a = vec![];
@@ -879,17 +879,17 @@ fn write_then_read() {
         fn read(name: &str) -> lsm::Result<()> {
             let db = try!(lsm::DatabaseFile::new(String::from(name), lsm::DEFAULT_SETTINGS));
             let mut csr = try!(db.open_cursor());
-            try!(csr.SeekRef(&lsm::KeyRef::Slice(&into_utf8(format!("{}", 42))), lsm::SeekOp::SEEK_EQ));
-            assert!(csr.IsValid());
-            try!(csr.Next());
+            try!(csr.seek(&lsm::KeyRef::Slice(&into_utf8(format!("{}", 42))), lsm::SeekOp::SEEK_EQ));
+            assert!(csr.is_valid());
+            try!(csr.next());
             assert_eq!("43", key_as_string(&csr));
-            try!(csr.SeekRef(&lsm::KeyRef::Slice(&into_utf8(format!("{}", 73))), lsm::SeekOp::SEEK_EQ));
-            assert!(!csr.IsValid());
-            try!(csr.SeekRef(&lsm::KeyRef::Slice(&into_utf8(format!("{}", 73))), lsm::SeekOp::SEEK_LE));
-            assert!(csr.IsValid());
+            try!(csr.seek(&lsm::KeyRef::Slice(&into_utf8(format!("{}", 73))), lsm::SeekOp::SEEK_EQ));
+            assert!(!csr.is_valid());
+            try!(csr.seek(&lsm::KeyRef::Slice(&into_utf8(format!("{}", 73))), lsm::SeekOp::SEEK_LE));
+            assert!(csr.is_valid());
             assert_eq!("72", key_as_string(&csr));
-            try!(csr.Next());
-            assert!(csr.IsValid());
+            try!(csr.next());
+            assert!(csr.is_valid());
             assert_eq!("74", key_as_string(&csr));
             Ok(())
         }
@@ -917,8 +917,8 @@ fn prefix_compression() {
             try!(lck.commit_segment(g));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.First());
-        assert!(csr.IsValid());
+        try!(csr.first());
+        assert!(csr.is_valid());
         Ok(())
     }
     assert!(f().is_ok());
@@ -977,19 +977,19 @@ fn key_ref() {
             try!(lck.commit_segment(g));
         }
         let mut csr = try!(db.open_cursor());
-        try!(csr.First());
-        assert!(csr.IsValid());
+        try!(csr.first());
+        assert!(csr.is_valid());
 
-        while csr.IsValid() {
+        while csr.is_valid() {
             {
                 // KeyRef takes an immutable reference on the cursor.
-                // which means you can't call Next() on that cursor
+                // which means you can't call next() on that cursor
                 // until the reference goes out of scope.  So this
                 // is in its own block.
-                let q = csr.KeyRef();
+                let q = csr.key();
                 println!("{:?}", q);
             }
-            try!(csr.Next());
+            try!(csr.next());
         }
         Ok(())
     }
