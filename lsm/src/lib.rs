@@ -7677,7 +7677,7 @@ impl DatabaseFile {
             // TODO if we need to sleep more than once, do we really need to notify_work
             // every time?
             try!(self.inner.notify_work(FromLevel::Incoming));
-            println!("desperate,regular,sleeping,{}", self.inner.settings.sleep_desperate_incoming);
+            println!("desperate,main,sleeping,{}", self.inner.settings.sleep_desperate_incoming);
             std::thread::sleep(std::time::Duration::from_millis(self.inner.settings.sleep_desperate_incoming));
         }
 
@@ -7814,10 +7814,11 @@ impl HeaderStuff {
         try!(self.f.write_all(pb.buf()));
         try!(self.f.flush());
 
+        //println!("header, incoming,{}, waiting,{}, regular,{}", hdr.incoming.len(), hdr.waiting.len(), hdr.regular.len());
+
         let old_header_overflow = hdr.overflow;
         let mut new_hdr = hdr;
         new_hdr.overflow = header_overflow;
-        //println!("header, incoming,{}, waiting,{}, regular,{}", hdr.incoming.len(), hdr.waiting.len(), hdr.regular.len());
         self.data = new_hdr;
 
         if let Some(header_overflow_block) = old_header_overflow {

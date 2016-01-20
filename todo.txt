@@ -1,4 +1,8 @@
 
+diag_lsm list_segments during lots of merges causes a panic.
+multi-process concurrency is not implemented, and simply
+opening the db is not safe because list_all_blocks(). 
+
 need tests that read_header
 
 headless blocklist in format 2 overflow
@@ -29,9 +33,16 @@ should the level multiplier be stored in the file header?
 grow number of levels as needed
 
 experiment with triggering desperate less often or never,
-now that header overflow is back.
+now that header overflow is back.  with no desperate,
+seems like Waiting and Regular(0) are just fighting back
+and forth.  might be better to just let Waiting finish
+and then do Regular(0)?  maybe the mergeloop should
+hold its lock(s) until it is done?
 
 --
+
+interesting that allowing levels to get bigger actually
+makes merge take longer, not just cursor.
 
 the blocklist in the format 2 overflow should have
 its very first u64 removed, since it will be the
