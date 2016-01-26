@@ -8753,6 +8753,26 @@ impl InnerPart {
             },
         }
 
+        impl MergingFrom {
+            fn count_tombstones(&self) -> u64 {
+                match self {
+                    &MergingFrom::WaitingLeaf{count_tombstones, ..} => count_tombstones,
+                    &MergingFrom::WaitingPartial{count_tombstones, ..} => count_tombstones,
+                    &MergingFrom::RegularLeaf{count_tombstones, ..} => count_tombstones,
+                    &MergingFrom::RegularPartial{count_tombstones, ..} => count_tombstones,
+                }
+            }
+
+            fn get_dest_level(&self) -> usize {
+                match self {
+                    &MergingFrom::WaitingLeaf{..} => 0,
+                    &MergingFrom::WaitingPartial{..} => 0,
+                    &MergingFrom::RegularLeaf{level, ..} => level + 1,
+                    &MergingFrom::RegularPartial{level, ..} => level + 1,
+                }
+            }
+        }
+
         let f = &inner.page_cache;
 
         let (cursor, from, into, behind_cursors, behind_rlock) = {
@@ -8909,71 +8929,24 @@ impl InnerPart {
                 // so we need cursors on all those segments so that we can check
                 // while writing the merge segment.
 
-                // TODO is it really true that we can skip tombstone checks if
-                // there are no tombstones being promoted?  what about tombstones
-                // in the overlapping stuff that needs to get rewritten?  is that
-                // possible?
+                let behind_segments = 
+                    if from.count_tombstones() == 0 {
+                        // TODO is it really true that we can skip tombstone checks if
+                        // there are no tombstones being promoted?  what about tombstones
+                        // in the overlapping stuff that needs to get rewritten?  is that
+                        // possible?
 
-                let behind_segments = {
-                    match from {
-                        MergingFrom::WaitingLeaf{count_tombstones, ..} => {
-                            if count_tombstones == 0 {
-                                None
-                            } else {
-                                let dest_level = 0;
-                                let mut behind_segments = Vec::with_capacity(header.regular.len());
-                                for i in dest_level + 1 .. header.regular.len() {
-                                    let seg = &header.regular[i];
+                        None
+                    } else {
+                        let dest_level = from.get_dest_level();
+                        let mut behind_segments = Vec::with_capacity(header.regular.len());
+                        for i in dest_level + 1 .. header.regular.len() {
+                            let seg = &header.regular[i];
 
-                                    behind_segments.push(seg);
-                                }
-                                Some(behind_segments)
-                            }
-                        },
-                        MergingFrom::RegularLeaf{level, count_tombstones, ..} => {
-                            if count_tombstones == 0 {
-                                None
-                            } else {
-                                let dest_level = level + 1;
-                                let mut behind_segments = Vec::with_capacity(header.regular.len());
-                                for i in dest_level + 1 .. header.regular.len() {
-                                    let seg = &header.regular[i];
-
-                                    behind_segments.push(seg);
-                                }
-                                Some(behind_segments)
-                            }
-                        },
-                        MergingFrom::WaitingPartial{count_tombstones, ..} => {
-                            if count_tombstones == 0 {
-                                None
-                            } else {
-                                let dest_level = 0;
-                                let mut behind_segments = Vec::with_capacity(header.regular.len());
-                                for i in dest_level + 1 .. header.regular.len() {
-                                    let seg = &header.regular[i];
-
-                                    behind_segments.push(seg);
-                                }
-                                Some(behind_segments)
-                            }
-                        },
-                        MergingFrom::RegularPartial{level, count_tombstones, ..} => {
-                            if count_tombstones == 0 {
-                                None
-                            } else {
-                                let dest_level = level + 1;
-                                let mut behind_segments = Vec::with_capacity(header.regular.len());
-                                for i in dest_level + 1 .. header.regular.len() {
-                                    let seg = &header.regular[i];
-
-                                    behind_segments.push(seg);
-                                }
-                                Some(behind_segments)
-                            }
-                        },
-                    }
-                };
+                            behind_segments.push(seg);
+                        }
+                        Some(behind_segments)
+                    };
 
                 match behind_segments {
                     Some(behind_segments) => {
