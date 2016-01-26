@@ -1,4 +1,6 @@
 
+problem in pagecache with assert!(e.get().upgrade().is_none())
+
 diag_lsm list_segments during lots of merges causes a panic.
 multi-process concurrency is not implemented, and simply
 opening the db is not safe because list_all_blocks(). 

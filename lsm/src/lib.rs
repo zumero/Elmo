@@ -3621,6 +3621,12 @@ struct WroteMerge {
     elapsed_ms: i64,
 }
 
+struct WroteMergeFromIncoming {
+    segment: Option<SegmentHeaderInfo>,
+    keys_promoted: usize,
+    elapsed_ms: i64,
+}
+
 struct WroteSurvivors {
     segment: Option<SegmentHeaderInfo>,
     nodes_rewritten: Box<[Vec<PageNum>]>, // TODO why is this in a box?
@@ -3944,6 +3950,79 @@ fn merge_rewrite_parent(
     Ok(ret)
 }
 
+fn write_merge_from_incoming(
+                pw: &mut PageWriter,
+                pairs: &mut CursorIterator,
+                path: &str,
+                f: std::sync::Arc<PageCache>,
+                ) -> Result<WroteMergeFromIncoming> {
+
+    let t1 = time::PreciseTime::now();
+
+    // TODO could/should pb move into LeafUnderConstruction?
+
+    let mut pb = PageBuilder::new(pw.page_size());
+    let mut st = LeafUnderConstruction {
+        sofar: 0,
+        items: Vec::new(),
+        prefix_len: 0,
+        prev_key: None,
+    };
+    let mut chain = ParentNodeWriter::new(pw.page_size(), 1);
+
+    let mut keys_promoted = 0;
+
+    for pair in pairs {
+        let pair = try!(pair);
+        if let Some(pg) = try!(process_pair_into_leaf(&mut st, &mut pb, pw, pair)) {
+            try!(chain.add_child(pw, pg, 0));
+            keys_promoted += 1;
+        }
+    }
+
+    if let Some(pg) = try!(flush_leaf(&mut st, &mut pb, pw)) {
+        //println!("dest,{:?},child,{:?}", dest_level, pg);
+        try!(chain.add_child(pw, pg, 0));
+    }
+
+    let (count_parent_nodes, seg) = try!(chain.done(pw));
+
+    let seg =
+        match seg {
+            Some(seg) => {
+                let buf = 
+                    match seg.buf {
+                        Some(buf) => {
+                            buf
+                        },
+                        None => {
+                            let (pb_seg, buf) = pb.into_buf();
+                            assert!(pb_seg == seg.root_page);
+                            buf
+                        },
+                    };
+
+                let buf = std::sync::Arc::new(buf);
+                try!(f.put(seg.root_page, &buf));
+                let seg = SegmentHeaderInfo::new(seg.root_page, buf);
+                Some(seg)
+            },
+            None => {
+                None
+            },
+        };
+
+    let t2 = time::PreciseTime::now();
+    let elapsed = t1.to(t2);
+
+    let wrote = WroteMergeFromIncoming {
+        segment: seg,
+        keys_promoted: keys_promoted,
+        elapsed_ms: elapsed.num_milliseconds(),
+    };
+    Ok(wrote)
+}
+
 fn write_merge(
                 pw: &mut PageWriter,
                 pairs: &mut CursorIterator,
@@ -4047,28 +4126,6 @@ fn write_merge(
     }
 
     let (count_parent_nodes, seg) = try!(chain.done(pw));
-    let starting_depth =
-        match *into {
-            MergingInto::None => {
-                None
-            },
-            MergingInto::Leaf(_) => {
-                Some(0)
-            },
-            MergingInto::Parent(ref p) => {
-                Some(p.depth())
-            },
-        };
-
-    let ending_depth =
-        match seg {
-            Some(ref seg) => {
-                Some(seg.depth)
-            },
-            None => {
-                None
-            },
-        };
 
     let seg =
         match seg {
@@ -7127,21 +7184,31 @@ impl MergingInto {
 
 #[derive(Debug)]
 enum MergeFrom {
-    Incoming{segments: Vec<PageNum>},
-    IncomingNoRewrite{segments: Vec<PageNum>},
     Waiting{old_segment: PageNum, new_segment: Option<SegmentHeaderInfo>},
     Regular{level: usize, old_segment: PageNum, new_segment: Option<SegmentHeaderInfo>},
 }
 
+#[derive(Debug)]
+enum MergeFromIncoming {
+    Incoming{segments: Vec<PageNum>},
+    IncomingNoRewrite{segments: Vec<PageNum>},
+}
+
 impl MergeFrom {
+    fn get_from_non_incoming_level(&self) -> FromNonIncomingLevel {
+        match self {
+            &MergeFrom::Waiting{..} => FromNonIncomingLevel::Regular(0),
+            &MergeFrom::Regular{level, ..} => FromNonIncomingLevel::Regular(level + 1),
+        }
+    }
+
     fn get_dest_level(&self) -> DestLevel {
         match self {
-            &MergeFrom::Incoming{..} => DestLevel::Waiting,
-            &MergeFrom::IncomingNoRewrite{..} => DestLevel::Waiting,
             &MergeFrom::Waiting{..} => DestLevel::Regular(0),
             &MergeFrom::Regular{level, ..} => DestLevel::Regular(level + 1),
         }
     }
+
 }
 
 #[derive(Debug, PartialEq)]
@@ -7155,6 +7222,13 @@ enum NeedsMerge {
 pub struct PendingMerge {
     from: MergeFrom,
     old_dest_segment: Option<PageNum>,
+    new_dest_segment: Option<SegmentHeaderInfo>,
+    now_inactive: HashMap<PageNum, BlockList>,
+}
+
+#[derive(Debug)]
+pub struct PendingMergeFromIncoming {
+    from: MergeFromIncoming,
     new_dest_segment: Option<SegmentHeaderInfo>,
     now_inactive: HashMap<PageNum, BlockList>,
 }
@@ -7212,7 +7286,8 @@ impl PageCache {
                 e.insert(weak);
             },
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                // TODO the following assert failed once.  why?
+                // TODO the following assert failed a couple times.  why?
+                // not reproduceable
                 assert!(e.get().upgrade().is_none());
                 e.insert(weak);
             },
@@ -7279,6 +7354,28 @@ pub enum FromLevel {
     Regular(usize),
 }
 
+#[derive(Debug, Copy, Clone)]
+pub enum FromNonIncomingLevel {
+    Waiting,
+    Regular(usize),
+}
+
+impl FromNonIncomingLevel {
+    fn get_dest_level(&self) -> DestLevel {
+        match self {
+            &FromNonIncomingLevel::Waiting => DestLevel::Regular(0),
+            &FromNonIncomingLevel::Regular(level) => DestLevel::Regular(level + 1),
+        }
+    }
+
+    fn to_from_level(&self) -> FromLevel {
+        match self {
+            &FromNonIncomingLevel::Waiting => FromLevel::Waiting,
+            &FromNonIncomingLevel::Regular(level) => FromLevel::Regular(level),
+        }
+    }
+}
+
 impl FromLevel {
     fn get_dest_level(&self) -> DestLevel {
         match self {
@@ -7319,11 +7416,16 @@ impl WriteLock {
         Ok(())
     }
 
-// TODO this doesn't need to be public at all now, does it?
-    pub fn commit_merge(&self, pm: PendingMerge) -> Result<()> {
+    fn commit_merge(&self, pm: PendingMerge) -> Result<()> {
         try!(self.inner.commit_merge(pm));
         Ok(())
     }
+
+    fn commit_merge_from_incoming(&self, pm: PendingMergeFromIncoming) -> Result<()> {
+        try!(self.inner.commit_merge_from_incoming(pm));
+        Ok(())
+    }
+
 }
 
 pub struct DatabaseFile {
@@ -7587,11 +7689,31 @@ impl DatabaseFile {
                             Ok(Some(inner.settings.sleep_desperate_regular))
                         },
                         _ => {
-                            let pm = try!(InnerPart::prepare_merge(&inner, level));
-                            {
-                                let lck = try!(write_lock.lock());
-                                try!(lck.commit_merge(pm));
-                                Ok(Some(0))
+                            match level {
+                                FromLevel::Incoming => {
+                                    let pm = try!(InnerPart::prepare_merge_from_incoming(&inner));
+                                    {
+                                        let lck = try!(write_lock.lock());
+                                        try!(lck.commit_merge_from_incoming(pm));
+                                        Ok(Some(0))
+                                    }
+                                },
+                                FromLevel::Waiting => {
+                                    let pm = try!(InnerPart::prepare_merge(&inner, FromNonIncomingLevel::Waiting));
+                                    {
+                                        let lck = try!(write_lock.lock());
+                                        try!(lck.commit_merge(pm));
+                                        Ok(Some(0))
+                                    }
+                                },
+                                FromLevel::Regular(n) => {
+                                    let pm = try!(InnerPart::prepare_merge(&inner, FromNonIncomingLevel::Regular(n)));
+                                    {
+                                        let lck = try!(write_lock.lock());
+                                        try!(lck.commit_merge(pm));
+                                        Ok(Some(0))
+                                    }
+                                },
                             }
                         },
                     }
@@ -8233,17 +8355,409 @@ impl InnerPart {
         }
     }
 
-    fn prepare_merge(inner: &std::sync::Arc<InnerPart>, from_level: FromLevel) -> Result<PendingMerge> {
+    fn verify_inactive_against_old_method(
+        from_level: FromLevel,
+        from_segments: &Vec<PageNum>,
+        survivors: &Option<SegmentHeaderInfo>,
+        f: &std::sync::Arc<PageCache>, 
+        now_inactive: &HashMap<PageNum, BlockList>, 
+        old_dest_segment: &Option<PageNum>, 
+        new_dest_segment: &Option<SegmentHeaderInfo>, 
+        ) -> Result<()> {
+
+        // TODO function is inherently inefficient when called on a segment that
+        // is in the header, because it loads and allocs the root page, a copy
+        // of which is already in the header.
+        fn get_blocklist_for_segment_including_root(
+            page: PageNum,
+            f: &std::sync::Arc<PageCache>,
+            ) -> Result<BlockList> {
+            let buf = try!(f.get(page));
+
+            let pt = try!(PageType::from_u8(buf[0]));
+            let mut blocks =
+                match pt {
+                    PageType::Leaf => {
+                        let page = try!(LeafPage::new(f.clone(), page));
+                        try!(page.blocklist_unsorted())
+                    },
+                    PageType::Parent => {
+                        let parent = try!(ParentPage::new(f.clone(), page));
+                        try!(parent.blocklist_unsorted())
+                    },
+                };
+            blocks.add_page_no_reorder(page);
+            Ok(blocks)
+        }
+
+        let old_now_inactive = {
+            let mut now_inactive = HashMap::new();
+            for &seg in from_segments.iter() {
+                let blocks = try!(get_blocklist_for_segment_including_root(seg, f));
+                assert!(!now_inactive.contains_key(&seg));
+                now_inactive.insert(seg, blocks);
+            }
+            match old_dest_segment {
+                &Some(seg) => {
+                    let blocks = try!(get_blocklist_for_segment_including_root(seg, f));
+                    println!("old_dest_segment {} is {:?}", seg, blocks);
+                    assert!(!now_inactive.contains_key(&seg));
+                    now_inactive.insert(seg, blocks);
+                },
+                &None => {
+                },
+            }
+            now_inactive
+        };
+
+        let old_now_inactive = {
+            let mut old_now_inactive = old_now_inactive;
+            match new_dest_segment {
+                &Some(ref seg) => {
+                    let mut blocks = try!(seg.blocklist_unsorted(f));
+                    blocks.add_page_no_reorder(seg.root_page);
+                    println!("new_dest_segment {} is {:?}", seg.root_page, blocks);
+                    for (k,b) in old_now_inactive.iter_mut() {
+                        b.remove_anything_in(&blocks);
+                    }
+                },
+                &None => {
+                },
+            }
+            if let &Some(ref new_segment) = survivors {
+                let mut blocks = try!(new_segment.blocklist_unsorted(f));
+                blocks.add_page_no_reorder(new_segment.root_page);
+                println!("new_segment {} is {:?}", new_segment.root_page, blocks);
+                for (k, b) in old_now_inactive.iter_mut() {
+                    b.remove_anything_in(&blocks);
+                }
+            }
+            old_now_inactive
+        };
+
+        // TODO okay now the two should match
+
+        //println!("now_inactive: {:?}", now_inactive);
+        //println!("old_now_inactive: {:?}", old_now_inactive);
+
+        {
+            let mut new = now_inactive.keys().map(|p| *p).collect::<Vec<PageNum>>();
+            new.sort();
+
+            let mut old = old_now_inactive.keys().map(|p| *p).collect::<Vec<PageNum>>();
+            old.sort();
+
+            assert!(old == new);
+
+            for seg in old {
+                let mut old_blocks = old_now_inactive.get(&seg).unwrap().clone();
+                let mut new_blocks = now_inactive.get(&seg).unwrap().clone();
+
+                old_blocks.sort_and_consolidate();
+                new_blocks.sort_and_consolidate();
+
+                //if cfg!(expensive_check) 
+                {
+                    match new_dest_segment {
+                        &Some(ref new_dest_segment) => {
+                            let mut blocks = try!(new_dest_segment.blocklist_unsorted(f));
+                            blocks.add_page_no_reorder(new_dest_segment.root_page);
+
+                            let both = blocks.remove_anything_in(&new_blocks);
+                            if !both.is_empty() {
+                                println!("{:?}: inactive problem: segment {}", from_level, seg);
+                                println!("new: {:?}", new_blocks);
+                                println!("new inactive but in new dest ({}): {:?}", new_dest_segment.root_page, both);
+                                panic!();
+                            }
+
+                        },
+                        &None => {
+                            //println!("new_dest_segment: None");
+                        },
+                    }
+                }
+
+                //if cfg!(expensive_check) 
+                {
+                    if let &Some(ref new_segment) = survivors {
+                        let mut blocks = try!(new_segment.blocklist_unsorted(f));
+                        blocks.add_page_no_reorder(new_segment.root_page);
+
+                        let both = blocks.remove_anything_in(&new_blocks);
+                        if !both.is_empty() {
+                            println!("{:?}: inactive problem: segment {}", from_level, seg);
+                            println!("new: {:?}", new_blocks);
+                            println!("new inactive but in new from ({}): {:?}", new_segment.root_page, both);
+                            panic!();
+                        }
+                    }
+                }
+
+                if old_blocks.count_pages() != new_blocks.count_pages() {
+                    println!("{:?}: inactive mismatch: segment {}", from_level, seg);
+                    println!("from_level: {:?}", from_level);
+                    println!("from_segments: {:?}", from_segments);
+                    println!("old count: {:?}", old_blocks.count_pages());
+                    println!("new count: {:?}", new_blocks.count_pages());
+                    println!("old: {:?}", old_blocks);
+                    println!("new: {:?}", new_blocks);
+
+                    let mut only_in_old = old_blocks.clone();
+                    only_in_old.remove_anything_in(&new_blocks);
+                    println!("only_in_old: {:?}", only_in_old);
+
+                    let mut only_in_new = new_blocks.clone();
+                    only_in_new.remove_anything_in(&old_blocks);
+                    println!("only_in_new: {:?}", only_in_new);
+
+                    panic!("inactive mismatch");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_merge_from_incoming(inner: &std::sync::Arc<InnerPart>) -> Result<PendingMergeFromIncoming> {
+        // Segments of depth > 0 are moved from Incoming to Waiting
+        // without rewriting them.
+
+        // Leaf segments are moved from Incoming to Waiting by
+        // grouping them together into bigger segments.
+
+        // TODO should we be grouping and rewriting small non-leaf segments?
+
+        let t1 = time::PreciseTime::now();
+
+        let f = &inner.page_cache;
+
+        let (cursor, leaf_segments) = {
+            let headerstuff = try!(inner.header.read());
+            let header = &headerstuff.data;
+
+            let (cursors, leaf_segments) = {
+                // find all the stuff that is getting promoted.  
+                // we need a cursor on this so we can rewrite it into the next level.
+                // we also need to remember where it came from, so we can remove it 
+                // from the header segments lists.
+
+                // we actually do not need read locks on this stuff, because
+                // a read lock is simply to prevent commit_merge() from freeing
+                // something that is still being read by something else.
+                // two merges promoting the same stuff are not allowed.
+
+                fn get_cursors(f: &std::sync::Arc<PageCache>, segments: &[SegmentHeaderInfo]) -> Result<Vec<MultiPageCursor>> {
+                    let mut cursors = Vec::with_capacity(segments.len());
+                    for i in 0 .. segments.len() {
+                        let pagenum = segments[i].root_page;
+                        let cursor = try!(MultiPageCursor::new(f.clone(), vec![pagenum]));
+                        cursors.push(cursor);
+                    }
+
+                    Ok(cursors)
+                }
+
+                fn slice_from_end(v: &[SegmentHeaderInfo], count: usize) -> &[SegmentHeaderInfo] {
+                    let count = std::cmp::min(count, v.len());
+                    let i = v.len() - count;
+                    let v = &v[i ..];
+                    v
+                }
+
+                {
+                    let i = header.incoming.len() - 1;
+                    match try!(PageType::from_u8(header.incoming[i].buf[0])) {
+                        PageType::Leaf => {
+                            let mut i = i;
+                            // TODO should there be a limit to how many leaves we will take at one time?
+
+                            // note that must accept just one if that's all we have.
+                            // otherwise, we could get stuck with the last segment being a leaf
+                            // and the second-to-last segment being a parent.
+                            while i > 0 {
+                                if PageType::Leaf == try!(PageType::from_u8(header.incoming[i - 1].buf[0])) {
+                                    i -= 1;
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            let leaf_segments = slice_from_end(&header.incoming, header.incoming.len() - i);
+
+                            let cursors = try!(get_cursors(f, &leaf_segments));
+
+                            let leaf_segments = 
+                                leaf_segments
+                                .iter()
+                                .map( |seg| seg.root_page)
+                                .collect::<Vec<_>>();;
+
+                            (cursors, leaf_segments)
+                        },
+                        PageType::Parent => {
+                            let mut i = i;
+                            while i > 0 {
+                                if PageType::Parent == try!(PageType::from_u8(header.incoming[i - 1].buf[0])) {
+                                    i -= 1;
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            let segments = slice_from_end(&header.incoming, header.incoming.len() - i);
+
+                            let segments = 
+                                segments
+                                .iter()
+                                .map(|seg| seg.root_page)
+                                .collect::<Vec<_>>();;
+
+                            // TODO dislike early return
+                            let pm = 
+                                PendingMergeFromIncoming {
+                                    from: MergeFromIncoming::IncomingNoRewrite{segments: segments},
+                                    new_dest_segment: None,
+                                    now_inactive: HashMap::new(),
+                                };
+                            let t2 = time::PreciseTime::now();
+                            let elapsed = t1.to(t2);
+                            //println!("prepare,from,{:?}, ms,{}", from_level, elapsed.num_milliseconds());
+                            return Ok(pm);
+                        },
+                    }
+
+                }
+            };
+
+            let cursor = {
+                let mc = MergeCursor::new(cursors);
+                mc
+            };
+
+            (cursor, leaf_segments)
+        };
+
+        let mut pw = try!(PageWriter::new(inner.clone()));
+
+        let (new_dest_segment, overflows_eaten) = {
+            // note that cursor.first() should NOT have already been called
+            let mut cursor = cursor;
+            try!(cursor.first());
+            if cursor.is_valid() {
+                let mut source = CursorIterator::new(cursor);
+                let wrote = try!(write_merge_from_incoming(&mut pw, &mut source, &inner.path, f.clone()));
+
+                //println!("write_merge, nodes_rewritten: {:?}", wrote.nodes_rewritten);
+
+                let count_keys_yielded_by_merge_cursor = source.count_keys_yielded();
+                //println!("count_keys_yielded_by_merge_cursor: {}", count_keys_yielded_by_merge_cursor);
+
+                println!("merge,from,{:?}, keys_promoted,{}, ms,{}", 
+                         FromLevel::Incoming, 
+                         wrote.keys_promoted, 
+                         wrote.elapsed_ms,
+                        );
+
+                if cfg!(expensive_check) 
+                {
+                    let count_dest_keys_after =
+                        match wrote.segment {
+                            Some(ref seg) => {
+                                try!(seg.count_keys(f))
+                            },
+                            None => {
+                                0
+                            },
+                        };
+
+                    let count_keys_shadowed_in_merge_cursor = source.count_keys_shadowed();
+                    let count_keys_yielded_by_merge_cursor = source.count_keys_yielded();
+
+                    println!("count_dest_keys_after: {}", count_dest_keys_after);
+                    println!("count_keys_yielded_by_merge_cursor: {}", count_keys_yielded_by_merge_cursor);
+                    println!("count_keys_shadowed_in_merge_cursor: {}", count_keys_shadowed_in_merge_cursor);
+                    println!("keys promoted in merge: {}", wrote.keys_promoted);
+
+                    assert!(count_dest_keys_after == count_keys_yielded_by_merge_cursor);
+                }
+
+                let overflows_eaten = source.overflows_eaten();
+
+                (wrote.segment, overflows_eaten)
+            } else {
+                // TODO returning None and empty vecs is silly
+                (None, vec![])
+            }
+        };
+
+        // all pages in the incoming segments being promoted
+        // must end up in one of the following places:
+        //     the new dest segment
+        //     inactive
+
+        let now_inactive: HashMap<PageNum, BlockList> = {
+            let mut now_inactive = HashMap::new();
+            // this code assumes that all overflows (that were not eaten)
+            // got recycled into the new segment, so the only thing
+            // going inactive are the leaf pages themselves.
+            for &seg in leaf_segments.iter() {
+                let mut blocks = BlockList::new();
+                blocks.add_page_no_reorder(seg);
+                // TODO overflows_eaten should be a hashmap
+                for &(s, page) in overflows_eaten.iter() {
+                    if s == seg {
+                        let (_, blist) = try!(OverflowReader::get_len_and_blocklist(f.clone(), page));
+                        blocks.add_blocklist_no_reorder(&blist);
+                    }
+                }
+                assert!(!now_inactive.contains_key(&seg));
+                now_inactive.insert(seg, blocks);
+            }
+            now_inactive
+        };
+
+        try!(pw.end());
+
+        // bizarre
+        if cfg!(expensive_check) 
+        {
+            try!(Self::verify_inactive_against_old_method(
+                    FromLevel::Incoming,
+                    &leaf_segments,
+                    &None,
+                    &f,
+                    &now_inactive,
+                    &None,
+                    &new_dest_segment
+                    ));
+        }
+
+        //println!("now_inactive: {:?}", now_inactive);
+
+        let from = 
+            MergeFromIncoming::Incoming{
+                segments: leaf_segments,
+            };
+
+        let pm = 
+            PendingMergeFromIncoming {
+                from: from,
+                new_dest_segment: new_dest_segment,
+                now_inactive: now_inactive,
+            };
+        //println!("PendingMerge: {:?}", pm);
+
+        let t2 = time::PreciseTime::now();
+        let elapsed = t1.to(t2);
+        //println!("prepare,from,{:?}, ms,{}", from_level, elapsed.num_milliseconds());
+
+        Ok(pm)
+    }
+
+    fn prepare_merge(inner: &std::sync::Arc<InnerPart>, from_level: FromNonIncomingLevel) -> Result<PendingMerge> {
         let t1 = time::PreciseTime::now();
 
         enum MergingFrom {
-            IncomingLeaves{
-                // Segments of depth > 0 are moved from Incoming to Waiting
-                // without rewriting them.
-                // Leaf segments are moved from Incoming to Waiting by
-                // grouping them together into bigger segments.
-                segments: Vec<PageNum>,
-            },
             WaitingLeaf{
                 segment: PageNum,
                 count_tombstones: u64,
@@ -8288,90 +8802,8 @@ impl InnerPart {
                 // something that is still being read by something else.
                 // two merges promoting the same stuff are not allowed.
 
-                fn get_cursors(inner: &std::sync::Arc<InnerPart>, f: &std::sync::Arc<PageCache>, merge_segments: &[SegmentHeaderInfo]) -> Result<Vec<MultiPageCursor>> {
-                    let mut cursors = Vec::with_capacity(merge_segments.len());
-                    for i in 0 .. merge_segments.len() {
-                        let pagenum = merge_segments[i].root_page;
-                        let cursor = try!(MultiPageCursor::new(f.clone(), vec![pagenum]));
-                        cursors.push(cursor);
-                    }
-
-                    Ok(cursors)
-                }
-
-                fn slice_from_end(v: &[SegmentHeaderInfo], count: usize) -> &[SegmentHeaderInfo] {
-                    let count = std::cmp::min(count, v.len());
-                    let i = v.len() - count;
-                    let v = &v[i ..];
-                    v
-                }
-
                 match from_level {
-                    FromLevel::Incoming => {
-                        let i = header.incoming.len() - 1;
-                        match try!(PageType::from_u8(header.incoming[i].buf[0])) {
-                            PageType::Leaf => {
-                                let mut i = i;
-                                // TODO should there be a limit to how many leaves we will take at one time?
-
-                                // note that must accept just one if that's all we have.
-                                // otherwise, we could get stuck with the last segment being a leaf
-                                // and the second-to-last segment being a parent.
-                                while i > 0 {
-                                    if PageType::Leaf == try!(PageType::from_u8(header.incoming[i - 1].buf[0])) {
-                                        i -= 1;
-                                    } else {
-                                        break;
-                                    }
-                                }
-
-                                let merge_segments = slice_from_end(&header.incoming, header.incoming.len() - i);
-
-                                let cursors = try!(get_cursors(inner, f, &merge_segments));
-
-                                let merge_segments = 
-                                    merge_segments
-                                    .iter()
-                                    .map( |seg| seg.root_page)
-                                    .collect::<Vec<_>>();;
-
-                                (cursors, MergingFrom::IncomingLeaves{segments: merge_segments})
-                            },
-                            PageType::Parent => {
-                                let mut i = i;
-                                while i > 0 {
-                                    if PageType::Parent == try!(PageType::from_u8(header.incoming[i - 1].buf[0])) {
-                                        i -= 1;
-                                    } else {
-                                        break;
-                                    }
-                                }
-
-                                let merge_segments = slice_from_end(&header.incoming, header.incoming.len() - i);
-
-                                let merge_segments = 
-                                    merge_segments
-                                    .iter()
-                                    .map(|seg| seg.root_page)
-                                    .collect::<Vec<_>>();;
-
-                                // TODO dislike early return
-                                let pm = 
-                                    PendingMerge {
-                                        from: MergeFrom::IncomingNoRewrite{segments: merge_segments},
-                                        old_dest_segment: None,
-                                        new_dest_segment: None,
-                                        now_inactive: HashMap::new(),
-                                    };
-                                let t2 = time::PreciseTime::now();
-                                let elapsed = t1.to(t2);
-                                //println!("prepare,from,{:?}, ms,{}", from_level, elapsed.num_milliseconds());
-                                return Ok(pm);
-                            },
-                        }
-
-                    },
-                    FromLevel::Waiting => {
+                    FromNonIncomingLevel::Waiting => {
                         let i = header.waiting.len() - 1;
                         let segment = &header.waiting[i];
                         match try!(PageType::from_u8(header.waiting[i].buf[0])) {
@@ -8412,7 +8844,7 @@ impl InnerPart {
                             }
                         }
                     },
-                    FromLevel::Regular(level) => {
+                    FromNonIncomingLevel::Regular(level) => {
                         assert!(header.regular.len() > level);
                         // TODO unwrap here is ugly.  but needs_merge happpened first
                         let old_from_segment = header.regular[level].as_ref().unwrap();
@@ -8526,9 +8958,6 @@ impl InnerPart {
 
                 let behind_segments = {
                     match from {
-                        MergingFrom::IncomingLeaves{..} => {
-                            None
-                        },
                         MergingFrom::WaitingLeaf{count_tombstones, ..} => {
                             if count_tombstones == 0 {
                                 None
@@ -8747,35 +9176,18 @@ impl InnerPart {
                 },
             };
 
-        // there are four sources of pages in this operation:
-        //     the incoming segments being promoted
-        //     the waiting segments being promoted
-        //     the regular segment being promoted
+        // there are two sources of pages in this operation:
+        //     the segment being promoted
         //     the dest segment
         //
         // all those pages must end up in one of three places:
         //     the new dest segment
-        //     the new from segment
+        //     the new from segment (survivors)
         //     inactive
 
         let mut now_inactive: HashMap<PageNum, BlockList> = {
             let mut now_inactive = HashMap::new();
             match from {
-                MergingFrom::IncomingLeaves{ref segments} => {
-                    for &seg in segments.iter() {
-                        let mut blocks = BlockList::new();
-                        blocks.add_page_no_reorder(seg);
-                        // TODO overflows_eaten should be a hashmap
-                        for &(s, page) in overflows_eaten.iter() {
-                            if s == seg {
-                                let (_, blist) = try!(OverflowReader::get_len_and_blocklist(f.clone(), page));
-                                blocks.add_blocklist_no_reorder(&blist);
-                            }
-                        }
-                        assert!(!now_inactive.contains_key(&seg));
-                        now_inactive.insert(seg, blocks);
-                    }
-                },
                 MergingFrom::WaitingLeaf{segment, ..} => {
                     let mut blocks = BlockList::new();
                     blocks.add_page_no_reorder(segment);
@@ -8820,11 +9232,6 @@ impl InnerPart {
 
         let from = 
             match from {
-                MergingFrom::IncomingLeaves{segments} => {
-                    MergeFrom::Incoming{
-                        segments: segments,
-                    }
-                },
                 MergingFrom::WaitingLeaf{segment, ..} => {
                     MergeFrom::Waiting{
                         old_segment: segment,
@@ -8925,210 +9332,25 @@ impl InnerPart {
         // bizarre
         if cfg!(expensive_check) 
         {
-            // TODO function is inherently inefficient when called on a segment that
-            // is in the header, because it loads and allocs the root page, a copy
-            // of which is already in the header.
-            fn get_blocklist_for_segment_including_root(
-                page: PageNum,
-                f: &std::sync::Arc<PageCache>,
-                ) -> Result<BlockList> {
-                let buf = try!(f.get(page));
-
-                let pt = try!(PageType::from_u8(buf[0]));
-                let mut blocks =
-                    match pt {
-                        PageType::Leaf => {
-                            let page = try!(LeafPage::new(f.clone(), page));
-                            try!(page.blocklist_unsorted())
-                        },
-                        PageType::Parent => {
-                            let parent = try!(ParentPage::new(f.clone(), page));
-                            try!(parent.blocklist_unsorted())
-                        },
-                    };
-                blocks.add_page_no_reorder(page);
-                Ok(blocks)
-            }
-
-            let old_now_inactive = {
-                let mut now_inactive = HashMap::new();
+            let (old_from_segment, survivors) =
                 match from {
-                    MergeFrom::Incoming{ref segments} => {
-                        for &seg in segments.iter() {
-                            let blocks = try!(get_blocklist_for_segment_including_root(seg, f));
-                            assert!(!now_inactive.contains_key(&seg));
-                            now_inactive.insert(seg, blocks);
-                        }
+                    MergeFrom::Waiting{old_segment, ref new_segment, ..} => {
+                        (old_segment, new_segment)
                     },
-                    MergeFrom::IncomingNoRewrite{..} => {
+                    MergeFrom::Regular{old_segment, ref new_segment, ..} => {
+                        (old_segment, new_segment)
                     },
-                    MergeFrom::Waiting{old_segment, ..} => {
-                        let blocks = try!(get_blocklist_for_segment_including_root(old_segment, f));
-                        println!("old_segment {} was {:?}", old_segment, blocks);
-                        assert!(!now_inactive.contains_key(&old_segment));
-                        now_inactive.insert(old_segment, blocks);
-                    },
-                    MergeFrom::Regular{old_segment, ..} => {
-                        let blocks = try!(get_blocklist_for_segment_including_root(old_segment, f));
-                        assert!(!now_inactive.contains_key(&old_segment));
-                        now_inactive.insert(old_segment, blocks);
-                    },
-                }
-                match old_dest_segment {
-                    Some(seg) => {
-                        let blocks = try!(get_blocklist_for_segment_including_root(seg, f));
-                        println!("old_dest_segment {} is {:?}", seg, blocks);
-                        assert!(!now_inactive.contains_key(&seg));
-                        now_inactive.insert(seg, blocks);
-                    },
-                    None => {
-                    },
-                }
-                now_inactive
-            };
+                };
 
-            let old_now_inactive = {
-                let mut old_now_inactive = old_now_inactive;
-                match new_dest_segment {
-                    Some(ref seg) => {
-                        let mut blocks = try!(seg.blocklist_unsorted(f));
-                        blocks.add_page_no_reorder(seg.root_page);
-                        println!("new_dest_segment {} is {:?}", seg.root_page, blocks);
-                        for (k,b) in old_now_inactive.iter_mut() {
-                            b.remove_anything_in(&blocks);
-                        }
-                    },
-                    None => {
-                    },
-                }
-                match from {
-                    MergeFrom::Waiting{ref new_segment, ..} => {
-                        if let &Some(ref new_segment) = new_segment {
-                            let mut blocks = try!(new_segment.blocklist_unsorted(f));
-                            blocks.add_page_no_reorder(new_segment.root_page);
-                            println!("new_segment {} is {:?}", new_segment.root_page, blocks);
-                            for (k, b) in old_now_inactive.iter_mut() {
-                                b.remove_anything_in(&blocks);
-                            }
-                        }
-                    },
-                    MergeFrom::Regular{ref new_segment, ..} => {
-                        if let &Some(ref new_segment) = new_segment {
-                            let mut blocks = try!(new_segment.blocklist_unsorted(f));
-                            blocks.add_page_no_reorder(new_segment.root_page);
-                            for (k, b) in old_now_inactive.iter_mut() {
-                                b.remove_anything_in(&blocks);
-                            }
-                        }
-                    },
-                    _ => {
-                    },
-                }
-                old_now_inactive
-            };
-
-            // TODO okay now the two should match
-
-            //println!("now_inactive: {:?}", now_inactive);
-            //println!("old_now_inactive: {:?}", old_now_inactive);
-
-            {
-                let mut new = now_inactive.keys().map(|p| *p).collect::<Vec<PageNum>>();
-                new.sort();
-
-                let mut old = old_now_inactive.keys().map(|p| *p).collect::<Vec<PageNum>>();
-                old.sort();
-
-                assert!(old == new);
-
-                for seg in old {
-                    let mut old_blocks = old_now_inactive.get(&seg).unwrap().clone();
-                    let mut new_blocks = now_inactive.get(&seg).unwrap().clone();
-
-                    old_blocks.sort_and_consolidate();
-                    new_blocks.sort_and_consolidate();
-
-                    //if cfg!(expensive_check) 
-                    {
-                        match new_dest_segment {
-                            Some(ref new_dest_segment) => {
-                                let mut blocks = try!(new_dest_segment.blocklist_unsorted(f));
-                                blocks.add_page_no_reorder(new_dest_segment.root_page);
-
-                                let both = blocks.remove_anything_in(&new_blocks);
-                                if !both.is_empty() {
-                                    println!("{:?}: inactive problem: segment {}", from_level, seg);
-                                    println!("new: {:?}", new_blocks);
-                                    println!("new inactive but in new dest ({}): {:?}", new_dest_segment.root_page, both);
-                                    panic!();
-                                }
-
-                            },
-                            None => {
-                                //println!("new_dest_segment: None");
-                            },
-                        }
-                    }
-
-                    //if cfg!(expensive_check) 
-                    {
-                        match from {
-                            MergeFrom::Waiting{ref new_segment, ..} => {
-                                if let &Some(ref new_segment) = new_segment {
-                                    let mut blocks = try!(new_segment.blocklist_unsorted(f));
-                                    blocks.add_page_no_reorder(new_segment.root_page);
-
-                                    let both = blocks.remove_anything_in(&new_blocks);
-                                    if !both.is_empty() {
-                                        println!("{:?}: inactive problem: segment {}", from_level, seg);
-                                        println!("new: {:?}", new_blocks);
-                                        println!("new inactive but in new from ({}): {:?}", new_segment.root_page, both);
-                                        panic!();
-                                    }
-                                }
-
-                            },
-                            MergeFrom::Regular{ref new_segment, ..} => {
-                                if let &Some(ref new_segment) = new_segment {
-                                    let mut blocks = try!(new_segment.blocklist_unsorted(f));
-                                    blocks.add_page_no_reorder(new_segment.root_page);
-
-                                    let both = blocks.remove_anything_in(&new_blocks);
-                                    if !both.is_empty() {
-                                        println!("{:?}: inactive problem: segment {}", from_level, seg);
-                                        println!("new: {:?}", new_blocks);
-                                        println!("new inactive but in new from ({}): {:?}", new_segment.root_page, both);
-                                        panic!();
-                                    }
-                                }
-
-                            },
-                            _ => {
-                                //println!("new_from_segment: None");
-                            },
-                        }
-                    }
-
-                    if old_blocks.count_pages() != new_blocks.count_pages() {
-                        println!("{:?}: inactive mismatch: segment {}", from_level, seg);
-                        println!("from: {:?}", from);
-                        println!("old count: {:?}", old_blocks.count_pages());
-                        println!("new count: {:?}", new_blocks.count_pages());
-                        println!("old: {:?}", old_blocks);
-                        println!("new: {:?}", new_blocks);
-
-                        let mut only_in_old = old_blocks.clone();
-                        only_in_old.remove_anything_in(&new_blocks);
-                        println!("only_in_old: {:?}", only_in_old);
-
-                        let mut only_in_new = new_blocks.clone();
-                        only_in_new.remove_anything_in(&old_blocks);
-                        println!("only_in_new: {:?}", only_in_new);
-
-                        panic!("inactive mismatch");
-                    }
-                }
-            }
+            try!(Self::verify_inactive_against_old_method(
+                    from_level.to_from_level(),
+                    &vec![old_from_segment],
+                    &survivors,
+                    &f,
+                    &now_inactive,
+                    &old_dest_segment,
+                    &new_dest_segment
+                    ));
         }
 
         //println!("now_inactive: {:?}", now_inactive);
@@ -9147,6 +9369,118 @@ impl InnerPart {
         //println!("prepare,from,{:?}, ms,{}", from_level, elapsed.num_milliseconds());
 
         Ok(pm)
+    }
+
+    fn commit_merge_from_incoming(&self, pm: PendingMergeFromIncoming) -> Result<()> {
+        //println!("commit_merge: {:?}", pm);
+        {
+            let mut headerstuff = try!(self.header.write());
+
+            // TODO assert new seg shares no pages with any seg in current state?
+
+            let mut new_header = headerstuff.data.clone();
+
+            fn find_segments_in_list(merge: &[PageNum], hdr: &[SegmentHeaderInfo]) -> usize {
+                fn slice_within(sub: &[PageNum], within: &[PageNum]) -> usize {
+                    match within.iter().position(|&g| g == sub[0]) {
+                        Some(ndx_first) => {
+                            let count = sub.len();
+                            if sub == &within[ndx_first .. ndx_first + count] {
+                                ndx_first
+                            } else {
+                                panic!("not contiguous")
+                            }
+                        },
+                        None => {
+                            panic!("not contiguous")
+                        },
+                    }
+                }
+
+                // verify that segemnts are contiguous and at the end
+                let hdr = hdr.iter().map(|seg| seg.root_page).collect::<Vec<_>>();
+                let ndx = slice_within(merge, hdr.as_slice());
+                assert!(ndx == hdr.len() - merge.len());
+                ndx
+            }
+
+            let mut deps = HashMap::new();
+
+            // TODO this code assumes that the new dest segment might have
+            // recycled an overflow from ANY of the promoted segments.
+            // this is a little bit pessimistic.
+            // the write merge segment code
+            // could keep track of things more closely, but that would probably
+            // be low bang for the buck.
+            match pm.new_dest_segment {
+                None => {
+                },
+                Some(ref new_seg) => {
+                    let mut deps_dest = vec![];
+                    match pm.from {
+                        MergeFromIncoming::Incoming{ref segments} => {
+                            for seg in segments {
+                                deps_dest.push(*seg);
+                            }
+                        },
+                        MergeFromIncoming::IncomingNoRewrite{..} => {
+                            assert!(pm.now_inactive.is_empty());
+                        },
+                    }
+                    assert!(!deps.contains_key(&new_seg.root_page));
+                    deps.insert(new_seg.root_page, deps_dest);
+                },
+            }
+
+            match pm.from {
+                MergeFromIncoming::Incoming{ref segments} => {
+                    let ndx = find_segments_in_list(segments, &headerstuff.data.incoming);
+                    for _ in segments {
+                        new_header.incoming.remove(ndx);
+                    }
+
+                    match pm.new_dest_segment {
+                        None => {
+                            // a merge resulted in what would have been an empty segment.
+                            // this happens because tombstones.
+                            // multiple segments from the incoming level cancelled each other out.
+                            // nothing needs to be inserted in the waiting level.
+                        },
+                        Some(new_seg) => {
+                            new_header.waiting.insert(0, new_seg);
+                        },
+                    }
+                },
+                MergeFromIncoming::IncomingNoRewrite{ref segments} => {
+                    let ndx = find_segments_in_list(segments, &headerstuff.data.incoming);
+                    for _ in segments {
+                        let s = new_header.incoming.remove(ndx);
+                        new_header.waiting.insert(0, s);
+                    }
+
+                    assert!(pm.new_dest_segment.is_none());
+                },
+            }
+
+            new_header.merge_counter += 1;
+
+            let mut space = try!(self.space.lock());
+            try!(headerstuff.write_header(&mut space, new_header, self.page_cache.page_size()));
+            //println!("merge committed");
+
+            for (seg, depends_on) in deps {
+                space.add_dependencies(seg, depends_on);
+            }
+            space.add_inactive(pm.now_inactive);
+        }
+
+        // note that we intentionally do not release the writeLock here.
+        // you can change the segment list more than once while holding
+        // the writeLock.  the writeLock gets released when you Dispose() it.
+
+        try!(self.notify_work(FromLevel::Waiting));
+
+        Ok(())
     }
 
     fn commit_merge(&self, pm: PendingMerge) -> Result<()> {
@@ -9203,34 +9537,10 @@ impl InnerPart {
                 }
             }
 
-            fn find_segments_in_list(merge: &[PageNum], hdr: &[SegmentHeaderInfo]) -> usize {
-                fn slice_within(sub: &[PageNum], within: &[PageNum]) -> usize {
-                    match within.iter().position(|&g| g == sub[0]) {
-                        Some(ndx_first) => {
-                            let count = sub.len();
-                            if sub == &within[ndx_first .. ndx_first + count] {
-                                ndx_first
-                            } else {
-                                panic!("not contiguous")
-                            }
-                        },
-                        None => {
-                            panic!("not contiguous")
-                        },
-                    }
-                }
-
-                // verify that segemnts are contiguous and at the end
-                let hdr = hdr.iter().map(|seg| seg.root_page).collect::<Vec<_>>();
-                let ndx = slice_within(merge, hdr.as_slice());
-                assert!(ndx == hdr.len() - merge.len());
-                ndx
-            }
-
             let mut deps = HashMap::new();
 
             // TODO this code assumes that the new dest segment might have
-            // recycled something from ANY of the promoted segments OR from
+            // recycled something from the promoted segment OR from
             // the old dest segment.  this is a little bit pessimistic.
             // a node page can only be recycled from the old dest, but overflows
             // could have been recycled from anywhere.  the write merge segment code
@@ -9242,14 +9552,6 @@ impl InnerPart {
                 Some(ref new_seg) => {
                     let mut deps_dest = vec![];
                     match pm.from {
-                        MergeFrom::Incoming{ref segments} => {
-                            for seg in segments {
-                                deps_dest.push(*seg);
-                            }
-                        },
-                        MergeFrom::IncomingNoRewrite{..} => {
-                            assert!(pm.now_inactive.is_empty());
-                        },
                         MergeFrom::Waiting{old_segment, ..} => {
                             deps_dest.push(old_segment);
                         },
@@ -9272,10 +9574,6 @@ impl InnerPart {
             // also, the survivors must depend on the old segment
 
             match pm.from {
-                MergeFrom::Incoming{..} => {
-                },
-                MergeFrom::IncomingNoRewrite{..} => {
-                },
                 MergeFrom::Waiting{old_segment, ref new_segment} => {
                     match new_segment {
                         &Some(ref new_segment) => {
@@ -9299,35 +9597,6 @@ impl InnerPart {
             }
 
             match pm.from {
-                MergeFrom::Incoming{ref segments} => {
-                    let ndx = find_segments_in_list(segments, &headerstuff.data.incoming);
-                    for _ in segments {
-                        new_header.incoming.remove(ndx);
-                    }
-
-                    assert!(pm.old_dest_segment.is_none());
-                    match pm.new_dest_segment {
-                        None => {
-                            // a merge resulted in what would have been an empty segment.
-                            // this happens because tombstones.
-                            // multiple segments from the incoming level cancelled each other out.
-                            // nothing needs to be inserted in the waiting level.
-                        },
-                        Some(new_seg) => {
-                            new_header.waiting.insert(0, new_seg);
-                        },
-                    }
-                },
-                MergeFrom::IncomingNoRewrite{ref segments} => {
-                    let ndx = find_segments_in_list(segments, &headerstuff.data.incoming);
-                    for _ in segments {
-                        let s = new_header.incoming.remove(ndx);
-                        new_header.waiting.insert(0, s);
-                    }
-
-                    assert!(pm.old_dest_segment.is_none());
-                    assert!(pm.new_dest_segment.is_none());
-                },
                 MergeFrom::Waiting{old_segment, new_segment} => {
                     let i = new_header.waiting.len() - 1;
                     assert!(old_segment == new_header.waiting[i].root_page);
