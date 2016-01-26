@@ -7182,35 +7182,6 @@ impl MergingInto {
     }
 }
 
-#[derive(Debug)]
-enum MergeFrom {
-    Waiting{old_segment: PageNum, new_segment: Option<SegmentHeaderInfo>},
-    Regular{level: usize, old_segment: PageNum, new_segment: Option<SegmentHeaderInfo>},
-}
-
-#[derive(Debug)]
-enum MergeFromIncoming {
-    Incoming{segments: Vec<PageNum>},
-    IncomingNoRewrite{segments: Vec<PageNum>},
-}
-
-impl MergeFrom {
-    fn get_from_non_incoming_level(&self) -> FromNonIncomingLevel {
-        match self {
-            &MergeFrom::Waiting{..} => FromNonIncomingLevel::Regular(0),
-            &MergeFrom::Regular{level, ..} => FromNonIncomingLevel::Regular(level + 1),
-        }
-    }
-
-    fn get_dest_level(&self) -> DestLevel {
-        match self {
-            &MergeFrom::Waiting{..} => DestLevel::Regular(0),
-            &MergeFrom::Regular{level, ..} => DestLevel::Regular(level + 1),
-        }
-    }
-
-}
-
 #[derive(Debug, PartialEq)]
 enum NeedsMerge {
     No,
@@ -7220,7 +7191,9 @@ enum NeedsMerge {
 
 #[derive(Debug)]
 pub struct PendingMerge {
-    from: MergeFrom,
+    from_level: FromNonIncomingLevel,
+    old_from_segment: PageNum,
+    survivors: Option<SegmentHeaderInfo>,
     old_dest_segment: Option<PageNum>,
     new_dest_segment: Option<SegmentHeaderInfo>,
     now_inactive: HashMap<PageNum, BlockList>,
@@ -7228,7 +7201,8 @@ pub struct PendingMerge {
 
 #[derive(Debug)]
 pub struct PendingMergeFromIncoming {
-    from: MergeFromIncoming,
+    segments: Vec<PageNum>,
+    promote_without_rewrite: bool,
     new_dest_segment: Option<SegmentHeaderInfo>,
     now_inactive: HashMap<PageNum, BlockList>,
 }
@@ -8615,7 +8589,8 @@ impl InnerPart {
                             // TODO dislike early return
                             let pm = 
                                 PendingMergeFromIncoming {
-                                    from: MergeFromIncoming::IncomingNoRewrite{segments: segments},
+                                    segments: segments,
+                                    promote_without_rewrite: true,
                                     new_dest_segment: None,
                                     now_inactive: HashMap::new(),
                                 };
@@ -8734,14 +8709,10 @@ impl InnerPart {
 
         //println!("now_inactive: {:?}", now_inactive);
 
-        let from = 
-            MergeFromIncoming::Incoming{
-                segments: leaf_segments,
-            };
-
         let pm = 
             PendingMergeFromIncoming {
-                from: from,
+                segments: leaf_segments,
+                promote_without_rewrite: false,
                 new_dest_segment: new_dest_segment,
                 now_inactive: now_inactive,
             };
@@ -9230,13 +9201,10 @@ impl InnerPart {
             now_inactive
         };
 
-        let from = 
+        let (old_from_segment, survivors) = 
             match from {
                 MergingFrom::WaitingLeaf{segment, ..} => {
-                    MergeFrom::Waiting{
-                        old_segment: segment,
-                        new_segment: None,
-                    }
+                    (segment, None)
                 },
                 MergingFrom::WaitingPartial{old_segment, promote_pages, promote_depth, promote_lineage, promote_blocks, ..} => {
                     // TODO this code is very similar to the MergingFrom::RegularPartial case below
@@ -9256,11 +9224,6 @@ impl InnerPart {
                             );
                     //println!("node_rewritten: {:?}", wrote.nodes_rewritten);
 
-                    let from = 
-                        MergeFrom::Waiting{
-                            old_segment: old_segment.pagenum,
-                            new_segment: wrote.segment,
-                        };
                     let mut blocks = promote_blocks;
                     for page in promote_pages {
                         blocks.add_page_no_reorder(page);
@@ -9278,14 +9241,10 @@ impl InnerPart {
                     //println!("blocks becoming inactive on survivors: {:?}", blocks);
                     assert!(!now_inactive.contains_key(&old_segment.pagenum));
                     now_inactive.insert(old_segment.pagenum, blocks);
-                    from
+                    (old_segment.pagenum, wrote.segment)
                 },
                 MergingFrom::RegularLeaf{level, segment, ..} => {
-                    MergeFrom::Regular{
-                        level: level,
-                        old_segment: segment,
-                        new_segment: None,
-                    }
+                    (segment, None)
                 },
                 MergingFrom::RegularPartial{level, old_segment, promote_pages, promote_depth, promote_lineage, promote_blocks, ..} => {
                     //println!("promote_lineage: {:?}", promote_lineage);
@@ -9300,12 +9259,6 @@ impl InnerPart {
                              wrote.elapsed_ms,
                             );
 
-                    let from = 
-                        MergeFrom::Regular {
-                            level: level,
-                            old_segment: old_segment.pagenum,
-                            new_segment: wrote.segment,
-                        };
                     let mut blocks = promote_blocks;
                     for page in promote_pages {
                         blocks.add_page_no_reorder(page);
@@ -9323,7 +9276,7 @@ impl InnerPart {
                     //println!("blocks becoming inactive on survivors: {:?}", blocks);
                     assert!(!now_inactive.contains_key(&old_segment.pagenum));
                     now_inactive.insert(old_segment.pagenum, blocks);
-                    from
+                    (old_segment.pagenum, wrote.segment)
                 },
             };
 
@@ -9332,16 +9285,6 @@ impl InnerPart {
         // bizarre
         if cfg!(expensive_check) 
         {
-            let (old_from_segment, survivors) =
-                match from {
-                    MergeFrom::Waiting{old_segment, ref new_segment, ..} => {
-                        (old_segment, new_segment)
-                    },
-                    MergeFrom::Regular{old_segment, ref new_segment, ..} => {
-                        (old_segment, new_segment)
-                    },
-                };
-
             try!(Self::verify_inactive_against_old_method(
                     from_level.to_from_level(),
                     &vec![old_from_segment],
@@ -9357,7 +9300,9 @@ impl InnerPart {
 
         let pm = 
             PendingMerge {
-                from: from,
+                from_level: from_level,
+                old_from_segment: old_from_segment,
+                survivors: survivors,
                 old_dest_segment: old_dest_segment,
                 new_dest_segment: new_dest_segment,
                 now_inactive: now_inactive,
@@ -9417,49 +9362,42 @@ impl InnerPart {
                 },
                 Some(ref new_seg) => {
                     let mut deps_dest = vec![];
-                    match pm.from {
-                        MergeFromIncoming::Incoming{ref segments} => {
-                            for seg in segments {
-                                deps_dest.push(*seg);
-                            }
-                        },
-                        MergeFromIncoming::IncomingNoRewrite{..} => {
-                            assert!(pm.now_inactive.is_empty());
-                        },
+                    if pm.promote_without_rewrite {
+                        assert!(pm.now_inactive.is_empty());
+                    } else {
+                        for seg in pm.segments.iter() {
+                            deps_dest.push(*seg);
+                        }
                     }
                     assert!(!deps.contains_key(&new_seg.root_page));
                     deps.insert(new_seg.root_page, deps_dest);
                 },
             }
 
-            match pm.from {
-                MergeFromIncoming::Incoming{ref segments} => {
-                    let ndx = find_segments_in_list(segments, &headerstuff.data.incoming);
-                    for _ in segments {
-                        new_header.incoming.remove(ndx);
-                    }
+            let ndx = find_segments_in_list(&pm.segments, &headerstuff.data.incoming);
+            if pm.promote_without_rewrite {
+                for _ in pm.segments {
+                    let s = new_header.incoming.remove(ndx);
+                    new_header.waiting.insert(0, s);
+                }
 
-                    match pm.new_dest_segment {
-                        None => {
-                            // a merge resulted in what would have been an empty segment.
-                            // this happens because tombstones.
-                            // multiple segments from the incoming level cancelled each other out.
-                            // nothing needs to be inserted in the waiting level.
-                        },
-                        Some(new_seg) => {
-                            new_header.waiting.insert(0, new_seg);
-                        },
-                    }
-                },
-                MergeFromIncoming::IncomingNoRewrite{ref segments} => {
-                    let ndx = find_segments_in_list(segments, &headerstuff.data.incoming);
-                    for _ in segments {
-                        let s = new_header.incoming.remove(ndx);
-                        new_header.waiting.insert(0, s);
-                    }
+                assert!(pm.new_dest_segment.is_none());
+            } else {
+                for _ in pm.segments {
+                    new_header.incoming.remove(ndx);
+                }
 
-                    assert!(pm.new_dest_segment.is_none());
-                },
+                match pm.new_dest_segment {
+                    None => {
+                        // a merge resulted in what would have been an empty segment.
+                        // this happens because tombstones.
+                        // multiple segments from the incoming level cancelled each other out.
+                        // nothing needs to be inserted in the waiting level.
+                    },
+                    Some(new_seg) => {
+                        new_header.waiting.insert(0, new_seg);
+                    },
+                }
             }
 
             new_header.merge_counter += 1;
@@ -9484,7 +9422,7 @@ impl InnerPart {
     }
 
     fn commit_merge(&self, pm: PendingMerge) -> Result<()> {
-        let dest_level = pm.from.get_dest_level();
+        let dest_level = pm.from_level.get_dest_level();
         //println!("commit_merge: {:?}", pm);
         {
             let mut headerstuff = try!(self.header.write());
@@ -9551,14 +9489,7 @@ impl InnerPart {
                 },
                 Some(ref new_seg) => {
                     let mut deps_dest = vec![];
-                    match pm.from {
-                        MergeFrom::Waiting{old_segment, ..} => {
-                            deps_dest.push(old_segment);
-                        },
-                        MergeFrom::Regular{old_segment, ..} => {
-                            deps_dest.push(old_segment);
-                        },
-                    }
+                    deps_dest.push(pm.old_from_segment);
                     match pm.old_dest_segment {
                         Some(seg) => {
                             deps_dest.push(seg);
@@ -9573,34 +9504,20 @@ impl InnerPart {
 
             // also, the survivors must depend on the old segment
 
-            match pm.from {
-                MergeFrom::Waiting{old_segment, ref new_segment} => {
-                    match new_segment {
-                        &Some(ref new_segment) => {
-                            assert!(!deps.contains_key(&new_segment.root_page));
-                            deps.insert(new_segment.root_page, vec![old_segment]);
-                        },
-                        &None => {
-                        },
-                    }
+            match &pm.survivors {
+                &Some(ref new_segment) => {
+                    assert!(!deps.contains_key(&new_segment.root_page));
+                    deps.insert(new_segment.root_page, vec![pm.old_from_segment]);
                 },
-                MergeFrom::Regular{level, old_segment, ref new_segment} => {
-                    match new_segment {
-                        &Some(ref new_segment) => {
-                            assert!(!deps.contains_key(&new_segment.root_page));
-                            deps.insert(new_segment.root_page, vec![old_segment]);
-                        },
-                        &None => {
-                        },
-                    }
+                &None => {
                 },
             }
 
-            match pm.from {
-                MergeFrom::Waiting{old_segment, new_segment} => {
+            match pm.from_level {
+                FromNonIncomingLevel::Waiting => {
                     let i = new_header.waiting.len() - 1;
-                    assert!(old_segment == new_header.waiting[i].root_page);
-                    match new_segment {
+                    assert!(pm.old_from_segment == new_header.waiting[i].root_page);
+                    match pm.survivors {
                         Some(new_segment) => {
                             new_header.waiting[i] = new_segment;
                         },
@@ -9612,9 +9529,9 @@ impl InnerPart {
                     let dest_level = 0;
                     update_header(&mut new_header, pm.old_dest_segment, pm.new_dest_segment, dest_level);
                 },
-                MergeFrom::Regular{level, old_segment, new_segment} => {
-                    assert!(old_segment == new_header.regular[level].as_ref().unwrap().root_page);
-                    new_header.regular[level] = new_segment;
+                FromNonIncomingLevel::Regular(level) => {
+                    assert!(pm.old_from_segment == new_header.regular[level].as_ref().unwrap().root_page);
+                    new_header.regular[level] = pm.survivors;
 
                     let dest_level = level + 1;
                     update_header(&mut new_header, pm.old_dest_segment, pm.new_dest_segment, dest_level);
