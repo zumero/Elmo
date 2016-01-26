@@ -7191,7 +7191,6 @@ struct PromotionDetails {
     promoted_leaves: Vec<PageNum>, // must be contig within same parent
     // TODO instead of lineage, we may need key range
     promote_lineage: Vec<PageNum>, 
-    count_tombstones: u64,
 }
 
 #[derive(Debug)]
@@ -8740,6 +8739,7 @@ impl InnerPart {
             },
             WaitingPartial{
                 details: PromotionDetails,
+                count_tombstones: u64,
             },
             RegularLeaf{
                 level: usize,  // TODO why is this here?
@@ -8749,6 +8749,7 @@ impl InnerPart {
             RegularPartial{
                 level: usize,  // TODO why is this here?
                 details: PromotionDetails,
+                count_tombstones: u64,
             },
         }
 
@@ -8801,10 +8802,10 @@ impl InnerPart {
                                     segment: parent, 
                                     promote_lineage: lineage, 
                                     promoted_leaves: chosen_pages, 
-                                    count_tombstones: count_tombstones,
                                 };
                                 let from = MergingFrom::WaitingPartial{
                                     details: details,
+                                    count_tombstones: count_tombstones,
                                 };
                                 (vec![cursor], from)
                             }
@@ -8847,11 +8848,11 @@ impl InnerPart {
                                     segment: parent, 
                                     promote_lineage: lineage, 
                                     promoted_leaves: chosen_pages, 
-                                    count_tombstones: count_tombstones,
                                 };
                                 let from = MergingFrom::RegularPartial{
                                     level: level, 
                                     details: details,
+                                    count_tombstones: count_tombstones,
                                 };
                                 (vec![cursor], from)
                             },
@@ -8943,8 +8944,8 @@ impl InnerPart {
                                 Some(behind_segments)
                             }
                         },
-                        MergingFrom::WaitingPartial{ref details, ..} => {
-                            if details.count_tombstones == 0 {
+                        MergingFrom::WaitingPartial{count_tombstones, ..} => {
+                            if count_tombstones == 0 {
                                 None
                             } else {
                                 let dest_level = 0;
@@ -8957,8 +8958,8 @@ impl InnerPart {
                                 Some(behind_segments)
                             }
                         },
-                        MergingFrom::RegularPartial{level, ref details, ..} => {
-                            if details.count_tombstones == 0 {
+                        MergingFrom::RegularPartial{level, count_tombstones, ..} => {
+                            if count_tombstones == 0 {
                                 None
                             } else {
                                 let dest_level = level + 1;
@@ -9230,7 +9231,7 @@ impl InnerPart {
                 MergingFrom::WaitingLeaf{segment, ..} | MergingFrom::RegularLeaf{segment, ..} => {
                     (segment, None)
                 },
-                MergingFrom::WaitingPartial{details} | MergingFrom::RegularPartial{details, ..} => {
+                MergingFrom::WaitingPartial{details, ..} | MergingFrom::RegularPartial{details, ..} => {
                     let old_segment = details.segment.pagenum;
                     assert!(!now_inactive.contains_key(&details.segment.pagenum));
                     let (survivors, inactive) = try!(handle_survivors(&mut pw, details, from_level, &inner, &f));
