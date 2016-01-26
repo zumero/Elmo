@@ -4282,10 +4282,7 @@ fn survivors_rewrite_node(
 
 fn write_survivors(
                 pw: &mut PageWriter,
-                skip_pages: &Vec<PageNum>,
-                skip_depth: u8,
-                skip_lineage: &Vec<PageNum>,
-                parent: &ParentPage,
+                details: &PromotionDetails,
                 path: &str,
                 f: &PageCache,
                 dest_level: DestLevel,
@@ -4293,16 +4290,16 @@ fn write_survivors(
 
     let t1 = time::PreciseTime::now();
 
-    assert!(!skip_pages.is_empty());
-    assert!(skip_lineage[skip_depth as usize] == 0);
+    assert!(!details.promoted_leaves.is_empty());
+    assert!(details.promote_lineage[0] == 0);
 
     let mut chain = ParentNodeWriter::new(pw.page_size(), 1);
-    let mut nodes_rewritten = vec![vec![]; parent.depth() as usize + 1].into_boxed_slice();
-    let mut nodes_recycled = vec![0; parent.depth() as usize + 1].into_boxed_slice();
+    let mut nodes_rewritten = vec![vec![]; details.segment.depth() as usize + 1].into_boxed_slice();
+    let mut nodes_recycled = vec![0; details.segment.depth() as usize + 1].into_boxed_slice();
     let mut owned_overflows = vec![];
 
-    try!(survivors_rewrite_node(pw, skip_pages, skip_depth, skip_lineage, parent, &mut chain, &mut nodes_rewritten, &mut nodes_recycled, &mut owned_overflows));
-    nodes_rewritten[parent.depth() as usize].push(parent.pagenum);
+    try!(survivors_rewrite_node(pw, &details.promoted_leaves, 0, &details.promote_lineage, &details.segment, &mut chain, &mut nodes_rewritten, &mut nodes_recycled, &mut owned_overflows));
+    nodes_rewritten[details.segment.depth() as usize].push(details.segment.pagenum);
 
     let (count_parent_nodes, seg) = try!(chain.done(pw));
 
@@ -7189,6 +7186,14 @@ enum NeedsMerge {
     Desperate,
 }
 
+struct PromotionDetails {
+    segment: ParentPage,
+    promoted_leaves: Vec<PageNum>, // must be contig within same parent
+    // TODO instead of lineage, we may need key range
+    promote_lineage: Vec<PageNum>, 
+    count_tombstones: u64,
+}
+
 #[derive(Debug)]
 pub struct PendingMerge {
     from_level: FromNonIncomingLevel,
@@ -8665,6 +8670,8 @@ impl InnerPart {
             }
         };
 
+        try!(pw.end());
+
         // all pages in the incoming segments being promoted
         // must end up in one of the following places:
         //     the new dest segment
@@ -8690,8 +8697,6 @@ impl InnerPart {
             }
             now_inactive
         };
-
-        try!(pw.end());
 
         // bizarre
         if cfg!(expensive_check) 
@@ -8734,12 +8739,7 @@ impl InnerPart {
                 count_tombstones: u64,
             },
             WaitingPartial{
-                old_segment: ParentPage,
-                promote_pages: Vec<PageNum>, // must be contig within same parent
-                promote_depth: u8,
-                promote_blocks: BlockList, 
-                promote_lineage: Vec<PageNum>, 
-                count_tombstones: u64,
+                details: PromotionDetails,
             },
             RegularLeaf{
                 level: usize,  // TODO why is this here?
@@ -8748,12 +8748,7 @@ impl InnerPart {
             },
             RegularPartial{
                 level: usize,  // TODO why is this here?
-                old_segment: ParentPage, 
-                promote_pages: Vec<PageNum>, // must be contig within same parent
-                promote_depth: u8,
-                promote_blocks: BlockList, 
-                promote_lineage: Vec<PageNum>, 
-                count_tombstones: u64,
+                details: PromotionDetails,
             },
         }
 
@@ -8792,24 +8787,24 @@ impl InnerPart {
                                 (vec![cursor], from)
                             },
                             PageType::Parent => {
-                                let promote_depth = 0;
-
                                 let parent = try!(ParentPage::new(f.clone(), segment.root_page));
 
                                 let mut lineage = vec![0; parent.depth() as usize + 1];
+                                let promote_depth = 0;
                                 let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, inner.settings.num_leaves_promote));
                                 //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
                                 //println!("lineage: {}", lineage);
 
                                 let cursor = try!(MultiPageCursor::new(f.clone(), chosen_pages.clone()));
 
-                                let from = MergingFrom::WaitingPartial{
-                                    old_segment: parent, 
+                                let details = PromotionDetails{
+                                    segment: parent, 
                                     promote_lineage: lineage, 
-                                    promote_pages: chosen_pages, 
-                                    promote_depth: promote_depth,
-                                    promote_blocks: BlockList::new(), 
+                                    promoted_leaves: chosen_pages, 
                                     count_tombstones: count_tombstones,
+                                };
+                                let from = MergingFrom::WaitingPartial{
+                                    details: details,
                                 };
                                 (vec![cursor], from)
                             }
@@ -8838,34 +8833,25 @@ impl InnerPart {
                                 let depth_root = old_from_segment.buf[2];
                                 //println!("old_from_segment: {}, depth: {}", old_from_segment.root_page, depth_root);
                                 assert!(depth_root >= 1);
-                                // TODO do we really ever want to promote from a depth other than leaves?
-                                let promote_depth = 0;
 
                                 let parent = try!(ParentPage::new(f.clone(), old_from_segment.root_page));
 
                                 let mut lineage = vec![0; parent.depth() as usize + 1];
+                                let promote_depth = 0;
                                 let (chosen_pages, count_tombstones) = try!(parent.choose_nodes_to_promote(promote_depth, &mut lineage, inner.settings.num_leaves_promote));
                                 //println!("{:?},promoting_pages,{:?}", from_level, chosen_pages);
                                 let cursor = try!(MultiPageCursor::new(f.clone(), chosen_pages.clone()));
                                 //println!("lineage: {}", lineage);
 
-                                let promote_blocks =
-                                    // TODO if promote_depth is always 0, this is silly
-                                    if promote_depth == 0 {
-                                        BlockList::new()
-                                    } else {
-                                        // TODO don't include the overflows here
-                                        unreachable!();
-                                    };
-
+                                let details = PromotionDetails{
+                                    segment: parent, 
+                                    promote_lineage: lineage, 
+                                    promoted_leaves: chosen_pages, 
+                                    count_tombstones: count_tombstones,
+                                };
                                 let from = MergingFrom::RegularPartial{
                                     level: level, 
-                                    old_segment: parent, 
-                                    promote_lineage: lineage, 
-                                    promote_pages: chosen_pages, 
-                                    promote_depth: promote_depth,
-                                    promote_blocks: promote_blocks, 
-                                    count_tombstones: count_tombstones,
+                                    details: details,
                                 };
                                 (vec![cursor], from)
                             },
@@ -8943,20 +8929,6 @@ impl InnerPart {
                                 Some(behind_segments)
                             }
                         },
-                        MergingFrom::WaitingPartial{count_tombstones, ..} => {
-                            if count_tombstones == 0 {
-                                None
-                            } else {
-                                let dest_level = 0;
-                                let mut behind_segments = Vec::with_capacity(header.regular.len());
-                                for i in dest_level + 1 .. header.regular.len() {
-                                    let seg = &header.regular[i];
-
-                                    behind_segments.push(seg);
-                                }
-                                Some(behind_segments)
-                            }
-                        },
                         MergingFrom::RegularLeaf{level, count_tombstones, ..} => {
                             if count_tombstones == 0 {
                                 None
@@ -8971,8 +8943,22 @@ impl InnerPart {
                                 Some(behind_segments)
                             }
                         },
-                        MergingFrom::RegularPartial{level, count_tombstones, ..} => {
-                            if count_tombstones == 0 {
+                        MergingFrom::WaitingPartial{ref details, ..} => {
+                            if details.count_tombstones == 0 {
+                                None
+                            } else {
+                                let dest_level = 0;
+                                let mut behind_segments = Vec::with_capacity(header.regular.len());
+                                for i in dest_level + 1 .. header.regular.len() {
+                                    let seg = &header.regular[i];
+
+                                    behind_segments.push(seg);
+                                }
+                                Some(behind_segments)
+                            }
+                        },
+                        MergingFrom::RegularPartial{level, ref details, ..} => {
+                            if details.count_tombstones == 0 {
                                 None
                             } else {
                                 let dest_level = level + 1;
@@ -9151,7 +9137,7 @@ impl InnerPart {
         //     the segment being promoted
         //     the dest segment
         //
-        // all those pages must end up in one of three places:
+        // all those pages must end up in one of the following places:
         //     the new dest segment
         //     the new from segment (survivors)
         //     inactive
@@ -9201,82 +9187,55 @@ impl InnerPart {
             now_inactive
         };
 
+        fn handle_survivors(
+            pw: &mut PageWriter,
+            details: PromotionDetails,
+            from_level: FromNonIncomingLevel,
+            inner: &std::sync::Arc<InnerPart>,
+            f: &std::sync::Arc<PageCache>,
+            ) -> Result<(Option<SegmentHeaderInfo>, BlockList)> {
+
+            let wrote = try!(write_survivors(pw, &details, &inner.path, &f, from_level.get_dest_level()));
+
+            println!("survivors,from,{:?}, leaves_rewritten,{}, leaves_recycled,{}, parent1_rewritten,{}, parent1_recycled,{}, ms,{}", 
+                     from_level, 
+                     if wrote.nodes_rewritten.len() > 0 { wrote.nodes_rewritten[0].len() } else { 0 },
+                     if wrote.nodes_recycled.len() > 0 { wrote.nodes_recycled[0] } else { 0 },
+                     if wrote.nodes_rewritten.len() > 1 { wrote.nodes_rewritten[1].len() } else { 0 },
+                     if wrote.nodes_recycled.len() > 1 { wrote.nodes_recycled[1] } else { 0 },
+                     wrote.elapsed_ms,
+                    );
+            //println!("node_rewritten: {:?}", wrote.nodes_rewritten);
+
+            let mut blocks = BlockList::new();
+            for page in details.promoted_leaves {
+                blocks.add_page_no_reorder(page);
+            }
+            // TODO isn't promote_lineage the same as nodes rewritten, basically?
+            for depth in 0 .. wrote.nodes_rewritten.len() {
+                for pgnum in wrote.nodes_rewritten[depth].iter() {
+                    blocks.add_page_no_reorder(*pgnum);
+                }
+            }
+            for page in wrote.owned_overflows {
+                let (_, blist) = try!(OverflowReader::get_len_and_blocklist(f.clone(), page));
+                blocks.add_blocklist_no_reorder(&blist);
+            }
+            //println!("blocks becoming inactive on survivors: {:?}", blocks);
+            Ok((wrote.segment, blocks))
+        }
+
         let (old_from_segment, survivors) = 
             match from {
-                MergingFrom::WaitingLeaf{segment, ..} => {
+                MergingFrom::WaitingLeaf{segment, ..} | MergingFrom::RegularLeaf{segment, ..} => {
                     (segment, None)
                 },
-                MergingFrom::WaitingPartial{old_segment, promote_pages, promote_depth, promote_lineage, promote_blocks, ..} => {
-                    // TODO this code is very similar to the MergingFrom::RegularPartial case below
-                    //println!("promote_lineage: {:?}", promote_lineage);
-                    //println!("promote_pages: {:?}", promote_pages);
-                    // TODO this seems to be the place where overflowed keys are getting lost
-                    // instead of becoming inactive
-                    let wrote = try!(write_survivors(&mut pw, &promote_pages, promote_depth, &promote_lineage, &old_segment, &inner.path, &f, from_level.get_dest_level()));
-
-                    println!("survivors,from,{:?}, leaves_rewritten,{}, leaves_recycled,{}, parent1_rewritten,{}, parent1_recycled,{}, ms,{}", 
-                             from_level, 
-                             if wrote.nodes_rewritten.len() > 0 { wrote.nodes_rewritten[0].len() } else { 0 },
-                             if wrote.nodes_recycled.len() > 0 { wrote.nodes_recycled[0] } else { 0 },
-                             if wrote.nodes_rewritten.len() > 1 { wrote.nodes_rewritten[1].len() } else { 0 },
-                             if wrote.nodes_recycled.len() > 1 { wrote.nodes_recycled[1] } else { 0 },
-                             wrote.elapsed_ms,
-                            );
-                    //println!("node_rewritten: {:?}", wrote.nodes_rewritten);
-
-                    let mut blocks = promote_blocks;
-                    for page in promote_pages {
-                        blocks.add_page_no_reorder(page);
-                    }
-                    // TODO isn't promote_lineage the same as nodes rewritten, basically?
-                    for depth in 0 .. wrote.nodes_rewritten.len() {
-                        for pgnum in wrote.nodes_rewritten[depth].iter() {
-                            blocks.add_page_no_reorder(*pgnum);
-                        }
-                    }
-                    for page in wrote.owned_overflows {
-                        let (_, blist) = try!(OverflowReader::get_len_and_blocklist(f.clone(), page));
-                        blocks.add_blocklist_no_reorder(&blist);
-                    }
-                    //println!("blocks becoming inactive on survivors: {:?}", blocks);
-                    assert!(!now_inactive.contains_key(&old_segment.pagenum));
-                    now_inactive.insert(old_segment.pagenum, blocks);
-                    (old_segment.pagenum, wrote.segment)
-                },
-                MergingFrom::RegularLeaf{level, segment, ..} => {
-                    (segment, None)
-                },
-                MergingFrom::RegularPartial{level, old_segment, promote_pages, promote_depth, promote_lineage, promote_blocks, ..} => {
-                    //println!("promote_lineage: {:?}", promote_lineage);
-                    //println!("promote_blocks: {:?}", promote_blocks);
-                    let wrote = try!(write_survivors(&mut pw, &promote_pages, promote_depth, &promote_lineage, &old_segment, &inner.path, &f, from_level.get_dest_level()));
-                    println!("survivors,from,{:?}, leaves_rewritten,{}, leaves_recycled,{}, parent1_rewritten,{}, parent1_recycled,{}, ms,{}", 
-                             from_level, 
-                             if wrote.nodes_rewritten.len() > 0 { wrote.nodes_rewritten[0].len() } else { 0 },
-                             if wrote.nodes_recycled.len() > 0 { wrote.nodes_recycled[0] } else { 0 },
-                             if wrote.nodes_rewritten.len() > 1 { wrote.nodes_rewritten[1].len() } else { 0 },
-                             if wrote.nodes_recycled.len() > 1 { wrote.nodes_recycled[1] } else { 0 },
-                             wrote.elapsed_ms,
-                            );
-
-                    let mut blocks = promote_blocks;
-                    for page in promote_pages {
-                        blocks.add_page_no_reorder(page);
-                    }
-                    // TODO isn't promote_lineage the same as nodes rewritten, basically?
-                    for depth in 0 .. wrote.nodes_rewritten.len() {
-                        for pgnum in wrote.nodes_rewritten[depth].iter() {
-                            blocks.add_page_no_reorder(*pgnum);
-                        }
-                    }
-                    for page in wrote.owned_overflows {
-                        let (_, blist) = try!(OverflowReader::get_len_and_blocklist(f.clone(), page));
-                        blocks.add_blocklist_no_reorder(&blist);
-                    }
-                    //println!("blocks becoming inactive on survivors: {:?}", blocks);
-                    assert!(!now_inactive.contains_key(&old_segment.pagenum));
-                    now_inactive.insert(old_segment.pagenum, blocks);
-                    (old_segment.pagenum, wrote.segment)
+                MergingFrom::WaitingPartial{details} | MergingFrom::RegularPartial{details, ..} => {
+                    let old_segment = details.segment.pagenum;
+                    assert!(!now_inactive.contains_key(&details.segment.pagenum));
+                    let (survivors, inactive) = try!(handle_survivors(&mut pw, details, from_level, &inner, &f));
+                    now_inactive.insert(old_segment, inactive);
+                    (old_segment, survivors)
                 },
             };
 
